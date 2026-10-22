@@ -1,0 +1,8 @@
+# Build output
+/target/
+
+# Reference repositories cloned for research (see kb/sluice/research/references/)
+/refs/
+
+# Pando local state (the config .pando.toml and the kb/ documents are versioned)
+/.pando/

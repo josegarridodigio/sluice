@@ -1,0 +1,17 @@
+[package]
+name = "sluice-gate-mcp"
+description = "MCP server front-end for Sluice, a thin client of the daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
