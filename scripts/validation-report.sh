@@ -9,6 +9,7 @@
 # run, still wrapped) to compare. `sluice status --json` adds hits,
 # coalesced requests and time saved for the "after" period.
 set -eu
+export LC_ALL=C   # numeric formatting independent of the user locale
 
 csv="${1:-$HOME/.local/state/sluice/validation.csv}"
 [ -f "$csv" ] || { echo "no log at $csv" >&2; exit 1; }
