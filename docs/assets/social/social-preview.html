@@ -1,0 +1,126 @@
+<!doctype html>
+<!-- Source of docs/assets/social-preview.png (GitHub social preview, 1280x640).
+     Render: google-chrome --headless=new --hide-scrollbars --force-device-scale-factor=1 \
+       --window-size=1280,640 --screenshot=docs/assets/social-preview.png docs/assets/social/social-preview.html -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sluice social preview</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0a0f1c; }
+  body { width: 1280px; height: 640px; overflow: hidden; }
+  svg { display: block; }
+  .mono { font-family: "Fira Code", "DejaVu Sans Mono", monospace; }
+</style>
+</head>
+<body>
+<svg width="1280" height="640" viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="glow" cx="40%" cy="50%" r="65%">
+      <stop offset="0" stop-color="#12304a" stop-opacity="1"/>
+      <stop offset="0.55" stop-color="#0c1830" stop-opacity="1"/>
+      <stop offset="1" stop-color="#0a0f1c" stop-opacity="1"/>
+    </radialGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#1b2a44" stroke-width="1"/>
+    </pattern>
+    <linearGradient id="out" gradientUnits="userSpaceOnUse" x1="462" y1="0" x2="660" y2="0">
+      <stop offset="0" stop-color="#2dd4bf"/>
+      <stop offset="1" stop-color="#5eead4"/>
+    </linearGradient>
+    <linearGradient id="pillar" x1="0" x2="1">
+      <stop offset="0" stop-color="#3b4a63"/>
+      <stop offset="0.5" stop-color="#55667f"/>
+      <stop offset="1" stop-color="#344259"/>
+    </linearGradient>
+    <linearGradient id="gate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f59e0b"/>
+      <stop offset="1" stop-color="#d97706"/>
+    </linearGradient>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="6"/>
+    </filter>
+    <linearGradient id="fadeL" x1="0" x2="1">
+      <stop offset="0" stop-color="#0a0f1c" stop-opacity="1"/>
+      <stop offset="0.12" stop-color="#0a0f1c" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1280" height="640" fill="url(#glow)"/>
+  <rect width="1280" height="640" fill="url(#grid)" opacity="0.55"/>
+
+  <!-- Six agent streams converging on the gate -->
+  <g fill="none" stroke-linecap="round" stroke-width="7" opacity="0.92">
+    <path d="M40 110 C 220 110, 300 300, 452 318" stroke="#60a5fa"/>
+    <path d="M40 190 C 220 190, 300 300, 452 322" stroke="#a78bfa"/>
+    <path d="M40 270 C 220 270, 320 300, 452 326" stroke="#f472b6"/>
+    <path d="M40 370 C 220 370, 320 350, 452 334" stroke="#fb923c"/>
+    <path d="M40 450 C 220 450, 300 350, 452 338" stroke="#facc15"/>
+    <path d="M40 530 C 220 530, 300 350, 452 344" stroke="#4ade80"/>
+  </g>
+  <!-- Requests travelling on the streams (points on the curves) -->
+  <g>
+    <circle cx="300" cy="243" r="7" fill="#dbeafe"/>
+    <circle cx="256" cy="248" r="7" fill="#ede9fe"/>
+    <circle cx="339" cy="302" r="7" fill="#fce7f3"/>
+    <circle cx="294" cy="354" r="7" fill="#ffedd5"/>
+    <circle cx="315" cy="373" r="7" fill="#fef9c3"/>
+    <circle cx="271" cy="428" r="7" fill="#dcfce7"/>
+  </g>
+  <!-- Agent chips: above the upper streams, below the lower ones -->
+  <g class="mono" font-size="15" fill="#9fb0c8">
+    <text x="62" y="94">agent·1  verify</text>
+    <text x="62" y="170">agent·2  pre-commit</text>
+    <text x="62" y="254">agent·3  verify</text>
+    <text x="62" y="400">agent·4  pre-push</text>
+    <text x="62" y="480">agent·5  verify</text>
+    <text x="62" y="560">agent·6  verify</text>
+  </g>
+  <rect width="1280" height="640" fill="url(#fadeL)"/>
+
+  <!-- The sluice gate -->
+  <g>
+    <ellipse cx="482" cy="330" rx="70" ry="22" fill="#2dd4bf" opacity="0.25" filter="url(#soft)"/>
+    <rect x="440" y="214" width="22" height="176" rx="4" fill="url(#pillar)"/>
+    <rect x="502" y="214" width="22" height="176" rx="4" fill="url(#pillar)"/>
+    <rect x="432" y="204" width="100" height="16" rx="4" fill="#64748b"/>
+    <!-- raised gate panel with ribs -->
+    <rect x="462" y="226" width="40" height="78" rx="3" fill="url(#gate)"/>
+    <g stroke="#92400e" stroke-width="2" opacity="0.7">
+      <line x1="462" y1="246" x2="502" y2="246"/>
+      <line x1="462" y1="266" x2="502" y2="266"/>
+      <line x1="462" y1="286" x2="502" y2="286"/>
+    </g>
+    <!-- the single stream passing under the gate -->
+    <rect x="462" y="314" width="40" height="30" fill="url(#out)" opacity="0.95"/>
+  </g>
+
+  <!-- One run flows out -->
+  <path d="M500 329 L 646 329" fill="none" stroke="url(#out)" stroke-width="24" stroke-linecap="round"/>
+  <g>
+    <circle cx="676" cy="329" r="34" fill="#0f2a2f" stroke="#2dd4bf" stroke-width="4"/>
+    <path d="M660 330 l11 11 l22 -24" fill="none" stroke="#5eead4" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <g class="mono" font-size="15" fill="#5eead4" text-anchor="middle">
+    <text x="676" y="394">1 run</text>
+    <text x="676" y="414" fill="#7b8ba3">5 coalesced</text>
+    <text x="676" y="434" fill="#7b8ba3">repeats: 29 ms</text>
+  </g>
+
+  <!-- Wordmark and message -->
+  <g class="mono">
+    <text x="800" y="262" font-size="100" font-weight="600" fill="#f8fafc" letter-spacing="-2">sluice</text>
+    <rect x="804" y="284" width="68" height="6" rx="3" fill="#2dd4bf"/>
+    <text x="802" y="344" font-size="28" font-weight="500" fill="#e2e8f0">Many agents.</text>
+    <text x="802" y="382" font-size="28" font-weight="500" fill="#5eead4">One verification per tree.</text>
+    <text x="802" y="428" font-size="18" fill="#94a3b8">Verification queue and result cache</text>
+    <text x="802" y="452" font-size="18" fill="#94a3b8">for parallel coding agents.</text>
+  </g>
+  <g class="mono" font-size="15" fill="#7b8ba3">
+    <rect x="802" y="488" width="404" height="34" rx="17" fill="#111c33" stroke="#22324f"/>
+    <text x="1004" y="510" text-anchor="middle">git hooks · MCP · merge queue · Linux</text>
+  </g>
+</svg>
+</body>
+</html>
