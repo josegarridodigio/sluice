@@ -435,10 +435,6 @@ fn write_user_queue_config(sb: &Sandbox, body: &str) {
     .expect("user config");
 }
 
-fn enable_agent_approval(sb: &Sandbox) {
-    write_user_queue_config(sb, "allow_agent_approval = true\n");
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn queue_tools_are_listed_with_descriptions_and_instructions() {
     let sb = Sandbox::standard();
