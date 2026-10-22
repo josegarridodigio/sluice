@@ -100,6 +100,7 @@ fn reason(r: WaitReason) -> &'static str {
         WaitReason::Psi => "psi",
         WaitReason::RepoCap => "repo-cap",
         WaitReason::HeadReserved => "head-reserved",
+        WaitReason::Unknown => "unknown",
     }
 }
 

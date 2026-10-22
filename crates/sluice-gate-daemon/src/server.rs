@@ -863,6 +863,7 @@ fn finish_job(shared: &Shared, id: &str, outcome: Outcome, exit_code: Option<i32
         OutcomeStatus::Killed => "killed",
         OutcomeStatus::Cached => "cached",
         OutcomeStatus::Error => "error",
+        OutcomeStatus::Unknown => "unknown",
     };
     let events = {
         let mut st = shared.state();
@@ -1720,6 +1721,7 @@ fn caller_str(caller: Caller) -> &'static str {
     match caller {
         Caller::Agent => "agent",
         Caller::Human => "human",
+        Caller::Unknown => "unknown",
     }
 }
 

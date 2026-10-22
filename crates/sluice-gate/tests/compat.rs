@@ -276,7 +276,6 @@ fn queue_requests_refused_by_the_queue_state_exit_4() {
 }
 
 #[test]
-#[ignore = "gap G11: fixed by task H3b"]
 fn long_help_documents_every_exit_code() {
     let help = current_help(&[]);
     for (code, what) in [

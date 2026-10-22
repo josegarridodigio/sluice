@@ -334,6 +334,7 @@ fn caller_str(c: Caller) -> &'static str {
     match c {
         Caller::Agent => "agent",
         Caller::Human => "human",
+        Caller::Unknown => "unknown",
     }
 }
 

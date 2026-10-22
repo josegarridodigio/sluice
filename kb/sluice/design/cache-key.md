@@ -182,8 +182,8 @@ Rules:
   the new tree.
 - TTL: a marker older than `cache.ttl_days` (by file mtime or `passed_at`,
   whichever is older) is deleted when it is read and treated as a miss;
-  `prune` (called after every marker write) additionally removes markers
-  older than the TTL by mtime. Miss records never expire on their own.
+  `prune` (called after every marker write) additionally removes markers,
+  miss records and files of a foreign `format` older than the TTL by mtime.
 - `sluice cache clear [--gate <name>]` removes markers **and miss records**
   of the current repository (optionally one gate) and prints the count.
 - `sluice cache status [--all]` prints the markers directory, the current
@@ -215,7 +215,8 @@ Rules:
   shell snippets can check a marker without Sluice if they ever need to.
   Markers are pretty-printed JSON with a trailing newline, written via
   `.tmp-<pid>-<n>` files, `fsync` and rename; the directory is `0700`.
-  A marker with unknown fields is treated as corrupt (strict schema).
+  Unknown fields are tolerated on read (ignored); the format still forbids
+  writing new fields in 0.3.0 because released binaries delete such markers.
 - The daemon writes markers with its job id and daemon instance id; a
   marker from an unknown daemon instance is still valid (markers are facts
   about trees, not about processes).

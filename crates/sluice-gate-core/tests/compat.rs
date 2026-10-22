@@ -418,7 +418,6 @@ fn foreign_format_and_wrong_key_markers_are_misses() {
 }
 
 #[test]
-#[ignore = "gap G4a: fixed by task H3b"]
 fn a_marker_with_an_unknown_field_is_still_a_hit() {
     for release in RELEASES {
         let (_g, store, key, path) = bad_case(release, "unknown-field");
@@ -431,7 +430,6 @@ fn a_marker_with_an_unknown_field_is_still_a_hit() {
 }
 
 #[test]
-#[ignore = "gap G3: fixed by task H3b"]
 fn prune_removes_orphaned_miss_records_and_foreign_formats() {
     for release in RELEASES {
         let (_g, store, dir) = store_with(release);

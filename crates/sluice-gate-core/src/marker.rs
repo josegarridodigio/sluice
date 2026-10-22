@@ -14,8 +14,11 @@ use crate::tree::TreeHash;
 use crate::{CACHE_FORMAT_VERSION, Error, Result};
 
 /// Record of a gate that passed on a given key.
+///
+/// Unknown fields are tolerated on read so that a field added by a future
+/// release is not destructive. The format still forbids writing new fields
+/// in 0.3.0 (older binaries treat them as corrupt and delete the marker).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Marker {
     /// On-disk format version ([`CACHE_FORMAT_VERSION`]).
     pub format: u32,
@@ -42,8 +45,11 @@ pub struct Marker {
 }
 
 /// Record of a failed run (or a tree-changing pass), for `status` reporting.
+///
+/// Unknown fields are tolerated on read so that a field added by a future
+/// release is not destructive. The format still forbids writing new fields
+/// in 0.3.0 (older binaries treat them as corrupt and delete the marker).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MissRecord {
     /// On-disk format version.
     pub format: u32,
@@ -315,18 +321,16 @@ impl MarkerStore {
         Ok(removed)
     }
 
-    /// Remove markers whose mtime is older than `ttl`. Per-file errors are
-    /// ignored. Returns how many were removed.
+    /// Remove markers, miss records and files of a foreign `format` whose
+    /// mtime is older than `ttl`. Per-file errors are ignored. Returns how
+    /// many were removed.
     ///
     /// # Errors
     ///
     /// [`Error::Io`] when the directory cannot be read.
     pub fn prune(&self, ttl: Duration) -> Result<usize> {
         let mut removed = 0;
-        for (path, name) in self.entries()? {
-            if is_miss_name(&name) {
-                continue;
-            }
+        for (path, _) in self.entries()? {
             let expired = fs::metadata(&path)
                 .and_then(|m| m.modified())
                 .is_ok_and(|t| age_of(t) > ttl);

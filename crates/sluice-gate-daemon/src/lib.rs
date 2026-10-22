@@ -11,6 +11,7 @@
 //! `psi-admission.md`.
 
 pub mod executor;
+mod meta;
 pub mod psi;
 pub mod scheduler;
 pub mod server;
@@ -30,8 +31,14 @@ pub enum Error {
     #[error("database busy, retry later")]
     Busy,
     /// Schema version mismatch.
-    #[error("database {path} has schema version {found}, this daemon needs {expected}")]
+    #[error(
+        "database {path} has schema version {found} (written by {writer}), this daemon needs \
+         {expected}; restore a backup or delete the file (job history and queue state are \
+         lost, cache markers live in the repository and are not affected)"
+    )]
     Schema {
+        /// Release that last opened the database (`sluice X.Y.Z`).
+        writer: String,
         /// Database file.
         path: std::path::PathBuf,
         /// Version found.

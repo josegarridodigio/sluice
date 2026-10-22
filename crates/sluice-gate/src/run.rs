@@ -567,6 +567,10 @@ fn report_outcome(
             return ExitCode::SUCCESS;
         }
         OutcomeStatus::Error => return fail(&outcome.message),
+        // Never a pass: a status from a newer daemon is an error.
+        OutcomeStatus::Unknown => {
+            return fail("the daemon reported an outcome this client does not know; update sluice");
+        }
         OutcomeStatus::Pass => Finish::Pass {
             note: match (state, &outcome.not_cached_reason) {
                 _ if ctx.gate.is_queue_only() => String::new(),

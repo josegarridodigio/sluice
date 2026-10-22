@@ -407,6 +407,9 @@ pub enum Caller {
     /// A person at a terminal.
     #[default]
     Human,
+    /// A value this peer does not know (sent by a newer release).
+    #[serde(other)]
+    Unknown,
 }
 
 /// Telemetry event payload carried by [`ClientMessage::Event`].
@@ -619,6 +622,9 @@ pub enum OutcomeStatus {
     /// Sluice itself failed.
     #[default]
     Error,
+    /// A value this peer does not know (sent by a newer release).
+    #[serde(other)]
+    Unknown,
 }
 
 /// Code carried by [`ServerMessage::Error`].
@@ -643,6 +649,9 @@ pub enum ErrorCode {
     DuplicateBranch,
     /// The daemon does not serve this request (no extension handles it).
     NotSupported,
+    /// A value this peer does not know (sent by a newer release).
+    #[serde(other)]
+    Unknown,
 }
 
 /// Payload of the `status` reply.
@@ -794,6 +803,9 @@ pub enum WaitReason {
     RepoCap,
     /// Capacity reserved for an older queued job.
     HeadReserved,
+    /// A value this peer does not know (sent by a newer release).
+    #[serde(other)]
+    Unknown,
 }
 
 /// Cumulative counters in a status report.
@@ -1088,6 +1100,47 @@ pub fn line_too_long(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_enums_round_trip_and_fall_back_to_unknown() {
+        fn check<T>(known: &[(T, &str)], unknown: &T)
+        where
+            T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+        {
+            for (value, text) in known {
+                assert_eq!(&serde_json::to_string(value).unwrap(), text);
+                assert_eq!(&serde_json::from_str::<T>(text).unwrap(), value);
+            }
+            let future: T = serde_json::from_str("\"from-the-future\"").unwrap();
+            assert_eq!(&future, unknown);
+        }
+        check(
+            &[(Caller::Agent, "\"agent\""), (Caller::Human, "\"human\"")],
+            &Caller::Unknown,
+        );
+        check(
+            &[
+                (OutcomeStatus::Pass, "\"pass\""),
+                (OutcomeStatus::Cached, "\"cached\""),
+                (OutcomeStatus::Error, "\"error\""),
+            ],
+            &OutcomeStatus::Unknown,
+        );
+        check(
+            &[
+                (ErrorCode::BadRequest, "\"bad-request\""),
+                (ErrorCode::NotSupported, "\"not-supported\""),
+            ],
+            &ErrorCode::Unknown,
+        );
+        check(
+            &[
+                (WaitReason::RepoCap, "\"repo-cap\""),
+                (WaitReason::HeadReserved, "\"head-reserved\""),
+            ],
+            &WaitReason::Unknown,
+        );
+    }
 
     const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const TREE: &str = "0123456789abcdef0123456789abcdef01234567";

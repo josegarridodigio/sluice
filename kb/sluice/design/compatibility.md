@@ -96,7 +96,7 @@ a compat test until a human changes a fixture deliberately.
   old markers are never read: a lookup misses, the gate runs once, a v2
   marker is written. No migration and no run-time error; the release notes
   must say that the first run after upgrade is a miss.
-- **GAP G3**: `prune` only deletes markers by mtime and skips miss records
+- **GAP G3 (closed in H3b: `Marker`/`prune` extended)**: `prune` only deletes markers by mtime and skips miss records
   (`marker.rs:324-336`); after a bump, orphaned `*.miss.json` live forever
   and orphans markers one TTL. Prune records with a foreign `format` and miss
   records older than the TTL.
@@ -121,7 +121,7 @@ a compat test until a human changes a fixture deliberately.
 - Promise: `format` stays 1 and the field sets above stay exactly as listed
   for 0.3.0. New data goes in a separate file, or waits for G4a plus a
   release.
-- **GAP G4a**: drop `deny_unknown_fields` on `Marker` and `MissRecord`
+- **GAP G4a (closed in H3b: `deny_unknown_fields` dropped on markers and miss records; format still forbids new fields in 0.3.0)**: drop `deny_unknown_fields` on `Marker` and `MissRecord`
   (`marker.rs:18, 46`), keep the `format` check, and correct cache-key.md
   ("unknown fields are corrupt"). Field additions become safe one release
   later.
@@ -153,7 +153,7 @@ a compat test until a human changes a fixture deliberately.
   and current clients work against their daemons. A `protocol` bump keeps
   the stop-hint refusal and ships one release in which clients warn about an
   older daemon.
-- **GAP G5**: the wire enums `OutcomeStatus` (`proto/lib.rs:497`),
+- **GAP G5 (closed in H3b: `Unknown` fallbacks on `Caller`, `OutcomeStatus`, `ErrorCode`, `WaitReason`; unknown outcome is an error, never a pass; `ApproveVia` and `ExecSignal` are client-to-daemon only and stay strict)**: the wire enums `OutcomeStatus` (`proto/lib.rs:497`),
   `ErrorCode` (`:516`), `WaitReason` (`:664`) and `Caller` (`:301`) have no
   `#[serde(other)]` fallback, unlike the queue enums (`:746, 772, 914`). A new
   variant from a newer daemon makes the whole line undecodable in an older
@@ -242,7 +242,7 @@ Migration policy (promise):
   running anything (`queue/store.rs:307`). Needed before the first bump: a
   `migrate(from, to)` step per schema, the `.bak` copy and tests on committed
   v0.1.0/v0.2.0 database files (section 6).
-- **GAP G10**: `Error::Schema` (`daemon/lib.rs:33`) does not name the writer
+- **GAP G10 (closed in H3b: `meta` table, `daemon/src/meta.rs`, named in `Error::Schema`)**: `Error::Schema` (`daemon/lib.rs:33`) does not name the writer
   release. Store `sluice_version` in a new `meta` table (additive) and print
   it.
 
@@ -265,7 +265,7 @@ No marker; documented in `sluice --help`.
 - Compatible: a new code for a new situation; refining a former 1 into a
   new documented non-zero code. Incompatible: changing a listed number or
   meaning (hooks and the plugin skill rely on 3).
-- **GAP G11**: the long help lists 0, gate code, 3, 124, 143, 1, 2 but not 4
+- **GAP G11 (closed in H3b: long help lists every code incl. 4, 75, 125, 141; unit table test in `main.rs`)**: the long help lists 0, gate code, 3, 124, 143, 1, 2 but not 4
   and 75; only eight assertions in `crates/sluice-gate/tests` cover codes.
   Document both and add a table-driven test.
 
@@ -322,16 +322,16 @@ fallbacks, never move without a migration.
 |---|---|---|---|
 | G1 | alpha A2/D1 | `cache` bool cannot become a string | new key `mode` |
 | G2 | `config.rs` tests | no older-release config tests | fixtures |
-| G3 | `marker.rs:324-336` | prune skips miss records/foreign formats | extend prune |
-| G4a | `marker.rs:18,46` | strict markers make added fields destructive | drop `deny_unknown_fields` |
+| G3 | `marker.rs:324-336` | prune skips miss records/foreign formats | extend prune (CLOSED H3b) |
+| G4a | `marker.rs:18,46` | strict markers make added fields destructive | drop `deny_unknown_fields` (CLOSED H3b) |
 | G4b | alpha D1/L1 | cannot add marker data in 0.3.0 | side file |
-| G5 | `proto/lib.rs:301,497,516,664` | wire enums lack `serde(other)` | `Unknown` fallback |
+| G5 | `proto/lib.rs:301,497,516,664` | wire enums lack `serde(other)` | `Unknown` fallback (CLOSED H3b) |
 | G6 | protocol tests | unknown `type` not pinned | replay test |
 | G7 | alpha C | socket fallback differs per version | document |
 | G8 | queue status | no frozen fixture | add |
 | G9 | `daemon/store.rs:313`, `queue/store.rs:307` | no migration framework | `migrate` + `.bak` + tests |
-| G10 | `daemon/lib.rs:33` | downgrade error omits writer release | `meta` row |
-| G11 | `--help` | codes 4, 75 undocumented; few pinned | doc + table test |
+| G10 | `daemon/lib.rs:33` | downgrade error omits writer release | `meta` row (CLOSED H3b) |
+| G11 | `--help` | codes 4, 75 undocumented; few pinned | doc + table test (CLOSED H3b) |
 | G12 | CLI | surface unpinned | snapshot |
 | G13 | `mcp/src/lib.rs` | tools unpinned | snapshot |
 | G14 | plugin | version equality unchecked | test/CI |

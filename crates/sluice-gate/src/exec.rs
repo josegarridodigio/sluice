@@ -611,6 +611,10 @@ fn report(job: &Job, job_id: &str, outcome: &Outcome, signo: i32) -> ExitCode {
             ExitCode::from(EXIT_KILLED)
         }
         OutcomeStatus::Error => sluice_error(&outcome.message),
+        // Never a pass: a status from a newer daemon is an error.
+        OutcomeStatus::Unknown => {
+            sluice_error("the daemon reported an outcome this client does not know; update sluice")
+        }
     }
 }
 

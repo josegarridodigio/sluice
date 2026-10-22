@@ -72,9 +72,13 @@ the field sets of 0.2.0, so old and new binaries share one cache.
 
 Facts about old binaries: a marker with another `format`, unparsable JSON or a
 key that does not match its file name is deleted by every released binary and
-counts as a miss. Released binaries also treat a marker with an unknown extra
-field as damaged, so no field is added to markers in 0.3.0; new per-marker data
-goes in separate files. If a future release changes the key prefix
+counts as a miss. Released binaries (0.1.0 and 0.2.0) also treat a marker with an
+unknown extra field as damaged, so no field is added to markers in 0.3.0; new
+per-marker data goes in separate files. From 0.3.0 on, Sluice itself accepts
+unknown fields in markers and miss records (they are ignored, not deleted), so
+a field added by a later release is safe once 0.3.0 is the oldest binary in
+use. `cache prune` also removes miss records and files of a foreign `format`
+once they are older than the TTL. If a future release changes the key prefix
 (`sluice-cache-v2`), the first run after the upgrade is a cache miss, the gate
 runs once and a `v2` marker is written. Nothing else happens: no migration and
 no error.
@@ -92,10 +96,12 @@ sides. A real `protocol` bump keeps the refusal that tells you to run `sluice
 daemon stop`, and ships one release in which clients warn about an older
 daemon.
 
-Fact: in released binaries some wire enumerations (outcome status, error code,
+Fact: in 0.1.0 and 0.2.0 some wire enumerations (outcome status, error code,
 wait reason, caller) have no fallback for unknown values, so a newer daemon
-that sent a new value would make an older client fail to decode the line.
-Until fallbacks are in every client, no new values are sent.
+that sent a new value would make those clients fail to decode the line. From
+0.3.0 they parse unknown values as `unknown` (an unknown outcome is reported as
+an error, never as a pass). No new values are sent until 0.3.0 is the oldest
+client in use.
 
 ### Status JSON and queue status JSON
 
@@ -120,7 +126,9 @@ queue's state in two independent schemas. Markers are not in it.
   `sluice.db.bak-<version>`. One release of warnings comes first.
 
 **Downgrading.** An older binary that meets a database with a newer schema
-version refuses it and never writes to it: the daemon does not start (clients
+version refuses it and never writes to it. From 0.3.0 the message names the
+release that last opened the database (kept in an additive `meta` table that
+older binaries ignore) and how to recover: the daemon does not start (clients
 fall back to running gates in-process and `sluice doctor` reports the reason),
 or, for the queue schema, the merge queue does not start while gates keep
 working. Before you update across a release that announces a schema change,
@@ -147,6 +155,8 @@ markers, which live in the repository.
 | 4 | `sluice queue` request refused by the state of the queue |
 | 75 | `sluice daemon` found another daemon holding the lock |
 | 124 | gate timeout |
+| 125 | `sluice exec` failed after the daemon accepted the request |
+| 141 | `sluice exec` stdout is a closed pipe |
 | 143 | gate killed (signal, `daemon stop --force`) |
 
 A new code may be added for a new situation, or a former `1` refined into a new

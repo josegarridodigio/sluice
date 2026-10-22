@@ -185,3 +185,26 @@ its own while it was written (`cargo test -p <crate> --test compat`).
   author `Compat <compat@example.invalid>`, scratch PATH); no real user data.
 - The fixtures were recorded on x86_64 glibc hosts with the musl release
   binaries; nothing in them depends on the host except scratch paths.
+
+## Gaps closed
+
+The five ignored tests were un-ignored (fixtures untouched) by task H3b:
+
+- G4a: `Marker` and `MissRecord` no longer use `deny_unknown_fields`
+  (`sluice-gate-core/src/marker.rs`); a comment records that 0.3.0 still must
+  not write new fields.
+- G3: `MarkerStore::prune` now covers miss records and foreign-format files,
+  by mtime age.
+- G5: `Unknown` (`#[serde(other)]`) on `Caller`, `OutcomeStatus`, `ErrorCode`,
+  `WaitReason` (`sluice-gate-proto/src/lib.rs`, round-trip unit test). Match
+  sites: daemon `server.rs` (labels), queue `store.rs`/`runner.rs`, mcp
+  `lib.rs`/`text.rs`, CLI `run.rs`/`exec.rs`/`status.rs`. An unknown outcome is
+  reported as an error and never as a pass. `ApproveVia` and `ExecSignal` flow
+  client to daemon only and stay strict.
+- G10: new `sluice-gate-daemon/src/meta.rs` (`meta(key, value)` table, key
+  `writer_version`, written after a successful `Store::open`, one line in
+  `store.rs`); `Error::Schema` gained a `writer` field and its message names it
+  (`sluice 0.2.0 or older` when the row is absent) and the recovery.
+- G11: `sluice --help` lists every exit code (0, N, 1, 2, 3, 4, 75, 124, 125,
+  141, 143); unit test `exit_code_tests` in `sluice-gate/src/main.rs` pins the
+  constants and the help text.

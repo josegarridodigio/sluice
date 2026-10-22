@@ -654,7 +654,7 @@ fn outcome_line(
         OutcomeStatus::Fail => GateStatus::Fail,
         OutcomeStatus::Timeout => GateStatus::Timeout,
         OutcomeStatus::Killed => GateStatus::Killed,
-        OutcomeStatus::Error => GateStatus::Error,
+        OutcomeStatus::Error | OutcomeStatus::Unknown => GateStatus::Error,
     };
     let not_cached = off_reason
         .map(str::to_owned)
@@ -683,6 +683,10 @@ fn outcome_line(
         }
         OutcomeStatus::Killed => format!("KILLED after {secs:.1}s (job {job_id}) log={log}"),
         OutcomeStatus::Error => format!("ERROR {}", outcome.message),
+        // Never a pass: a status from a newer daemon is reported as an error.
+        OutcomeStatus::Unknown => {
+            format!("ERROR unknown outcome status from the daemon (job {job_id}); update sluice")
+        }
     };
     let failed_with_log = matches!(
         status,

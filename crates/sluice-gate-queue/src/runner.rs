@@ -1177,7 +1177,7 @@ async fn await_gates(
                             OutcomeStatus::Fail => "fail",
                             OutcomeStatus::Timeout => "timeout",
                             OutcomeStatus::Killed => "killed",
-                            OutcomeStatus::Error => "error",
+                            OutcomeStatus::Error | OutcomeStatus::Unknown => "error",
                         }.clone_into(&mut views[idx].status);
                         if !ok {
                             set.abort_all();

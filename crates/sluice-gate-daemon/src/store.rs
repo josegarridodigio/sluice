@@ -231,6 +231,7 @@ impl Store {
             path: path.to_path_buf(),
         };
         store.init_schema()?;
+        crate::meta::record_writer(&store.conn).map_err(db)?;
         Ok(store)
     }
 
@@ -314,6 +315,7 @@ impl Store {
             Ok(())
         } else {
             Err(Error::Schema {
+                writer: crate::meta::describe_writer(&self.conn),
                 path: self.path.clone(),
                 found,
                 expected: SCHEMA_VERSION,
@@ -870,6 +872,7 @@ mod tests {
                 found,
                 expected,
                 path,
+                ..
             }) => {
                 assert_eq!((found, expected), (99, SCHEMA_VERSION));
                 assert_eq!(path, p);

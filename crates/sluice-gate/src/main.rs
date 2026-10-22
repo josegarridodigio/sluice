@@ -43,10 +43,18 @@ use snippets::{HookManager, snippet};
                   or started the gate runs in-process. `sluice status` shows the queue. \
                   `sluice exec -- <cmd>` runs any other heavy command under the same budget, \
                   without cache.\n\n\
-                  Exit codes of `sluice run`: 0 pass or cache hit; the gate's own code on \
-                  failure; 3 refused by agent_hook_policy = \"fail-fast\"; 124 gate timeout; \
-                  143 gate killed (signal or `sluice daemon stop --force`); 1 Sluice error; \
-                  2 usage error.\n\n\
+                  Exit codes:\n  \
+                  0    pass or cache hit\n  \
+                  N    the gate's own code when it fails (`sluice run`, `sluice exec`)\n  \
+                  1    Sluice error\n  \
+                  2    usage error (also `sluice queue` and `sluice update`)\n  \
+                  3    refused by agent_hook_policy = \"fail-fast\"\n  \
+                  4    `sluice queue` request refused by the state of the queue\n  \
+                  75   `sluice daemon` found a daemon already holding the lock\n  \
+                  124  gate timeout\n  \
+                  125  `sluice exec` failed after the daemon accepted the request\n  \
+                  141  `sluice exec` stdout is a closed pipe\n  \
+                  143  gate killed (signal or `sluice daemon stop --force`)\n\n\
                   Environment: SLUICE_DISABLE=1 runs the gate directly (no cache, no queue); \
                   SLUICE_CACHE=0|1 forces the cache off or on (on overrides CI); CI disables \
                   the cache; SLUICE_AGENT=1|0 forces agent or human detection; SLUICE_CONFIG \
@@ -501,4 +509,54 @@ fn init(force: bool) -> ExitCode {
     let (pre_commit, pre_push) = starter_gates();
     print!("{}", snippet(HookManager::Plain, &pre_commit, &pre_push));
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod exit_code_tests {
+    use clap::CommandFactory;
+
+    use super::Cli;
+
+    /// Every exit code of the CLI: the number, the constant the program uses
+    /// for it (where reachable from here) and a phrase `--help` must put next
+    /// to it. The numbers are a compatibility promise (docs/compatibility.md).
+    #[test]
+    fn exit_codes_are_pinned_and_documented() {
+        let table: [(u8, Option<u8>, &str); 11] = [
+            (0, None, "pass"),
+            (1, Some(crate::run::EXIT_ERROR), "Sluice error"),
+            (2, None, "usage error"),
+            (3, Some(crate::run::EXIT_FAIL_FAST), "agent_hook_policy"),
+            (4, None, "queue"),
+            (
+                75,
+                Some(sluice_gate_proto::client::EXIT_ALREADY_RUNNING),
+                "daemon",
+            ),
+            (124, Some(crate::run::EXIT_TIMEOUT), "timeout"),
+            (125, Some(crate::exec::EXIT_SLUICE), "exec"),
+            (141, None, "closed pipe"),
+            (143, Some(crate::run::EXIT_KILLED), "killed"),
+            (7, None, "gate's own code"),
+        ];
+        let help = Cli::command().render_long_help().to_string();
+        for (code, constant, phrase) in table {
+            if let Some(used) = constant {
+                assert_eq!(used, code, "the constant for exit code {code} changed");
+            }
+            // The gate's own code is listed as `N`, not as a number.
+            let label = if code == 7 {
+                "N".to_owned()
+            } else {
+                code.to_string()
+            };
+            let listed = help
+                .lines()
+                .any(|l| l.split_whitespace().next() == Some(label.as_str()) && l.contains(phrase));
+            assert!(
+                listed,
+                "`sluice --help` must document exit code {label} ({phrase})"
+            );
+        }
+    }
 }

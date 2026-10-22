@@ -458,7 +458,6 @@ async fn a_daemon_runs_on_an_old_database() {
 }
 
 #[test]
-#[ignore = "gap G10: fixed by task H3b"]
 fn a_refused_newer_database_names_the_release_that_wrote_it() {
     for release in RELEASES {
         let (_dir, db) = copy_db(release);

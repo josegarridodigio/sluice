@@ -45,6 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Markers and miss records tolerate unknown fields; cache `prune` also
+  removes expired miss records and foreign-format files.
+- Wire enums parse unknown values as `unknown`; an unknown outcome is an
+  error, never a pass.
+- A refusal to open a newer database names the release that wrote it (new
+  additive `meta` table); `sluice --help` documents every exit code.
 - `sluice logs` and log retention handle `.exec` spools; `doctor` and
   `hook print` warn when a queue-only gate is listed in `hooks`.
 

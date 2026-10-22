@@ -294,7 +294,6 @@ fn run_requests_of_old_clients_decode_to_runs() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "gap G5: fixed by task H3b"]
 fn wire_enums_have_an_unknown_fallback() {
     // A newer daemon may add a variant; an older client must still decode
     // the line (the queue enums already do).
