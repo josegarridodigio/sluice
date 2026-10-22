@@ -10,3 +10,6 @@
 
 # Local agent commands (personal workflow, kept in ~/.claude/commands)
 /.claude/
+
+# Python bytecode (alpha harness)
+__pycache__/

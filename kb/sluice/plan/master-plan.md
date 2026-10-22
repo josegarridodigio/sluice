@@ -204,6 +204,25 @@ Why: today the log level is fixed at daemon start, the MCP server and the hook c
 
 Why: one install per user instead of a block pasted into every repository's `CLAUDE.md`; the skill only enters the context when relevant; the hook is the only piece that enforces the queue.
 
+## Alpha readiness (after v0.2.0)
+
+Goal: prove, without AI sessions (agents are simulated by scripts that use
+the CLI and speak MCP over stdio directly), that Sluice solves the original
+problem on real non-Rust stacks and survives abuse. Harness:
+`scripts/alpha/`. Evidence: [[sluice/changes/alpha-readiness.md]].
+The detailed, orchestrated plan that closes this block and cuts v0.3.0 is
+[[sluice/plan/alpha-plan.md]] (it supersedes the checklist below as the
+unit of work; tick these items when its tasks close them).
+
+- [x] Real stacks: a public Node project with Husky and a public Python project with the pre-commit framework, installed from the release binary, gates are the projects' own test commands.
+- [x] Hook managers for real: husky, lefthook, pre-commit and plain hooks installed with their own tools, driving `sluice run --hook …` in real `git commit` / `git push`.
+- [ ] The original problem, measured: N simulated agents in N worktrees verify, commit and push concurrently, with and without Sluice; suite executions, wall time, peak concurrent suites vs budget, CPU load.
+- [ ] Correctness invariants under concurrency: a broken tree never gets a pass; identical trees share one run; untracked files invalidate, ignored files do not; no stale pass after TTL or `key_inputs` change.
+- [ ] Chaos: SIGKILL of the daemon and of clients mid-run, many concurrent clients, synthetic CPU pressure; no orphan process, no stale lock, every client gets an answer or a clear error.
+- [ ] Merge queue on a real project: several simulated agents enqueue (conflicting and not), a human approves, the bare remote only moves on approval.
+- [ ] Upgrade with live state: v0.1.0 daemon, markers and database, then `sluice update` to v0.2.0; markers still hit, database opens, daemon restarts cleanly.
+- [ ] User intake: issue templates asking for `sluice doctor --bundle`, CHANGELOG, known limitations in the README; badge to alpha when every item above passes.
+
 ## Working agreements
 
 - Everything in English (code, docs, commits, KB).
