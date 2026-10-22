@@ -590,7 +590,7 @@ impl UserConfig {
             if !value.is_finite() || !(0.0..=100.0).contains(&value) {
                 return Err(config_err(
                     path,
-                    &format!("{name} must be a percentage between 0 and 100, got {value}"),
+                    format!("{name} must be a percentage between 0 and 100, got {value}"),
                 ));
             }
         }

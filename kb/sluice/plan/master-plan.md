@@ -150,9 +150,10 @@ Tasks:
 - [x] Integration tests with fake PSI files; `scripts/psi-pressure-demo.sh` measurements.
 - [x] Reconciliation pass ([[sluice/changes/phase-4-reconciliation.md]]): 36 findings; thresholds validated, docs corrected, metrics export defined as `status --json`.
 
-Deliverables: PSI-based admission, stable `sluice status --json` schema,
-metrics export (time saved, hit rate, wait times) for the user's existing HTML
-dashboard.
+Deliverables: PSI-based admission, stable `sluice status --json` schema;
+that JSON (runs, hits, coalesced count, wait and run times, time saved,
+PSI) **is** the metrics export the user's HTML dashboard consumes (no
+separate exporter).
 
 Acceptance: under synthetic CPU pressure new jobs wait; thresholds documented
 with measurements.
