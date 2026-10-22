@@ -125,3 +125,57 @@ checksum, replaced the binary (now the static release build, `sluice
 0.2.0`), printed the cargo-metadata note, stopped the idle daemon and
 reminded that running MCP servers keep the old binary. `sluice doctor`
 afterwards: no failures.
+
+## crates.io readiness (dry run)
+
+Task H4 of the alpha plan. Nothing was published; no `cargo publish`
+without `--dry-run`, no `cargo login`.
+
+Metadata (all six crates): specific `description`, `readme = "README.md"`,
+`documentation = "https://docs.rs/<crate>"`, `include = ["src/**",
+"tests/**", "README.md", "LICENSE"]`; `license`, `repository`, `homepage`,
+`rust-version`, `keywords` (5, the crates.io maximum) and `categories`
+stay workspace-inherited. Each crate got a `LICENSE` copy (cargo does not
+pick up the root file for a workspace member) and a short `README.md`:
+the five libraries say they are internal components of Sluice with no
+stability promise outside it; `sluice-gate` points to the root README
+(`readme = "../../README.md"` would not be inside the package, so a
+per-crate file is used; it links to the GitHub README).
+
+Package contents (`cargo package --list -p <crate> --allow-dirty`): only
+`src/`, `tests/`, `Cargo.toml`, `Cargo.toml.orig`, `Cargo.lock`,
+`LICENSE`, `README.md`, `.cargo_vcs_info.json`. Tests stay in the
+packages: they are small (20-164 KiB), self-contained (the only
+`include_str!` is `proto/tests/fixtures/status-schema-1.json`, which is
+packaged) and let downstream packagers run them.
+
+Results:
+
+- `cargo publish --workspace --dry-run --allow-dirty` (cargo 1.99.1
+  resolves internal dependencies locally): all six crates package, verify
+  (compile from the packaged sources) and reach "aborting upload due to
+  dry run", uploaded in dependency order core, proto, daemon, mcp, queue,
+  sluice-gate.
+- Per crate `cargo publish --dry-run -p <crate> --allow-dirty`:
+  `sluice-gate-core` passes completely; `sluice-gate-proto`, `-daemon`,
+  `-queue`, `-mcp` and `sluice-gate` stop at registry resolution with
+  `no matching package named sluice-gate-core found` (core is not on
+  crates.io yet). This is expected, not a defect; it disappears once the
+  crates are published in order.
+
+| crate | files | size | compressed |
+|---|---|---|---|
+| sluice-gate-core | 19 | 183.4 KiB | 47.7 KiB |
+| sluice-gate-proto | 10 | 97.5 KiB | 25.1 KiB |
+| sluice-gate-daemon | 15 | 250.8 KiB | 65.0 KiB |
+| sluice-gate-mcp | 10 | 137.6 KiB | 37.6 KiB |
+| sluice-gate-queue | 18 | 303.0 KiB | 72.1 KiB |
+| sluice-gate | 28 | 360.7 KiB | 92.7 KiB |
+
+Remaining for a real publish (user decision): a crates.io account and API
+token (`cargo login`, done by the user); confirm the crate names are free
+and that publishing the five internal crates is acceptable; publish with
+`cargo publish --workspace` from a clean `main` at a release tag (the
+`--allow-dirty` flag was only needed here); crates.io versions are
+immutable, so a bad release can only be yanked; decide whether
+`scripts/release.sh` should also publish.

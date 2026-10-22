@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tags, weekly and on demand.
 - Issue templates that ask for `sluice doctor --bundle`, this changelog,
   release notes taken from it, and a "Known limitations" README section.
+- Package metadata, per-crate READMEs and LICENSE files; `cargo publish
+  --workspace --dry-run` passes for all six crates (crates.io readiness,
+  nothing published).
 
 ### Changed
 

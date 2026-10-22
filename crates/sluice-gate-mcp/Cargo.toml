@@ -1,6 +1,6 @@
 [package]
 name = "sluice-gate-mcp"
-description = "MCP server front-end for Sluice, a thin client of the daemon"
+description = "Internal MCP server of Sluice: a thin client of the daemon that gives coding agents a blocking verify tool"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,9 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/sluice-gate-mcp"
+include = ["src/**", "tests/**", "README.md", "LICENSE"]
 
 [dependencies]
 anyhow.workspace = true

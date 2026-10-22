@@ -1,6 +1,6 @@
 [package]
 name = "sluice-gate-proto"
-description = "IPC message types shared by the Sluice daemon and its clients"
+description = "Internal IPC protocol of Sluice: request and response types and a blocking client for the daemon socket"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,9 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/sluice-gate-proto"
+include = ["src/**", "tests/**", "README.md", "LICENSE"]
 
 [features]
 # Blocking std-only client of the daemon (ADR-0008). The CLI and the MCP

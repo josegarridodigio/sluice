@@ -1,6 +1,6 @@
 [package]
 name = "sluice-gate-queue"
-description = "Sluice local merge queue: trains, approval, crash-safe push and reconcile, as a daemon extension"
+description = "Internal local merge queue of Sluice: trains, human approval, crash-safe push and reconcile"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,9 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/sluice-gate-queue"
+include = ["src/**", "tests/**", "README.md", "LICENSE"]
 
 [dependencies]
 sluice-gate-core.workspace = true

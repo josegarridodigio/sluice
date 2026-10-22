@@ -1,6 +1,6 @@
 [package]
 name = "sluice-gate-core"
-description = "Core library for Sluice: gate configuration, git tree hashing, cache keys and markers"
+description = "Internal core library of Sluice: gate configuration, git tree hashing, cache keys and result markers"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,9 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/sluice-gate-core"
+include = ["src/**", "tests/**", "README.md", "LICENSE"]
 
 [dependencies]
 directories = "6.0.0"

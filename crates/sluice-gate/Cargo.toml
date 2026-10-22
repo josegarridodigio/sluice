@@ -1,6 +1,6 @@
 [package]
 name = "sluice-gate"
-description = "Sluice: a stack-agnostic verification queue and cache for parallel coding agents"
+description = "Sluice: verify each git tree once. A verification queue and cache for parallel coding agents, with a daemon, an MCP server and a local merge queue"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,9 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-readme = "../../README.md"
+readme = "README.md"
+documentation = "https://docs.rs/sluice-gate"
+include = ["src/**", "tests/**", "README.md", "LICENSE"]
 
 [[bin]]
 name = "sluice"
