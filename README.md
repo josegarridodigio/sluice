@@ -13,9 +13,10 @@
   <img alt="Status: pre-alpha" src="https://img.shields.io/badge/status-pre--alpha-red.svg">
 </p>
 
-> **Status: pre-alpha, Phases 1 and 2 done.** `sluice run` caches gate
-> results per git tree, and a per-user daemon queues misses under a weighted
-> budget and coalesces identical requests. The MCP server for agents comes
+> **Status: pre-alpha, Phases 1–3 done.** `sluice run` caches gate results
+> per git tree, a per-user daemon queues misses under a weighted budget and
+> coalesces identical requests, and `sluice mcp` gives coding agents a
+> `verify` tool that blocks safely. Load-aware admission and packaging come
 > next; see the [roadmap](#roadmap).
 
 ---
@@ -58,9 +59,8 @@ respect that.
   result. If a marker appears while a request is queued, it completes
   without running. No other tool in this space does this.
 - **Two front-ends, one brain.** `sluice run <gate>` for git hooks, humans
-  and scripts today; `sluice mcp` for agents, as an MCP server over stdio,
-  in Phase 3. Both will talk to the same daemon and share cache, queue and
-  logs.
+  and scripts; `sluice mcp` for agents, as an MCP server over stdio. Both
+  talk to the same daemon and share cache, queue and logs.
 - **Never hangs inside an agent.** On a cache miss in a hook invoked by an
   agent, Sluice fails fast with an actionable message (run the gate
   through Sluice first, then retry) instead of waiting. Humans wait,
@@ -77,7 +77,7 @@ respect that.
 ```
  git hook ──▶ sluice run ──┐                        ┌──▶ gate (process group)
  terminal ──▶ sluice run ──┼──(Unix socket)──▶ daemon ─┼──▶ gate (process group)
- agent    ──▶ sluice mcp ──┘      (Phase 3)         └──▶ …  bounded by budget
+ agent    ──▶ sluice mcp ──┘                        └──▶ …  bounded by budget
                 │
                 └── cache hit: marker found under .git/, exit 0 in milliseconds,
                     no daemon involved
@@ -144,6 +144,14 @@ sluice status [--json]                                   # queue, in-flight, tot
 sluice mcp                                               # MCP stdio server for agents  (Phase 3)
 ```
 
+Point your agent at the server (`claude mcp add sluice -- sluice mcp`) and
+paste the `CLAUDE.md` block from [docs/agents.md](docs/agents.md); the
+agent then calls `verify` before committing instead of running suites
+through its shell.
+
+```
+```
+
 Exit codes of `sluice run`: 0 pass or cache hit; the gate's own code on
 failure; 3 refused by `agent_hook_policy = "fail-fast"`; 124 timeout; 143
 gate killed by a signal; 1 Sluice error; 2 usage error. Commands of a later
@@ -172,8 +180,8 @@ saved). `sluice daemon stop` lets running gates finish and waits for the
 daemon to exit; `--force` kills them. `sluice daemon` exits 75 when a
 daemon is already running.
 
-MCP tools for agents (Phase 3): `verify` (blocks until the gates finish,
-with progress notifications), `status`, `gate_list`, `logs`.
+MCP tools for agents: `verify` (blocks until the gates finish, with
+progress notifications and cancellation), `status`, `gate_list`, `logs`.
 
 ## Roadmap
 
@@ -182,8 +190,8 @@ with progress notifications), `status`, `gate_list`, `logs`.
 | 0 | Research, design, ADRs, workspace | done |
 | 1 | Cache only, no daemon: `sluice run`, markers, TTL, hook snippets, agent detection and `agent_hook_policy`, a file-lock semaphore | done |
 | 2 | Daemon: budget scheduler, coalescing, process groups, timeouts, SQLite metrics, `sluice status` | done |
-| 3 | MCP server (`verify`, `status`, `gate_list`, `logs`), `docs/agents.md` | next |
-| 4 | PSI-based admission, stable `--json` schema, metrics export | |
+| 3 | MCP server (`verify`, `status`, `gate_list`, `logs`), `docs/agents.md` | done (manual two-agent run pending) |
+| 4 | PSI-based admission, stable `--json` schema, metrics export | next |
 | 5 | Release builds, install script, real-world numbers | |
 
 Design history lives in [`kb/`](kb/sluice/plan/master-plan.md): the plan,

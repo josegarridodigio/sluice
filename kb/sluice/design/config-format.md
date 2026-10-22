@@ -103,7 +103,7 @@ memory_some_avg10_max = 20.0
 psi_poll_interval = "1s"
 psi_max_wait = "5m"        # Phase 4: admit the head anyway after this long blocked by PSI
 
-[mcp]                      # Phase 3
+[mcp]
 progress_interval = "15s"  # progress notifications while verify runs
 
 [cache]
@@ -130,7 +130,7 @@ Environment variables (highest precedence):
 | `CI` | Cache off unless `SLUICE_CACHE` is truthy. A falsy `CI` (`0`, `false`, `no`, `off`) does not count as set. |
 | `SLUICE_AGENT=1` / `0` | Force agent / human detection (truthy / falsy words as below; any other value is ignored). |
 | `SLUICE_SOCKET` | Override the daemon socket path. |
-| `SLUICE_LOG` | Log filter of the daemon process (`sluice daemon`), e.g. `debug`; default `info`. Not read by the client. |
+| `SLUICE_LOG` | Log filter of the daemon (`sluice daemon`) and MCP (`sluice mcp`) processes, e.g. `debug`; default `info`; written to stderr (the daemon's goes to `daemon.log`). Not read by `sluice run`. |
 | `SLUICE_CONFIG` | Override the user config path (ignored when empty). |
 
 Truthy words: `1`, `true`, `yes`, `on`; falsy: `0`, `false`, `no`, `off`
@@ -142,7 +142,8 @@ means defaults); unknown fields are errors; validation: `daemon.budget >= 1`,
 `daemon.nice <= 19`, `daemon.ionice_level <= 7`, `admission.psi_poll_interval > 0`,
 `budget_share_max >= 1`. `admission.*` (Phase 4) and `daemon.idle_exit` (always "never" in v1)
 are parsed and validated but have no effect yet; everything else is live
-since Phase 2 (`log_retention_days` prunes job logs daily from the daemon).
+(`log_retention_days` prunes job logs daily from the daemon;
+`mcp.progress_interval` paces `verify`'s progress notifications).
 
 ## Decisions on this format
 

@@ -21,8 +21,8 @@ Related: [[sluice/research/problem-statement.md]],
 | 0 | Setup and research | **done** (2026-10-22) | Questions answered, decisions recorded in ADR-0001..0005, workspace scaffolded and green. See [[sluice/changes/phase-0-scaffold.md]]. |
 | 1 | Cache only, no daemon | **done** (2026-10-22) | [[sluice/changes/phase-1-cache-only.md]], [[sluice/changes/phase-1-acceptance.md]], [[sluice/changes/hit-path-latency.md]]. |
 | 2 | Daemon, scheduler, coalescing | **done** (2026-10-22) | [[sluice/changes/phase-2-daemon.md]], [[sluice/changes/phase-2-acceptance.md]]; design in [[sluice/design/protocol.md]], [[sluice/design/scheduler.md]], [[sluice/design/executor.md]], ADR-0007. |
-| 3 | MCP front-end and agent policy | **next** | Design: [[sluice/design/mcp-tools.md]]. |
-| 4 | Load-aware admission and observability | not started | |
+| 3 | MCP front-end and agent policy | **done, manual run pending** (2026-10-22) | [[sluice/changes/phase-3-mcp.md]]; the two-agent manual test (`docs/manual-test-phase-3.md`) needs the user. |
+| 4 | Load-aware admission and observability | **in progress** (2026-10-22) | Design: [[sluice/design/psi-admission.md]]. |
 | 5 | Packaging and real-world validation | not started | |
 | later | Local merge queue (mergetrain-inspired) | not planned | Ask before starting. |
 
@@ -122,6 +122,16 @@ Acceptance:
 
 ## Phase 3 — MCP front-end and agent policy
 
+Tasks:
+
+- [x] Design [[sluice/design/mcp-tools.md]]; facts [[sluice/research/claude-code-facts.md]].
+- [x] `sluice-gate-core::lookup` shared hit check; `sluice-gate-mcp` with rmcp 3.6 (`verify`, `status`, `gate_list`, `logs`), progress, cancellation; `sluice mcp`.
+- [x] Fail-fast message points to `verify`; `[mcp] progress_interval`.
+- [x] `docs/agents.md`; `docs/manual-test-phase-3.md`.
+- [x] Automated MCP client tests (`crates/sluice-gate/tests/mcp.rs`).
+- [ ] Reconciliation pass ([[sluice/changes/phase-3-reconciliation.md]]).
+- [ ] Manual two-agent run by the user, recorded in [[sluice/changes/phase-3-acceptance.md]].
+
 Deliverables: `sluice mcp` built with rmcp ([[sluice/design/mcp-tools.md]]),
 tools `verify`, `status`, `gate_list`, `logs`; agent detection and
 `agent_hook_policy`; `docs/agents.md` with a ready-to-paste CLAUDE.md section.
@@ -157,7 +167,12 @@ project(s) with before/after numbers.
 
 ## Next steps
 
-1. Phase 3: `sluice-gate-mcp` with rmcp per [[sluice/design/mcp-tools.md]]
+1. Phase 3 reconciliation; ask the user to run the manual test.
+2. Phase 4 per [[sluice/design/psi-admission.md]]: PSI sampler, admission hook, status fields, schema test, `psi_max_wait`.
+3. Phase 5: tag `v0.1.0` once Phase 4 closes; validate on the user's project.
+4. Phase 6: present [[sluice/design/merge-queue.md]] and its open questions to the user.
+
+Earlier plan for Phase 3: `sluice-gate-mcp` with rmcp per [[sluice/design/mcp-tools.md]]
    (`verify`, `status`, `gate_list`, `logs`), fail-fast message pointing to
    `verify`, `docs/agents.md`, automated MCP client test, documented manual
    end-to-end run with two Claude Code agents.

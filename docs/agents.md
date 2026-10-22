@@ -100,7 +100,7 @@ wording; `<rule>` is the detection rule that fired):
 ```
 sluice: '<gate>' has not passed on this tree (<why>).
 sluice: <hook> was invoked by a coding agent (<rule>) and agent_hook_policy is "fail-fast".
-sluice: run 'sluice run <gate>' from your shell first, then retry the git command.
+sluice: call the 'verify' MCP tool (or run 'sluice run <gate>') first, then retry the git command.
 ```
 
 Phase 3 changes the last line to point at the `verify` MCP tool ("call the

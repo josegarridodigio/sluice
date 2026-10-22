@@ -26,9 +26,6 @@ sluice status [--json]                                               # queue, in
 sluice mcp                                                           # MCP stdio server spawned by the agent (Phase 3)
 ```
 
-`sluice mcp` exits 70 with `sluice: 'mcp' is not implemented yet (it arrives
-with the daemon and MCP phases)` until Phase 3.
-
 Process topology:
 
 ```
@@ -184,11 +181,14 @@ Authoritative in [[sluice/design/protocol.md]]; types in
 
 ## 7. MCP server
 
-`sluice mcp` uses `rmcp` with stdio transport. It is a thin client: it
-performs the same hit check as the CLI, and forwards misses to the daemon,
-blocking as long as needed (no shell timeout applies to MCP tool calls).
-Tools: `verify`, `status`, `gate_list`, `logs`. Details and the decision on
-the MCP Tasks extension in [[sluice/design/mcp-tools.md]].
+`sluice mcp` uses `rmcp` 3.6 with stdio transport. It is a thin client:
+it performs the same hit check as the CLI (`sluice_gate_core::lookup`),
+and forwards misses to the daemon over its own async socket client,
+blocking as long as needed with progress notifications every
+`mcp.progress_interval` (no shell timeout applies to MCP tool calls; see
+[[sluice/research/claude-code-facts.md]]). Tools: `verify`, `status`,
+`gate_list`, `logs`. Details and the decision on the MCP Tasks extension
+in [[sluice/design/mcp-tools.md]] and ADR-0005.
 
 ## 8. Hook integration and agent policy
 
@@ -198,7 +198,7 @@ invoked the hook:
 
 | Caller | Default policy | Behaviour |
 |---|---|---|
-| agent | `fail-fast` | exit 3 with a three-line message naming the gate, the detection rule and the fix (`run 'sluice run <gate>' from your shell first`; Phase 3 adds the `verify` MCP tool). Applies only when the cache was consulted and missed; with caching off or an unknown tree the gate runs instead. |
+| agent | `fail-fast` | exit 3 with a three-line message naming the gate, the detection rule and the fix (`call the 'verify' MCP tool (or run 'sluice run <gate>') first, then retry the git command`). Applies only when the cache was consulted and missed; with caching off or an unknown tree the gate runs instead. |
 | agent | `wait` | wait for budget (risky under Bash timeouts) |
 | agent | `run-unqueued` | run immediately outside the queue |
 | human | `wait` | wait in the daemon queue; `queued (position N, U of B units busy)` and `running (job …)` notices (the in-process fallback prints `waiting for N of M budget units` instead) |
