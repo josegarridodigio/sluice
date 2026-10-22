@@ -1,5 +1,7 @@
 # Sluice verifies itself. These gates run from the repository's own hooks
 # (see .githooks/ and CONTRIBUTING.md) and from the validation benchmark.
+# The gates are path-scoped (Sluice >= 0.3.0): documentation, KB and
+# harness-only changes keep the cached passes.
 version = 1
 
 [defaults]
@@ -12,6 +14,7 @@ weight = 1
 timeout = "2m"
 hooks = ["pre-commit"]
 key_inputs = ["rustc --version"]
+paths = ["crates/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "plugin/**"]
 
 [gates.clippy]
 cmd = "cargo clippy --workspace --all-targets -- -D warnings"
@@ -19,6 +22,7 @@ weight = 4
 timeout = "15m"
 hooks = ["pre-commit"]
 key_inputs = ["rustc --version"]
+paths = ["crates/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "plugin/**"]
 
 [gates.test]
 cmd = "cargo test --workspace"
@@ -26,3 +30,4 @@ weight = 6
 timeout = "30m"
 hooks = ["pre-push"]
 key_inputs = ["rustc --version"]
+paths = ["crates/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "plugin/**"]
