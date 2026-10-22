@@ -5,9 +5,11 @@
 mod common;
 
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command as StdCommand, Stdio};
+use std::process::{Child, Command as StdCommand, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -67,16 +69,63 @@ fn sigkill(pid: u32) {
     let _ = kill(Pid::from_raw(i32::try_from(pid).unwrap()), Signal::SIGKILL);
 }
 
-fn spawn_run(sb: &Sandbox, gate: &str) -> Child {
-    StdCommand::new(Sandbox::binary())
-        .args(["run", gate])
+/// A `sluice run` client whose stderr is collected while it runs, so a test
+/// can wait for a progress line (`<gate> running (job …)`).
+struct Client {
+    child: Child,
+    stderr: Arc<Mutex<String>>,
+    reader: thread::JoinHandle<()>,
+}
+
+impl Client {
+    fn stderr(&self) -> String {
+        self.stderr.lock().unwrap().clone()
+    }
+
+    /// Exit status, stdout and the complete stderr.
+    fn finish(mut self) -> (ExitStatus, String, String) {
+        let mut stdout = String::new();
+        if let Some(mut out) = self.child.stdout.take() {
+            out.read_to_string(&mut stdout).unwrap();
+        }
+        let status = self.child.wait().unwrap();
+        self.reader.join().unwrap();
+        let stderr = self.stderr.lock().unwrap().clone();
+        (status, stdout, stderr)
+    }
+}
+
+fn spawn_run(sb: &Sandbox, gate: &str, path: Option<&str>) -> Client {
+    let mut cmd = StdCommand::new(Sandbox::binary());
+    cmd.args(["run", gate])
         .current_dir(&sb.repo)
         .env_clear()
         .envs(sb.env())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn sluice run")
+        .stderr(Stdio::piped());
+    if let Some(path) = path {
+        cmd.env("PATH", path);
+    }
+    let mut child = cmd.spawn().expect("spawn sluice run");
+    let mut pipe = child.stderr.take().unwrap();
+    let stderr = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&stderr);
+    let reader = thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = pipe.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            sink.lock()
+                .unwrap()
+                .push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    });
+    Client {
+        child,
+        stderr,
+        reader,
+    }
 }
 
 fn daemon_pid(sb: &Sandbox) -> u32 {
@@ -88,21 +137,34 @@ fn daemon_pid(sb: &Sandbox) -> u32 {
 
 /// Starts `sluice run long` for a gate that forks a background `sleep`
 /// next to a foreground one (`marker` is part of both command lines) and
-/// waits until all three processes (`sh` and both sleeps) run; returns the
-/// client and the daemon pid.
-fn start_forking_gate(sb: &Sandbox, marker: &str) -> (Child, u32) {
-    let client = spawn_run(sb, "long");
+/// waits until all three processes (`sh` and both sleeps) run and the
+/// client was told the job started (the daemon announces a start only
+/// after it registered the group with its reaper and recorded it in the
+/// store, so the test never kills the daemon in the middle of a spawn);
+/// returns the client and the daemon pid.
+fn start_forking_gate(sb: &Sandbox, marker: &str) -> (Client, u32) {
+    let client = spawn_run(sb, "long", None);
     assert!(
-        wait_for(LIMIT, || live(&format!("sleep {marker}")).len() == 3),
-        "the gate and its child never started"
+        wait_for(LIMIT, || live(&format!("sleep {marker}")).len() == 3
+            && client.stderr().contains("sluice: long running (job")),
+        "the gate and its child never started: {}",
+        client.stderr()
     );
     (client, daemon_pid(sb))
 }
 
+/// PSI admission is off: these tests are about daemon death, and on a
+/// loaded machine CPU pressure would keep the gate queued past `LIMIT`.
 fn forking_gate(marker: &str) -> Sandbox {
-    Sandbox::new(&format!(
+    let sb = Sandbox::new(&format!(
         "[gates.long]\ncmd = \"sleep {marker}1 & sleep {marker}2; wait\"\n"
-    ))
+    ));
+    fs::write(
+        sb.home.join(".config/sluice/config.toml"),
+        "version = 1\n[admission]\npsi_enabled = false\n",
+    )
+    .unwrap();
+    sb
 }
 
 #[test]
@@ -121,15 +183,53 @@ fn a_sigkilled_daemon_takes_its_gates_and_their_children_with_it() {
             .is_none_or(|f| f.first().is_some_and(|s| s == "Z"))),
         "the reaper exits once it cleaned up"
     );
-    let out = client.wait_with_output().unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(143), "{stderr}");
+    let (status, stdout, stderr) = client.finish();
+    assert_eq!(status.code(), Some(143), "{stderr}");
     assert!(
         stderr.contains("the daemon died while running long; it was killed"),
         "{stderr}"
     );
-    assert!(!String::from_utf8_lossy(&out.stdout).contains("PASS"));
+    assert!(!stdout.contains("PASS"));
     assert_eq!(sb.marker_count(), 0, "an interrupted run is never cached");
+}
+
+/// Regression (CI flake of the test above): the daemon used to register a
+/// gate with its reaper only after `renice` and `ionice` had run on it, and
+/// a daemon killed while those helpers ran left the gate behind. A slow
+/// `ionice` shim holds the daemon in that window; the gate, already
+/// running, must still be reaped.
+#[test]
+fn a_daemon_killed_while_it_sets_gate_priorities_still_reaps_the_gate() {
+    let sb = forking_gate("316.2");
+    let shims = sb.root.path().join("slow-ionice-bin");
+    fs::create_dir_all(&shims).unwrap();
+    let shim = shims.join("ionice");
+    fs::write(&shim, "#!/bin/sh\n# slow-ionice-316\nsleep 3\n").unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        shims.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let client = spawn_run(&sb, "long", Some(&path));
+    let shim_cmd = shim.display().to_string();
+    assert!(
+        wait_for(LIMIT, || live("sleep 316.2").len() == 3
+            && !live(&shim_cmd).is_empty()),
+        "the gate never started next to the slow ionice: {}",
+        client.stderr()
+    );
+    let daemon = daemon_pid(&sb);
+    reaper_of(daemon).expect("the daemon starts a reaper");
+    sigkill(daemon);
+    assert!(
+        wait_for(LIMIT, || live("sleep 316.2").is_empty()),
+        "gate processes survived the daemon: {:?}",
+        live("sleep 316.2")
+    );
+    let (status, _, stderr) = client.finish();
+    assert_eq!(status.code(), Some(143), "{stderr}");
+    assert!(wait_for(LIMIT, || live(&shim_cmd).is_empty()));
 }
 
 #[test]
@@ -142,8 +242,8 @@ fn a_restarted_daemon_kills_the_gates_a_dead_daemon_left_behind() {
     sigkill(reaper);
     assert!(wait_for(LIMIT, || reaper_of(daemon).is_none()));
     sigkill(daemon);
-    let out = client.wait_with_output().unwrap();
-    assert_eq!(out.status.code(), Some(143), "{out:?}");
+    let (status, _, stderr) = client.finish();
+    assert_eq!(status.code(), Some(143), "{stderr}");
     thread::sleep(Duration::from_millis(500));
     assert_eq!(
         live("sleep 315.2").len(),

@@ -350,26 +350,53 @@ fn a_killed_client_kills_its_job_even_under_finish() {
 // Budget, status, coalescing
 // ---------------------------------------------------------------------------
 
-/// Leaders of running jobs tagged `tag`, found by scanning `/proc`.
+/// True when `pid` runs `sh -c <script> <tag>` (NUL-separated cmdline with
+/// a trailing NUL; a zombie's cmdline is empty, so it never matches).
+fn runs_tagged_sh(pid: u32, tag: &str) -> bool {
+    fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| {
+        let args: Vec<&[u8]> = c
+            .strip_suffix(b"\0")
+            .unwrap_or(&c)
+            .split(|b| *b == 0)
+            .collect();
+        let is_sh = args.first().is_some_and(|a| a.ends_with(b"sh"));
+        is_sh && args.last().is_some_and(|a| *a == tag.as_bytes())
+    })
+}
+
+/// Parent pid of `pid` (field 4 of `/proc/<pid>/stat`).
+fn ppid(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat[stat.rfind(')')? + 1..]
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// Leaders of jobs tagged `tag` that were all running at the same instant,
+/// found by scanning `/proc`. Two artefacts of a naive scan are removed so
+/// the count never exceeds the real concurrency (CI flake "/proc peak 5"):
+/// - a leader forking `sleep` is briefly two processes with the same
+///   cmdline (the child before its `exec`): a match whose parent also
+///   matches is that copy, not a job;
+/// - the scan is not a snapshot: a job that ended early in the scan and one
+///   that started late in it would both be counted, so every leader is
+///   checked again after the scan and only those still running count (all
+///   of them were alive at that last instant).
 fn proc_count(tag: &str) -> usize {
     let Ok(entries) = fs::read_dir("/proc") else {
         return 0;
     };
-    entries
+    let leaders: Vec<u32> = entries
         .filter_map(Result::ok)
-        .filter(|e| e.file_name().to_string_lossy().parse::<u32>().is_ok())
-        .filter(|e| {
-            fs::read(e.path().join("cmdline")).is_ok_and(|c| {
-                // `sh -c <script> <tag>`: NUL-separated, with a trailing NUL.
-                let args: Vec<&[u8]> = c
-                    .strip_suffix(b"\0")
-                    .unwrap_or(&c)
-                    .split(|b| *b == 0)
-                    .collect();
-                let is_sh = args.first().is_some_and(|a| a.ends_with(b"sh"));
-                is_sh && args.last().is_some_and(|a| *a == tag.as_bytes())
-            })
-        })
+        .filter_map(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter(|&pid| runs_tagged_sh(pid, tag))
+        .filter(|&pid| ppid(pid).is_some_and(|p| !runs_tagged_sh(p, tag)))
+        .collect();
+    leaders
+        .into_iter()
+        .filter(|&pid| runs_tagged_sh(pid, tag))
         .count()
 }
 

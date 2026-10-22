@@ -85,6 +85,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A daemon killed while it applied `nice` and `ionice` to a new gate left
+  that gate running: the gate was registered with the reaper only after
+  the `renice` and `ionice` helpers had finished. It is now registered
+  first and the priorities follow.
+- The merge queue works with git 2.31 and 2.32 (2.31 is the declared
+  minimum): its worktree was created with `git worktree add --lock
+  --reason`, which needs git 2.33.
 - Merge queue: a wrong SSH key or HTTP password fails `sluice queue
   approve` at once with `push_rejected` instead of leaving the train
   approved forever or parking it for reconcile; the SSH error text reaches

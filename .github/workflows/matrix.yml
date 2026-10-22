@@ -60,12 +60,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/git-${{ env.GIT_VERSION }}
-          key: git-${{ env.GIT_VERSION }}-${{ runner.os }}-${{ runner.arch }}-v1
+          key: git-${{ env.GIT_VERSION }}-${{ runner.os }}-${{ runner.arch }}-nocurl-v2
       - name: Build git ${{ env.GIT_VERSION }} from source
         if: steps.git-cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq libcurl4-gnutls-dev libssl-dev zlib1g-dev libexpat1-dev
+          sudo apt-get install -y -qq libssl-dev zlib1g-dev
           scripts/ci/build-git.sh "$GIT_VERSION" "$HOME/git-$GIT_VERSION"
       - name: Put git ${{ env.GIT_VERSION }} first in PATH
         run: echo "$HOME/git-$GIT_VERSION/bin" >> "$GITHUB_PATH"
@@ -79,8 +79,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: git-${{ env.GIT_VERSION }}
-      # The core crate wraps git; the CLI crate drives it end to end.
-      - run: cargo test --locked -p sluice-gate-core -p sluice-gate
+      # The core crate wraps git; the CLI crate drives it end to end; the queue
+      # crate runs worktrees, merges and pushes (git 2.33-only flags broke it).
+      - run: cargo test --locked --no-fail-fast -p sluice-gate-core -p sluice-gate -p sluice-gate-queue
 
   aarch64:
     name: test (aarch64, native)

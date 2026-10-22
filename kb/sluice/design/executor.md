@@ -96,6 +96,14 @@ start may be hours away.
   in the daemon (close-on-exec, never inherited by gates), so the kernel
   closes it when the daemon exits for any reason, SIGKILL and OOM
   included.
+- The `+` line is written right after `executor::spawn` returns, with no
+  await in between; `renice` and `ionice` run only when `Running::wait`
+  starts, after the registration and the store's `mark_started`. Until
+  2026-10-23 they ran inside `spawn`, before the registration, and a
+  daemon killed while those helpers ran (tens of milliseconds, seconds on
+  a loaded runner) left an unregistered gate behind (CI flake, see
+  [[sluice/changes/ci-flakes.md]]). The window that remains is the few
+  instructions between the fork and the pipe write.
 - On end of file the reaper SIGTERMs every registered group that
   `group_is_ours`, waits up to `KILL_GRACE` (5 s), SIGKILLs the rest and
   exits. After a clean stop the daemon closes the pipe, nothing is

@@ -382,13 +382,35 @@ fn write_http_config(path: &Path, anonymous_read: bool) {
     fs::rename(&tmp, path).expect("http config");
 }
 
+/// True when the `git` under test has the HTTP client transport
+/// (`git-remote-http` in `git --exec-path`). A git built with `NO_CURL`
+/// (the git 2.31.0 job of the matrix) has none.
+fn git_has_http_transport() -> bool {
+    Command::new("git")
+        .arg("--exec-path")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some_and(|o| {
+            Path::new(String::from_utf8_lossy(&o.stdout).trim())
+                .join("git-remote-http")
+                .is_file()
+        })
+}
+
 /// Serves the bare repositories under `root` (`<url>/<name>.git`); `None`
-/// (reason printed) without `python3`.
+/// (reason printed) without `python3` or without git's HTTP transport.
 pub fn http_remote(dir: &Path, root: &Path, repo: &str) -> Option<HttpRemote> {
     let Some(python) = find_program("python3", &[]) else {
         eprintln!("skipped: python3 is not installed");
         return None;
     };
+    if !git_has_http_transport() {
+        eprintln!(
+            "skipped: this git has no HTTP transport (no git-remote-http, built without curl)"
+        );
+        return None;
+    }
     fs::create_dir_all(dir).expect("http dir");
     let script = dir.join("git_http_server.py");
     fs::write(&script, SERVER_PY).expect("server script");

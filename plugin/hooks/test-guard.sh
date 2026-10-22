@@ -30,8 +30,10 @@ cmd = "cargo   clippy --workspace -- -D warnings"  # comment
 cmd = 'npm run  check'
 TOML
 
-# PATH without any directory that holds a `sluice`.
-NOSLUICE_PATH=$(printf '%s' "$PATH" | tr ':' '\n' | while IFS= read -r d; do
+# PATH without any directory that holds a `sluice`. The trailing newline
+# matters: `read` drops a last line without one, and on Alpine that line is
+# `/bin`, the only directory with `sh`.
+NOSLUICE_PATH=$(printf '%s\n' "$PATH" | tr ':' '\n' | while IFS= read -r d; do
     [ -n "$d" ] && [ ! -x "$d/sluice" ] && printf '%s:' "$d"
 done)
 NOSLUICE_PATH=${NOSLUICE_PATH%:}

@@ -273,6 +273,8 @@ pub struct Running {
     log_path: PathBuf,
     started: Instant,
     timeout: Duration,
+    nice: u8,
+    ionice: Option<IoPriority>,
 }
 
 impl Running {
@@ -302,6 +304,11 @@ impl Running {
     /// returns the result.
     pub async fn wait(mut self) -> Finished {
         let pgid = self.info.pgid;
+        // Priorities are applied here, not in `spawn`: the caller registers
+        // the group with the gate reaper between the two, and the helper
+        // processes take long enough on a loaded machine that a daemon
+        // killed meanwhile would leave an unregistered gate behind.
+        tokio::spawn(apply_priority(self.info.pid, self.nice, self.ionice));
         let deadline = tokio::time::Instant::from_std(self.started + self.timeout);
         let cancel = Arc::clone(&self.handle.cancel);
 
@@ -396,8 +403,10 @@ async fn join_all(tasks: Vec<JoinHandle<()>>) {
 /// `spec.log_path`: behind the Phase 1 header for [`Sink::Log`], as framed
 /// records for [`Sink::Spool`].
 ///
-/// Priorities are applied right after the spawn through the `renice` and
-/// `ionice` binaries when they are in `PATH` (failures are ignored).
+/// Priorities are applied when [`Running::wait`] starts, through the
+/// `renice` and `ionice` binaries when they are in `PATH` (failures are
+/// ignored); `spawn` returns as soon as the process exists, so the caller
+/// can register its group (gate reaper, store) before anything slow runs.
 ///
 /// A gate's log that cannot be created (read-only `logs/` or state
 /// directory) does not stop the gate: its output is kept in memory for the
@@ -407,6 +416,10 @@ async fn join_all(tasks: Vec<JoinHandle<()>>) {
 ///
 /// [`Error::Io`] when a spool cannot be created or the process cannot start
 /// (for example, a missing working directory).
+#[expect(
+    clippy::unused_async,
+    reason = "kept async for the callers; it awaited the priority helpers before they moved to `Running::wait`"
+)]
 pub async fn spawn(spec: ExecSpec) -> Result<Running> {
     let io = |context: String| move |source| Error::Io { context, source };
 
@@ -456,8 +469,6 @@ pub async fn spawn(spec: ExecSpec) -> Result<Running> {
     let group = i32::try_from(pid).unwrap_or(i32::MAX);
     let proc_start_ticks = proc_start_ticks(pid);
 
-    apply_priority(pid, spec.nice, spec.ionice).await;
-
     let framed = |stream: u8| (spec.sink == Sink::Spool).then_some(stream);
     let mut pumps = Vec::with_capacity(2);
     if let Some(out) = child.stdout.take() {
@@ -496,6 +507,8 @@ pub async fn spawn(spec: ExecSpec) -> Result<Running> {
         log_path: spec.log_path,
         started,
         timeout: spec.timeout,
+        nice: spec.nice,
+        ionice: spec.ionice,
     })
 }
 

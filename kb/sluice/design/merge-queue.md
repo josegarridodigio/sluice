@@ -220,8 +220,9 @@ dissolves an unfinished build and parks an unfinished push).
    with the reason recorded (section 7, "Base unavailable"), retried at most once per tick,
    and `failed` after 3 consecutive failures. `push_timeout`, `audit_ref` and
    `network_timeout` are stored with the train (`settings`).
-3. **Worktree.** `git worktree add --detach --lock <state>/merge/<train-id> <base_sha>`
-   (`--reason "sluice merge queue"`); all git calls with `-c core.hooksPath=/dev/null`, every
+3. **Worktree.** `git worktree add --detach <state>/merge/<train-id> <base_sha>`, then
+   `git worktree lock --reason "sluice merge queue"` (two steps: `add --lock --reason` needs
+   git 2.33, the minimum is 2.31); all git calls with `-c core.hooksPath=/dev/null`, every
    `GIT_*` variable stripped.
 4. **Merge.** For each member in order: if the train has one member and `base_sha` is an
    ancestor of `head_sha`, fast-forward (`git checkout --detach <head_sha>`, `S = head_sha`);

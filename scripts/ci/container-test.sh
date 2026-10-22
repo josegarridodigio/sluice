@@ -4,7 +4,8 @@
 # toolchain from rust-toolchain.toml, then runs `cargo test --locked`.
 #
 # Environment:
-#   CI_CARGO_ARGS  arguments after `cargo test --locked` (default: --workspace)
+#   CI_CARGO_ARGS  arguments after `cargo test --locked --no-fail-fast`
+#                  (default: --workspace)
 #   CI_OWNER       uid:gid to chown the mounted cache directories to
 # Plain POSIX sh: Alpine has no bash.
 set -eu
@@ -50,8 +51,10 @@ rustc --version
 cargo --version
 
 status=0
+# --no-fail-fast: one failing test binary must not hide the others (the first
+# matrix run stopped Alpine at guard.rs and Ubuntu at daemon.rs).
 # shellcheck disable=SC2086
-cargo test --locked ${CI_CARGO_ARGS:---workspace} || status=$?
+cargo test --locked --no-fail-fast ${CI_CARGO_ARGS:---workspace} || status=$?
 
 # The cache directories are mounted from the runner; hand them back.
 if [ -n "${CI_OWNER:-}" ]; then

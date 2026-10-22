@@ -1311,18 +1311,15 @@ fn merge_members(git: &Git, t: &TrainRow, members: &[(String, String, String)]) 
         git.remove_worktree(&t.repo, &t.worktree);
     }
     let wt_s = t.worktree.to_string_lossy().into_owned();
+    // `worktree add --lock --reason` needs git 2.33; the declared minimum is
+    // 2.31, where `worktree lock --reason` (2.10) does the same in two steps.
     git.repo(
         &t.repo,
-        &[
-            "worktree",
-            "add",
-            "--detach",
-            "--lock",
-            "--reason",
-            "sluice merge queue",
-            &wt_s,
-            &t.base_sha,
-        ],
+        &["worktree", "add", "--detach", &wt_s, &t.base_sha],
+    )?;
+    git.repo(
+        &t.repo,
+        &["worktree", "lock", "--reason", "sluice merge queue", &wt_s],
     )?;
     let wt = &t.worktree;
     let ident_ok = git
