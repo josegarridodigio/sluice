@@ -20,7 +20,7 @@ Related: [[sluice/research/problem-statement.md]],
 |---|---|---|---|
 | 0 | Setup and research | **done** (2026-10-22) | Questions answered, decisions recorded in ADR-0001..0005, workspace scaffolded and green. See [[sluice/changes/phase-0-scaffold.md]]. |
 | 1 | Cache only, no daemon | **done** (2026-10-22) | [[sluice/changes/phase-1-cache-only.md]], [[sluice/changes/phase-1-acceptance.md]], [[sluice/changes/hit-path-latency.md]]. |
-| 2 | Daemon, scheduler, coalescing | **next** | |
+| 2 | Daemon, scheduler, coalescing | **in progress** (started 2026-10-22) | Design: [[sluice/design/protocol.md]], [[sluice/design/scheduler.md]], [[sluice/design/executor.md]], ADR-0007. Done: proto crate, store, scheduler, executor. Pending: server, CLI client, `status`/`logs`/`daemon stop`, acceptance. |
 | 3 | MCP front-end and agent policy | not started | |
 | 4 | Load-aware admission and observability | not started | |
 | 5 | Packaging and real-world validation | not started | |
@@ -94,6 +94,17 @@ Status: done 2026-10-22. All acceptance criteria proven by
 [[sluice/design/adr/0006-hook-flag.md]].
 
 ## Phase 2 — Daemon, scheduler, coalescing
+
+Tasks:
+
+- [x] Design docs: protocol, scheduler (+ ADR-0007), executor and lifecycle, committed-tree lookup decision.
+- [x] `sluice-gate-proto`: typed messages with round-trip tests.
+- [x] `sluice-gate-daemon::store`: SQLite schema, fenced lease, jobs, events, totals, log pruning.
+- [x] `sluice-gate-daemon::scheduler`: budget, weights, backfill + head reservation, repo caps, coalescing by key.
+- [x] `sluice-gate-daemon::executor`: process groups, renice/ionice, log capture, timeout, cancel, kill-tree, pid-reuse guard.
+- [ ] `sluice-gate-daemon::server`: socket, handshake, subscribers, scheduling loop, marker double-check, orphan reconciliation, stop.
+- [ ] CLI: `sluice daemon [--foreground] | stop`, client on misses with autostart and fallback, `status [--json]`, `logs` via daemon, `hit` events.
+- [ ] Acceptance tests and evidence document; reconciliation pass; README/docs.
 
 Deliverables: versioned IPC protocol over a Unix socket
 ([[sluice/design/protocol.md]]), daemon autostart with a start lock, budget

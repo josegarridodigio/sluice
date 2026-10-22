@@ -1,1 +1,1500 @@
-//! Placeholder: implemented in Phase 2 (see kb/sluice/design/executor.md).
+//! Socket listener, protocol handling, subscribers, scheduling loop and
+//! daemon lifecycle.
+//!
+//! Design: `kb/sluice/design/protocol.md` (wire protocol),
+//! `kb/sluice/design/scheduler.md` (coalescing, admission, subscribers) and
+//! `kb/sluice/design/executor.md` (lifecycle, executor, persistence).
+//!
+//! Concurrency model: one task per connection, one scheduling task, one
+//! task per started job and one heartbeat task. Shared state lives in
+//! [`Shared`] behind two `std::sync::Mutex`es (scheduler state, then
+//! store; always taken in that order and never held across an `.await`).
+//! Each job has a `broadcast` channel of [`JobEvent`]s; every subscriber
+//! rewrites them into [`ServerMessage`]s carrying its own request id.
+
+use std::collections::{BTreeMap, HashMap};
+use std::fs::{DirBuilder, File, OpenOptions};
+use std::future::Future;
+use std::hash::BuildHasher;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
+pub use sluice_gate_core::config::LastSubscriberGone;
+use sluice_gate_core::dirs::{job_id as new_job_id, now_ms};
+use sluice_gate_core::git::RepoPaths;
+use sluice_gate_core::key::{CacheKey, normalize_cmd};
+use sluice_gate_core::marker::{Lookup, Marker, MarkerStore, MissRecord};
+use sluice_gate_core::{CACHE_FORMAT_VERSION, tree};
+use sluice_gate_proto::{
+    self as proto, BudgetInfo, Caller, ClientEvent, ClientMessage, DaemonInfo, ErrorCode,
+    MAX_LINE_BYTES, Outcome, OutcomeStatus, PROTOCOL_VERSION, PsiInfo, QueuedJob, RunRequest,
+    RunningJob, STATUS_SCHEMA_VERSION, ServerMessage, StatusReport,
+};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{Notify, broadcast, mpsc, watch};
+use tokio::task::JoinSet;
+use tokio::time::{Instant, interval_at, sleep, timeout};
+
+use crate::executor::{self, ExecSpec, ExecStatus, Finished, IoPriority, RunningHandle};
+use crate::scheduler::{Enqueued, JobSpec, Scheduler};
+use crate::store::{JobRow, JobState, Store};
+use crate::{Error, Result};
+
+/// Name of the lease row held by the running daemon.
+const LEASE_NAME: &str = "daemon";
+/// Lease validity, renewed by the heartbeat.
+const LEASE_TTL_MS: u64 = 90_000;
+/// Heartbeat period.
+const HEARTBEAT: Duration = Duration::from_secs(15);
+/// Period of `progress` events.
+const PROGRESS_EVERY: Duration = Duration::from_secs(5);
+/// Maximum time a client may take to send `hello` and its request.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Capacity of each job's event channel.
+const CHANNEL_CAPACITY: usize = 64;
+/// Fallback admission tick (head reservation depends on elapsed time).
+const ADMIT_TICK: Duration = Duration::from_secs(1);
+/// How often old logs are pruned while the daemon runs.
+const PRUNE_EVERY_MS: u64 = 24 * 60 * 60 * 1000;
+/// Time given to open connections to flush their last message on exit.
+const CONNECTION_DRAIN: Duration = Duration::from_secs(2);
+/// Timeout used when a gate has `timeout_ms = 0` (no timeout): ten years.
+const NO_TIMEOUT: Duration = Duration::from_hours(10 * 365 * 24);
+
+/// Everything the daemon needs to run; built by the CLI from the user config.
+#[derive(Debug, Clone)]
+pub struct DaemonConfig {
+    /// Unix socket to listen on.
+    pub socket_path: PathBuf,
+    /// Lock file held (`flock`) for the daemon's whole life.
+    pub lock_path: PathBuf,
+    /// SQLite database.
+    pub db_path: PathBuf,
+    /// Directory of job logs (`<job-id>.log`).
+    pub logs_dir: PathBuf,
+    /// Budget units.
+    pub budget: u32,
+    /// Head-of-line reservation threshold.
+    pub head_reserve_after: Duration,
+    /// Per-repository caps (`budget_share_max`), keyed by toplevel.
+    pub repo_caps: BTreeMap<PathBuf, u32>,
+    /// CPU niceness of gate processes.
+    pub nice: u8,
+    /// I/O priority of gate processes.
+    pub ionice: Option<IoPriority>,
+    /// What to do when the last subscriber of a job disconnects.
+    pub last_subscriber_gone: LastSubscriberGone,
+    /// Logs of finished jobs older than this are deleted.
+    pub log_retention: Duration,
+    /// Lines of log tail sent in `done` and by default in `logs`.
+    pub tail_lines: usize,
+    /// Marker time to live (double-check before start, prune after write).
+    pub marker_ttl: Duration,
+    /// Sluice version (welcome, status, markers).
+    pub version: String,
+}
+
+/// Event of one job, broadcast to all its subscribers.
+#[derive(Debug, Clone)]
+enum JobEvent {
+    Started { started_at: u64 },
+    Progress { elapsed_ms: u64, log_bytes: u64 },
+    Done(Box<Outcome>),
+}
+
+/// A job known to the daemon (queued or running).
+#[derive(Debug)]
+struct JobEntry {
+    request: Arc<RunRequest>,
+    queued_at: u64,
+    events: broadcast::Sender<JobEvent>,
+    coalesced: u32,
+    cancelled: bool,
+    handle: Option<RunningHandle>,
+}
+
+/// Mutable scheduling state.
+#[derive(Debug)]
+struct State {
+    sched: Scheduler,
+    jobs: HashMap<String, JobEntry>,
+    accepting: bool,
+    refusal: &'static str,
+}
+
+/// State shared by every task of one daemon run.
+#[derive(Debug)]
+struct Shared {
+    config: DaemonConfig,
+    instance: String,
+    pid: u32,
+    started_at: String,
+    state: Mutex<State>,
+    store: Mutex<Store>,
+    wake: Notify,
+    idle: Notify,
+    stop: watch::Sender<Option<bool>>,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Shared {
+    /// Runs one synchronous store operation, logging failures.
+    fn store<R>(&self, what: &str, f: impl FnOnce(&Store) -> Result<R>) -> Option<R> {
+        match f(&lock(&self.store)) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                tracing::warn!("store: {what}: {e}");
+                None
+            }
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, State> {
+        lock(&self.state)
+    }
+}
+
+fn rfc3339(ms: u64) -> String {
+    humantime::format_rfc3339_seconds(UNIX_EPOCH + Duration::from_millis(ms)).to_string()
+}
+
+fn io_err(context: impl Into<String>) -> impl FnOnce(std::io::Error) -> Error {
+    let context = context.into();
+    move |source| Error::Io { context, source }
+}
+
+fn current_uid() -> u32 {
+    std::fs::metadata("/proc/self").map_or(0, |m| m.uid())
+}
+
+fn random_token(pid: u32) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let a = std::collections::hash_map::RandomState::new().hash_one((nanos, pid));
+    let b = std::collections::hash_map::RandomState::new().hash_one(a);
+    format!("{a:016x}{b:016x}")
+}
+
+fn ensure_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .map_err(io_err(format!("creating {}", parent.display())))?;
+    }
+    Ok(())
+}
+
+fn take_lock(path: &Path) -> Result<Flock<File>> {
+    ensure_parent(path)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .map_err(io_err(format!("opening {}", path.display())))?;
+    Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_, errno)| {
+        if errno == Errno::EWOULDBLOCK {
+            Error::AlreadyRunning(path.to_path_buf())
+        } else {
+            Error::Io {
+                context: format!("locking {}", path.display()),
+                source: errno.into(),
+            }
+        }
+    })
+}
+
+/// Kills the process groups of running jobs left by a previous instance and
+/// marks their rows `orphaned`.
+async fn reconcile_orphans(store: &Mutex<Store>, instance: &str) -> Result<()> {
+    let orphans = lock(store).orphans(instance)?;
+    for row in &orphans {
+        let Some(pgid) = row.pgid else { continue };
+        let Ok(leader) = u32::try_from(pgid) else {
+            continue;
+        };
+        if executor::process_matches(leader, row.proc_start_ticks) {
+            tracing::info!(job = %row.id, pgid, "killing orphaned gate process group");
+            executor::terminate_group(pgid, executor::KILL_GRACE).await;
+        } else {
+            tracing::info!(job = %row.id, pgid, "orphaned job is no longer running");
+        }
+    }
+    let n = lock(store).mark_orphaned(instance, now_ms())?;
+    if n > 0 {
+        tracing::info!("marked {n} job(s) of previous daemons as orphaned");
+    }
+    Ok(())
+}
+
+fn prune_logs(shared: &Shared) {
+    let cutoff = now_ms()
+        .saturating_sub(u64::try_from(shared.config.log_retention.as_millis()).unwrap_or(u64::MAX));
+    if let Some(n) = shared.store("pruning logs", |s| {
+        s.prune_logs(&shared.config.logs_dir, cutoff)
+    }) && n > 0
+    {
+        tracing::info!("deleted {n} old log file(s)");
+    }
+}
+
+/// Runs the daemon until `shutdown` resolves or a `stop` request arrives.
+///
+/// Order of operations: exclusive `flock` on `lock_path`, store and lease,
+/// orphan reconciliation, socket bind (mode `0600`), then the accept loop
+/// with a scheduling task and a heartbeat task. On `stop` (or `shutdown`)
+/// the socket file is removed, queued jobs are dropped with outcome
+/// `killed`, running jobs are left to finish (`stop` without `force`) or
+/// killed (`stop --force` and `shutdown`), and the lease is released.
+///
+/// # Errors
+///
+/// [`Error::AlreadyRunning`] when another daemon holds the lock or the
+/// lease; store, schema and I/O errors during start-up.
+pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send) -> Result<()> {
+    let _lock = take_lock(&config.lock_path)?;
+    let pid = std::process::id();
+    let started_ms = now_ms();
+    let instance = format!("{pid}-{started_ms}");
+    let store = Store::open(&config.db_path)?;
+    let token = random_token(pid);
+    let owner = format!("{}:{pid}", current_uid());
+    if !store.acquire_lease(LEASE_NAME, &owner, &token, started_ms, LEASE_TTL_MS)? {
+        return Err(Error::AlreadyRunning(config.lock_path.clone()));
+    }
+    let store = Mutex::new(store);
+    if let Err(e) = reconcile_orphans(&store, &instance).await {
+        tracing::warn!("orphan reconciliation failed: {e}");
+    }
+
+    let (stop, _) = watch::channel(None);
+    let head_ms = u64::try_from(config.head_reserve_after.as_millis()).unwrap_or(u64::MAX);
+    let shared = Arc::new(Shared {
+        state: Mutex::new(State {
+            sched: Scheduler::new(config.budget, head_ms, config.repo_caps.clone()),
+            jobs: HashMap::new(),
+            accepting: true,
+            refusal: "",
+        }),
+        store,
+        instance,
+        pid,
+        started_at: rfc3339(started_ms),
+        wake: Notify::new(),
+        idle: Notify::new(),
+        stop,
+        config,
+    });
+    prune_logs(&shared);
+
+    let listener = match bind(&shared.config.socket_path) {
+        Ok(l) => l,
+        Err(e) => {
+            release_lease(&shared, &token);
+            return Err(e);
+        }
+    };
+    tracing::info!(
+        instance = %shared.instance,
+        socket = %shared.config.socket_path.display(),
+        budget = shared.config.budget,
+        "daemon started"
+    );
+
+    let scheduling = tokio::spawn(scheduling_loop(Arc::clone(&shared)));
+    let heartbeat = tokio::spawn(heartbeat_loop(Arc::clone(&shared), token.clone()));
+
+    let mut conns = JoinSet::new();
+    let force = accept_loop(&shared, &listener, &mut conns, shutdown).await;
+    drop(listener);
+    remove_socket(&shared.config.socket_path);
+
+    drain(&shared, force).await;
+    scheduling.abort();
+    heartbeat.abort();
+    release_lease(&shared, &token);
+    let _ = timeout(CONNECTION_DRAIN, async {
+        while conns.join_next().await.is_some() {}
+    })
+    .await;
+    conns.abort_all();
+    tracing::info!(instance = %shared.instance, "daemon stopped");
+    Ok(())
+}
+
+fn bind(socket: &Path) -> Result<UnixListener> {
+    ensure_parent(socket)?;
+    // We hold the lock, so any socket file left behind is stale.
+    remove_socket(socket);
+    let listener =
+        UnixListener::bind(socket).map_err(io_err(format!("binding {}", socket.display())))?;
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
+        .map_err(io_err(format!("chmod {}", socket.display())))?;
+    Ok(listener)
+}
+
+fn remove_socket(socket: &Path) {
+    match std::fs::remove_file(socket) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!("cannot remove {}: {e}", socket.display()),
+    }
+}
+
+fn release_lease(shared: &Shared, token: &str) {
+    shared.store("releasing the lease", |s| {
+        s.release_lease(LEASE_NAME, token)
+    });
+}
+
+/// Accepts connections until shutdown or `stop`; returns whether running
+/// jobs must be killed.
+async fn accept_loop(
+    shared: &Arc<Shared>,
+    listener: &UnixListener,
+    conns: &mut JoinSet<()>,
+    shutdown: impl Future<Output = ()> + Send,
+) -> bool {
+    let mut stop_rx = shared.stop.subscribe();
+    let mut shutdown = std::pin::pin!(shutdown);
+    loop {
+        tokio::select! {
+            () = &mut shutdown => {
+                tracing::info!("shutdown requested");
+                return true;
+            }
+            changed = stop_rx.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+                let requested = *stop_rx.borrow_and_update();
+                if let Some(force) = requested {
+                    return force;
+                }
+            }
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    conns.spawn(handle_connection(Arc::clone(shared), stream));
+                }
+                Err(e) => {
+                    tracing::warn!("accept failed: {e}");
+                    sleep(Duration::from_millis(100)).await;
+                }
+            },
+            Some(_) = conns.join_next(), if !conns.is_empty() => {}
+        }
+    }
+}
+
+/// Stops accepting work, drops queued jobs, optionally kills running ones
+/// and waits until no job is left.
+async fn drain(shared: &Arc<Shared>, force: bool) {
+    let queued: Vec<String> = {
+        let mut st = shared.state();
+        st.accepting = false;
+        st.refusal = "the daemon is stopping";
+        let ids: Vec<String> = st.jobs.keys().cloned().collect();
+        let mut queued = Vec::new();
+        for id in ids {
+            if st.sched.is_queued(&id) {
+                queued.push(id);
+            } else if force && let Some(entry) = st.jobs.get_mut(&id) {
+                entry.cancelled = true;
+                if let Some(h) = &entry.handle {
+                    h.cancel();
+                }
+            }
+        }
+        queued
+    };
+    for id in queued {
+        let gate = gate_name(shared, &id);
+        finish_job(
+            shared,
+            &id,
+            Outcome {
+                status: OutcomeStatus::Killed,
+                message: format!("{gate}: dropped from the queue, the daemon is stopping"),
+                ..Outcome::default()
+            },
+            None,
+        );
+    }
+    tracing::info!(force, "waiting for running jobs");
+    loop {
+        let notified = shared.idle.notified();
+        if shared.state().jobs.is_empty() {
+            break;
+        }
+        tokio::select! {
+            () = notified => {}
+            () = sleep(Duration::from_millis(100)) => {}
+        }
+    }
+}
+
+fn gate_name(shared: &Shared, id: &str) -> String {
+    shared
+        .state()
+        .jobs
+        .get(id)
+        .map(|e| e.request.gate.name.clone())
+        .unwrap_or_default()
+}
+
+async fn heartbeat_loop(shared: Arc<Shared>, token: String) {
+    let mut last_prune = now_ms();
+    loop {
+        sleep(HEARTBEAT).await;
+        let now = now_ms();
+        let held = shared.store("heartbeat", |s| {
+            s.heartbeat(LEASE_NAME, &token, now, LEASE_TTL_MS)
+        });
+        if held == Some(false) {
+            tracing::error!("the daemon lease was lost; no new work is accepted");
+            let mut st = shared.state();
+            st.accepting = false;
+            st.refusal = "the daemon lost its lease; run `sluice daemon stop`";
+            return;
+        }
+        if now.saturating_sub(last_prune) >= PRUNE_EVERY_MS {
+            last_prune = now;
+            prune_logs(&shared);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scheduling and job execution
+// ---------------------------------------------------------------------------
+
+async fn scheduling_loop(shared: Arc<Shared>) {
+    loop {
+        tokio::select! {
+            () = shared.wake.notified() => {}
+            () = sleep(ADMIT_TICK) => {}
+        }
+        let started = shared.state().sched.admit(now_ms(), false);
+        for id in started {
+            tracing::debug!(job = %id, "admitted");
+            tokio::spawn(start_job(Arc::clone(&shared), id));
+        }
+    }
+}
+
+/// Completes a job: records it, removes it from the scheduler and the job
+/// map, broadcasts `done` and wakes the scheduling loop.
+fn finish_job(shared: &Shared, id: &str, outcome: Outcome, exit_code: Option<i32>) {
+    let label = match outcome.status {
+        OutcomeStatus::Pass => "pass",
+        OutcomeStatus::Fail => "fail",
+        OutcomeStatus::Timeout => "timeout",
+        OutcomeStatus::Killed => "killed",
+        OutcomeStatus::Cached => "cached",
+        OutcomeStatus::Error => "error",
+    };
+    let events = {
+        let mut st = shared.state();
+        let max = st.sched.subscribers_max(id).unwrap_or(1);
+        if st.sched.finish(id).is_none() {
+            st.sched.remove_queued(id);
+        }
+        let entry = st.jobs.remove(id);
+        let coalesced = entry.as_ref().map_or(0, |e| e.coalesced);
+        shared.store("recording the outcome", |s| {
+            s.set_subscribers(id, u32::try_from(max).unwrap_or(u32::MAX), coalesced)?;
+            s.mark_done(
+                id,
+                &shared.instance,
+                now_ms(),
+                label,
+                exit_code,
+                outcome.marker_written,
+            )
+        });
+        entry.map(|e| e.events)
+    };
+    tracing::info!(job = %id, outcome = label, "job done");
+    if let Some(events) = events {
+        let _ = events.send(JobEvent::Done(Box::new(outcome)));
+    }
+    shared.wake.notify_one();
+    shared.idle.notify_waiters();
+}
+
+fn repo_paths(request: &RunRequest) -> RepoPaths {
+    RepoPaths {
+        toplevel: request.repo.toplevel.clone(),
+        git_dir: request.repo.git_dir.clone(),
+        common_dir: request.repo.common_dir.clone(),
+        index_file: request.repo.git_dir.join("index"),
+        objects_dir: request.repo.common_dir.join("objects"),
+    }
+}
+
+fn duration_ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Re-checks the marker store right before a start; `Some` on a fresh hit.
+async fn marker_hit(shared: &Shared, request: &RunRequest) -> Option<Marker> {
+    let key = request.key.clone()?;
+    let common = request.repo.common_dir.clone();
+    let ttl = shared.config.marker_ttl;
+    match tokio::task::spawn_blocking(move || MarkerStore::new(&common).lookup(&key, ttl)).await {
+        Ok(Ok(Lookup::Hit(marker))) => Some(marker),
+        _ => None,
+    }
+}
+
+fn exec_spec(shared: &Shared, request: &RunRequest, id: &str, log_path: &Path) -> ExecSpec {
+    let mut env = request.child_env.clone();
+    env.extend(request.gate.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    ExecSpec {
+        job_id: id.to_owned(),
+        gate: request.gate.name.clone(),
+        cmd: request.cmd.clone(),
+        extra: request.extra.clone(),
+        cwd: request.cwd.clone(),
+        env,
+        timeout: if request.gate.timeout_ms == 0 {
+            NO_TIMEOUT
+        } else {
+            Duration::from_millis(request.gate.timeout_ms)
+        },
+        nice: shared.config.nice,
+        ionice: shared.config.ionice,
+        log_path: log_path.to_path_buf(),
+    }
+}
+
+async fn start_job(shared: Arc<Shared>, id: String) {
+    let Some(request) = shared.state().jobs.get(&id).map(|e| Arc::clone(&e.request)) else {
+        return;
+    };
+    let gate = request.gate.name.clone();
+
+    if let Some(marker) = marker_hit(&shared, &request).await {
+        let outcome = Outcome {
+            status: OutcomeStatus::Cached,
+            exit_code: Some(0),
+            duration_ms: marker.duration_ms,
+            message: format!(
+                "{gate}: a pass for this tree appeared while queued (job {})",
+                marker.job_id
+            ),
+            ..Outcome::default()
+        };
+        finish_job(&shared, &id, outcome, Some(0));
+        return;
+    }
+    if shared.state().jobs.get(&id).is_none_or(|e| e.cancelled) {
+        finish_job(&shared, &id, killed_outcome(&gate), None);
+        return;
+    }
+
+    let log_path = shared.config.logs_dir.join(format!("{id}.log"));
+    let running = match executor::spawn(exec_spec(&shared, &request, &id, &log_path)).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(job = %id, "cannot start the gate: {e}");
+            let outcome = Outcome {
+                status: OutcomeStatus::Error,
+                log_path: Some(log_path),
+                message: format!("{gate}: cannot start the gate: {e}"),
+                ..Outcome::default()
+            };
+            finish_job(&shared, &id, outcome, None);
+            return;
+        }
+    };
+    let info = running.info().clone();
+    let handle = running.handle();
+    shared.store("recording the start", |s| {
+        s.mark_started(
+            &id,
+            &shared.instance,
+            info.started_at,
+            Some(info.pgid),
+            info.proc_start_ticks,
+            &log_path,
+        )
+    });
+    let events = {
+        let mut st = shared.state();
+        let Some(entry) = st.jobs.get_mut(&id) else {
+            handle.cancel();
+            return;
+        };
+        entry.handle = Some(handle.clone());
+        if entry.cancelled {
+            handle.cancel();
+        }
+        let _ = entry.events.send(JobEvent::Started {
+            started_at: info.started_at,
+        });
+        entry.events.clone()
+    };
+    tracing::info!(job = %id, gate = %gate, pgid = info.pgid, "gate started");
+
+    let mut wait = std::pin::pin!(running.wait());
+    let mut tick = interval_at(Instant::now() + PROGRESS_EVERY, PROGRESS_EVERY);
+    let finished = loop {
+        tokio::select! {
+            f = &mut wait => break f,
+            _ = tick.tick() => {
+                let _ = events.send(JobEvent::Progress {
+                    elapsed_ms: now_ms().saturating_sub(info.started_at),
+                    log_bytes: handle.log_bytes(),
+                });
+            }
+        }
+    };
+    let (outcome, exit_code) = conclude(&shared, &request, &id, finished).await;
+    finish_job(&shared, &id, outcome, exit_code);
+}
+
+fn killed_outcome(gate: &str) -> Outcome {
+    Outcome {
+        status: OutcomeStatus::Killed,
+        message: format!("{gate} was killed"),
+        ..Outcome::default()
+    }
+}
+
+/// Status, exit code, message and miss reason of a finished run.
+fn classify(
+    request: &RunRequest,
+    finished: &Finished,
+) -> (OutcomeStatus, Option<i32>, String, Option<&'static str>) {
+    let gate = &request.gate.name;
+    let secs = finished.duration.as_secs_f64();
+    match finished.status {
+        ExecStatus::Exited(0) => (
+            OutcomeStatus::Pass,
+            Some(0),
+            format!("{gate} passed in {secs:.1}s"),
+            None,
+        ),
+        ExecStatus::Exited(n) => (
+            OutcomeStatus::Fail,
+            Some(n),
+            format!("{gate} failed with exit code {n} after {secs:.1}s"),
+            Some("gate failed"),
+        ),
+        ExecStatus::Signaled => (
+            OutcomeStatus::Fail,
+            None,
+            format!("{gate} was terminated by a signal after {secs:.1}s"),
+            Some("gate failed"),
+        ),
+        ExecStatus::Timeout => (
+            OutcomeStatus::Timeout,
+            None,
+            format!(
+                "{gate} timed out after {}",
+                humantime::format_duration(Duration::from_millis(request.gate.timeout_ms))
+            ),
+            Some("timed out"),
+        ),
+        ExecStatus::Killed => (
+            OutcomeStatus::Killed,
+            None,
+            format!("{gate} was killed after {secs:.1}s"),
+            Some("killed"),
+        ),
+    }
+}
+
+/// Inputs of the post-run cache bookkeeping (runs on a blocking thread).
+struct CacheWrite {
+    request: Arc<RunRequest>,
+    key: CacheKey,
+    job_id: String,
+    version: String,
+    ttl: Duration,
+    log_path: PathBuf,
+    duration_ms: u64,
+    exit_code: Option<i32>,
+    miss_reason: Option<&'static str>,
+}
+
+impl CacheWrite {
+    fn miss(&self, store: &MarkerStore, exit_code: Option<i32>, reason: &str) {
+        let record = MissRecord {
+            format: CACHE_FORMAT_VERSION,
+            key: self.key.clone(),
+            gate: self.request.gate.name.clone(),
+            exit_code,
+            reason: reason.to_owned(),
+            job_id: self.job_id.clone(),
+            log_path: Some(self.log_path.clone()),
+            recorded_at: sluice_gate_core::dirs::now_rfc3339(),
+        };
+        if let Err(e) = store.write_miss(&record) {
+            tracing::warn!("cannot record the miss: {e}");
+        }
+    }
+
+    /// Writes the marker (pass on an unchanged tree) or a miss record;
+    /// returns `(marker_written, not_cached_reason)`.
+    fn apply(self) -> (bool, Option<String>) {
+        let store = MarkerStore::new(&self.request.repo.common_dir);
+        if let Some(reason) = self.miss_reason {
+            self.miss(&store, self.exit_code, reason);
+            return (false, None);
+        }
+        let Some(tree_before) = self.request.tree.clone() else {
+            return (false, Some("the tree is unknown".to_owned()));
+        };
+        let env: BTreeMap<String, String> = std::env::vars().collect();
+        let after = tree::scratch_root(&env).and_then(|root| {
+            tree::snapshot(&repo_paths(&self.request), &self.request.probe_env, &root)
+        });
+        match after {
+            Ok(snap) if snap.tree() == Some(&tree_before) => {
+                let marker = Marker {
+                    format: CACHE_FORMAT_VERSION,
+                    key: self.key.clone(),
+                    tree: tree_before,
+                    gate: self.request.gate.name.clone(),
+                    cmd: normalize_cmd(&self.request.gate.cmd),
+                    passed_at: sluice_gate_core::dirs::now_rfc3339(),
+                    duration_ms: self.duration_ms,
+                    exit_code: 0,
+                    job_id: self.job_id.clone(),
+                    sluice_version: self.version.clone(),
+                    committed_tree: self.request.committed_tree.clone(),
+                };
+                match store.write(&marker) {
+                    Ok(()) => {
+                        let _ = store.prune(self.ttl);
+                        (true, None)
+                    }
+                    Err(e) => (false, Some(format!("cannot write the marker: {e}"))),
+                }
+            }
+            Ok(_) => {
+                self.miss(&store, Some(0), "the gate modified the tree");
+                (
+                    false,
+                    Some("the gate modified the tree; verify the new tree again".to_owned()),
+                )
+            }
+            Err(e) => (false, Some(format!("cannot snapshot the tree: {e}"))),
+        }
+    }
+}
+
+/// Maps a finished run to its outcome and writes the marker or miss record.
+async fn conclude(
+    shared: &Arc<Shared>,
+    request: &Arc<RunRequest>,
+    id: &str,
+    finished: Finished,
+) -> (Outcome, Option<i32>) {
+    let (status, exit_code, message, miss_reason) = classify(request, &finished);
+    let mut outcome = Outcome {
+        status,
+        exit_code,
+        duration_ms: duration_ms(finished.duration),
+        log_path: Some(finished.log_path.clone()),
+        message,
+        ..Outcome::default()
+    };
+    if let Some(key) = request.key.clone() {
+        let write = CacheWrite {
+            request: Arc::clone(request),
+            key,
+            job_id: id.to_owned(),
+            version: shared.config.version.clone(),
+            ttl: shared.config.marker_ttl,
+            log_path: finished.log_path.clone(),
+            duration_ms: outcome.duration_ms,
+            exit_code,
+            miss_reason,
+        };
+        match tokio::task::spawn_blocking(move || write.apply()).await {
+            Ok((written, reason)) => {
+                outcome.marker_written = written;
+                outcome.not_cached_reason = reason;
+            }
+            Err(e) => outcome.not_cached_reason = Some(format!("marker task failed: {e}")),
+        }
+    }
+    let tail = shared.config.tail_lines;
+    let log = finished.log_path;
+    outcome.tail = tokio::task::spawn_blocking(move || executor::tail_lines(&log, tail))
+        .await
+        .unwrap_or_default();
+    (outcome, exit_code)
+}
+
+// ---------------------------------------------------------------------------
+// Connections
+// ---------------------------------------------------------------------------
+
+/// Why a line could not be read.
+#[derive(Debug)]
+enum LineError {
+    TooLong,
+    NotUtf8,
+    Io,
+}
+
+/// Reads one line of at most [`MAX_LINE_BYTES`] bytes; `Ok(None)` on EOF.
+async fn read_line(
+    rd: &mut BufReader<OwnedReadHalf>,
+) -> std::result::Result<Option<String>, LineError> {
+    let mut buf = Vec::new();
+    let limit = u64::try_from(MAX_LINE_BYTES).unwrap_or(u64::MAX) + 2;
+    let n = (&mut *rd)
+        .take(limit)
+        .read_until(b'\n', &mut buf)
+        .await
+        .map_err(|_| LineError::Io)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    while matches!(buf.last(), Some(b'\n' | b'\r')) {
+        buf.pop();
+    }
+    if buf.len() > MAX_LINE_BYTES {
+        return Err(LineError::TooLong);
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|_| LineError::NotUtf8)
+}
+
+async fn send(wr: &mut OwnedWriteHalf, msg: &ServerMessage) -> bool {
+    tracing::debug!(?msg, "send");
+    let Ok(line) = proto::encode(msg) else {
+        return false;
+    };
+    wr.write_all(line.as_bytes()).await.is_ok()
+}
+
+async fn send_error(wr: &mut OwnedWriteHalf, id: u64, code: ErrorCode, message: impl Into<String>) {
+    let _ = send(
+        wr,
+        &ServerMessage::Error {
+            id,
+            code,
+            message: message.into(),
+        },
+    )
+    .await;
+}
+
+fn line_error_message(e: &LineError) -> &'static str {
+    match e {
+        LineError::TooLong => "line longer than 1 MiB",
+        LineError::NotUtf8 => "line is not valid UTF-8",
+        LineError::Io => "read error",
+    }
+}
+
+/// Reads one request line with the handshake timeout. Replies with an
+/// error and returns `None` when the line is unusable.
+async fn read_message(
+    rd: &mut BufReader<OwnedReadHalf>,
+    wr: &mut OwnedWriteHalf,
+) -> Option<std::result::Result<ClientMessage, serde_json::Error>> {
+    match timeout(HANDSHAKE_TIMEOUT, read_line(rd)).await {
+        Ok(Ok(Some(line))) => {
+            tracing::debug!(line = %line, "recv");
+            Some(proto::decode_client(&line))
+        }
+        Ok(Err(e @ (LineError::TooLong | LineError::NotUtf8))) => {
+            send_error(wr, 0, ErrorCode::BadRequest, line_error_message(&e)).await;
+            None
+        }
+        Ok(Ok(None) | Err(LineError::Io)) | Err(_) => None,
+    }
+}
+
+/// Reads `hello` and answers `welcome`; false when the connection must close.
+async fn handshake(
+    shared: &Shared,
+    rd: &mut BufReader<OwnedReadHalf>,
+    wr: &mut OwnedWriteHalf,
+) -> bool {
+    match read_message(rd, wr).await {
+        None => return false,
+        Some(Ok(ClientMessage::Hello {
+            protocol, client, ..
+        })) if protocol == PROTOCOL_VERSION => {
+            tracing::debug!(client = %client, "hello");
+        }
+        Some(Ok(ClientMessage::Hello { protocol, .. })) => {
+            let msg = format!(
+                "this daemon speaks protocol {PROTOCOL_VERSION}, the client speaks {protocol}; run `sluice daemon stop`"
+            );
+            send_error(wr, 0, ErrorCode::Protocol, msg).await;
+            return false;
+        }
+        Some(Ok(_)) => {
+            send_error(wr, 0, ErrorCode::Protocol, "expected hello").await;
+            return false;
+        }
+        Some(Err(e)) => {
+            send_error(
+                wr,
+                0,
+                ErrorCode::BadRequest,
+                format!("malformed hello: {e}"),
+            )
+            .await;
+            return false;
+        }
+    }
+    let welcome = ServerMessage::Welcome {
+        protocol: PROTOCOL_VERSION,
+        daemon: format!("sluice-gate {}", shared.config.version),
+        instance: shared.instance.clone(),
+        pid: shared.pid,
+        started_at: shared.started_at.clone(),
+    };
+    send(wr, &welcome).await
+}
+
+async fn handle_connection(shared: Arc<Shared>, stream: UnixStream) {
+    let (rd, mut wr) = stream.into_split();
+    let mut rd = BufReader::new(rd);
+
+    if !handshake(&shared, &mut rd, &mut wr).await {
+        return;
+    }
+
+    let request = match read_message(&mut rd, &mut wr).await {
+        None => return,
+        Some(Ok(m)) => m,
+        Some(Err(e)) => {
+            send_error(
+                &mut wr,
+                0,
+                ErrorCode::BadRequest,
+                format!("malformed request: {e}"),
+            )
+            .await;
+            return;
+        }
+    };
+    match request {
+        ClientMessage::Run { id, request } => handle_run(&shared, rd, wr, id, request).await,
+        ClientMessage::Status { id } => {
+            let status = status_report(&shared);
+            let _ = send(&mut wr, &ServerMessage::Status { id, status }).await;
+        }
+        ClientMessage::Logs { id, job_id, tail } => {
+            handle_logs(&shared, &mut wr, id, job_id, tail).await;
+        }
+        ClientMessage::Event {
+            event:
+                ClientEvent::Hit {
+                    repo,
+                    gate,
+                    saved_ms,
+                },
+            ..
+        } => {
+            shared.store("recording a hit", |s| {
+                s.record_hit(now_ms(), &repo, &gate, saved_ms)
+            });
+        }
+        ClientMessage::Stop { id, force } => {
+            let running = {
+                let st = shared.state();
+                st.jobs.keys().filter(|j| st.sched.is_running(j)).count()
+            };
+            tracing::info!(force, running, "stop requested");
+            let _ = send(&mut wr, &ServerMessage::Stopping { id, running }).await;
+            remove_socket(&shared.config.socket_path);
+            shared.stop.send_replace(Some(force));
+        }
+        ClientMessage::Cancel { id } => {
+            send_error(
+                &mut wr,
+                id,
+                ErrorCode::BadRequest,
+                "cancel outside a run connection",
+            )
+            .await;
+        }
+        ClientMessage::Hello { .. } => {
+            send_error(&mut wr, 0, ErrorCode::Protocol, "duplicate hello").await;
+        }
+    }
+}
+
+fn status_report(shared: &Shared) -> StatusReport {
+    let now = now_ms();
+    let (running, queued, total, used) = {
+        let st = shared.state();
+        let (running, queued) = st.sched.snapshot(now, false);
+        let caller = |id: &str| {
+            st.jobs
+                .get(id)
+                .map_or(Caller::default(), |e| e.request.caller)
+        };
+        let running: Vec<RunningJob> = running
+            .into_iter()
+            .map(|v| RunningJob {
+                caller: caller(&v.id),
+                job_id: v.id,
+                repo: v.repo,
+                gate: v.gate,
+                weight: v.weight,
+                started_at: rfc3339(v.started_at),
+                elapsed_ms: now.saturating_sub(v.started_at),
+                subscribers: v.subscribers,
+            })
+            .collect();
+        let queued: Vec<QueuedJob> = queued
+            .into_iter()
+            .map(|v| QueuedJob {
+                job_id: v.id,
+                repo: v.repo,
+                gate: v.gate,
+                weight: v.weight,
+                queued_at: rfc3339(v.queued_at),
+                waiting_ms: now.saturating_sub(v.queued_at),
+                subscribers: v.subscribers,
+                reason: v.reason,
+            })
+            .collect();
+        (running, queued, st.sched.budget(), st.sched.used())
+    };
+    let totals = shared
+        .store("reading totals", |s| s.totals(None))
+        .unwrap_or_default();
+    StatusReport {
+        schema: STATUS_SCHEMA_VERSION,
+        daemon: DaemonInfo {
+            instance: shared.instance.clone(),
+            pid: shared.pid,
+            started_at: shared.started_at.clone(),
+            version: shared.config.version.clone(),
+            socket: shared.config.socket_path.clone(),
+        },
+        budget: BudgetInfo {
+            total,
+            used,
+            psi: PsiInfo::default(),
+        },
+        running,
+        queued,
+        totals,
+    }
+}
+
+async fn handle_logs(
+    shared: &Shared,
+    wr: &mut OwnedWriteHalf,
+    id: u64,
+    job_id: Option<String>,
+    tail: usize,
+) {
+    let row = shared.store("reading a job", |s| match &job_id {
+        Some(j) => s.job(j),
+        None => s.newest_job(),
+    });
+    let Some(Some(row)) = row else {
+        send_error(wr, id, ErrorCode::NotFound, "no such job").await;
+        return;
+    };
+    let Some(path) = row.log_path else {
+        send_error(
+            wr,
+            id,
+            ErrorCode::NotFound,
+            format!("job {} has no log yet", row.id),
+        )
+        .await;
+        return;
+    };
+    let n = if tail == 0 {
+        shared.config.tail_lines
+    } else {
+        tail
+    };
+    let p = path.clone();
+    let lines = tokio::task::spawn_blocking(move || executor::tail_lines(&p, n))
+        .await
+        .unwrap_or_default();
+    let _ = send(
+        wr,
+        &ServerMessage::Log {
+            id,
+            job_id: row.id,
+            path,
+            lines,
+        },
+    )
+    .await;
+}
+
+fn caller_str(caller: Caller) -> &'static str {
+    match caller {
+        Caller::Agent => "agent",
+        Caller::Human => "human",
+    }
+}
+
+/// Registers the request (new job or coalesced) and returns
+/// `(job_id, coalesced, position, weight, events)`, or an error message.
+fn register(
+    shared: &Shared,
+    request: RunRequest,
+) -> std::result::Result<(String, bool, usize, u32, broadcast::Receiver<JobEvent>), String> {
+    let now = now_ms();
+    let mut st = shared.state();
+    if !st.accepting {
+        return Err(st.refusal.to_owned());
+    }
+    let id = new_job_id();
+    let spec = JobSpec {
+        id: id.clone(),
+        key: request.key.clone(),
+        repo: request.repo.toplevel.clone(),
+        gate: request.gate.name.clone(),
+        weight: request.gate.weight,
+        queued_at: now,
+    };
+    match st.sched.enqueue(spec) {
+        Enqueued::Created { position } => {
+            let weight = st.sched.spec(&id).map_or(1, |s| s.weight);
+            let row = JobRow {
+                id: id.clone(),
+                key: request.key.as_ref().map(|k| k.as_str().to_owned()),
+                tree: request.tree.as_ref().map(|t| t.as_str().to_owned()),
+                repo: request.repo.toplevel.clone(),
+                gate: request.gate.name.clone(),
+                cmd: request.cmd.clone(),
+                weight,
+                caller: caller_str(request.caller).to_owned(),
+                session: request.session.clone(),
+                state: JobState::Queued,
+                outcome: None,
+                exit_code: None,
+                queued_at: now,
+                started_at: None,
+                finished_at: None,
+                log_path: None,
+                pgid: None,
+                proc_start_ticks: None,
+                daemon_instance: shared.instance.clone(),
+                subscribers_max: 1,
+                coalesced: 0,
+                marker_written: false,
+            };
+            shared.store("inserting a job", |s| s.insert_job(&row));
+            let (events, rx) = broadcast::channel(CHANNEL_CAPACITY);
+            st.jobs.insert(
+                id.clone(),
+                JobEntry {
+                    request: Arc::new(request),
+                    queued_at: now,
+                    events,
+                    coalesced: 0,
+                    cancelled: false,
+                    handle: None,
+                },
+            );
+            Ok((id, false, position, weight, rx))
+        }
+        Enqueued::Coalesced { job_id, position } => {
+            let weight = st.sched.spec(&job_id).map_or(1, |s| s.weight);
+            let max = st.sched.subscribers_max(&job_id).unwrap_or(1);
+            let Some(entry) = st.jobs.get_mut(&job_id) else {
+                st.sched.unsubscribe(&job_id);
+                return Err("internal error: coalesced into an unknown job".to_owned());
+            };
+            entry.coalesced += 1;
+            let coalesced = entry.coalesced;
+            let rx = entry.events.subscribe();
+            shared.store("updating subscribers", |s| {
+                s.set_subscribers(&job_id, u32::try_from(max).unwrap_or(u32::MAX), coalesced)
+            });
+            Ok((job_id, true, position.unwrap_or(0), weight, rx))
+        }
+    }
+}
+
+/// Removes one subscriber and applies `last_subscriber_gone` when it was the last.
+fn detach(shared: &Shared, job_id: &str) {
+    let drop_queued = {
+        let mut st = shared.state();
+        let Some(remaining) = st.sched.unsubscribe(job_id) else {
+            return;
+        };
+        tracing::debug!(job = %job_id, remaining, "subscriber detached");
+        if remaining > 0 || shared.config.last_subscriber_gone == LastSubscriberGone::Finish {
+            return;
+        }
+        if st.sched.is_queued(job_id) {
+            true
+        } else {
+            if let Some(entry) = st.jobs.get_mut(job_id) {
+                tracing::info!(job = %job_id, "last subscriber gone, cancelling");
+                entry.cancelled = true;
+                if let Some(h) = &entry.handle {
+                    h.cancel();
+                }
+            }
+            false
+        }
+    };
+    if drop_queued {
+        let gate = gate_name(shared, job_id);
+        tracing::info!(job = %job_id, "last subscriber gone, dropping the queued job");
+        finish_job(shared, job_id, killed_outcome(&gate), None);
+    }
+}
+
+/// Reads the client side of a `run` connection in its own task (`read_line`
+/// is not cancel-safe); `None` on the channel means EOF or a read error.
+fn spawn_reader(
+    mut rd: BufReader<OwnedReadHalf>,
+) -> (tokio::task::JoinHandle<()>, mpsc::Receiver<Option<String>>) {
+    let (tx, rx) = mpsc::channel::<Option<String>>(4);
+    let task = tokio::spawn(async move {
+        loop {
+            let line = read_line(&mut rd).await.ok().flatten();
+            let eof = line.is_none();
+            if tx.send(line).await.is_err() || eof {
+                return;
+            }
+        }
+    });
+    (task, rx)
+}
+
+/// One subscriber of a job: its request id and how it joined.
+struct Subscriber<'a> {
+    shared: &'a Shared,
+    id: u64,
+    job_id: String,
+    coalesced: bool,
+}
+
+impl Subscriber<'_> {
+    /// Translates a job event; the bool is true for the final message.
+    fn message(
+        &self,
+        event: std::result::Result<JobEvent, broadcast::error::RecvError>,
+    ) -> Option<(ServerMessage, bool)> {
+        let (id, job_id) = (self.id, self.job_id.clone());
+        match event {
+            Ok(JobEvent::Started { started_at }) => Some((
+                ServerMessage::Started {
+                    id,
+                    job_id,
+                    started_at: rfc3339(started_at),
+                },
+                false,
+            )),
+            Ok(JobEvent::Progress {
+                elapsed_ms,
+                log_bytes,
+            }) => Some((
+                ServerMessage::Progress {
+                    id,
+                    job_id,
+                    elapsed_ms,
+                    log_bytes,
+                    position: None,
+                },
+                false,
+            )),
+            Ok(JobEvent::Done(outcome)) => {
+                let mut outcome = *outcome;
+                if self.coalesced {
+                    outcome.coalesced_with = Some(job_id.clone());
+                }
+                Some((
+                    ServerMessage::Done {
+                        id,
+                        job_id,
+                        outcome,
+                    },
+                    true,
+                ))
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::debug!(job = %job_id, "subscriber lagged by {n} events");
+                None
+            }
+            Err(broadcast::error::RecvError::Closed) => Some((
+                ServerMessage::Done {
+                    id,
+                    job_id,
+                    outcome: Outcome {
+                        status: OutcomeStatus::Error,
+                        message: "the job vanished without an outcome".to_owned(),
+                        ..Outcome::default()
+                    },
+                },
+                true,
+            )),
+        }
+    }
+
+    /// `progress` with the queue position while the job is still queued.
+    fn queued_progress(&self) -> Option<ServerMessage> {
+        let st = self.shared.state();
+        let position = st.sched.position(&self.job_id)?;
+        let queued_at = st.jobs.get(&self.job_id)?.queued_at;
+        Some(ServerMessage::Progress {
+            id: self.id,
+            job_id: self.job_id.clone(),
+            elapsed_ms: now_ms().saturating_sub(queued_at),
+            log_bytes: 0,
+            position: Some(position),
+        })
+    }
+}
+
+async fn handle_run(
+    shared: &Arc<Shared>,
+    rd: BufReader<OwnedReadHalf>,
+    mut wr: OwnedWriteHalf,
+    id: u64,
+    request: RunRequest,
+) {
+    let (job_id, coalesced, position, weight, mut events) = match register(shared, request) {
+        Ok(r) => r,
+        Err(message) => {
+            send_error(&mut wr, id, ErrorCode::Internal, message).await;
+            return;
+        }
+    };
+    tracing::info!(job = %job_id, coalesced, position, "run request queued");
+    if !coalesced {
+        shared.wake.notify_one();
+    }
+    let sub = Subscriber {
+        shared,
+        id,
+        job_id,
+        coalesced,
+    };
+    let queued = ServerMessage::Queued {
+        id,
+        job_id: sub.job_id.clone(),
+        position,
+        coalesced,
+        weight,
+    };
+    if !send(&mut wr, &queued).await {
+        detach(shared, &sub.job_id);
+        return;
+    }
+
+    let (reader, mut lines) = spawn_reader(rd);
+    let mut tick = interval_at(Instant::now() + PROGRESS_EVERY, PROGRESS_EVERY);
+    loop {
+        let (msg, last) = tokio::select! {
+            ev = events.recv() => match sub.message(ev) {
+                Some(m) => m,
+                None => continue,
+            },
+            _ = tick.tick() => match sub.queued_progress() {
+                Some(m) => (m, false),
+                None => continue,
+            },
+            line = lines.recv() => match line.flatten().map(|l| proto::decode_client(&l)) {
+                None | Some(Ok(ClientMessage::Cancel { .. })) => {
+                    tracing::debug!(job = %sub.job_id, "subscriber left");
+                    detach(shared, &sub.job_id);
+                    break;
+                }
+                Some(Ok(_)) => {
+                    send_error(&mut wr, id, ErrorCode::BadRequest, "only cancel is accepted during a run").await;
+                    continue;
+                }
+                Some(Err(e)) => {
+                    send_error(&mut wr, id, ErrorCode::BadRequest, format!("malformed message: {e}")).await;
+                    continue;
+                }
+            },
+        };
+        if !send(&mut wr, &msg).await && !last {
+            detach(shared, &sub.job_id);
+            break;
+        }
+        if last {
+            break;
+        }
+    }
+    reader.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Client helper
+// ---------------------------------------------------------------------------
+
+/// Connects to the daemon, performs the handshake and sends `request`.
+///
+/// Returns the write half (to send `cancel` or close) and the reply stream
+/// as an async line reader (decode each line with
+/// [`sluice_gate_proto::decode_server`]). Small on purpose: the CLI has its
+/// own client.
+///
+/// # Errors
+///
+/// [`Error::Io`] when the socket cannot be reached or written, and
+/// [`Error::Protocol`] when the daemon does not answer with a matching
+/// `welcome`.
+pub async fn connect(
+    socket: &Path,
+    request: &ClientMessage,
+) -> Result<(OwnedWriteHalf, Lines<BufReader<OwnedReadHalf>>)> {
+    let stream = UnixStream::connect(socket)
+        .await
+        .map_err(io_err(format!("connecting to {}", socket.display())))?;
+    let (rd, mut wr) = stream.into_split();
+    let mut lines = BufReader::new(rd).lines();
+    let hello = ClientMessage::Hello {
+        protocol: PROTOCOL_VERSION,
+        client: format!("sluice-gate {}", env!("CARGO_PKG_VERSION")),
+        pid: std::process::id(),
+    };
+    let write =
+        |msg: &ClientMessage| proto::encode(msg).map_err(|e| Error::Protocol(e.to_string()));
+    wr.write_all(write(&hello)?.as_bytes())
+        .await
+        .map_err(io_err("sending hello"))?;
+    let line = lines
+        .next_line()
+        .await
+        .map_err(io_err("reading welcome"))?
+        .ok_or_else(|| Error::Protocol("the daemon closed the connection".to_owned()))?;
+    match proto::decode_server(&line) {
+        Ok(ServerMessage::Welcome { protocol, .. }) if protocol == PROTOCOL_VERSION => {}
+        Ok(other) => {
+            return Err(Error::Protocol(format!(
+                "unexpected handshake reply: {other:?}"
+            )));
+        }
+        Err(e) => return Err(Error::Protocol(format!("malformed handshake reply: {e}"))),
+    }
+    wr.write_all(write(request)?.as_bytes())
+        .await
+        .map_err(io_err("sending the request"))?;
+    Ok((wr, lines))
+}
