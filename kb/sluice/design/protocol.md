@@ -5,15 +5,19 @@ tags: [sluice, design, protocol, phase-2]
 
 # Daemon ↔ client protocol (v1)
 
-Status: design for Phase 2, to be frozen when Phase 2 closes. Types live in
-`sluice-gate-proto` (serde, no I/O). Context: [[sluice/design/architecture.md]]
+Status: implemented in Phase 2 as `PROTOCOL_VERSION = 1` (frozen; additive
+changes only). Types live in `sluice-gate-proto` (serde, no I/O); the
+blocking client lives in the same crate behind the `client` feature
+([[sluice/design/adr/0008-client-in-proto-crate.md]]). Context: [[sluice/design/architecture.md]]
 section 5, [[sluice/design/scheduler.md]], [[sluice/design/executor.md]].
 
 ## Transport
 
 - Unix stream socket at `<runtime-dir>/daemon.sock`
   (`$XDG_RUNTIME_DIR/sluice/daemon.sock`, fallback `/tmp/sluice-<uid>/daemon.sock`),
-  directory mode `0700`. `SLUICE_SOCKET` overrides the path.
+  directory mode `0700`, socket `0600`. `SLUICE_SOCKET` overrides the
+  socket path only; `daemon.lock` and `start.lock` stay in the runtime
+  directory, so one daemon per user regardless of the socket path.
 - Newline-delimited JSON: one JSON object per line, UTF-8, no pretty
   printing. Lines longer than 1 MiB are rejected.
 - The first line in each direction is the handshake. One connection serves
@@ -24,13 +28,17 @@ section 5, [[sluice/design/scheduler.md]], [[sluice/design/executor.md]].
 ## Handshake
 
 Client → `{"type":"hello","protocol":1,"client":"sluice-gate 0.1.0","pid":4242}`
-Server → `{"type":"welcome","protocol":1,"daemon":"sluice-gate 0.1.0","instance":"<uuid>","pid":1234,"started_at":"<rfc3339>"}`
+Server → `{"type":"welcome","protocol":1,"daemon":"sluice-gate 0.1.0","instance":"<pid>-<start unix ms>","pid":1234,"started_at":"<rfc3339>"}`
+
+`instance` is also the value fenced into `jobs.daemon_instance`.
 
 A daemon that does not speak the client's `protocol` answers
-`{"type":"error","code":"protocol","message":"..."}` and closes. A client
-that receives a `welcome` with a different `protocol` reports the mismatch
-and tells the user to run `sluice daemon stop` (the next client restarts a
-matching daemon).
+`{"type":"error","id":0,"code":"protocol","message":"..."}` and closes. A
+client that receives a `welcome` with a different `protocol` reports
+`the running daemon speaks protocol N, this client speaks M; run 'sluice
+daemon stop'`. Client timeouts: 1 s to connect (retrying a full backlog),
+5 s per write, 10 s to read a `status`/`logs`/`stop` reply, none while a
+`run` is in flight.
 
 ## Requests and replies
 
@@ -58,8 +66,8 @@ Server events on that connection, in order:
 
 | Event | Fields | When |
 |---|---|---|
-| `queued` | `id`, `job_id`, `position`, `coalesced` (bool), `weight` | always first; `coalesced=true` when attached to an existing job |
-| `started` | `id`, `job_id`, `started_at` | when the gate process starts |
+| `queued` | `id`, `job_id`, `position` (1-based; `0` when attached to a job that is already running), `coalesced` (bool), `weight` | always first; `coalesced=true` when attached to an existing job |
+| `started` | `id`, `job_id`, `started_at` | when the gate process starts; a request attached to a running job receives it right after `queued`, with the job's original `started_at` |
 | `progress` | `id`, `job_id`, `elapsed_ms`, `log_bytes`, `position` (while queued) | every 5 s while queued or running |
 | `done` | `id`, `job_id`, `outcome` | once, then the server closes |
 
@@ -75,8 +83,12 @@ Server events on that connection, in order:
 `cached` is returned when a marker for `key` appeared while the request was
 queued (another client finished the same tree): the daemon re-checks the
 marker store right before starting a job ([[sluice/design/scheduler.md]]).
-`error` carries a `message` and means Sluice itself failed (cannot spawn,
-cannot write the log, daemon stopping or lease lost); the client exits 1.
+`error` carries a `message` and means Sluice itself failed after the job
+was accepted (cannot spawn, cannot write the log); the client exits 1. A
+daemon that is stopping or has lost its lease refuses the request before
+`queued` with a top-level `error{internal}`, and the client falls back to
+an in-process run. A gate killed by a signal Sluice did not send is `fail`
+with `exit_code: null` (`<gate> was terminated by a signal`).
 `killed` is also what every subscriber of a queued job receives when the
 daemon stops (forced or not) or when the job's last subscriber left under
 the `cancel` policy. For a coalesced subscriber `done` carries
@@ -101,20 +113,35 @@ A pass whose request had a `key` but no `tree` is reported with
 ```
 
 `schema` is bumped when a field changes meaning; Phase 4 freezes it and
-adds a test. `sluice status --json` prints this object verbatim.
+adds a test. `sluice status --json` prints this object (pretty-printed,
+without the `type`/`id` envelope); with no daemon running it prints
+`{"schema":1,"daemon":null}`, so `daemon` is nullable in the CLI output
+and every other field is absent in that case. Queued `reason` precedence:
+`budget` when the job does not fit the budget, then `repo-cap`, then
+`head-reserved` for jobs behind a reserved head; `psi` only from Phase 4.
+`totals` are all-time over the database (`since` = oldest job or event);
+`runs` counts every finished job except `orphaned` (so `cached` and
+`error` outcomes count), `hits` counts only client `event`s, coalescing is
+credited as `coalesced × run time` on passed jobs, and `wait_ms_total`
+includes jobs still running.
 
 ### `logs`
 
 `{"type":"logs","id":3,"job_id":"<id or null>","tail":40}` →
 `{"type":"log","id":3,"job_id":"...","path":"...","lines":[...]}`. With
-`job_id: null` the newest job is used. When the daemon is not running the
-client falls back to reading `<state>/logs/` directly (Phase 1 behaviour).
+`job_id: null` the newest job is used; `tail: 0` means the daemon's default
+(`cache.tail_lines`). The CLI uses the reply mainly to learn the path and
+reads the file itself; on any failure (no daemon, `not-found` for a job
+the daemon never saw, such as an in-process run) it falls back to the
+newest file in `<state>/logs/`. `sluice logs` never autostarts the daemon.
 
 ### `event`
 
-Best-effort, fire-and-forget telemetry from clients that did not need the
-daemon: `{"type":"event","id":0,"event":"hit","repo":"/abs","gate":"test","saved_ms":32100}`.
-The client connects with a 20 ms timeout, writes one line and closes; the
+Best-effort telemetry from clients that did not need the daemon:
+`{"type":"event","id":0,"event":"hit","repo":"/abs","gate":"test","saved_ms":32100}`
+(`saved_ms` = the marker's `duration_ms`). Sent only when the socket file
+exists (a hit never starts a daemon); the client writes `hello` and the
+event, waits for `welcome` within the same 20 ms budget and closes; the
 daemon sends no reply; any failure is ignored. It feeds `totals.hits` and
 `time_saved_ms`.
 
@@ -129,9 +156,10 @@ with `force` it also kills running jobs (their subscribers get `done` with
 
 ### `cancel`
 
-`{"type":"cancel","id":1}` on a `run` connection detaches that subscriber
-without closing the socket (used by the MCP server when the model cancels a
-tool call). Equivalent to closing the connection.
+`{"type":"cancel","id":1}` on a `run` connection detaches that subscriber;
+the daemon then closes its side. Equivalent to closing the connection
+(what the CLI does; the MCP server sends `cancel`). Any other message on a
+`run` connection is answered with `error{bad-request}` and ignored.
 
 ## Disconnects
 
@@ -143,9 +171,12 @@ completion and write the marker so the next request hits).
 ## Errors
 
 `{"type":"error","id":N,"code":"protocol|bad-request|not-found|internal","message":"..."}`.
-Unknown `type` or malformed JSON → `bad-request`; a `hello` with another
-protocol → `protocol` (no `id`); a `run` while the daemon is stopping or
-has lost its lease → `internal`. Both the `hello` and the request line
+Unknown `type`, malformed JSON, a line over 1 MiB or invalid UTF-8 →
+`bad-request` (`id` 0 when unknown); a first line that is not `hello` →
+`protocol` (`expected hello`), a second `hello` → `duplicate hello`; a
+`hello` with another protocol → `protocol`; a `run` while the daemon is
+stopping or has lost its lease → `internal`; `logs` for an unknown job or a
+job without a log yet → `not-found`. Both the `hello` and the request line
 must arrive within 10 s or the connection is closed. The server never
 panics on malformed input.
 

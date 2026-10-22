@@ -161,7 +161,15 @@ cache, no budget, no log); `SLUICE_CACHE=0|1` forces the cache off or on
 (on overrides `CI`); `CI` (any value other than `0`/`false`/`no`/`off`)
 disables the cache; `SLUICE_AGENT=1|0` forces agent or human detection;
 `SLUICE_CONFIG` points at the user config
-(`~/.config/sluice/config.toml`).
+(`~/.config/sluice/config.toml`); `SLUICE_SOCKET` moves the daemon socket;
+`SLUICE_LOG` sets the daemon's log filter (`info` by default, written to
+`~/.local/state/sluice/daemon.log`).
+
+`sluice status` prints the daemon (pid, version, uptime, socket), budget
+use, running and queued jobs with the reason each one waits, and all-time
+totals (runs, passes, failures, timeouts, hits, coalesced requests, time
+saved). `sluice daemon stop` lets running gates finish and waits for the
+daemon to exit; `--force` kills them.
 
 MCP tools for agents (Phase 3): `verify` (blocks until the gates finish,
 with progress notifications), `status`, `gate_list`, `logs`.

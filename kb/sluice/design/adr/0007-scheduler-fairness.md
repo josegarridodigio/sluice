@@ -23,7 +23,10 @@ heavy one. Agents issue both kinds constantly.
   (default 30 s).
 - **Reservation:** after that, the head reserves the budget: no job behind
   it starts until the head fits. Running jobs finish normally.
-- No priorities, no preemption, no weight resizing in v1.
+- No priorities, no preemption, no dynamic weight resizing in v1 (weights
+  are only clamped at enqueue to the budget and the repository cap).
+- The reservation applies only when the head is blocked by the budget; a
+  head blocked by its repository cap never stops other repositories.
 
 ## Consequences
 

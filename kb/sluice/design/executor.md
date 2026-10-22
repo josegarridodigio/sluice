@@ -5,7 +5,7 @@ tags: [sluice, design, executor, daemon, phase-2]
 
 # Executor, daemon lifecycle and persistence (Phase 2)
 
-Status: design for Phase 2. Related: [[sluice/design/protocol.md]],
+Status: implemented in Phase 2 (`sluice-gate-daemon`, CLI `daemon_cmd`, proto `client`). Related: [[sluice/design/protocol.md]],
 [[sluice/design/scheduler.md]], [[sluice/design/architecture.md]] sections
 4b and 5, [[sluice/research/references/agent-task-queue.md]],
 [[sluice/research/references/mergetrain.md]].
@@ -24,18 +24,30 @@ Status: design for Phase 2. Related: [[sluice/design/protocol.md]],
   serving its running jobs and refuses new `run` requests with
   `error{internal}`. The daily log pruning runs from the heartbeat task
   (and once at start).
-- **Autostart from clients:** a client that cannot connect takes a short
-  `flock` on `<runtime>/start.lock`, re-checks the socket, spawns
-  `sluice daemon` (detached), waits up to 5 s for the socket with 20 ms
-  polls, releases the lock. Failure to start is reported; the client then
-  runs the gate itself (Phase 1 path) so a broken daemon never blocks work.
+- **Autostart from clients:** a client that cannot connect takes a
+  blocking `flock` on `<runtime>/start.lock`, re-checks the socket, spawns
+  its own executable as `sluice daemon` (stdin null, stdout and stderr
+  appended to `<state>/daemon.log`, own process group, environment minus
+  every `GIT_*` variable), waits up to 5 s for the socket with 20 ms polls
+  (an early non-zero exit is reported at once; while an old daemon is still
+  draining after `stop`, the client retries for up to 5 s), releases the
+  lock. Failure text: `the daemon could not be started (<why>); see
+  <daemon.log>`. The client then runs the gate itself (Phase 1 path) so a
+  broken daemon never blocks work. Start-up errors of `sluice daemon`
+  itself (exit 1): `a daemon is already running (lock <path>)`,
+  `unusable socket path <p>`, config errors, runtime creation failure.
 - **Stop:** `sluice daemon stop [--force]` sends `stop`; the daemon removes
-  the socket file first (so new clients start a fresh one), drops queued
-  jobs (`done{killed}`), finishes or (with `--force`, SIGTERM or SIGINT)
-  kills running jobs, releases the lease, exits 0.
+  the socket file first, drops queued jobs (`done{killed}` with their job
+  id), finishes or (with `--force`, SIGTERM or SIGINT) kills running
+  jobs, releases the lease and the lock, exits 0. The command prints
+  `sluice: daemon stopping (N running jobs)` (or `no daemon running`, exit
+  0) and waits for the old daemon to release `daemon.lock` (up to 60 s,
+  printing `waiting for N running jobs to finish`; `--force` polls the pid
+  for up to 10 s) so the next client gets a fresh daemon.
 - **Idle:** never exits on its own in v1 (`daemon.idle_exit = 0s`, Q10).
 - **Restart reconciliation:** on start, rows in `jobs` with
-  `state = 'running'` from another `daemon_instance` are orphans. For each,
+  `state = 'running'` from another `daemon_instance` are orphans (queued
+  rows of other instances are closed as `orphaned` too). For each,
   if `/proc/<pgid>` exists and its `starttime` (field 22 of
   `/proc/<pid>/stat`) equals the recorded `proc_start_ticks`, the process
   group is killed (SIGTERM, 5 s, SIGKILL); the row is marked
@@ -47,8 +59,9 @@ Status: design for Phase 2. Related: [[sluice/design/protocol.md]],
 - Spawn: `sh -c '<cmd> "$@"' sh <extra…>` with `current_dir = request.cwd`,
   `env_clear().envs(child_env)`, `stdin = null`, stdout and stderr piped,
   `process_group(0)` (new group; the daemon owns the gate, no terminal).
-- Record `pgid`, `proc_start_ticks` and `log_path` in SQLite before the
-  first byte of output is read.
+- Record `pgid`, `proc_start_ticks` and `log_path` in SQLite right after
+  the spawn (the output pumps are already running; a queued row has a null
+  `log_path`).
 - Priority: the `nix` crate exposes no `setpriority`, and calling libc
   directly needs `unsafe`, so the CPU priority is applied with the
   `renice` binary right after spawn (`renice -n <nice> -p <pid>`, skipped
@@ -77,13 +90,18 @@ Status: design for Phase 2. Related: [[sluice/design/protocol.md]],
   code; timeouts `timed out`; cancellations `killed`. The gate environment
   is the request's `child_env` with `gate.env` laid over it.
 - The `tail` in `done` is the last `cache.tail_lines` lines of the log.
-- Log retention: on start and daily, delete logs older than
-  `daemon.log_retention_days` whose job row is terminal.
+- Log retention: on start and daily (from the heartbeat task, so it stops
+  if the lease is lost), delete job logs older than
+  `daemon.log_retention_days` whose job row is terminal or that belong to
+  no row at all (in-process fallback runs). `daemon.log` is appended to
+  and never rotated.
 
 ## Persistence (SQLite, `rusqlite` bundled, WAL)
 
-File `<state>/sluice.db`. Clients open it `mode=ro` only for diagnostics;
-all writes go through the daemon.
+File `<state>/sluice.db`. `Store::open_read_only` exists for diagnostics
+tooling (no CLI command uses it yet); all writes go through the daemon.
+The state dir, the logs dir and the socket directory are created `0700`;
+files inside follow the process umask.
 
 ```sql
 CREATE TABLE schema (version INTEGER NOT NULL);            -- 1
@@ -116,14 +134,27 @@ message naming the file. `totals(since)` filters jobs by `queued_at` and events 
 
 1. Phase 1 hit path unchanged (no daemon involved).
 2. On a miss with policy `wait`: connect (autostart if needed), send `run`
-   with everything precomputed, print `queued`/`started` lines to stderr
-   for humans (`sluice: test queued (position 2, 5 of 8 units busy)`),
-   stream nothing else unless `-v` (then poll the log file), print the
-   `done` summary exactly as Phase 1 does, exit with the mapped code.
-3. If the daemon cannot be reached or started: fall back to the Phase 1
-   in-process run with the `flock` semaphore and say so once on stderr.
+   with everything precomputed (`cmd` trimmed but not whitespace-normalised,
+   `cwd` = worktree root), print `queued`/`started` lines to stderr for
+   humans (`sluice: test queued (position 2, 5 of 8 units busy[, sharing
+   job <id>])` — the `U of B` part comes from one extra `status` call and
+   is omitted if it fails — then `sluice: test running (job <id>)`),
+   stream nothing else unless `-v` (then poll the log file every 500 ms),
+   print the `done` summary exactly as Phase 1 does, exit with the mapped
+   code. A connection lost after `queued` is final: `sluice: error: lost
+   the connection to the daemon`, exit 1, no fallback (the job may keep
+   running in the daemon). `killed` prints `KILLED after <s>s (job …)` and
+   exits 143; a job dropped before it started prints `KILLED before it
+   started (job <id>): the daemon stopped`.
+3. If the daemon cannot be reached or started (or refuses before
+   `queued`): `sluice: daemon unavailable (<why>); running in-process`,
+   then the Phase 1 in-process run with the `flock` semaphore. Gates run
+   this way, or under `run-unqueued` (which takes no slots at all), do not
+   appear in `status`, do not consume the daemon's budget and get no
+   `nice`/`ionice`. A zero `timeout` means no timeout on both paths.
 4. `run-unqueued` policy never touches the daemon.
-5. On a hit, send the best-effort `hit` event (20 ms budget).
+5. On a hit, send the best-effort `hit` event (20 ms budget) when the
+   socket file exists.
 
 ## Properties to test (Phase 2 acceptance)
 

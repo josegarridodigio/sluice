@@ -36,7 +36,7 @@ cargo test --workspace
   sluice-gate-core: 89 passed
   sluice-gate-proto: 11 passed
   sluice-gate-daemon: 26 unit + 12 integration passed
-  sluice-gate: 8 unit + 8 (cli) + 19 (run) + 8 (daemon_cli) passed
+  sluice-gate: 10 unit + 8 (cli) + 19 (run) + 8 (daemon_cli) passed
 ```
 
 Hit-path latency after wiring the daemon: median 24.7 ms on 5 000 files

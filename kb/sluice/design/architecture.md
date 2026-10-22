@@ -26,7 +26,8 @@ sluice status [--json]                                               # queue, in
 sluice mcp                                                           # MCP stdio server spawned by the agent (Phase 3)
 ```
 
-Commands of a later phase exit 70 with `sluice: '<cmd>' is not implemented yet`.
+`sluice mcp` exits 70 with `sluice: 'mcp' is not implemented yet (it arrives
+with the daemon and MCP phases)` until Phase 3.
 
 Process topology:
 
@@ -44,7 +45,8 @@ Three invariants:
    checks the marker file itself (target < 30 ms). Only misses talk to the
    daemon.
 2. **Every expensive run goes through the daemon** (except the explicit
-   `run-unqueued` escape hatch), so budget, coalescing and PSI apply globally.
+   `run-unqueued` escape hatch and the in-process fallback when the daemon
+   is unavailable), so budget, coalescing and PSI apply globally.
 3. **Sluice never touches the user's index or working tree.**
 
 ## 2. Crate layout (proposed, see [[sluice/design/adr/0001-rust-edition-and-workspace.md]])
@@ -133,16 +135,18 @@ is ignored when empty; with no `HOME` the state dir falls back to
 
 For each `Run` request (repo, gate, key, cwd, env snapshot, policy, client kind):
 
-1. Look up the **in-flight map** `key → broadcast::Sender<Outcome>`. If
-   present, subscribe and stream the outcome when it arrives (coalescing, G3).
-2. Otherwise create the entry and enqueue a **job** with the gate's weight.
+1. Look for a queued or running job with the same key. If found,
+   subscribe to its event channel and stream the outcome when it arrives
+   (coalescing, G3).
+2. Otherwise enqueue a **job** with the gate's weight.
 3. The **scheduler** admits jobs when `used + weight <= budget` and PSI is
-   below thresholds. Policy is documented in [[sluice/design/scheduler.md]]
-   (FIFO with a no-starvation rule for heavy gates; to be recorded as an ADR).
-4. The **executor** runs the command in the requester's working directory,
-   in a new process group, with `nice`/`ionice` applied, stdout+stderr
-   streamed to `<data-dir>/logs/<job-id>.log`, enforcing the gate timeout and
-   killing the whole group on timeout or cancel.
+   below thresholds. Policy in [[sluice/design/scheduler.md]] (FIFO with
+   backfill and head-of-line reservation, [[sluice/design/adr/0007-scheduler-fairness.md]]).
+4. The **executor** runs the command in the worktree root, in a new
+   process group, with `nice`/`ionice` applied through the `renice` and
+   `ionice` binaries, stdout+stderr streamed to `<state>/logs/<job-id>.log`,
+   enforcing the gate timeout and killing the whole group on timeout or
+   cancel.
 5. On success with an unchanged tree, the daemon writes the marker. On
    failure it returns the exit code and the log tail.
 6. Outcome is broadcast to all subscribers; the in-flight entry is removed.
@@ -160,11 +164,12 @@ For each `Run` request (repo, gate, key, cwd, env snapshot, policy, client kind)
 
 ### 5.4 Persistence
 
-SQLite (`rusqlite`, bundled) at `<data-dir>/sluice.db`: jobs table
-(id, key, repo, gate, state, timestamps, wait/run durations, exit code, log
-path, coalesced count, daemon instance id), plus aggregate metrics for
-`sluice status` (hit count, coalesced count, estimated time saved = sum of
-previous run durations for hits and coalesced waits).
+SQLite (`rusqlite`, bundled) at `<state>/sluice.db`: jobs table (id, key,
+repo, gate, state, timestamps from which wait and run times are derived,
+exit code, log path, coalesced count, daemon instance id), plus aggregate
+metrics for `sluice status` (hit count, coalesced count, estimated time
+saved = sum of marker durations for hits and run times for coalesced
+subscribers of passed jobs).
 
 Markers stay as files inside `.git`: the hit path must not depend on the DB.
 
@@ -196,7 +201,7 @@ invoked the hook:
 | agent | `fail-fast` | exit 3 with a three-line message naming the gate, the detection rule and the fix (`run 'sluice run <gate>' from your shell first`; Phase 3 adds the `verify` MCP tool). Applies only when the cache was consulted and missed; with caching off or an unknown tree the gate runs instead. |
 | agent | `wait` | wait for budget (risky under Bash timeouts) |
 | agent | `run-unqueued` | run immediately outside the queue |
-| human | `wait` | wait for budget; one `waiting for N of M budget units` notice when blocked (progress output arrives with the daemon) |
+| human | `wait` | wait in the daemon queue; `queued (position N, U of B units busy)` and `running (job …)` notices (the in-process fallback prints `waiting for N of M budget units` instead) |
 | human | `run-unqueued` | run immediately outside the queue |
 | anyone, not in a hook | `wait` | the policies only apply inside hooks (`--hook` given, or `GIT_DIR`/`GIT_INDEX_FILE` present) |
 
@@ -216,7 +221,8 @@ Agent detection: see [[sluice/design/adr/0004-agent-detection.md]].
 - Timeout: `sluice: test TIMEOUT after 20m (job …) log=<path>` + tail, exit 124.
 - Exit codes of `sluice run`: 0 pass or hit; the gate's exit code on
   failure; 3 refused by `fail-fast`; 124 timeout; 143 gate killed by a
-  signal (`FAIL exit=signal`); 1 Sluice error (`sluice: error: <message>`
+  signal (`FAIL exit=signal`), by `daemon stop --force`, by cancellation
+  or dropped from the queue by `daemon stop` (`KILLED`); 1 Sluice error (`sluice: error: <message>`
   on stderr: no repository, bad config, unknown gate, spawn or log
   failure); 2 usage error; 70 command not implemented yet.
 - Stderr notices on the way to an uncached run: `sluice: cache disabled
@@ -242,10 +248,10 @@ output lines and exit codes (`cached` prints the hit line; `killed` prints
 `KILLED` and exits 143). A cache hit additionally sends a best-effort
 `hit` event (about 1 ms) so `status` can count hits and time saved.
 
-When the daemon is unavailable (and under `run-unqueued`), `sluice run`
-runs the gate itself: it takes `weight` slots (all or nothing, capped at
-the budget) of a `flock` counting semaphore with `daemon.budget` slots
-under the runtime dir, spawns `sh -c '<cmd>'` (with `"$@"` and the extra
+When the daemon is unavailable, `sluice run` runs the gate itself: it
+takes `weight` slots (all or nothing, capped at the budget) of a `flock`
+counting semaphore with `daemon.budget` slots under the runtime dir
+(`run-unqueued` runs the same way but takes no slots), spawns `sh -c '<cmd>'` (with `"$@"` and the extra
 arguments appended only when there are any, because a compound command
 followed by `"$@"` is a syntax error) in the worktree root with the
 sanitised environment, captures stdout and stderr interleaved into
@@ -266,9 +272,11 @@ and [[sluice/changes/phase-2-daemon.md]].
 ## 10. Security and safety
 
 - Socket directory `0700`, owned by the user. No network listener in v1.
-- The daemon runs gates with the requester's cwd and the requester's
+- The daemon runs gates in the worktree root with the requester's
   environment snapshot, minus git hook variables and `CLAUDE*`, plus the
-  gate's declared `env` (Q11).
+  gate's declared `env` (Q11). The runtime directory is `0700`, the socket
+  `0600`, the state and logs directories `0700`; files inside follow the
+  umask.
 - `SLUICE_DISABLE=1` bypasses everything (runs the gate directly, no cache,
   no queue). `SLUICE_CACHE=0` disables only the cache.
 

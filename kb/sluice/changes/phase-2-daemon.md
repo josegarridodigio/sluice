@@ -46,11 +46,15 @@ no `deny_unknown_fields`, defaults on optional fields.
 ```
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace     # core 89, proto 11, daemon 26 unit + 12 integration, CLI 8 unit + 8 + 19 + 8 integration
+cargo test --workspace     # core 89, proto 11, daemon 26 unit + 12 integration, CLI 10 unit + 8 + 19 + 8 integration
 scripts/bench-hit-path.sh 5000 20   # hit median 24.7 ms (load ~10); the hit event costs about 1 ms
 ```
 
 Acceptance evidence: [[sluice/changes/phase-2-acceptance.md]].
+
+Reconciliation at phase close: [[sluice/changes/phase-2-reconciliation.md]]
+(56 findings; the code items were fixed the same day, see its Resolution
+section, the rest documented).
 
 ## Known limitations (documented, intentional)
 
