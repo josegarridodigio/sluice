@@ -84,6 +84,9 @@ impl Fixture {
     }
 
     /// Runs the private copy with the sandbox environment.
+    ///
+    /// The copy was just written by this process; see
+    /// [`output_retrying_busy`] for why its first exec can fail.
     fn update(&self, args: &[&str]) -> Output {
         let mut cmd = Command::new(&self.exe);
         cmd.arg("update")
@@ -95,11 +98,11 @@ impl Fixture {
                 "SLUICE_UPDATE_BASE_URL",
                 format!("file://{}", self.release.display()),
             );
-        cmd.output().unwrap()
+        output_retrying_busy(&mut cmd)
     }
 
     fn version_of_exe(&self) -> String {
-        let out = Command::new(&self.exe).arg("--version").output().unwrap();
+        let out = output_retrying_busy(Command::new(&self.exe).arg("--version"));
         String::from_utf8_lossy(&out.stdout).trim().to_owned()
     }
 
@@ -249,4 +252,20 @@ fn unwritable_directory_gives_a_hint() {
         "{err}"
     );
     assert_eq!(fx.exe_bytes(), before);
+}
+
+/// Runs `cmd`, retrying while exec fails with `ETXTBSY`. Tests run in
+/// parallel threads: a child forked by another test between our write of the
+/// executable and its close inherits the write descriptor until it execs, and
+/// Linux refuses to execute a file open for writing.
+fn output_retrying_busy(cmd: &mut Command) -> Output {
+    for _ in 0..100 {
+        match cmd.output() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => return other.unwrap(),
+        }
+    }
+    panic!("executable stayed busy for 2 s");
 }
