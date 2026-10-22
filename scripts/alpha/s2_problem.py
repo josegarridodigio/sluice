@@ -40,6 +40,12 @@ ITER = int(os.environ.get("ALPHA_ITER", "2"))
 THREADS = int(os.environ.get("ALPHA_BURN_THREADS", "4"))
 SECONDS = float(os.environ.get("ALPHA_BURN_SECONDS", "6"))
 BROKEN_AGENT = 0
+# Low-core variant: restrict this process (and so every child, daemon
+# included) to the first N CPUs, e.g. ALPHA_CPUS=6 to model a laptop.
+CPUS = int(os.environ.get("ALPHA_CPUS", "0"))
+if CPUS:
+    os.sched_setaffinity(0, set(range(CPUS)))
+VARIANT = os.environ.get("ALPHA_VARIANT", "default")
 
 BURN_JS = """// Synthetic CPU load standing in for a heavy test suite (alpha harness).
 // Work-bounded like a real suite: each thread performs a fixed number of
@@ -263,7 +269,7 @@ def run_mode(mode: str) -> dict:
 
 def main() -> int:
     out = Path(os.environ.get("ALPHA_OUT", "."))
-    rep = Report("s2_problem", out)
+    rep = Report(f"s2_problem-{VARIANT}", out)
     print(f"== {AGENTS} agents x {ITER} iterations, heavy suite = ava + {THREADS} threads x {ITERATIONS} iterations "
           f"(~{SECONDS}s on an idle core)", flush=True)
     results = {}
@@ -286,10 +292,29 @@ def main() -> int:
               f"{s['heavy_suite_executions']} (expected {expected_sluice})", totals=s["totals"])
     saved = 1 - s["heavy_suite_executions"] / max(1, b["heavy_suite_executions"])
     rep.check("sluice executes fewer heavy suites", s["heavy_suite_executions"] < b["heavy_suite_executions"], f"{saved:.0%} fewer")
-    rep.check("sluice keeps concurrent heavy suites within the budget", s["peak_concurrent_suites"] <= max(1, (os.cpu_count() - 1) // THREADS),
-              f"peak {s['peak_concurrent_suites']} vs baseline {b['peak_concurrent_suites']}")
-    rep.check("sluice wall time is not worse than baseline", s["wall_s"] <= b["wall_s"] * 1.05,
-              f"{s['wall_s']:.1f}s vs {b['wall_s']:.1f}s")
+    # The alpha targets (plan workstream L).
+    import statistics as _st
+
+    def p95(mode: str) -> float:
+        xs = sorted(x for rec in results[mode]["log"].values() for x in rec["verify_s"])
+        return xs[max(0, int(round(0.95 * len(xs))) - 1)] if xs else 0.0
+
+    p95_b, p95_s = p95("baseline"), p95("sluice")
+    iww = int(s["totals"].get("idle_while_waiting_ms", 0))
+    iww_frac = iww / max(1.0, s["wall_s"] * 1000)
+    rep.check("target: wall time not worse than baseline", s["wall_s"] <= b["wall_s"] * 1.02,
+              f"{s['wall_s']:.1f}s vs {b['wall_s']:.1f}s ({s['wall_s'] / b['wall_s']:.2f}x)")
+    rep.check("target: p95 verify latency at most 1.2x baseline", p95_s <= p95_b * 1.2,
+              f"{p95_s:.1f}s vs {p95_b:.1f}s ({p95_s / max(p95_b, 0.001):.2f}x)")
+    rep.check("target: idle CPU while jobs wait under 10% of wall time", iww_frac < 0.10,
+              f"idle_while_waiting {iww} ms = {iww_frac:.1%} of wall")
+    rep.check("target: peak load not above baseline", s["peak_load1"] <= b["peak_load1"],
+              f"{s['peak_load1']:.1f} vs {b['peak_load1']:.1f}")
+    rep.check("info: concurrency and medians", True,
+              f"peak suites {s['peak_concurrent_suites']} vs {b['peak_concurrent_suites']}; verify median "
+              f"{_st.median(x for rec in s['log'].values() for x in rec['verify_s']):.1f}s vs "
+              f"{_st.median(x for rec in b['log'].values() for x in rec['verify_s']):.1f}s; cpus {len(os.sched_getaffinity(0))}",
+              p95_baseline=p95_b, p95_sluice=p95_s, idle_while_waiting_ms=iww)
     for mode, r in results.items():
         log = r["log"]
         good = all(ok for i, rec in log.items() if i != BROKEN_AGENT for _, ok in rec["events"]) and len(log) == AGENTS
