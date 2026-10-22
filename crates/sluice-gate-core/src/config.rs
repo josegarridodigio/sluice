@@ -570,8 +570,53 @@ pub struct UserConfig {
     pub queue: UserQueueConfig,
     /// Logging settings.
     pub debug: DebugConfig,
+    /// Agent command control (guard rewrite, shims, `sluice exec` weight).
+    pub agent: AgentConfig,
     /// Per-repository overrides keyed by repository path.
     pub repos: BTreeMap<PathBuf, RepoOverride>,
+}
+
+/// Most entries `[agent] heavy_commands` plus `heavy_commands_extra` may hold.
+pub const MAX_HEAVY_COMMANDS: usize = 256;
+
+/// The `[agent]` table: which commands of coding agents count as heavy
+/// (rewritten by the plugin guard to run through `sluice exec`) and the
+/// default weight of `sluice exec`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AgentConfig {
+    /// Replaces the built-in heavy-command list when present (entries are
+    /// command words, compared after the package-manager equivalences).
+    pub heavy_commands: Option<Vec<String>>,
+    /// Appended to the (default or replaced) heavy-command list.
+    pub heavy_commands_extra: Vec<String>,
+    /// Default `sluice exec` weight; 0 means `ceil(budget / 2)`.
+    pub exec_weight: u32,
+}
+
+impl AgentConfig {
+    /// The `sluice exec` weight to use when `--weight` is absent.
+    pub fn exec_weight_or(&self, budget: u32) -> u32 {
+        if self.exec_weight == 0 {
+            budget.div_ceil(2).max(1)
+        } else {
+            self.exec_weight
+        }
+    }
+}
+
+/// Why `entry` cannot be a heavy-command entry, `None` when it is fine.
+fn invalid_heavy_entry(entry: &str) -> Option<&'static str> {
+    if entry.trim().is_empty() {
+        return Some("must not be empty");
+    }
+    if entry.chars().any(char::is_control) {
+        return Some("must not contain control characters");
+    }
+    if entry.split_whitespace().count() > 8 {
+        return Some("must have at most 8 words");
+    }
+    None
 }
 
 /// The `[queue]` table of the user config.
@@ -758,6 +803,7 @@ impl Default for UserConfig {
             mcp: McpConfig::default(),
             queue: UserQueueConfig::default(),
             debug: DebugConfig::default(),
+            agent: AgentConfig::default(),
             repos: BTreeMap::new(),
         }
     }
@@ -892,6 +938,26 @@ impl UserConfig {
                     cfg.debug.level
                 ),
             ));
+        }
+        let defaults = cfg.agent.heavy_commands.as_ref().map_or(0, Vec::len);
+        if defaults + cfg.agent.heavy_commands_extra.len() > MAX_HEAVY_COMMANDS {
+            return Err(config_err(
+                path,
+                format!("agent: at most {MAX_HEAVY_COMMANDS} heavy commands are allowed"),
+            ));
+        }
+        for (field, list) in [
+            (
+                "heavy_commands",
+                cfg.agent.heavy_commands.as_deref().unwrap_or_default(),
+            ),
+            ("heavy_commands_extra", &cfg.agent.heavy_commands_extra[..]),
+        ] {
+            for (i, entry) in list.iter().enumerate() {
+                if let Some(why) = invalid_heavy_entry(entry) {
+                    return Err(config_err(path, format!("agent.{field}[{i}]: {why}")));
+                }
+            }
         }
         for (repo, over) in &cfg.repos {
             if over.budget_share_max == Some(0) {
@@ -1472,6 +1538,58 @@ budget_share_max = 4
         assert_eq!(UserConfig::path(&env), PathBuf::from("/tmp/x/cfg.toml"));
         let default = UserConfig::path(&EnvMap::new());
         assert!(default.ends_with("sluice/config.toml"), "{default:?}");
+    }
+
+    #[test]
+    fn user_agent_section() {
+        let c = UserConfig::default();
+        assert_eq!(c.agent, AgentConfig::default());
+        assert_eq!(c.agent.heavy_commands, None);
+        assert_eq!(c.agent.exec_weight_or(8), 4);
+        assert_eq!(c.agent.exec_weight_or(7), 4);
+        assert_eq!(c.agent.exec_weight_or(1), 1);
+        let c = UserConfig::parse(
+            "version = 1\n[agent]\nheavy_commands = [\"make\", \"cargo build\"]\n\
+             heavy_commands_extra = [\"bazel build\"]\nexec_weight = 3\n",
+            Path::new("/u.toml"),
+        )
+        .unwrap();
+        assert_eq!(
+            c.agent.heavy_commands.as_deref(),
+            Some(&["make".to_owned(), "cargo build".to_owned()][..])
+        );
+        assert_eq!(c.agent.heavy_commands_extra, ["bazel build"]);
+        assert_eq!(c.agent.exec_weight_or(8), 3);
+        let c = UserConfig::parse(
+            "version = 1\n[agent]\nheavy_commands = []",
+            Path::new("/u.toml"),
+        )
+        .unwrap();
+        assert_eq!(c.agent.heavy_commands.as_deref(), Some(&[][..]));
+        assert!(user_err("version = 1\n[agent]\nheavy = [\"make\"]").contains("unknown field"));
+        assert!(
+            user_err("version = 1\n[agent]\nheavy_commands = \"make\"").contains("invalid type")
+        );
+        assert!(user_err("version = 1\n[agent]\nexec_weight = -1").contains("exec_weight"));
+        assert!(
+            user_err("version = 1\n[agent]\nheavy_commands = [\"  \"]")
+                .contains("agent.heavy_commands[0]: must not be empty")
+        );
+        assert!(
+            user_err("version = 1\n[agent]\nheavy_commands_extra = [\"make\", \"a\\tb\"]")
+                .contains("agent.heavy_commands_extra[1]: must not contain control characters")
+        );
+        assert!(
+            user_err("version = 1\n[agent]\nheavy_commands_extra = [\"a b c d e f g h i\"]")
+                .contains("at most 8 words")
+        );
+        let many = vec!["\"make\""; MAX_HEAVY_COMMANDS + 1].join(", ");
+        assert!(
+            user_err(&format!(
+                "version = 1\n[agent]\nheavy_commands_extra = [{many}]"
+            ))
+            .contains("at most 256 heavy commands")
+        );
     }
 
     #[test]

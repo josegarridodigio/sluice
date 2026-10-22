@@ -221,7 +221,10 @@ pub fn exec(args: &ExecArgs) -> ExitCode {
             .label
             .as_deref()
             .map_or_else(|| default_label(&args.argv), sanitize_label),
-        weight: args.weight.unwrap_or_else(|| budget.div_ceil(2)).max(1),
+        weight: args
+            .weight
+            .unwrap_or_else(|| user.agent.exec_weight_or(budget))
+            .max(1),
         budget,
         cwd,
         env,

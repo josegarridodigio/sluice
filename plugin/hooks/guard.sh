@@ -1,6 +1,15 @@
 #!/bin/sh
 # Sluice guard: PreToolUse hook for the Bash tool.
 #
+# Thin wrapper. When `sluice` on PATH has the `guard` subcommand (0.3.0 and
+# later), the hook JSON goes to `sluice guard --hook`, which may rewrite a gate
+# or heavy command to run through Sluice's queue (allow/ask + updatedInput),
+# deny `sluice queue approve`, or deny a raw gate command; its stdout is
+# printed when it is a hook decision. `sluice guard` reads files only and never
+# contacts the daemon. When the binary is missing, too old (no `guard`, so a
+# usage error) or crashes, the shell logic below runs instead (unchanged from
+# 0.2.0, it never rewrites):
+#
 # Reads the hook JSON on stdin. Denies (with a reason the model sees):
 #   - a command that runs a gate of the repository's .sluice.toml (or a raw
 #     test runner the repository defines a gate for) outside the Sluice queue;
@@ -138,7 +147,7 @@ check_segment() {
     fi
 }
 
-main() {
+legacy_main() {
     input=$(cat)
     command=$(printf '%s' "$input" | json_field command)
     [ -n "$command" ] || return 0
@@ -168,7 +177,21 @@ main() {
     return 0
 }
 
-out=$(main 2>/dev/null) || out=""
+hook_input=$(cat)
+
+# The Rust guard, when this sluice has it. Exit 0 means it decided (possibly
+# "no output"); anything else (127 missing, 2 unknown subcommand, a crash)
+# falls back to the shell logic.
+if command -v sluice >/dev/null 2>&1; then
+    if out=$(printf '%s' "$hook_input" | sluice guard --hook 2>/dev/null); then
+        case "$out" in
+            '{"hookSpecificOutput"'*) printf '%s\n' "$out" ;;
+        esac
+        exit 0
+    fi
+fi
+
+out=$(printf '%s' "$hook_input" | legacy_main 2>/dev/null) || out=""
 case "$out" in
     '{"hookSpecificOutput"'*) printf '%s\n' "$out" ;;
 esac

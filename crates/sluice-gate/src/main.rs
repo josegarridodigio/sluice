@@ -18,6 +18,7 @@ mod daemon_cmd;
 mod dirs;
 mod doctor;
 mod exec;
+mod guard;
 mod logging;
 mod logs;
 mod queue;
@@ -129,6 +130,21 @@ enum Command {
             value_name = "CMD"
         )]
         argv: Vec<String>,
+    },
+    /// `PreToolUse` hook of the agent plugin: read the hook JSON on stdin, print a decision.
+    ///
+    /// Denies `sluice queue approve` (reserved to humans). Rewrites a gate command
+    /// to `sluice run <gate> -v` and a heavy command (`[agent] heavy_commands`) to
+    /// `sluice exec --label <L> -- <cmd>` by inserting that prefix into the
+    /// unchanged original, answering `allow` or `ask` as the agent client's
+    /// permission settings permit, or not at all. Otherwise denies raw gate
+    /// commands as the shell guard does. Never fails closed: any error prints
+    /// nothing and exits 0. Never contacts the daemon. `SLUICE_GUARD=0` disables
+    /// it; `SLUICE_GUARD=deny` denies with the rewritten command as a suggestion.
+    Guard {
+        /// Accepted for the plugin's hook script (the hook JSON is always read on stdin).
+        #[arg(long)]
+        hook: bool,
     },
     /// Start the MCP stdio server (spawned by the coding agent).
     ///
@@ -387,6 +403,7 @@ fn main() -> ExitCode {
             command: HookCommand::Print { manager },
         } => hook_print(manager),
         Command::Logs { job_id, lines } => logs::show(job_id.as_deref(), lines),
+        Command::Guard { hook: _ } => guard::run_hook(),
         Command::Mcp => mcp(),
         Command::Daemon {
             command: Some(DaemonCommand::Stop { force }),

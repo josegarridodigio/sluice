@@ -19,6 +19,12 @@ A tree that already passed is answered from the cache in milliseconds.
 - Never run a gate command through Bash (`cargo test`, `npm test`, `pytest`,
   linters, ...). It bypasses the queue and the cache. A guard hook may deny it
   and tell you which gate to verify instead.
+- Heavy Bash commands (builds, test runners, `docker build`, `make`, ...) may
+  be rewritten by the guard to run through Sluice's shared queue: you then see
+  a note "Sluice ran this through its shared queue as: `sluice exec --label
+  ... -- <your command>`" (or `sluice run <gate> -v` for a gate). Output and
+  exit code are your command's own; treat the result as if you had run it. Do
+  not retry it without the prefix and do not prefix commands yourself.
 - Call `verify` before every commit. Do not re-run a gate that just passed:
   a pass is cached for this exact git tree.
 

@@ -48,10 +48,23 @@ repository, contains:
   push or land a branch in a repository with a `.sluice.toml`. It teaches the
   `verify` flow, exit code 3 from hooks, and the merge queue (verify,
   `queue_enqueue`, stop, never approve);
-- a `PreToolUse` hook on `Bash` that denies the raw commands your gates run
-  (and the common raw runners the repository has a gate for) with a message
-  that names the gate to verify, and denies `sluice queue approve`. It fails
-  open, and `SLUICE_GUARD=0` disables it.
+- a `PreToolUse` hook on `Bash` (`sluice guard`, from 0.3.0) that rewrites a
+  gate command to `sluice run <gate> -v` and a heavy command (builds, test
+  runners, `docker build`, `make`: `[agent] heavy_commands` of the user
+  config) to `sluice exec --label <L> -- <command>`, so they queue under the
+  machine's budget with the same output and exit code. The rewrite only
+  inserts that prefix into the agent's unchanged command; pipelines after the
+  first command, `&`, heredocs, `<`, `$(`, subshells, `sh -c` and wrappers are
+  never rewritten. It answers `allow` only where your permission settings
+  already allow the original (or in `bypassPermissions` mode), `ask` in
+  `default`/`acceptEdits` mode (the prompt shows the rewritten command), and
+  leaves the command alone when a deny or ask rule could match (section 6).
+  The agent sees a one-line note naming the rewritten command. Raw gate
+  commands it does not rewrite are denied with a message that names the gate
+  to verify, and `sluice queue approve` is always denied. It fails open;
+  `SLUICE_GUARD=0` disables it and `SLUICE_GUARD=deny` turns rewrites into
+  denials that suggest the rewritten command. With an older `sluice` the hook
+  falls back to the 0.2.0 deny-only logic.
 
 With the plugin, the repository needs no `CLAUDE.md` block. Details and the
 hook's limits: [plugin/README.md](../plugin/README.md).
@@ -240,9 +253,10 @@ it bypasses the queue and the cache.
 Levers, in order:
 
 1. The plugin (section 2). Its skill tells the agent to verify, and its hook
-   denies the gate commands of `.sluice.toml` run through Bash with a reason
-   the model reads. Hooks run in `bypassPermissions` mode too. Without the
-   plugin, use the `CLAUDE.md` / `AGENTS.md` section from section 3.
+   rewrites gate and heavy commands run through Bash to go through Sluice (or
+   denies raw gate commands it cannot rewrite) with a note the model reads.
+   Hooks run in `bypassPermissions` mode too. Without the plugin, use the
+   `CLAUDE.md` / `AGENTS.md` section from section 3.
 2. A deny rule for the raw command is the enforcement option. In
    `.claude/settings.json`:
 
@@ -260,6 +274,23 @@ comes from the plugin. A rule like `Bash(sluice run:*)` is reasonable:
 daemon is unavailable, and `run-unqueued` must be configured explicitly).
 Prefer it to a blanket `Bash(sluice:*)`, which would also allow
 `sluice daemon stop --force`.
+
+How the guard's rewrite interacts with your rules: Claude Code matches deny
+and ask rules against the command a hook returns, so a rule such as
+`Bash(make deploy:*)` would not match `sluice exec --label make-deploy -- make
+deploy`. The guard therefore reads the `Bash` rules of
+`~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`),
+`.claude/settings.json`, `.claude/settings.local.json` of
+`$CLAUDE_PROJECT_DIR` and `/etc/claude-code/managed-settings.json`, and does
+not rewrite at all when a deny or ask rule may match the original or the
+rewrite (matching is deliberately liberal) or a file cannot be parsed. It
+answers `allow` only when every part of the original matches an allow rule
+(matching is strict: exact text, `prefix:*` with a word boundary, `*` globs;
+any redirection counts as not allowed) or the session is in
+`bypassPermissions` mode; in `plan`, `auto` and `dontAsk` modes it rewrites
+only commands the allow rules cover. Rules given on the command line
+(`--allowedTools`, `--disallowedTools`) are invisible to hooks and are not
+considered.
 
 ## 7. Running several agents
 

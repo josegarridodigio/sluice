@@ -69,4 +69,17 @@ Error codes: `conflict-state`, `stale-plan`, `duplicate-branch`, `not-allowed`,
 - A Bash command was denied with "This repository verifies through Sluice":
   call `verify` with the gate named in the message. The human can disable the
   guard with `SLUICE_GUARD=0` in the environment.
+- A Bash command came back with the note "Sluice ran this through its shared
+  queue as: `<command>`": the guard inserted `sluice exec --label <L> -- ` in
+  front of a heavy command (or replaced a gate command with
+  `sluice run <gate> -v`) so it waited for the machine's shared budget. The
+  output and exit code are those of your command (`sluice exec` adds at most
+  two `sluice: exec ...` queue lines on stderr; `sluice run -v` streams the gate
+  log on stderr and prints the gate summary). Nothing else changed: same
+  arguments, quotes, directory and environment.
+- A Bash command was denied with "This machine shares its CPU through Sluice:
+  run `<command>` instead": the human enabled suggestion mode
+  (`SLUICE_GUARD=deny`); run exactly the command given.
+- The human is asked to approve a rewritten command (`ask`): this happens when
+  the original command would have needed a permission prompt anyway.
 - Hook exit code 3 on a git command: see the section in `SKILL.md`.

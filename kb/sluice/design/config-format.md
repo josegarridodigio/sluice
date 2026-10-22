@@ -168,6 +168,11 @@ head_reserve_after = "30s" # backfill behind the queue head only this long (ADR-
 env_any_set = ["CLAUDECODE"]      # any of these set and non-empty => agent (SLUICE_AGENT is the override, see below)
 env_any_equals = {}               # e.g. { CLAUDE_CODE_ENTRYPOINT = "cli" }
 
+[agent]                            # optional; needs sluice >= 0.3.0 (older binaries reject the table)
+# heavy_commands = ["make", "cargo build"]  # replaces the built-in heavy-command list when present
+heavy_commands_extra = []         # appended to the (default or replaced) list, e.g. ["bazel build"]
+exec_weight = 0                   # default `sluice exec` weight; 0 = ceil(budget / 2)
+
 [repos."/home/jose/Escritorio/Proyectos/foo"]
 budget_share_max = 4       # optional per-repo cap
 ```
@@ -183,6 +188,8 @@ Environment variables (highest precedence):
 | `SLUICE_SOCKET` | Override the daemon socket path. |
 | `SLUICE_JOB` | Set by Sluice on every process it runs (`<job id>`, or `inproc-<pid>` for in-process runs). When set, `sluice exec` runs the command directly and a `sluice run` miss runs in-process, unqueued (the parent job holds the budget). Not meant to be set by hand. |
 | `SLUICE_LOG` | Log filter of the daemon (`sluice daemon`), MCP (`sluice mcp`) and CLI (`sluice run`) processes, e.g. `debug`. Precedence: `SLUICE_LOG` (when valid), then `[debug] level`, then `info`. Written to stderr (the daemon's goes to `daemon.log`, the MCP server's also to `logs/mcp-<pid>.log`). |
+| `SLUICE_GUARD` | Plugin guard hook: `0` (or another falsy word) disables it; `deny` turns rewrites into denials suggesting the rewritten command; anything else rewrites. |
+| `SLUICE_TEST_GUARD_WATCHDOG_MS` | Test-only: the guard's watchdog in milliseconds instead of 500. Not a user setting. |
 | `SLUICE_TEST_CLIENT_LOG_CAP` | Test-only: byte cap that triggers the `client.log` rotation instead of 5 MiB. Not a user setting. |
 | `SLUICE_CONFIG` | Override the user config path (ignored when empty). |
 | `SLUICE_VERSION`, `SLUICE_INSTALL_DIR` | `scripts/install.sh` only: release tag to install (default latest) and target directory (default `$HOME/.local/bin`). |
@@ -200,7 +207,18 @@ means defaults); unknown fields are errors; validation: `daemon.budget >= 1`,
 `EnvFilter` directive (`info`, `debug`, `sluice_gate_daemon=debug,info`; the error names the
 file and the value). `sluice daemon restart [--debug]` applies a changed `[debug]` section;
 `--debug` forces `debug` for that daemon instance only. `daemon.idle_exit` (always "never" in v1) is parsed but has
-no effect and is not range-checked. The `[queue]` keys have no validation
+no effect and is not range-checked. `[agent]`: `heavy_commands` and
+`heavy_commands_extra` entries must not be empty or contain control
+characters, have at most 8 words each and at most 256 entries together;
+`exec_weight` is a non-negative integer (the daemon clamps it to the budget).
+Entries are command words compared after the guard's equivalences
+(`npm run build`, `pnpm build`, `yarn build` all mean `run build`); the
+default list is `docker build`, `docker buildx build`, `docker compose build`,
+`run build`, `cargo build`, `cargo test`, `cargo clippy`, `cargo nextest`,
+`go build`, `go test`, `make`, `gradle`, `mvn`, `tsc`, `vite build`,
+`webpack`, `next build`, `pytest`, `jest`, `vitest`. The plugin guard
+(`sluice guard`) and `sluice exec` re-read `[agent]` per call; an invalid user
+config makes the guard skip every rewrite. The `[queue]` keys have no validation
 beyond their types; the runner floors `tick` at 50 ms, and `retention = "0s"`
 prunes every finished row at the next pass. The daemon reads `[daemon]`, `[scheduler]`, `[admission]`,
 `[repos]`, `[queue]` (`enabled`, `allow_agent_approval`, `tick`, `retention`),
