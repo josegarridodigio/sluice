@@ -308,10 +308,25 @@ impl Client {
     ///
     /// I/O or protocol errors, and [`ClientError::Closed`] when the daemon
     /// closes the connection without replying.
-    pub fn request(
+    pub fn request(self, msg: &ClientMessage) -> std::result::Result<ServerMessage, ClientError> {
+        self.request_timeout(msg, Some(REPLY_TIMEOUT))
+    }
+
+    /// Like [`Client::request`] with an explicit read timeout (`None`: wait
+    /// as long as the daemon needs, for requests that push or fetch).
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::request`].
+    pub fn request_timeout(
         mut self,
         msg: &ClientMessage,
+        timeout: Option<Duration>,
     ) -> std::result::Result<ServerMessage, ClientError> {
+        self.reader
+            .get_ref()
+            .set_read_timeout(timeout)
+            .context("configuring the socket")?;
         self.send(msg)?;
         let line = self.read_line()?.ok_or(ClientError::Closed)?;
         if proto::line_too_long(&line) {

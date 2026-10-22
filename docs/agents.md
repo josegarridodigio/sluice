@@ -46,7 +46,8 @@ claude mcp add sluice -- sluice mcp
 form above follows the documented `claude mcp add <name> <command> [args]`
 syntax; check `claude mcp list` afterwards.
 
-The server exposes four tools:
+The server exposes seven tools (the last three are the merge queue, see
+section 3):
 
 | Tool | Purpose |
 |---|---|
@@ -54,6 +55,9 @@ The server exposes four tools:
 | `status` | Queued and running jobs; with `working_directory`, also the cache state of that tree per gate. |
 | `gate_list` | Gates defined in `.sluice.toml`. |
 | `logs` | Tail of a job log (default: newest). |
+| `queue_enqueue` | Put the committed branch (default: the current one) in the local merge queue. Refuses a detached HEAD and tracked uncommitted changes. |
+| `queue_status` | Trains, members and their state, conflicts with paths, and which trains are ready for a human to approve. |
+| `queue_approve` | Approve a ready train. Refused with `not-allowed` unless the user config has `[queue] allow_agent_approval = true`. |
 
 `verify` takes `working_directory` (absolute path inside the repository or
 worktree, required) and optionally `gates`, `timeout_seconds` and
@@ -83,6 +87,45 @@ Paste this into `CLAUDE.md` (Claude Code) or `AGENTS.md` (other agents):
 ```
 
 Adapt the examples in the second bullet to your stack.
+
+### Landing work through the merge queue
+
+If the repository uses the Sluice merge queue, add these lines to the same
+file. The MCP server also sends the gist as its own instructions, but the
+file is read first:
+
+```markdown
+## Landing work (Sluice merge queue)
+
+- When a branch is finished: commit it, call `verify` and wait for it to pass
+  on the committed branch, then call `queue_enqueue` with your absolute
+  working directory. Then stop.
+- Tell the human the job id (and the train id that `queue_status` shows). A
+  human approves the train with `sluice queue approve <train id>`.
+- Never approve a train, never call `queue_approve` unless the user told you
+  to, and never push to the target branch yourself.
+- If `queue_status` reports a conflict for your branch, rebase it onto the
+  target, call `verify` again, and call `queue_enqueue` again. (`sluice queue
+  retry` exists only in the CLI for now.)
+- Errors start with a code: `conflict-state`, `stale-plan`,
+  `duplicate-branch`, `not-allowed`, `not-supported`. Report them; do not work
+  around them.
+```
+
+Approval is a human decision. `queue_approve` is off by default and answers
+`not-allowed` without contacting the daemon; it only works when the user
+enables `[queue] allow_agent_approval = true` in
+`~/.config/sluice/config.toml` (the daemon checks the flag again). The daemon
+cannot tell a human from an agent on its socket, so also deny the CLI path to
+agents in `.claude/settings.json`:
+
+```json
+{"permissions": {"deny": ["Bash(sluice queue approve:*)"]}}
+```
+
+Deny rules still apply in `bypassPermissions` mode. An agent with shell
+access and push credentials can still `git push` directly: protect the target
+branch on the forge as well.
 
 ## 4. How the hooks behave with an agent
 

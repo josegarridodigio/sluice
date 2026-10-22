@@ -15,6 +15,7 @@ mod cache;
 mod daemon_cmd;
 mod dirs;
 mod logs;
+mod queue;
 mod run;
 mod snippets;
 mod status;
@@ -114,6 +115,78 @@ enum Command {
         #[arg(short = 'n', long)]
         lines: Option<usize>,
     },
+    /// Local merge queue: enqueue committed branches, approve trains, land them.
+    ///
+    /// Agents enqueue committed branches; a daemon task combines them on top of the
+    /// target branch in a disposable worktree, runs the gates once on the combined
+    /// tree and shows the plan. Nothing is pushed until a human runs
+    /// `sluice queue approve`. Exit codes: 0 ok; 1 error; 2 usage; 4 refused by the
+    /// state of the queue (conflict-state, not-allowed, stale-plan, duplicate-branch).
+    Queue {
+        #[command(subcommand)]
+        command: QueueCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum QueueCommand {
+    /// Queue a committed branch for the next train.
+    ///
+    /// Defaults to the current branch of this worktree. Refuses a detached HEAD, a
+    /// worktree with staged or unstaged changes to tracked files (untracked files do
+    /// not matter), a branch that is already queued and a branch equal to the target.
+    Enqueue {
+        /// Branch to queue; defaults to the current branch.
+        branch: Option<String>,
+        /// Where the train lands: `<remote>/<branch>` (pushed), `<branch>` (a local
+        /// branch, updated in place) or a bare name tried first as a branch of the
+        /// configured remote and then as a local branch. Defaults to `[queue] remote`
+        /// and `target`. Tags, raw SHAs, HEAD and checked-out local branches are refused.
+        #[arg(long)]
+        base: Option<String>,
+    },
+    /// Show trains, their members, gates, conflicts and queued jobs.
+    ///
+    /// Inside a repository only its own trains and jobs are listed. With --json the
+    /// `queue-status` payload is printed verbatim (it carries `schema: 1`).
+    Status {
+        /// Print machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Approve a ready train: print the plan and land it.
+    ///
+    /// On a terminal it asks `Land this train? [y/N]`; without one it requires --yes.
+    /// The train hash that was displayed is sent along, so a train that changed in the
+    /// meantime is refused (stale-plan, exit 4). Agents must not run this command.
+    Approve {
+        /// Train id, as shown by `sluice queue status`.
+        train_id: String,
+        /// Do not ask for confirmation (required without a terminal).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Re-queue a conflicted or failed job with the current head of its branch.
+    ///
+    /// Run it in the repository of the job after rebasing or fixing the branch; the
+    /// branch head is re-read here.
+    Retry {
+        /// Job id, as shown by `sluice queue status`.
+        job_id: String,
+    },
+    /// Cancel a job that has not been pushed.
+    ///
+    /// A job that is pushing is only cancelled if `sluice queue reconcile` proves
+    /// that nothing landed.
+    Cancel {
+        /// Job id, as shown by `sluice queue status`.
+        job_id: String,
+    },
+    /// Resolve trains whose push outcome is unknown (`needs_reconcile`).
+    ///
+    /// Reads the remote and prints one line per train: the decision (landed, ready,
+    /// queued, cancelled or refused) and the reason. It never pushes.
+    Reconcile,
 }
 
 #[derive(Debug, Subcommand)]
@@ -191,6 +264,16 @@ fn main() -> ExitCode {
             command: None,
         } => daemon_cmd::start(foreground),
         Command::Status { json } => status::show(json),
+        Command::Queue { command } => match command {
+            QueueCommand::Enqueue { branch, base } => {
+                queue::enqueue(branch.as_deref(), base.as_deref())
+            }
+            QueueCommand::Status { json } => queue::status(json),
+            QueueCommand::Approve { train_id, yes } => queue::approve(&train_id, yes),
+            QueueCommand::Retry { job_id } => queue::retry(&job_id),
+            QueueCommand::Cancel { job_id } => queue::cancel(&job_id),
+            QueueCommand::Reconcile => queue::reconcile(),
+        },
     }
 }
 

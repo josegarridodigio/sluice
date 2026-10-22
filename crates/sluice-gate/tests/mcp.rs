@@ -424,3 +424,140 @@ async fn timeout_seconds_and_logs_limits() {
     assert_eq!(r.is_error, Some(true), "{}", text(&r));
     client.cancel().await.expect("shutdown");
 }
+
+// ---------------------------------------------------------------- merge queue
+
+fn write_user_queue_config(sb: &Sandbox, body: &str) {
+    fs::write(
+        sb.home.join(".config/sluice/config.toml"),
+        format!("version = 1\n[queue]\n{body}"),
+    )
+    .expect("user config");
+}
+
+fn enable_agent_approval(sb: &Sandbox) {
+    write_user_queue_config(sb, "allow_agent_approval = true\n");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_tools_are_listed_with_descriptions_and_instructions() {
+    let sb = Sandbox::standard();
+    let client = connect(&sb, Counter::default()).await;
+    let tools = client.list_all_tools().await.expect("tools/list");
+    for name in ["queue_enqueue", "queue_status", "queue_approve"] {
+        let tool = tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} not listed"));
+        assert!(
+            tool.description.as_deref().is_some_and(|d| d.len() > 20),
+            "{name}: {:?}",
+            tool.description
+        );
+    }
+    let instructions = client
+        .peer_info()
+        .and_then(|i| i.instructions.clone())
+        .unwrap_or_default();
+    for needle in ["queue_enqueue", "Never approve", "only in the CLI"] {
+        assert!(instructions.contains(needle), "{instructions}");
+    }
+    client.cancel().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_approve_is_refused_by_default_without_touching_the_daemon() {
+    let sb = Sandbox::standard();
+    let client = connect(&sb, Counter::default()).await;
+    let r = call(
+        &client,
+        "queue_approve",
+        &json!({"working_directory": repo_arg(&sb), "train_id": "t-1-abc"}),
+    )
+    .await;
+    assert_eq!(r.is_error, Some(true), "{}", text(&r));
+    assert_eq!(
+        text(&r),
+        "not-allowed: approval is reserved to humans (sluice queue approve); set [queue] \
+         allow_agent_approval = true in the user config to allow agents"
+    );
+    assert!(!sb.socket().exists(), "no daemon may be started");
+    client.cancel().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_approve_reaches_the_daemon_when_the_user_allows_it() {
+    let sb = Sandbox::standard();
+    // The queue is disabled in the user config, so the daemon answers the
+    // status fetch with `not-supported`: proof that the request left the
+    // MCP server once approval is allowed.
+    write_user_queue_config(&sb, "allow_agent_approval = true\nenabled = false\n");
+    let client = connect(&sb, Counter::default()).await;
+    let r = call(
+        &client,
+        "queue_approve",
+        &json!({"working_directory": repo_arg(&sb), "train_id": "t-1-abc"}),
+    )
+    .await;
+    assert_eq!(r.is_error, Some(true), "{}", text(&r));
+    assert!(text(&r).starts_with("not-supported: "), "{}", text(&r));
+    assert!(sb.socket().exists(), "the daemon was contacted");
+    client.cancel().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_enqueue_refuses_a_dirty_worktree_before_contacting_the_daemon() {
+    let sb = Sandbox::standard();
+    fs::write(sb.repo.join("a.txt"), "changed\n").expect("dirty a tracked file");
+    let client = connect(&sb, Counter::default()).await;
+    let r = call(
+        &client,
+        "queue_enqueue",
+        &json!({"working_directory": repo_arg(&sb)}),
+    )
+    .await;
+    assert_eq!(r.is_error, Some(true), "{}", text(&r));
+    assert!(text(&r).starts_with("dirty-worktree: "), "{}", text(&r));
+    assert!(!sb.socket().exists(), "no daemon may be started");
+    client.cancel().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_enqueue_refuses_a_detached_head_and_unknown_branch() {
+    let sb = Sandbox::standard();
+    let client = connect(&sb, Counter::default()).await;
+    let dir = repo_arg(&sb);
+    let r = call(
+        &client,
+        "queue_enqueue",
+        &json!({"working_directory": dir, "branch": "nope"}),
+    )
+    .await;
+    assert!(text(&r).starts_with("unknown-branch: "), "{}", text(&r));
+    sb.git(&["checkout", "-q", "--detach"]);
+    let r = call(&client, "queue_enqueue", &json!({"working_directory": dir})).await;
+    assert!(text(&r).starts_with("detached-head: "), "{}", text(&r));
+    assert!(!sb.socket().exists(), "no daemon may be started");
+    client.cancel().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_enqueue_and_status_report_not_supported_when_the_queue_is_disabled() {
+    let sb = Sandbox::standard();
+    write_user_queue_config(&sb, "enabled = false\n");
+    let client = connect(&sb, Counter::default()).await;
+    let dir = repo_arg(&sb);
+    for (tool, args) in [
+        ("queue_enqueue", json!({"working_directory": dir})),
+        ("queue_status", json!({"working_directory": dir})),
+    ] {
+        let r = call(&client, tool, &args).await;
+        assert_eq!(r.is_error, Some(true), "{tool}: {}", text(&r));
+        assert!(
+            text(&r).starts_with("not-supported: "),
+            "{tool}: {}",
+            text(&r)
+        );
+    }
+    client.cancel().await.expect("shutdown");
+}

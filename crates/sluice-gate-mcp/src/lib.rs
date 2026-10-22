@@ -9,6 +9,7 @@
 //! the MCP transport.
 
 mod daemon;
+mod queue;
 mod text;
 
 use std::fmt::Write as _;
@@ -30,7 +31,7 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sluice_gate_core::config::RepoConfig;
+use sluice_gate_core::config::{RepoConfig, UserConfig};
 use sluice_gate_core::git::{self, EnvMap};
 use sluice_gate_core::lookup::{self, Lookup, RepoContext, Resolved, RunMaterial};
 use sluice_gate_core::marker::{self, Marker};
@@ -39,12 +40,13 @@ use sluice_gate_core::tree::{self, Snapshot};
 use sluice_gate_core::{SLUICE_VERSION, dirs};
 use sluice_gate_proto::client::{self, ClientError};
 use sluice_gate_proto::{
-    self as proto, GateSpec, OutcomeStatus, RepoInfo, RunRequest, STATUS_SCHEMA_VERSION,
-    ServerMessage,
+    self as proto, ClientMessage, GateSpec, OutcomeStatus, QueueTrainState, RepoInfo, RunRequest,
+    STATUS_SCHEMA_VERSION, ServerMessage,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::daemon::{RunEnd, RunError};
+use crate::queue::{ApproveReport, JobSchema, StatusSchema, TrainSchema};
 use crate::text::{age, dur};
 
 /// Default and maximum number of lines returned by `logs`.
@@ -61,7 +63,16 @@ commands through the shell: they bypass the queue and the cache and slow down ev
 agent on the machine. When `verify` reports FAIL, read the log tail in the result, fix the \
 code, and call `verify` again rather than re-running the commands yourself. A tree that \
 already passed is answered from the cache in milliseconds. `status` shows queued and running \
-jobs, `logs` shows a job's output, `gate_list` lists the gates of a repository.";
+jobs, `logs` shows a job's output, `gate_list` lists the gates of a repository. \
+Merge queue: to land a finished branch, commit it, call `verify` and wait for it to pass, then \
+call `queue_enqueue` with your absolute working directory, and stop. Tell the human the job id \
+(and the train id from `queue_status`): a human approves the train with `sluice queue approve`. \
+Never approve a train yourself and never call `queue_approve` unless the user told you to; it \
+is refused unless the user enabled agent approval. Never push to the target branch yourself. \
+`queue_status` shows trains, conflicts and what is ready. When it reports a conflict for your \
+branch, rebase the branch onto the target, run `verify` again, and call `queue_enqueue` again \
+(the daemon's `retry` exists only in the CLI for now). Errors start with a code: \
+`conflict-state`, `stale-plan`, `duplicate-branch`, `not-allowed`, `not-supported`.";
 
 /// Runs the MCP server on stdin/stdout until the client disconnects.
 ///
@@ -134,6 +145,34 @@ struct LogsParams {
     /// Number of trailing lines (default 100, max 2000).
     #[serde(default)]
     tail: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct QueueEnqueueParams {
+    /// Absolute path inside the repository (worktree) whose branch is queued.
+    working_directory: String,
+    /// Branch to queue. Default: the current branch of the worktree
+    /// (a detached HEAD is refused).
+    #[serde(default)]
+    branch: Option<String>,
+    /// Landing target as `<remote>/<branch>` or a local branch. Default: the
+    /// repository's configured target.
+    #[serde(default)]
+    base: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct QueueStatusParams {
+    /// Absolute path inside the repository (worktree).
+    working_directory: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct QueueApproveParams {
+    /// Absolute path inside the repository (worktree).
+    working_directory: String,
+    /// Train to approve, as shown by `queue_status`.
+    train_id: String,
 }
 
 // ---------------------------------------------------------------- results
@@ -1028,6 +1067,193 @@ impl Server {
             false,
         )
     }
+
+    /// Put a committed branch in the local merge queue (default: the current
+    /// branch of the worktree). Call it only after `verify` passed on the
+    /// committed branch; refuses a detached HEAD and tracked uncommitted
+    /// changes. Returns the job; then stop and tell the human, who approves the
+    /// train with `sluice queue approve`. After a conflict, rebase and call it
+    /// again. Errors start with their code (`duplicate-branch`, `not-supported`,
+    /// ...).
+    #[tool(output_schema = schema_for_output::<JobSchema>())]
+    async fn queue_enqueue(
+        &self,
+        Parameters(params): Parameters<QueueEnqueueParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let dir = workdir(&params.working_directory)?;
+        let env = Arc::clone(&self.env);
+        let reply = blocking(move || {
+            let request = queue::enqueue_facts(&env, &dir, params.branch.as_deref(), params.base)?;
+            queue::request(&env, &ClientMessage::QueueEnqueue { id: 1, request })
+        })
+        .await?;
+        match reply {
+            Ok(ServerMessage::QueueJob { job, .. }) => {
+                result(queue::enqueue_text(&job), &job, false)
+            }
+            Ok(other) => Ok(tool_error(queue::failure(
+                "internal",
+                format!("unexpected reply to queue-enqueue: {other:?}"),
+            ))),
+            Err(why) => Ok(tool_error(why)),
+        }
+    }
+
+    /// Show the merge queue of the repository: trains, their members and
+    /// state, conflicts with paths, and which trains are ready for a human to
+    /// approve. The structured content is the `queue-status` payload
+    /// (`sluice queue status --json`, `schema: 1`).
+    #[tool(output_schema = schema_for_output::<StatusSchema>())]
+    async fn queue_status(
+        &self,
+        Parameters(params): Parameters<QueueStatusParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let dir = workdir(&params.working_directory)?;
+        let env = Arc::clone(&self.env);
+        let report = blocking(move || {
+            let paths = queue::discover(&env, &dir)?;
+            queue::fetch_status(&env, Some(paths.common_dir))
+        })
+        .await?;
+        match report {
+            Ok(report) => result(queue::render_status(&report), &report, false),
+            Err(why) => Ok(tool_error(why)),
+        }
+    }
+
+    /// Approve a ready train (its members land on the target). Humans normally
+    /// approve with `sluice queue approve`; this tool is refused with
+    /// `not-allowed` unless the user enabled `[queue] allow_agent_approval =
+    /// true` in the user config. Do not call it unless the user told you to.
+    /// When allowed, it waits until the train landed, failed or needs a human
+    /// to reconcile (up to 10 minutes), sending progress notifications when the
+    /// request carries a progressToken.
+    #[tool(output_schema = schema_for_output::<ApproveReport>())]
+    async fn queue_approve(
+        &self,
+        Parameters(params): Parameters<QueueApproveParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let dir = workdir(&params.working_directory)?;
+        if !valid_job_id(&params.train_id) {
+            return Err(invalid(format!("invalid train_id '{}'", params.train_id)));
+        }
+        let env = Arc::clone(&self.env);
+        let user = blocking(move || UserConfig::load(&env)).await?;
+        let user = match user {
+            Ok(u) if u.queue.allow_agent_approval => u,
+            Ok(_) => return Ok(tool_error(queue::NOT_ALLOWED_TEXT.to_owned())),
+            Err(e) => {
+                return Ok(tool_error(queue::failure(
+                    "not-allowed",
+                    format!("cannot read the user config ({e}); approval stays refused"),
+                )));
+            }
+        };
+        self.approve(&dir, &params.train_id, &user, &ctx).await
+    }
+}
+
+/// How long `queue_approve` waits for the push (the default `push_timeout`).
+const APPROVE_WAIT: Duration = Duration::from_secs(600);
+/// Poll period of `queue_approve`.
+const APPROVE_POLL: Duration = Duration::from_secs(1);
+
+/// A tool error result with only a text block.
+fn tool_error(text: String) -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text(text)])
+}
+
+impl Server {
+    /// The body of `queue_approve` once agent approval is known to be allowed.
+    async fn approve(
+        &self,
+        dir: &Path,
+        train_id: &str,
+        user: &UserConfig,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let ct = &ctx.ct;
+        let (env, dir, id) = (
+            Arc::clone(&self.env),
+            dir.to_path_buf(),
+            train_id.to_owned(),
+        );
+        let prepared = blocking(move || queue::send_approval(&env, &dir, &id)).await?;
+        let (common_dir, mut train) = match prepared {
+            Ok(v) => v,
+            Err(why) => return Ok(tool_error(why)),
+        };
+
+        let progress = ctx.meta.get_progress_token().map(|token| Progress {
+            peer: ctx.peer.clone(),
+            token,
+            interval: user.mcp.progress_interval.max(Duration::from_secs(1)),
+            started: Instant::now(),
+        });
+        let started = Instant::now();
+        let mut last_progress = Instant::now();
+        let mut timed_out = false;
+        while matches!(
+            train.state,
+            QueueTrainState::Approved | QueueTrainState::Pushing | QueueTrainState::Ready
+        ) {
+            if started.elapsed() >= APPROVE_WAIT {
+                timed_out = true;
+                break;
+            }
+            tokio::select! {
+                () = ct.cancelled() => {
+                    let text = format!(
+                        "cancelled: stopped waiting; train {} stays {} and the daemon continues\n",
+                        train.train_id,
+                        queue::train_state_name(train.state)
+                    );
+                    return Ok(tool_error(text));
+                }
+                () = tokio::time::sleep(APPROVE_POLL) => {}
+            }
+            let (env, dir) = (Arc::clone(&self.env), common_dir.clone());
+            let status = blocking(move || queue::fetch_status(&env, Some(dir))).await?;
+            let status = match status {
+                Ok(s) => s,
+                Err(why) => return Ok(tool_error(why)),
+            };
+            match status
+                .trains
+                .into_iter()
+                .find(|t| t.train_id == train.train_id)
+            {
+                Some(t) => train = t,
+                None => train.state = QueueTrainState::Dissolved,
+            }
+            if let Some(p) = &progress
+                && last_progress.elapsed() >= p.interval
+            {
+                last_progress = Instant::now();
+                p.notify(format!(
+                    "train {}: {} for {}",
+                    train.train_id,
+                    queue::train_state_name(train.state),
+                    dur(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
+                ))
+                .await;
+            }
+        }
+        let landed = train.state == QueueTrainState::Landed;
+        let text = queue::approve_text(&train, timed_out);
+        let view: TrainSchema = serde_json::from_value(
+            serde_json::to_value(&train).map_err(|e| internal(e.to_string()))?,
+        )
+        .map_err(|e| internal(e.to_string()))?;
+        let report = ApproveReport {
+            train_id: train.train_id.clone(),
+            state: queue::train_state_name(train.state).to_owned(),
+            landed,
+            train: view,
+        };
+        result(text, &report, !landed)
+    }
 }
 
 #[allow(clippy::unused_async_trait_impl)] // generated by `#[tool_handler]`
@@ -1261,6 +1487,9 @@ mod schema_tests {
             schema_for_output::<VerifyReport>(),
             schema_for_output::<GateList>(),
             schema_for_output::<LogsReport>(),
+            schema_for_output::<JobSchema>(),
+            schema_for_output::<StatusSchema>(),
+            schema_for_output::<ApproveReport>(),
         ] {
             required_names(
                 &serde_json::to_value(schema).expect("schema json"),
@@ -1273,6 +1502,17 @@ mod schema_tests {
             "duration_ms",
             "not_cached_reason",
             "message",
+            "merge_sha",
+            "train_hash",
+            "approved_via",
+            "approved_at",
+            "landed_at",
+            "finished_at",
+            "note",
+            "reason",
+            "detail",
+            "position",
+            "session",
         ] {
             assert!(
                 !required.iter().any(|r| r == skipped),
@@ -1285,5 +1525,34 @@ mod schema_tests {
             json.get("tail").is_none(),
             "empty tail must be omitted: {json}"
         );
+    }
+
+    #[test]
+    fn queue_tools_are_listed_with_descriptions_and_output_schemas() {
+        let tools = Server::new(EnvMap::new()).tool_router.list_all();
+        for name in ["queue_enqueue", "queue_status", "queue_approve"] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            assert!(
+                tool.description.as_deref().is_some_and(|d| !d.is_empty()),
+                "{name} has no description"
+            );
+            assert!(tool.output_schema.is_some(), "{name} has no output schema");
+        }
+    }
+
+    #[test]
+    fn instructions_carry_the_queue_guidance() {
+        for needle in [
+            "queue_enqueue",
+            "and stop",
+            "Never approve",
+            "conflict",
+            "only in the CLI",
+        ] {
+            assert!(INSTRUCTIONS.contains(needle), "missing '{needle}'");
+        }
     }
 }

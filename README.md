@@ -148,6 +148,7 @@ sluice logs [<job-id>] [-n <lines>]                      # job logs             
 sluice daemon [--foreground] | stop [--force]            # one per user, Unix socket    (Phase 2)
 sluice status [--json]                                   # queue, in-flight, totals     (Phase 2)
 sluice mcp                                               # MCP stdio server for agents  (Phase 3)
+sluice queue enqueue|status|approve|retry|cancel|reconcile   # local merge queue    (Phase 6)
 ```
 
 Point your agent at the server (`claude mcp add sluice -- sluice mcp`) and
@@ -191,6 +192,18 @@ daemon is already running.
 
 MCP tools for agents: `verify` (blocks until the gates finish, with
 progress notifications and cancellation), `status`, `gate_list`, `logs`.
+
+## Merge queue
+
+Agents working in separate worktrees can hand their committed branches to a
+local merge queue instead of pushing. `sluice queue enqueue` records the
+branch; the daemon merges the queued branches onto the target in a throwaway
+worktree, runs the gates once on the combined tree (through the usual cache
+and budget) and shows the plan in `sluice queue status`. Nothing is pushed
+until a human runs `sluice queue approve <train>`, which prints the plan and
+lands the train atomically. Agents enqueue, humans approve; add
+`Bash(sluice queue approve:*)` to the agent's deny rules. The full guide is in
+[docs/merge-queue.md](docs/merge-queue.md).
 
 ## Roadmap
 

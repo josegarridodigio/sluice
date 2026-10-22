@@ -158,6 +158,109 @@ file stays on disk. Never starts the daemon; falls back to the log
 directory on any daemon failure. An unknown job is an `is_error` text
 result; a job id with unsafe characters is `invalid_params`.
 
+## Merge-queue tools (Phase 6)
+
+Three tools, thin clients of the `queue-*` messages
+([[sluice/design/protocol.md]] "Merge queue",
+[[sluice/design/merge-queue.md]] sections 8, 9 and 12; change record
+[[sluice/changes/phase-6-mcp.md]]). Code: `crates/sluice-gate-mcp/src/queue.rs`
+(helpers, text, schema mirrors) and the three `#[tool]` methods in `lib.rs`.
+
+Common rules:
+
+- `working_directory` is required and absolute (`invalid_params` otherwise,
+  like the other tools). The repository comes from
+  `sluice_gate_core::git::discover`; every git call goes through
+  `sluice_gate_core::git::run` with `read_only = true`. Product code never
+  touches the index or the working tree.
+- The daemon is autostarted (`ensure_daemon`) and spoken to with the blocking
+  client's `Client::request` on a blocking thread; the reply is returned as is,
+  so an `error` message keeps its code. The server identifies itself as
+  `sluice-gate-mcp <version>`.
+- Failures are **tool error results** (`is_error = true`, no structured
+  content) whose text starts with the code and a colon: the daemon's own
+  codes `conflict-state`, `not-allowed`, `stale-plan`, `duplicate-branch`,
+  `not-supported`, `not-found`, `internal`, plus codes minted by the server
+  before or around the daemon call: `dirty-worktree`, `detached-head`,
+  `unknown-branch`, `not-a-repository`, `git`, `unavailable` (daemon cannot be
+  reached). Only a bad or relative `working_directory` or an unsafe `train_id`
+  is an MCP error (`invalid_params`).
+- The env sent to the daemon is the allowlist `SSH_AUTH_SOCK`,
+  `SSH_AGENT_PID`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `SSH_ASKPASS`, `HOME`,
+  `PATH`, `TERM` (only variables that are present).
+- Output schemas are derived from mirror types in `queue.rs` (`JobSchema`,
+  `TrainSchema`, `GateSchema`, `StatusSchema`, `ApproveReport`) because the
+  proto crate has no `schemars`. The structured content is the protocol view
+  itself; fields the views skip when empty are optional in the mirrors, and
+  `schema_tests::skipped_fields_are_never_required` covers them. A unit test
+  deserialises the real views into the mirrors to keep both in step.
+
+### `queue_enqueue`
+
+Inputs: `working_directory`, `branch?` (default: the worktree's current
+branch; a leading `refs/heads/` is stripped), `base?` (as typed:
+`<remote>/<branch>` or a local branch; the daemon resolves it).
+
+Before contacting the daemon it refuses: tracked changes in the worktree
+(`git status --porcelain --untracked-files=no`, `dirty-worktree`; checked
+even when `branch` names another branch), a detached HEAD without `branch`
+(`detached-head`), and a branch with no local ref (`unknown-branch`). It
+then sends `queue-enqueue {repo: git common dir, worktree: toplevel, branch,
+head_sha: refs/heads/<branch>^{commit}, base, caller: agent, session:
+$CLAUDE_CODE_SESSION_ID, env}`. A branch equal to the target, a base that is
+not a branch and an already active branch are refused by the daemon
+(`conflict-state`, `duplicate-branch`).
+
+Text: `queued <branch> (job <id>) for <remote>/<target>, position N` (no
+`position` when the job is not queued: `, state <state>`), then one line
+telling the agent to stop and tell the human. `structured_content`: the job
+view (`QueueJobView`: `job_id`, `branch`, `head_sha`, `remote`, `target`,
+`state`, `position?`, `train_id?`, `caller`, `session?`, `reason?`,
+`detail?`, `attempts`, timestamps).
+
+### `queue_status`
+
+Inputs: `working_directory`. Sends `queue-status {repo: common dir}`. Text:
+one block per train (`train <id>  <remote>/<target>  base <sha7>  <STATE>`),
+its members (`<branch>  job <id>  <state>`, queued position, `CONFLICT
+<paths>` with `rebase '<branch>' onto <target>, then call queue_enqueue
+again`, failure reasons), its gates (`test PASS 12.4s`, `lint CACHED`), and a
+state line: `ready; a human approves with `sluice queue approve <id>``,
+`approved; the daemon is pushing`, `landed <sha7>`, `push outcome unknown; a
+human runs `sluice queue reconcile``; jobs outside any train follow. Conflict
+paths are read from `detail.paths` (or a bare array). `structured_content` =
+the `queue-status` payload, `schema: 1`, same as `sluice queue status --json`.
+
+### `queue_approve`
+
+Inputs: `working_directory`, `train_id`.
+
+1. **Server-side gate**: the user config (`UserConfig::load`, read on every
+   call) must have `[queue] allow_agent_approval = true`. Otherwise the call
+   returns the error result `not-allowed: approval is reserved to humans
+   (sluice queue approve); set [queue] allow_agent_approval = true in the
+   user config to allow agents` **without contacting the daemon** (no
+   autostart either). An unreadable user config also refuses (fail closed).
+2. It fetches `queue-status` for the repository, finds the train
+   (`not-found` otherwise), requires it to be `ready` with a `train_hash`
+   (`conflict-state` otherwise) and sends `queue-approve {train_id,
+   train_hash, via: mcp, env}`.
+3. **Daemon-side gate**: the daemon repeats the check for `via: mcp` and
+   answers `not-allowed` if the flag is off (the daemon's copy of the user
+   config); a changed train gives `stale-plan`.
+4. On `queue-approved` with the train `approved`/`pushing`, it polls
+   `queue-status` every second, up to 10 minutes (the default
+   `[queue] push_timeout`), until the train is `landed`, `needs_reconcile`
+   or disappears/`dissolved`; it sends a progress notification every
+   `[mcp] progress_interval` when the request has a progress token.
+   Cancelling the call stops the wait, never the push.
+
+Text: `landed <sha7> on <remote>/<target> (train <id>)`, or
+`needs_reconcile: …`, `failed: train … was dissolved …`, `timeout: train …
+is still …`. `is_error` is set unless it landed. `structured_content`
+(`ApproveReport`): `{train_id, state, landed, train}` with the last known
+train view.
+
 ## Agent policy integration (G7)
 
 - Hooks keep using `sluice run --hook …`; the fail-fast message's last
