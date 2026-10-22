@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `sluice guard`: the agent plugin's PreToolUse hook now rewrites gate
+  commands to `sluice run <gate> -v` and heavy commands to
+  `sluice exec -- …` by inserting a fixed prefix in front of the untouched
+  original, approving or asking according to the agent client's
+  permission settings; `sluice queue approve` stays denied to agents.
+  User config `[agent] heavy_commands`, `heavy_commands_extra` and
+  `exec_weight`; `SLUICE_GUARD=deny` turns rewrites into suggestions and
+  `SLUICE_GUARD=0` disables the hook. With binaries older than 0.3.0 the
+  hook keeps the previous deny-only behaviour.
 - `docs/compatibility.md`: what stays compatible from 0.3.0 and how
   changes are made; golden files recorded from the 0.1.0 and 0.2.0 release
   binaries (configs, markers, status and queue JSON, protocol transcripts,
