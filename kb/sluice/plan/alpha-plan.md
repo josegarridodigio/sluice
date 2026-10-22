@@ -110,7 +110,7 @@ accepts ADR-0010 (command control, including shell shims), ADR-0011
 ADR-0013 (compatibility promise). No stop for the user unless a frozen
 format would change.
 
-Within wave 3: A1 → A2 and A1 → H5 (both build on `sluice exec`); B1 and
+Within wave 3: A1 → X1 → B1 (all three touch the daemon); A1 → A2 and A1 → H5 (both build on `sluice exec`); B1 and
 L1 after A1 and together in one agent (both touch the scheduler and the
 store); D1 in parallel with A in a worktree; H3 golden files in parallel
 (tests and fixtures only). Within wave 4: L2 → L3 strictly after E2 has
@@ -277,6 +277,26 @@ Build on `scripts/alpha/lib.py` and `mcp_agent.py`; each scenario writes
   use the same derivation; marker compatibility (old markers keep working
   for gates without `paths`); latency budget on the hit path (< 35 ms on
   5 000 files).
+
+### X1 — Fixes from the E1 harness findings (wave 3, Opus, after A1, before B1)
+
+Found by `s4_chaos.py` on 0.2.0 (evidence in
+[[sluice/changes/alpha-readiness.md]]):
+
+- SIGKILL of the daemon leaves gate process groups alive and the restarted
+  daemon neither reaps nor counts them: on start, reconcile every job row
+  still `running` (pgid + start ticks), kill surviving groups
+  (`terminate_group`, verified with `process_matches`), mark the jobs
+  killed; additionally make gate groups die with the daemon where Linux
+  allows it without `unsafe` (decide: `PR_SET_PDEATHSIG` through a crate
+  that wraps it safely, or a supervisor approach) and document the choice.
+- An unwritable `logs/` (or state dir) prevents the gate from running: run
+  it with output discarded (or kept in memory for the tail) and report the
+  log error once.
+- `doctor`: report an unwritable markers dir, corrupt or key-mismatched
+  marker files, and a database the daemon cannot open (exit 1).
+- Tests: the failing `s4_chaos.py` checks pass, plus Rust integration tests
+  for each fix.
 
 ### A1 — `sluice exec` and queue-only gates (wave 3, Opus)
 

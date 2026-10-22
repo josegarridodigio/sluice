@@ -85,3 +85,43 @@ policy problem, addressed by workstream B of the plan.
 - A socket path longer than 108 bytes (deep `XDG_RUNTIME_DIR`) makes the
   daemon refuse to start; clients fall back to in-process runs with a clear
   message but lose queue and coalescing. Plan task C.
+
+## s3_correctness, s4_chaos, s6_upgrade (task E1, 2026-10-22, binary 0.2.0)
+
+| Scenario | Checks | Runtime |
+|---|---|---|
+| s3 correctness invariants (items 1–7 of the plan) | 42/42 | 29 s |
+| s4 chaos (items 1–6) | 43/48 | 137 s |
+| s6 upgrade with live state (v0.1.0 → v0.2.0 → binary under test) | 50/50 | 15 s |
+
+Every scenario ends with a leak check (no daemon or gate process left).
+
+s3 proved: 16 concurrent `verify` on one tree → one run, same job id and
+verdict for all; 16 distinct trees → 16 runs within the budget; a failing
+tree is never reported as pass, also next to a passing sibling that
+differs by one byte; untracked file, mode change, rename and symlink
+target change miss while an ignored file hits; `key_inputs`, `key_files`
+and TTL invalidate; the user's index, `index.lock` and `.git/objects` are
+byte-identical after 200 cache checks; `CI=1` and `SLUICE_DISABLE=1`
+behave as documented.
+
+s6 proved: release checksums verified; v0.1.0 markers and job history
+survive the upgrades; queue tables appear on first queue use; `update`
+stops an idle daemon and leaves a busy one alone; `doctor` flags a stale
+daemon.
+
+s4 failures (Sluice defects, fixed by task X1 of the plan):
+
+| # | Item | Observed | Expected |
+|---|---|---|---|
+| 1 | SIGKILL of the daemon with 6 gates running | all 18 processes of the gate trees still alive 10 s later; the restarted daemon (0.2 s) neither reaps them nor counts them; clients exit 1 "lost the connection" | no gate process survives; interrupted runs reported as killed |
+| 2–3 | `logs/` (and the state dir) read-only | `cannot start the gate: cannot create …/logs/<job>.log: Permission denied`; the gate never runs | the gate runs without a log file and the error is reported once |
+| 4 | markers dir read-only | run passes and reports the write error once, but `doctor` says `markers: ok` | `doctor` reports the unwritable markers dir |
+| 5 | truncated, garbage and key-mismatched markers | ignored and rewritten correctly, `doctor` still `ok` | `doctor` reports corrupt markers |
+
+Other observations: a corrupt `sluice.db` stops the daemon from starting,
+clients fall back to in-process runs and `doctor` exits 0 (to be flagged
+by `doctor`, task X1); a truncated WAL is recovered with loss of the most
+recent history (SQLite semantics, documented); a gate that leaves a
+background child holding its stdout delays "job done" until the child
+exits (documented in the cookbook).
