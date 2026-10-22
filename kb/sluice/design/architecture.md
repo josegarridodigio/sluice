@@ -86,6 +86,18 @@ Summarised here; authoritative in [[sluice/design/cache-key.md]].
   worktrees share them. JSON content. Only successful, non-mutating runs
   write a marker. Default TTL 30 days.
 
+## 4b. Directories
+
+| Purpose | Path | Notes |
+|---|---|---|
+| Markers and miss records | `<git-common-dir>/sluice/markers/` | shared by all worktrees of a repo |
+| Scratch snapshots, daemon socket, locks, semaphore slots | `$XDG_RUNTIME_DIR/sluice/` (fallback `/tmp/sluice-<uid>/`) | mode `0700`; stale `snap-*` swept after 1 h |
+| Job logs, SQLite database | `$XDG_STATE_HOME/sluice/` (fallback `~/.local/state/sluice/`) | `logs/<job-id>.log`, `sluice.db` (Phase 2) |
+| User config | `$SLUICE_CONFIG` or `$XDG_CONFIG_HOME/sluice/config.toml` (fallback `~/.config/sluice/config.toml`) | optional |
+
+Job ids are `<unix-ms>-<pid>-<random hex>`; they are unique per machine
+and sort chronologically.
+
 ## 5. Daemon
 
 ### 5.1 Lifecycle
