@@ -21,6 +21,7 @@ by asserting that no daemon or gate process is left behind.
 | `s3_correctness.py` | Invariants under concurrency, cache-key sensitivity, git state untouched, `CI` / `SLUICE_DISABLE` |
 | `s4_chaos.py` | Daemon and client SIGKILL, 64-client hammering, CPU pressure (PSI), unwritable storage, corrupt markers and WAL (`ALPHA_HAMMER_SECONDS`, `ALPHA_HAMMER_CLIENTS`) |
 | `s6_upgrade.py` | Upgrade across real releases with a live daemon and state (`ALPHA_TAGS`, `ALPHA_RELEASES`) |
+| `s7_command_control.py` | Command control: 10 simulated agents through the guard hook (hook JSON on stdin, the returned command executed with `sh -c`) in `bypassPermissions` and `default` mode, a gate command answered from the cache, refusals (pipelines, `$(...)`, heredocs, `sluice queue approve`, deny rules), the shell-shim variant (`SLUICE_SHIMS=1` and off) and a raw baseline; budget 8, `exec_weight` 4, so at most 2 concurrent loads (`ALPHA_AGENTS`, `ALPHA_BURN_SECONDS`) |
 
 Shared helpers: `lib.py` (sandbox, report, process census), `pygate.py`
 (controllable Python gate and process helpers used by s3, s4 and s6),
@@ -71,6 +72,7 @@ cd scripts/alpha
 python3 s3_correctness.py   # about 30 s
 python3 s4_chaos.py         # about 2.5 min (60 s of hammering, two PSI phases)
 python3 s6_upgrade.py       # about 20 s
+python3 s7_command_control.py  # about 1 min; needs `SLUICE_BIN` with exec, guard and shim (0.3.0+)
 ./run_all.sh                # every s*.py present, in order; exits non-zero if any fails
 ```
 

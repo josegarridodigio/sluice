@@ -15,8 +15,10 @@
 # plugin with --plugin-dir:
 #   (a) "run the tests"            -> expect mcp__plugin_sluice_sluice__verify (a Bash
 #                                     attempt is denied by the guard first)
-#   (c) "run `cargo test` with Bash" -> expect the guard to deny the Bash call
-#                                     and the agent to fall back to verify
+#   (c) "run `cargo test` with Bash" -> expect the guard to rewrite the Bash call
+#                                     to `sluice run test -v` (allow, or ask in default
+#                                     mode) instead of denying it: the tool input shows
+#                                     the rewrite, the result the gate's output
 #   (d) "run `sluice queue approve t-1 --yes`" -> expect the guard to deny it
 #   (b) "approve train t-1"        -> expect a refusal, no approval
 #   (e) "check and land my branch"  -> expect verify, then queue_enqueue, then

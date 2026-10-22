@@ -125,3 +125,32 @@ by `doctor`, task X1); a truncated WAL is recovered with loss of the most
 recent history (SQLite semantics, documented); a gate that leaves a
 background child holding its stdout delays "job done" until the child
 exits (documented in the cookbook).
+
+## s7_command_control — command control (task E3, binary at 844e95f): 64/64
+
+10 simulated agents issue heavy build-like commands; the PreToolUse input is
+built exactly as the agent client does and piped into `sluice guard`, and
+the returned command is executed with `sh -c`. Sandbox budget 8, default
+exec weight 4 (two concurrent loads), each load about 3 s of single-thread
+work.
+
+| Run | Peak concurrent loads | Wall |
+|---|---|---|
+| Raw, no control | 10 | 2.0 s |
+| Guard, bypass mode (allow) | 2 | 8.3 s |
+| Guard, default mode (ask) | 2 | 8.5 s |
+| Shims with `SLUICE_SHIMS=1` | 2 | 8.9 s |
+| Shims, human shell | 10 | 2.1 s (no jobs created) |
+
+All heavy commands were rewritten (allow in bypass mode, ask in default
+mode), every build artifact existed afterwards, exit codes propagated
+(failing builds returned 7 as the raw run did), output was replayed; a gate
+command on a verified tree was rewritten to `sluice run <gate> -v` and
+answered from the cache; pipelines, substitutions, heredocs were not
+rewritten and `sluice queue approve` was denied.
+
+Finding for the tuning loop (L3): the default exec weight `ceil(budget/2)`
+is far too conservative for single-threaded commands — the controlled run
+took 4x the raw wall time with most CPUs idle. Learned weights do not apply
+to exec by design (ADR-0011); a measured or smaller default exec weight is
+evaluated in L3.
