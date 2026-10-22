@@ -154,3 +154,29 @@ is far too conservative for single-threaded commands — the controlled run
 took 4x the raw wall time with most CPUs idle. Learned weights do not apply
 to exec by design (ADR-0011); a measured or smaller default exec weight is
 evaluated in L3.
+
+## s5_merge_queue — merge queue on the Node project (task E4, binary at 844e95f): 65/65, 74 s
+
+Six simulated agents in six worktrees (two conflicting pairs, one branch
+that breaks `ava`, the rest independent) verify over MCP and enqueue
+(five over MCP, one through the CLI) against a bare remote.
+
+- One train per target at a time; conflicts are reported with their paths
+  and the retry hint; a failing train splits and the failing member shows
+  `gate test`.
+- The remote's main does not move for 20 s before approval; `queue_approve`
+  over MCP is refused (`not-allowed`); a human `sluice queue approve --yes`
+  lands exactly the approved members plus the audit ref.
+- Conflicting agents rebase, verify and call `queue_retry` over MCP; their
+  branches land on a second approval.
+- Crash during push (pre-receive blocked on a FIFO, the sandbox daemon
+  SIGKILLed while the push is alive): `needs_reconcile`; a reconcile while
+  the push is still alive answers `push_in_progress`; released hook →
+  `landed`; aborted hook → `ready` with the approval voided, and a new
+  approval lands it.
+- Gate reuse: single-member fast-forward trains whose tree an agent had
+  verified reach `ready` without running the gates again.
+- Leak check: no process of the sandbox left.
+
+Not covered: a multi-member train whose combined tree an agent verified
+(the reuse check uses fast-forward trains); SSH and HTTP remotes (task H2).
