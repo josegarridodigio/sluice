@@ -168,12 +168,13 @@ the MCP Tasks extension in [[sluice/design/mcp-tools.md]].
 
 ## 8. Hook integration and agent policy
 
-Hooks call `sluice run <gate>`. On a hit: exit 0 with one line. On a miss the
-behaviour depends on who invoked the hook:
+Hooks call `sluice run --hook <hook> <gate>` ([[sluice/design/adr/0006-hook-flag.md]]).
+On a hit: exit 0 with one line. On a miss the behaviour depends on who
+invoked the hook:
 
 | Caller | Default policy | Behaviour |
 |---|---|---|
-| agent | `fail-fast` | exit non-zero with an actionable message pointing to the `verify` MCP tool |
+| agent | `fail-fast` | exit 3 with an actionable message pointing to `sluice run <gate>` and the `verify` MCP tool |
 | agent | `wait` | wait in the queue (risky under Bash timeouts) |
 | agent | `run-unqueued` | run immediately outside the queue |
 | human | `wait` | wait in the queue, show progress |
@@ -182,11 +183,30 @@ Agent detection: see [[sluice/design/adr/0004-agent-detection.md]].
 
 ## 9. Output contract (G8)
 
-- Success: one line, e.g. `sluice: test PASS 32.1s (job 01J…)` or
-  `sluice: test PASS (cached 2h ago)`.
-- Failure: one line + the last N lines of the log (default 40, configurable)
-  + the log path.
-- `--json` variants for scripts; the MCP tool returns the same text block.
+- Success: one line on stdout, e.g. `sluice: test PASS 32.1s (job 1761…)`
+  or `sluice: test PASS (cached, passed 2h ago)`; a pass that could not be
+  cached appends `(not cached: <reason>)`.
+- Failure: one line on stderr `sluice: test FAIL exit=1 12.3s (job …) log=<path>`
+  followed by the last N lines of the log (default 40, `cache.tail_lines`).
+- Timeout: `sluice: test TIMEOUT after 20m (job …) log=<path>` + tail, exit 124.
+- Exit codes of `sluice run`: 0 pass or hit; the gate's exit code on
+  failure; 3 refused by `fail-fast`; 124 timeout; 143 gate killed by a
+  signal; 1 Sluice error; 2 usage error.
+- `-v/--verbose` streams the gate output to stderr while it runs; the log
+  file always has everything.
+- `--json` variants (Phase 2, `status`); the MCP tool returns the same text block.
+
+## 9b. Phase 1 execution (no daemon yet)
+
+Until the daemon exists, `sluice run` itself runs the gate: it takes
+`weight` slots (all or nothing, capped at the budget) of a `flock`
+counting semaphore with `daemon.budget` slots under the runtime dir, spawns
+`sh -c '<cmd> "$@"' sh <extra…>` in the worktree root with the sanitised
+environment, captures stdout and stderr interleaved into
+`<state>/logs/<job-id>.log`, and enforces the timeout by killing the
+process tree found through `/proc` (SIGTERM, 5 s grace, SIGKILL). The gate
+shares the client's process group so Ctrl-C reaches it. No coalescing in
+Phase 1. See [[sluice/changes/phase-1-cache-only.md]].
 
 ## 10. Security and safety
 

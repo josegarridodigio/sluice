@@ -5,7 +5,8 @@ tags: [sluice, design, cache]
 
 # Cache key and markers (draft)
 
-Status: draft for Phase-0 review. Reference analysis in
+Status: implemented in Phase 1 (`sluice-gate-core::tree`, `key`, `marker`),
+see [[sluice/changes/phase-1-cache-only.md]]. Reference analysis in
 [[sluice/research/references/gate-cache.md]].
 
 ## Tree hash
@@ -16,10 +17,10 @@ changes, without ever touching the real index.
 Procedure, ported from gate-cache's `_private_snapshot` (see
 [[sluice/research/references/gate-cache.md]] section 2):
 
-1. One `git rev-parse --show-toplevel --git-dir --git-common-dir --git-path index --git-path objects`
-   call (all values in one spawn). `--git-path index` honours an inherited
-   `GIT_INDEX_FILE`, which is what makes partial commits key on the content
-   being committed.
+1. One `git rev-parse --path-format=absolute --show-toplevel --git-dir --git-common-dir --git-path index --git-path objects`
+   call (all values in one spawn; needs git ≥ 2.31). `--git-path index`
+   honours an inherited `GIT_INDEX_FILE`, which is what makes partial
+   commits key on the content being committed.
 2. Create a scratch dir under the runtime dir (`$XDG_RUNTIME_DIR/sluice/snap-*`,
    mode `0700`; stale `snap-*` dirs older than an hour are swept). Copy the
    index into it **preserving mtime** (git's racily-clean detection depends
@@ -33,24 +34,32 @@ Procedure, ported from gate-cache's `_private_snapshot` (see
    the alternate, so the real index, `index.lock` and `.git/objects` are
    never touched. `core.splitIndex` is forced off because split index would
    write a shared-index file into the real git dir.
-4. `git -c core.splitIndex=false write-tree` with the same env returns the tree hash.
-5. Remove the scratch dir.
+4. `git ls-files -s -z` on the private index: any gitlink (mode `160000`)
+   makes the tree unknown (submodules are not supported in v1).
+5. `git -c core.splitIndex=false write-tree` with the same env returns the tree hash.
+6. Remove the scratch dir (also on error).
+
+Before step 3 a single `git ls-files -v -z` on the copied index rejects
+unmerged entries, assume-unchanged (lowercase tag) and skip-worktree
+(`S`) entries as unknown. Five git spawns in total on the hit path; the
+measured cost is in [[sluice/changes/hit-path-latency.md]].
 
 Read-only probes (`rev-parse`, `status`, `ls-files`) always pass
 `--no-optional-locks` so a cache check never blocks on `index.lock` held by
 another agent.
 
 **Unknown tree policy** (also from gate-cache): unmerged index, skip-worktree
-or assume-unchanged entries, dirty or uninitialised submodules, case-only
-mismatches on `core.ignorecase`, or any git error make the tree *unknown*.
+or assume-unchanged entries, any gitlink in the index, or any git error make
+the tree *unknown*. (Case-only mismatches on `core.ignorecase` are not
+checked: Linux only, case-sensitive filesystems assumed.)
 An unknown tree never fails the gate: Sluice runs the gate uncached (still
 queued in Phase 2) and prints the reason. A cache error must never change
 the gate's exit code.
 
-Cost: three git spawns plus an index copy. For a large repo this is tens of
-milliseconds, dominated by `git add -A` stat calls. Measure and record in
-[[sluice/changes/hit-path-latency.md]]. gate-cache publishes no numbers; its
-Python start-up plus about ten subprocesses is the baseline to beat.
+Cost: five git spawns plus an index copy; `git add -A` stat calls dominate
+on large repositories. Measured in [[sluice/changes/hit-path-latency.md]]
+(median 29 ms on 5 000 files). gate-cache publishes no numbers; its Python
+start-up plus about ten subprocesses is the baseline to beat.
 
 ### Inside hooks
 
@@ -121,7 +130,9 @@ repository share the common dir, so they share markers.
 Rules:
 
 - Written atomically (temp file + rename) only by the process that ran the
-  gate (daemon in Phase 2, the CLI in Phase 1).
+  gate (daemon in Phase 2, the CLI in Phase 1). A marker whose `format`
+  differs from `CACHE_FORMAT_VERSION`, whose JSON is corrupt, or whose inner
+  `key` does not match its file name is deleted on read and treated as a miss.
 - Only exit code 0 writes a marker.
 - A run that exits 0 but **changed the tree** (tree hash recomputed after the
   run differs) does not write a marker: auto-fixers must be re-verified on
@@ -130,7 +141,7 @@ Rules:
   (pruning on write only, mtime-based, errors swallowed).
 - `sluice cache clear [--gate <name>]` removes markers for the current repo.
 - `sluice cache status` lists markers for the current tree with age.
-- **Miss records**: a failed run or a tree-changing pass writes
+- **Miss records**: a failed run, a timeout or a tree-changing pass writes
   `<key>.miss.json` with `exit_code`, `reason`, `job_id`, `log_path` and a
   timestamp. A later pass deletes it. `sluice cache status` and the MCP
   `status` tool report it, which is exactly what an agent asks ("why did
@@ -146,7 +157,10 @@ Rules:
 
 - `CI` set and `SLUICE_CACHE != 1`: no reads, no writes.
 - `SLUICE_CACHE=0`: no reads, no writes.
-- `SLUICE_DISABLE=1`: Sluice runs the gate directly and exits with its code.
+- `SLUICE_DISABLE=1`: Sluice runs the gate directly (inherited stdio, no
+  log, no queue) and exits with its code.
+- Truthiness: `1`, `true`, `yes`, `on` (case-insensitive) are true; `0`,
+  `false`, `no`, `off` are false; `CI` counts as set unless it is false.
 
 ## Known limitations (document prominently in the README)
 

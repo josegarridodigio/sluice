@@ -67,7 +67,8 @@ struct Context {
     user: UserConfig,
     gate_name: String,
     gate: Gate,
-    child_env: EnvMap,
+    /// Environment of the gate process, computed on first use (it costs a git spawn).
+    child_env: std::cell::OnceCell<EnvMap>,
     probe_env: EnvMap,
     scratch: PathBuf,
     store: MarkerStore,
@@ -187,8 +188,6 @@ fn resolve(env: &EnvMap, cwd: &Path, args: &RunArgs) -> Result<Context, String> 
     let config = RepoConfig::load(&paths.toplevel).map_err(|e| e.to_string())?;
     let gate = config.gate(&args.gate).map_err(|e| e.to_string())?.clone();
     let user = UserConfig::load(env).map_err(|e| e.to_string())?;
-    let mut child_env = git::child_env(env).map_err(|e| e.to_string())?;
-    child_env.extend(gate.env.iter().map(|(k, v)| (k.clone(), v.clone())));
     let probe_env = git::probe_env(env, Some(&paths));
     let scratch = tree::scratch_root(env).map_err(|e| e.to_string())?;
     let store = MarkerStore::new(&paths.common_dir);
@@ -199,7 +198,7 @@ fn resolve(env: &EnvMap, cwd: &Path, args: &RunArgs) -> Result<Context, String> 
         user,
         gate_name: args.gate.clone(),
         gate,
-        child_env,
+        child_env: std::cell::OnceCell::new(),
         probe_env,
         scratch,
         store,
@@ -262,15 +261,32 @@ fn lookup(ctx: &Context, mode: &CacheMode) -> Decision {
     }
 }
 
+impl Context {
+    /// The caller's environment minus git hook and `CLAUDE*` variables, plus the gate's `env`.
+    fn child_env(&self) -> Result<&EnvMap, String> {
+        if let Some(env) = self.child_env.get() {
+            return Ok(env);
+        }
+        let mut env = git::child_env(&self.env).map_err(|e| e.to_string())?;
+        env.extend(self.gate.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        Ok(self.child_env.get_or_init(|| env))
+    }
+}
+
 /// Derives the cache key for `tree`; returns the normalised command as well.
 fn derive_key(ctx: &Context, tree: &TreeHash) -> Result<(String, CacheKey), String> {
-    let (key_inputs, key_files) = key::collect_inputs(
-        &ctx.gate.key_inputs,
-        &ctx.gate.key_files,
-        &ctx.paths.toplevel,
-        &ctx.child_env,
-    )
-    .map_err(|e| e.to_string())?;
+    let (key_inputs, key_files) = if ctx.gate.key_inputs.is_empty() && ctx.gate.key_files.is_empty()
+    {
+        (Vec::new(), Vec::new())
+    } else {
+        key::collect_inputs(
+            &ctx.gate.key_inputs,
+            &ctx.gate.key_files,
+            &ctx.paths.toplevel,
+            ctx.child_env()?,
+        )
+        .map_err(|e| e.to_string())?
+    };
     let cmd = ctx.gate.normalized_cmd();
     let material = KeyMaterial {
         tree: tree.clone(),
@@ -316,7 +332,7 @@ fn acquire_budget(ctx: &Context) -> Result<Vec<SlotGuard>, String> {
 }
 
 /// Builds the gate command: `sh -c '<cmd> "$@"' sh <extra...>`.
-fn gate_command(ctx: &Context, extra: &[String]) -> Command {
+fn gate_command(ctx: &Context, extra: &[String]) -> Result<Command, String> {
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
         .arg(format!("{} \"$@\"", ctx.gate.cmd.trim()))
@@ -324,13 +340,17 @@ fn gate_command(ctx: &Context, extra: &[String]) -> Command {
         .args(extra)
         .current_dir(&ctx.paths.toplevel)
         .env_clear()
-        .envs(&ctx.child_env);
-    cmd
+        .envs(ctx.child_env()?);
+    Ok(cmd)
 }
 
 /// `SLUICE_DISABLE=1`: run the gate with inherited stdio and exit with its code.
 fn run_inline(ctx: &Context, extra: &[String]) -> ExitCode {
-    match gate_command(ctx, extra).status() {
+    let mut cmd = match gate_command(ctx, extra) {
+        Ok(cmd) => cmd,
+        Err(e) => return fail(&e),
+    };
+    match cmd.status() {
         Ok(status) => exit_code_of(status.code()),
         Err(e) => fail(&format!("cannot start the gate: {e}")),
     }
@@ -423,7 +443,7 @@ fn spawn_and_wait(ctx: &Context, args: &RunArgs) -> Result<Execution, String> {
         );
     }
 
-    let mut child = gate_command(ctx, &args.extra)
+    let mut child = gate_command(ctx, &args.extra)?
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

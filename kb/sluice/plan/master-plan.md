@@ -19,8 +19,8 @@ Related: [[sluice/research/problem-statement.md]],
 | Phase | Name | Status | Notes |
 |---|---|---|---|
 | 0 | Setup and research | **done** (2026-10-22) | Questions answered, decisions recorded in ADR-0001..0005, workspace scaffolded and green. See [[sluice/changes/phase-0-scaffold.md]]. |
-| 1 | Cache only, no daemon | **next** | |
-| 2 | Daemon, scheduler, coalescing | not started | |
+| 1 | Cache only, no daemon | **done** (2026-10-22) | [[sluice/changes/phase-1-cache-only.md]], [[sluice/changes/phase-1-acceptance.md]], [[sluice/changes/hit-path-latency.md]]. |
+| 2 | Daemon, scheduler, coalescing | **next** | |
 | 3 | MCP front-end and agent policy | not started | |
 | 4 | Load-aware admission and observability | not started | |
 | 5 | Packaging and real-world validation | not started | |
@@ -88,6 +88,11 @@ Acceptance:
 Design inputs: [[sluice/design/cache-key.md]], [[sluice/design/config-format.md]],
 [[sluice/research/references/gate-cache.md]].
 
+Status: done 2026-10-22. All acceptance criteria proven by
+`crates/sluice-gate/tests/run.rs` and the latency measurement; evidence in
+[[sluice/changes/phase-1-acceptance.md]]. Decision added:
+[[sluice/design/adr/0006-hook-flag.md]].
+
 ## Phase 2 — Daemon, scheduler, coalescing
 
 Deliverables: versioned IPC protocol over a Unix socket
@@ -139,9 +144,11 @@ project(s) with before/after numbers.
 
 ## Next steps
 
-1. Phase 1, in `sluice-gate-core`: config parsing (`.sluice.toml`, user
-   config), git wrapper module, tree hash with the private index/object dir,
-   cache key, markers and miss records, agent detection.
-2. Phase 1, in `sluice-gate`: `sluice run` (hit path, flock semaphore, run,
-   marker write), `cache status|clear`, `init`, `hook print`.
-3. Measure hit-path latency and record it in [[sluice/changes/hit-path-latency.md]].
+1. Phase 2 design docs first: [[sluice/design/protocol.md]],
+   [[sluice/design/scheduler.md]] (+ ADR on fairness),
+   [[sluice/design/executor.md]].
+2. `sluice-gate-proto`: message types; `sluice-gate-daemon`: socket server,
+   lease, scheduler, in-flight map, executor, SQLite; `sluice run` becomes a
+   thin client on misses; `sluice status`, `sluice logs` via the daemon,
+   `sluice daemon stop`.
+3. Secondary lookup by `committed_tree` ([[sluice/design/committed-tree-lookup.md]]).

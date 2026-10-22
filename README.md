@@ -13,9 +13,10 @@
   <img alt="Status: pre-alpha" src="https://img.shields.io/badge/status-pre--alpha-red.svg">
 </p>
 
-> **Status: pre-alpha.** The design is done and the workspace builds, but no
-> command does anything useful yet. Watch the repo or follow the
-> [roadmap](#roadmap) if you want to be told when it does.
+> **Status: pre-alpha, Phase 1 done.** `sluice run` caches gate results per
+> git tree today (no daemon yet: a file-lock semaphore bounds concurrency).
+> The daemon with coalescing and the MCP server come next; see the
+> [roadmap](#roadmap).
 
 ---
 
@@ -120,26 +121,36 @@ env        = { NODE_ENV = "test" }
 ## Command surface
 
 ```
-sluice run <gate> [-- extra args]   # thin client: hooks, terminal, scripts
-sluice mcp                          # MCP stdio server spawned by the agent
-sluice daemon                       # one per user, Unix socket
-sluice status [--json]              # queue, in-flight, cache stats, time saved
-sluice cache status|clear [--gate]  # inspect / clear markers for the current repo
-sluice init                         # write a starter .sluice.toml and print hook snippets
-sluice hook print <manager>         # husky | lefthook | pre-commit | plain
-sluice logs [<job-id>]              # show job logs
+sluice run <gate> [--hook <hook>] [-v] [-- extra args]   # hooks, terminal, scripts   (Phase 1)
+sluice cache status [--all] | clear [--gate <gate>]      # markers of the current repo (Phase 1)
+sluice init [--force]                                    # starter .sluice.toml + hook snippet (Phase 1)
+sluice hook print husky|lefthook|pre-commit|plain        # integration snippets         (Phase 1)
+sluice logs [<job-id>] [-n <lines>]                      # job logs                     (Phase 1)
+sluice daemon                                            # one per user, Unix socket    (Phase 2)
+sluice status [--json]                                   # queue, in-flight, stats      (Phase 2)
+sluice mcp                                               # MCP stdio server for agents  (Phase 3)
 ```
 
-MCP tools for agents: `verify` (blocks until the gates finish, with progress
-notifications), `status`, `gate_list`, `logs`.
+Exit codes of `sluice run`: 0 pass or cache hit; the gate's own code on
+failure; 3 refused by `agent_hook_policy = "fail-fast"`; 124 timeout;
+1 Sluice error.
+
+Environment switches: `SLUICE_DISABLE=1` runs the gate directly;
+`SLUICE_CACHE=0|1` forces the cache off or on (on overrides `CI`); `CI`
+disables the cache; `SLUICE_AGENT=1|0` forces agent or human detection;
+`SLUICE_CONFIG` points at the user config
+(`~/.config/sluice/config.toml`).
+
+MCP tools for agents (Phase 3): `verify` (blocks until the gates finish,
+with progress notifications), `status`, `gate_list`, `logs`.
 
 ## Roadmap
 
 | Phase | Scope | Status |
 |---|---|---|
 | 0 | Research, design, ADRs, workspace | done |
-| 1 | Cache only, no daemon: `sluice run`, markers, TTL, hook snippets, a file-lock semaphore | next |
-| 2 | Daemon: budget scheduler, coalescing, process groups, timeouts, SQLite metrics, `sluice status` | |
+| 1 | Cache only, no daemon: `sluice run`, markers, TTL, hook snippets, a file-lock semaphore | done |
+| 2 | Daemon: budget scheduler, coalescing, process groups, timeouts, SQLite metrics, `sluice status` | next |
 | 3 | MCP server, agent detection, `agent_hook_policy`, `docs/agents.md` | |
 | 4 | PSI-based admission, stable `--json` schema, metrics export | |
 | 5 | Release builds, install script, real-world numbers | |
@@ -150,10 +161,13 @@ Sluice learned from.
 
 ## Install
 
-Not published yet. From source, with a stable Rust toolchain:
+Not published yet. From source, with a stable Rust toolchain (git ≥ 2.31
+at runtime):
 
 ```sh
 cargo install --path crates/sluice-gate
+cd your-repo && sluice init          # writes .sluice.toml, prints the hook snippet
+sluice hook print husky              # or lefthook | pre-commit | plain
 ```
 
 The crate is `sluice-gate` because `sluice` is taken on crates.io by an

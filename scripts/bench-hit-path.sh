@@ -47,20 +47,24 @@ git commit -q -m "bench"
 # Populate the cache.
 "$SLUICE" run noop >/dev/null
 
-# Time the hits. `date +%s%N` is GNU-specific; this script targets Linux.
-times=""
-i=0
-while [ "$i" -lt "$ITER" ]; do
-    start=$(date +%s%N)
-    "$SLUICE" run noop >/dev/null
-    end=$(date +%s%N)
-    times="$times $(( (end - start) / 1000000 ))"
-    i=$((i + 1))
-done
-
-sorted=$(printf '%s\n' $times | sort -n)
-min=$(printf '%s\n' "$sorted" | head -1)
-max=$(printf '%s\n' "$sorted" | tail -1)
-median=$(printf '%s\n' "$sorted" | sed -n "$(( (ITER + 1) / 2 ))p")
-echo "files=$FILES iterations=$ITER hit latency ms: min=$min median=$median max=$max"
+# Time the hits. Python measures the wall time of the sluice process alone
+# (the shell's own `date` spawns would add about a millisecond each).
+python3 -I - "$SLUICE" "$ITER" "$FILES" <<'PY'
+import statistics, subprocess, sys, time
+sluice, iterations, files = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+def bench(cmd):
+    samples = []
+    for _ in range(iterations):
+        start = time.perf_counter()
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        samples.append((time.perf_counter() - start) * 1000)
+    samples.sort()
+    return (f"min={samples[0]:.1f} median={statistics.median(samples):.1f} "
+            f"p90={samples[int(iterations * 0.9)]:.1f} max={samples[-1]:.1f} ms")
+print(f"files={files} iterations={iterations}")
+print("sluice run (hit):      ", bench([sluice, "run", "noop"]))
+print("git status --porcelain:", bench(["git", "status", "--porcelain"]))
+print("git --version:         ", bench(["git", "--version"]))
+PY
 echo "git version: $(git --version)"
+echo "load average: $(cut -d' ' -f1-3 /proc/loadavg)"
