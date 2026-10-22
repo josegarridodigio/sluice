@@ -41,8 +41,8 @@ use sluice_gate_proto::{
     self as proto, GateSpec, Outcome, OutcomeStatus, RepoInfo, RunRequest, ServerMessage,
 };
 
-use crate::client::{self, ClientError};
 use crate::dirs;
+use sluice_gate_proto::client::{self, ClientError};
 
 /// Exit code when `agent_hook_policy = "fail-fast"` refuses to run.
 pub const EXIT_FAIL_FAST: u8 = 3;
@@ -345,7 +345,7 @@ fn via_daemon(
         f.finish();
     }
     match result {
-        Ok(outcome) => Ok(report_outcome(ctx, state, &outcome)),
+        Ok(done) => Ok(report_outcome(ctx, state, &done.job_id, &done.outcome)),
         Err(ClientError::Closed | ClientError::Daemon(_)) if !queued => {
             Err("the daemon refused or dropped the request".to_owned())
         }
@@ -355,7 +355,12 @@ fn via_daemon(
 }
 
 /// Prints a daemon outcome exactly as the in-process path would.
-fn report_outcome(ctx: &Context, state: &CacheState, outcome: &Outcome) -> ExitCode {
+fn report_outcome(
+    ctx: &Context,
+    state: &CacheState,
+    done_job: &str,
+    outcome: &Outcome,
+) -> ExitCode {
     let job_id = outcome
         .coalesced_with
         .clone()
@@ -366,7 +371,15 @@ fn report_outcome(ctx: &Context, state: &CacheState, outcome: &Outcome) -> ExitC
                 .and_then(|p| p.file_stem())
                 .map(|s| s.to_string_lossy().into_owned())
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|| done_job.to_owned());
+    if outcome.status == OutcomeStatus::Killed && outcome.log_path.is_none() {
+        // Dropped from the queue (daemon stop, cancellation): it never ran.
+        eprintln!(
+            "sluice: {} KILLED before it started (job {job_id}): the daemon stopped",
+            ctx.gate_name
+        );
+        return ExitCode::from(EXIT_KILLED);
+    }
     let finish = match outcome.status {
         OutcomeStatus::Cached => {
             let passed = match state {
@@ -797,7 +810,8 @@ fn execute(ctx: &Context, args: &RunArgs, state: CacheState) -> ExitCode {
 
 fn spawn_and_wait(ctx: &Context, args: &RunArgs) -> Result<Execution, String> {
     let logs = dirs::logs_dir(&ctx.env);
-    fs::create_dir_all(&logs).map_err(|e| format!("cannot create {}: {e}", logs.display()))?;
+    sluice_gate_core::dirs::create_private_dir(&logs)
+        .map_err(|e| format!("cannot create {}: {e}", logs.display()))?;
     let job_id = dirs::job_id();
     let log_path = logs.join(format!("{job_id}.log"));
     let log = File::create(&log_path)
@@ -851,7 +865,7 @@ fn spawn_and_wait(ctx: &Context, args: &RunArgs) -> Result<Execution, String> {
         {
             break status;
         }
-        if started.elapsed() > ctx.gate.timeout {
+        if !ctx.gate.timeout.is_zero() && started.elapsed() > ctx.gate.timeout {
             timed_out = true;
             kill_tree(pid, Signal::SIGTERM);
             let grace = Instant::now();

@@ -8,8 +8,8 @@ use sluice_gate_core::dirs;
 use sluice_gate_core::git::EnvMap;
 use sluice_gate_proto::{StatusReport, WaitReason};
 
-use crate::client::{self, ClientError};
 use crate::run::{EXIT_ERROR, age};
+use sluice_gate_proto::client::{self, ClientError};
 
 /// Entry point of `sluice status`.
 pub fn show(json: bool) -> ExitCode {

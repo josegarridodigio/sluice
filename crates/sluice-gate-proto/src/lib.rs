@@ -19,6 +19,14 @@
 //!
 //! Both top-level enums are internally tagged with `type` and use kebab-case
 //! spellings, for example `{"type":"run","id":1,...}`.
+//!
+//! # Client
+//!
+//! With the `client` feature, [`client`] provides the blocking daemon client
+//! shared by the CLI and the MCP server (ADR-0008).
+
+#[cfg(feature = "client")]
+pub mod client;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

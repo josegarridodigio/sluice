@@ -275,7 +275,8 @@ pub async fn spawn(spec: ExecSpec) -> Result<Running> {
     let io = |context: String| move |source| Error::Io { context, source };
 
     if let Some(parent) = spec.log_path.parent() {
-        fs::create_dir_all(parent).map_err(io(format!("cannot create {}", parent.display())))?;
+        sluice_gate_core::dirs::create_private_dir(parent)
+            .map_err(io(format!("cannot create {}", parent.display())))?;
     }
     let file = File::create(&spec.log_path)
         .map_err(io(format!("cannot create {}", spec.log_path.display())))?;

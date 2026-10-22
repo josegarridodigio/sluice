@@ -34,16 +34,19 @@ Status: implemented in Phase 2 (`sluice-gate-daemon`, CLI `daemon_cmd`, proto `c
   lock. Failure text: `the daemon could not be started (<why>); see
   <daemon.log>`. The client then runs the gate itself (Phase 1 path) so a
   broken daemon never blocks work. Start-up errors of `sluice daemon`
-  itself (exit 1): `a daemon is already running (lock <path>)`,
-  `unusable socket path <p>`, config errors, runtime creation failure.
+  itself: `a daemon is already running (lock <path>)` exits 75
+  (`EX_TEMPFAIL`, so the client can tell it apart and retry during a
+  drain); `unusable socket path <p>`, config errors and runtime creation
+  failure exit 1.
 - **Stop:** `sluice daemon stop [--force]` sends `stop`; the daemon removes
   the socket file first, drops queued jobs (`done{killed}` with their job
   id), finishes or (with `--force`, SIGTERM or SIGINT) kills running
   jobs, releases the lease and the lock, exits 0. The command prints
   `sluice: daemon stopping (N running jobs)` (or `no daemon running`, exit
   0) and waits for the old daemon to release `daemon.lock` (up to 60 s,
-  printing `waiting for N running jobs to finish`; `--force` polls the pid
-  for up to 10 s) so the next client gets a fresh daemon.
+  printing `waiting for N running jobs to finish`, then a note and exit 0
+  if it gives up; `--force` polls the pid for up to 10 s) so the next
+  client gets a fresh daemon.
 - **Idle:** never exits on its own in v1 (`daemon.idle_exit = 0s`, Q10).
 - **Restart reconciliation:** on start, rows in `jobs` with
   `state = 'running'` from another `daemon_instance` are orphans (queued
@@ -100,8 +103,9 @@ Status: implemented in Phase 2 (`sluice-gate-daemon`, CLI `daemon_cmd`, proto `c
 
 File `<state>/sluice.db`. `Store::open_read_only` exists for diagnostics
 tooling (no CLI command uses it yet); all writes go through the daemon.
-The state dir, the logs dir and the socket directory are created `0700`;
-files inside follow the process umask.
+The state dir, the logs dir and the socket directory are created `0700`
+(`dirs::create_private_dir`, which also applies to missing parents such as
+`~/.local/state`); files inside follow the process umask.
 
 ```sql
 CREATE TABLE schema (version INTEGER NOT NULL);            -- 1

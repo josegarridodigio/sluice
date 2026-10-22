@@ -12,7 +12,6 @@ use clap::{Parser, Subcommand};
 use sluice_gate_core::config::{REPO_CONFIG_FILE, RepoConfig, starter_repo_config};
 
 mod cache;
-mod client;
 mod daemon_cmd;
 mod dirs;
 mod logs;
@@ -75,6 +74,8 @@ enum Command {
     /// Start the MCP stdio server (spawned by the coding agent).
     Mcp,
     /// Start the per-user daemon (detached unless --foreground), or stop it.
+    ///
+    /// Exits 75 when another daemon still holds the daemon lock.
     Daemon {
         /// Stay attached to the terminal instead of detaching.
         #[arg(long)]
@@ -117,6 +118,9 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
     /// Ask the running daemon to stop (queued jobs are dropped, running jobs finish).
+    ///
+    /// Without --force, waits (up to 60 s) until the running jobs finished and the
+    /// daemon released its lock, so the next command starts a fresh daemon.
     Stop {
         /// Kill running jobs instead of letting them finish.
         #[arg(long)]

@@ -17,8 +17,11 @@ Status: implemented in Phase 2 (`sluice-gate-daemon::scheduler`). Decision on fa
   weight w, timeout, cmd, env, cwd)`. `w` is clamped to `1..=min(B, cap)`
   where `cap` is the repository's `budget_share_max` if any; a clamp is
   logged once per job. `repo` is the repository identity (the main
-  worktree path, derived from the git common dir), so every worktree of a
-  project shares its cap and is listed under the same path in `status`.
+  worktree path, derived from the git common dir, no symlink
+  normalisation), so every worktree of a project shares its cap and is
+  listed under the same path in `status`; the job row in `sluice.db`
+  keeps the worktree path. The clamp warning fires only when a weight is
+  reduced.
 - A **request** is one client waiting for a job. A job has one or more
   subscribers; requests never run anything themselves.
 - **Used** = Σ w of running jobs. A job is admissible when

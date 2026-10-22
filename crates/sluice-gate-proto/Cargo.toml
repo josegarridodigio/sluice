@@ -11,10 +11,21 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# Blocking std-only client of the daemon (ADR-0008). The CLI and the MCP
+# server enable it; the daemon does not.
+client = ["dep:anyhow", "dep:nix", "dep:thiserror"]
+
 [dependencies]
 sluice-gate-core.workspace = true
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+anyhow = { workspace = true, optional = true }
+nix = { version = "0.31.3", features = ["fs", "socket"], optional = true }
+thiserror = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

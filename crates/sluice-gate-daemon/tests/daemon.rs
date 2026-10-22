@@ -732,3 +732,109 @@ async fn stop_waits_for_running_jobs() {
 async fn stop_force_kills_running_jobs() {
     stop_with_running_job(true).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_coalescer_gets_started() {
+    let repo = make_repo();
+    let d = start(2, LastSubscriberGone::Cancel).await;
+    let msg = run_msg(
+        &repo,
+        "test",
+        "sleep 1",
+        Some(key(4)),
+        Some(repo.tree.clone()),
+        0,
+    );
+    let (_w1, mut r1) = d.request(&msg).await;
+    let first = until_started(&mut r1).await;
+    let (_w2, mut r2) = d.request(&msg).await;
+    match next(&mut r2).await {
+        Some(ServerMessage::Queued {
+            job_id,
+            position: 0,
+            coalesced: true,
+            ..
+        }) => assert_eq!(job_id, first),
+        other => panic!("unexpected {other:?}"),
+    }
+    match next(&mut r2).await {
+        Some(ServerMessage::Started { job_id, .. }) => assert_eq!(job_id, first),
+        other => panic!("expected started, got {other:?}"),
+    }
+    let rest = until_done(&mut r2).await;
+    assert!(
+        !rest
+            .iter()
+            .any(|m| matches!(m, ServerMessage::Started { .. })),
+        "started is sent once: {rest:?}"
+    );
+    assert_eq!(done_status(&rest), OutcomeStatus::Pass);
+    assert_eq!(done_status(&until_done(&mut r1).await), OutcomeStatus::Pass);
+    d.shutdown().await;
+}
+
+fn git_in(dir: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "T")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "T")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worktrees_of_one_repository_share_its_cap() {
+    let repo = make_repo();
+    let main = repo.paths.toplevel.clone();
+    git_in(&main, &["add", "-A"]);
+    git_in(
+        &main,
+        &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"],
+    );
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt = wt_parent.path().join("wt");
+    git_in(
+        &main,
+        &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()],
+    );
+    let wt_paths = git::discover(&wt, &host_env()).unwrap();
+    assert_ne!(wt_paths.toplevel, main);
+    assert_eq!(wt_paths.common_dir, repo.paths.common_dir);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path(), 4, LastSubscriberGone::Cancel);
+    cfg.repo_caps = BTreeMap::from([(main.clone(), 1)]);
+    let d = start_in(dir, cfg).await;
+
+    let (_wa, mut ra) = d
+        .request(&run_msg(&repo, "a", "sleep 1", None, None, 0))
+        .await;
+    until_started(&mut ra).await;
+    let mut b = run_msg(&repo, "b", "true", None, None, 0);
+    if let ClientMessage::Run { request, .. } = &mut b {
+        request.repo = RepoInfo {
+            toplevel: wt_paths.toplevel.clone(),
+            common_dir: wt_paths.common_dir.clone(),
+            git_dir: wt_paths.git_dir.clone(),
+        };
+        request.cwd = wt_paths.toplevel.clone();
+    }
+    let (_wb, mut rb) = d.request(&b).await;
+    assert!(matches!(
+        next(&mut rb).await,
+        Some(ServerMessage::Queued { .. })
+    ));
+    let st = status(&d).await;
+    assert_eq!(st.running.len(), 1);
+    assert_eq!(st.running[0].repo, main);
+    assert_eq!(st.queued.len(), 1, "the worktree shares the cap");
+    assert_eq!(st.queued[0].repo, main);
+    assert_eq!(st.queued[0].reason, sluice_gate_proto::WaitReason::RepoCap);
+    assert_eq!(done_status(&until_done(&mut ra).await), OutcomeStatus::Pass);
+    assert_eq!(done_status(&until_done(&mut rb).await), OutcomeStatus::Pass);
+    d.shutdown().await;
+}

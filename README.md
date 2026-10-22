@@ -169,7 +169,8 @@ disables the cache; `SLUICE_AGENT=1|0` forces agent or human detection;
 use, running and queued jobs with the reason each one waits, and all-time
 totals (runs, passes, failures, timeouts, hits, coalesced requests, time
 saved). `sluice daemon stop` lets running gates finish and waits for the
-daemon to exit; `--force` kills them.
+daemon to exit; `--force` kills them. `sluice daemon` exits 75 when a
+daemon is already running.
 
 MCP tools for agents (Phase 3): `verify` (blocks until the gates finish,
 with progress notifications), `status`, `gate_list`, `logs`.

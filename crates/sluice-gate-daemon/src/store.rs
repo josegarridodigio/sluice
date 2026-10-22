@@ -215,7 +215,7 @@ impl Store {
     /// I/O, SQLite, busy or schema mismatch errors.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)
+            sluice_gate_core::dirs::create_private_dir(parent)
                 .map_err(|e| io(format!("creating {}", parent.display()), e))?;
         }
         let conn = Connection::open(path).map_err(db)?;
@@ -731,6 +731,53 @@ impl Store {
                 Err(e) => return Err(io(format!("removing {}", file.display()), e)),
             }
         }
+        deleted += self.prune_unowned_logs(logs_dir, older_than_ms)?;
+        Ok(deleted)
+    }
+
+    /// Deletes `<logs_dir>/<id>.log` files that belong to no job row (logs of
+    /// in-process fallback runs) whose mtime is before `older_than_ms`. Only
+    /// regular files named like a job id (`[A-Za-z0-9_-]+.log`) are touched.
+    fn prune_unowned_logs(&self, logs_dir: &Path, older_than_ms: u64) -> Result<usize> {
+        let entries = match std::fs::read_dir(logs_dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(io(format!("reading {}", logs_dir.display()), e)),
+        };
+        let cutoff = UNIX_EPOCH + Duration::from_millis(older_than_ms);
+        let mut known = self
+            .conn
+            .prepare("SELECT 1 FROM jobs WHERE id = ?1")
+            .map_err(db)?;
+        let mut deleted = 0;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".log")) else {
+                continue;
+            };
+            if id.is_empty()
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if !meta.is_file() || meta.modified().map_or(true, |m| m >= cutoff) {
+                continue;
+            }
+            if known.exists([id]).map_err(db)? {
+                continue;
+            }
+            let file = entry.path();
+            match std::fs::remove_file(&file) {
+                Ok(()) => deleted += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io(format!("removing {}", file.display()), e)),
+            }
+        }
         Ok(deleted)
     }
 }
@@ -967,6 +1014,46 @@ mod tests {
         assert!(logs.join("new.log").exists());
         assert!(logs.join("queued.log").exists());
         assert_eq!(s.prune_logs(&logs, 500).unwrap(), 0);
+    }
+
+    #[test]
+    fn prune_logs_removes_old_fallback_logs() {
+        let (d, p) = tmp();
+        let s = Store::open(&p).unwrap();
+        let logs = d.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        s.insert_job(&job("queued-old", "A", 1)).unwrap();
+        let old = UNIX_EPOCH + Duration::from_millis(100);
+        for name in [
+            "fallback-old.log",
+            "fallback-new.log",
+            "queued-old.log",
+            "odd name.log",
+            "notes.txt",
+        ] {
+            let f = logs.join(name);
+            std::fs::write(&f, "x").unwrap();
+            if name != "fallback-new.log" {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&f)
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+            }
+        }
+        // Retention cutoff at 1 s after the epoch: only `fallback-old` is
+        // old, owned by no row and well named.
+        assert_eq!(s.prune_logs(&logs, 1_000).unwrap(), 1);
+        assert!(!logs.join("fallback-old.log").exists());
+        for kept in [
+            "fallback-new.log",
+            "queued-old.log",
+            "odd name.log",
+            "notes.txt",
+        ] {
+            assert!(logs.join(kept).exists(), "{kept}");
+        }
     }
 
     #[test]

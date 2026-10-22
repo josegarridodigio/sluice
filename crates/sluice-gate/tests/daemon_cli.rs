@@ -262,6 +262,101 @@ fn a_second_daemon_refuses_to_start() {
         .args(["daemon", "--foreground"])
         .timeout(Duration::from_secs(10))
         .assert()
-        .code(1)
+        .code(75)
         .stderr(predicate::str::contains("already running"));
+}
+
+#[test]
+fn stop_waits_for_the_drain_and_the_next_run_gets_a_fresh_daemon() {
+    let sb = Sandbox::new(
+        r#"
+[gates.gate]
+cmd = "sleep 1.05"
+cache = false
+
+[gates.later]
+cmd = "true"
+cache = false
+"#,
+    );
+    fs::write(
+        sb.home.join(".config/sluice/config.toml"),
+        "version = 1\n[daemon]\nbudget = 1\n",
+    )
+    .unwrap();
+    let running = spawn_run(&sb, "gate");
+    assert!(
+        wait_for(Duration::from_secs(10), || pgrep("sleep 1.05")),
+        "the gate never started"
+    );
+    let queued = spawn_run(&sb, "later");
+    assert!(
+        wait_for(Duration::from_secs(5), || sb.status_json()["queued"]
+            .as_array()
+            .is_some_and(|q| q.len() == 1)),
+        "the second gate never queued"
+    );
+    let old_pid = sb.status_json()["daemon"]["pid"].as_u64().unwrap();
+
+    sb.sluice()
+        .args(["daemon", "stop"])
+        .timeout(Duration::from_secs(30))
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("daemon stopping (1 running jobs)").and(
+                predicate::str::contains("waiting for 1 running jobs to finish"),
+            ),
+        );
+    assert!(!pgrep("sleep 1.05"), "stop returns after the gate finished");
+    let out = running.wait_with_output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let out = queued.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(143), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("later KILLED before it started (job ")
+            && stderr.contains("): the daemon stopped")
+            && !stderr.contains("(job )"),
+        "{stderr}"
+    );
+
+    sb.sluice()
+        .args(["run", "later"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("running in-process").not());
+    let new_pid = sb.status_json()["daemon"]["pid"].as_u64().unwrap();
+    assert_ne!(new_pid, old_pid, "a fresh daemon must serve the next run");
+}
+
+#[test]
+fn a_custom_socket_directory_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::standard();
+    let socket = sb.home.join("sockdir/d.sock");
+    let socket_env = socket.display().to_string();
+    sb.sluice()
+        .env("SLUICE_SOCKET", &socket_env)
+        .args(["run", "test"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("running in-process").not());
+    let mode = fs::metadata(sb.home.join("sockdir"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    let state_mode = fs::metadata(sb.home.join("state/sluice"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    sb.sluice()
+        .env("SLUICE_SOCKET", &socket_env)
+        .args(["daemon", "stop", "--force"])
+        .assert()
+        .success();
+    assert_eq!(mode, 0o700);
+    assert_eq!(state_mode, 0o700);
 }

@@ -852,9 +852,13 @@ version = "0.1.0"
 name = "sluice-gate-proto"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "nix",
  "serde",
  "serde_json",
  "sluice-gate-core",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

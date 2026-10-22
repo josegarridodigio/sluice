@@ -135,7 +135,8 @@ impl Scheduler {
         self.running.iter().map(|j| j.spec.weight).sum()
     }
 
-    /// Adds a request. Weight is clamped to `1..=budget`. If `spec.key` is
+    /// Adds a request. Weight is clamped to `1..=min(budget, repo cap)` (a
+    /// warning is logged once per clamped job). If `spec.key` is
     /// `Some` and a queued or running job has the same key, the request is
     /// attached to it (subscribers += 1) and [`Enqueued::Coalesced`] is
     /// returned. Otherwise the job goes to the back of the queue with one
@@ -151,7 +152,19 @@ impl Scheduler {
                 position,
             };
         }
-        spec.weight = spec.weight.clamp(1, self.budget);
+        let max = self.max_weight(&spec.repo);
+        if spec.weight > max {
+            tracing::warn!(
+                job = %spec.id,
+                gate = %spec.gate,
+                repo = %spec.repo.display(),
+                weight = spec.weight,
+                clamped_to = max,
+                budget = self.budget,
+                "gate weight exceeds the budget or the repository cap; clamped"
+            );
+        }
+        spec.weight = spec.weight.clamp(1, max);
         self.queue.push_back(Job::new(spec));
         Enqueued::Created {
             position: self.queue.len(),
@@ -183,7 +196,9 @@ impl Scheduler {
                 self.running.push(job);
                 continue;
             }
-            if is_head && self.head_waited_too_long(&job, now) {
+            // Only a head blocked by the budget reserves: a head blocked by its
+            // repository cap alone must not stop other repositories.
+            if is_head && !self.fits_budget(&job) && self.head_waited_too_long(&job, now) {
                 reserved = true;
             }
             remaining.push_back(job);
@@ -279,7 +294,7 @@ impl Scheduler {
         let reserved = self
             .queue
             .front()
-            .is_some_and(|head| self.head_waited_too_long(head, now));
+            .is_some_and(|head| !self.fits_budget(head) && self.head_waited_too_long(head, now));
         let queued = self
             .queue
             .iter()
@@ -327,6 +342,15 @@ impl Scheduler {
             .iter_mut()
             .chain(self.queue.iter_mut())
             .find(|j| j.spec.id == id)
+    }
+
+    /// Largest weight a job of `repo` can ever hold: the budget, or the
+    /// repository cap when lower (at least 1).
+    fn max_weight(&self, repo: &std::path::Path) -> u32 {
+        self.repo_caps
+            .get(repo)
+            .map_or(self.budget, |&cap| cap.min(self.budget))
+            .max(1)
     }
 
     fn fits_budget(&self, job: &Job) -> bool {
@@ -453,6 +477,35 @@ mod tests {
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].id, "a3");
         assert_eq!(queued[0].reason, WaitReason::RepoCap);
+    }
+
+    #[test]
+    fn weight_is_clamped_to_repo_cap() {
+        let caps = BTreeMap::from([(PathBuf::from("/a"), 2)]);
+        let mut s = Scheduler::new(8, RESERVE, caps);
+        s.enqueue(spec("heavy", None, "/a", 5, 0));
+        assert_eq!(s.spec("heavy").unwrap().weight, 2);
+        assert_eq!(s.admit(0, false), vec!["heavy"]);
+        assert_eq!(s.used(), 2);
+    }
+
+    #[test]
+    fn cap_blocked_head_does_not_reserve() {
+        let caps = BTreeMap::from([(PathBuf::from("/a"), 2)]);
+        let mut s = Scheduler::new(8, RESERVE, caps);
+        s.enqueue(spec("a1", None, "/a", 2, 0));
+        assert_eq!(s.admit(0, false), vec!["a1"]);
+        s.enqueue(spec("a2", None, "/a", 2, 0));
+        s.enqueue(spec("b1", None, "/b", 1, 40_000));
+        // The head (a2) has waited past head_reserve_after but is blocked only
+        // by its repository cap: b1 still starts.
+        assert_eq!(s.admit(40_000, false), vec!["b1"]);
+        let (_, queued) = s.snapshot(40_000, false);
+        assert_eq!(queued[0].id, "a2");
+        assert_eq!(queued[0].reason, WaitReason::RepoCap);
+        s.enqueue(spec("b2", None, "/b", 1, 40_001));
+        let (_, queued) = s.snapshot(40_001, false);
+        assert_eq!(queued[1].reason, WaitReason::Budget);
     }
 
     #[test]

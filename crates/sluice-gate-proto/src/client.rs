@@ -1,9 +1,10 @@
-//! Blocking client of the Sluice daemon (std only, no async runtime).
+//! Blocking client of the Sluice daemon (std only, no async runtime),
+//! available with the `client` feature (ADR-0008).
 //!
 //! Wire protocol: `kb/sluice/design/protocol.md`. Daemon autostart:
 //! "Daemon lifecycle" in `kb/sluice/design/executor.md`.
 
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -13,16 +14,21 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::{
+    self as proto, ClientEvent, ClientMessage, Outcome, PROTOCOL_VERSION, RunRequest,
+    ServerMessage, StatusReport,
+};
 use anyhow::{Context as _, Result, anyhow};
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 use nix::sys::socket::{self, AddressFamily, SockFlag, SockType, UnixAddr};
 use sluice_gate_core::dirs;
 use sluice_gate_core::git::EnvMap;
-use sluice_gate_proto::{
-    self as proto, ClientEvent, ClientMessage, Outcome, PROTOCOL_VERSION, RunRequest,
-    ServerMessage, StatusReport,
-};
+
+/// Exit status of `sluice daemon` when another daemon still holds
+/// `daemon.lock` (for example, one draining its jobs after `stop`).
+/// `ensure_daemon` retries on it. Same value as `EX_TEMPFAIL`.
+pub const EXIT_ALREADY_RUNNING: u8 = 75;
 
 /// Connect timeout of ordinary requests.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -36,6 +42,10 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const START_WAIT: Duration = Duration::from_secs(5);
 /// Poll period while waiting for the socket.
 const START_POLL: Duration = Duration::from_millis(20);
+/// How long `ensure_daemon` keeps retrying while an old daemon drains.
+const DRAIN_WAIT: Duration = Duration::from_secs(5);
+/// Retry period while an old daemon drains.
+const DRAIN_POLL: Duration = Duration::from_millis(250);
 
 /// Why talking to the daemon failed.
 #[derive(Debug, thiserror::Error)]
@@ -52,6 +62,15 @@ pub enum ClientError {
     /// Anything else (I/O, malformed replies, protocol mismatch).
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+/// The final `done` of a `run` request.
+#[derive(Debug, Clone)]
+pub struct RunDone {
+    /// Id of the job that produced the outcome (the shared job when coalesced).
+    pub job_id: String,
+    /// The outcome.
+    pub outcome: Outcome,
 }
 
 /// A connection to the daemon after a successful handshake.
@@ -114,14 +133,30 @@ fn check_welcome(line: &str) -> std::result::Result<u32, ClientError> {
     }
 }
 
-/// Connects to the daemon and performs the `hello` / `welcome` handshake.
+/// Connects to the daemon and performs the `hello` / `welcome` handshake
+/// (same as [`Client::connect`]).
 ///
 /// # Errors
 ///
-/// [`ClientError::NotRunning`] when nothing listens on `socket`, otherwise
-/// I/O or protocol errors (a protocol mismatch tells the user to run
-/// `sluice daemon stop`).
+/// See [`Client::connect`].
 pub fn connect(socket: &Path) -> std::result::Result<Client, ClientError> {
+    Client::connect(socket)
+}
+
+impl Client {
+    /// Connects to the daemon and performs the `hello` / `welcome` handshake.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::NotRunning`] when nothing listens on `socket`, otherwise
+    /// I/O or protocol errors (a protocol mismatch tells the user to run
+    /// `sluice daemon stop`).
+    pub fn connect(socket: &Path) -> std::result::Result<Self, ClientError> {
+        handshake(socket)
+    }
+}
+
+fn handshake(socket: &Path) -> std::result::Result<Client, ClientError> {
     let stream = connect_timeout(socket, CONNECT_TIMEOUT)
         .map_err(|_| ClientError::NotRunning(socket.to_path_buf()))?;
     stream
@@ -180,7 +215,8 @@ impl Client {
         Ok(msg)
     }
 
-    /// Sends `run` and streams its events to `on_event` until `done`.
+    /// Sends `run` and streams its events to `on_event` until `done`;
+    /// returns the job id and outcome carried by `done`.
     ///
     /// # Errors
     ///
@@ -190,7 +226,7 @@ impl Client {
         mut self,
         request: RunRequest,
         mut on_event: impl FnMut(&ServerMessage),
-    ) -> std::result::Result<Outcome, ClientError> {
+    ) -> std::result::Result<RunDone, ClientError> {
         self.send(&ClientMessage::Run { id: 1, request })?;
         // Jobs may run for a long time: no read timeout from here on.
         self.reader
@@ -200,8 +236,11 @@ impl Client {
         loop {
             let msg = self.recv()?;
             on_event(&msg);
-            if let ServerMessage::Done { outcome, .. } = msg {
-                return Ok(outcome);
+            if let ServerMessage::Done {
+                job_id, outcome, ..
+            } = msg
+            {
+                return Ok(RunDone { job_id, outcome });
             }
         }
     }
@@ -303,7 +342,9 @@ fn reachable(socket: &Path) -> bool {
 /// Tries to connect; on failure takes the exclusive start lock, re-checks,
 /// spawns `sluice daemon` detached (stdin null, output appended to the
 /// daemon log, own process group), polls the socket every 20 ms for up to
-/// 5 s and releases the lock.
+/// 5 s and releases the lock. When the spawned daemon exits with
+/// [`EXIT_ALREADY_RUNNING`] (an old daemon is still draining after `stop`),
+/// it retries every 250 ms for up to 5 s.
 ///
 /// # Errors
 ///
@@ -335,18 +376,48 @@ pub fn ensure_daemon(env: &EnvMap) -> Result<PathBuf> {
     }
 
     if let Some(parent) = log_path.parent() {
-        fs::create_dir_all(parent)
+        dirs::create_private_dir(parent)
             .map_err(|e| fail(format!("cannot create {}: {e}", parent.display())))?;
     }
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(|e| fail(format!("cannot open the log: {e}")))?;
-    let log_err = log
-        .try_clone()
-        .map_err(|e| fail(format!("cannot open the log: {e}")))?;
-    let exe = std::env::current_exe().map_err(|e| fail(format!("cannot find myself: {e}")))?;
+    let drain_deadline = Instant::now() + DRAIN_WAIT;
+    loop {
+        match spawn_daemon(env, &socket, &log_path) {
+            Spawn::Ready => return Ok(socket),
+            Spawn::Failed(why) => return Err(fail(why)),
+            Spawn::AlreadyRunning(why) => {
+                if Instant::now() >= drain_deadline {
+                    return Err(fail(why));
+                }
+                thread::sleep(DRAIN_POLL);
+                if reachable(&socket) {
+                    return Ok(socket);
+                }
+            }
+        }
+    }
+}
+
+/// Result of one autostart attempt.
+enum Spawn {
+    /// The socket accepts connections.
+    Ready,
+    /// The spawned process exited with [`EXIT_ALREADY_RUNNING`].
+    AlreadyRunning(String),
+    /// Any other failure (the reason).
+    Failed(String),
+}
+
+/// Spawns `sluice daemon` once and waits up to 5 s for its socket.
+fn spawn_daemon(env: &EnvMap, socket: &Path, log_path: &Path) -> Spawn {
+    let open_log = || OpenOptions::new().create(true).append(true).open(log_path);
+    let (log, log_err) = match (open_log(), open_log()) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return Spawn::Failed(format!("cannot open the log: {e}")),
+    };
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return Spawn::Failed(format!("cannot find myself: {e}")),
+    };
     // The daemon outlives this hook or terminal: give it a neutral
     // environment without the per-invocation git hook variables.
     let mut cmd = Command::new(exe);
@@ -357,35 +428,87 @@ pub fn ensure_daemon(env: &EnvMap) -> Result<PathBuf> {
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err))
         .process_group(0);
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| fail(format!("cannot spawn: {e}")))?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return Spawn::Failed(format!("cannot spawn: {e}")),
+    };
 
     let deadline = Instant::now() + START_WAIT;
     let mut reaped = false;
     loop {
-        if reachable(&socket) {
-            return Ok(socket);
+        if reachable(socket) {
+            return Spawn::Ready;
         }
         if !reaped {
             // Without `--foreground` the spawned process forks and exits 0
             // right away; a non-zero exit means it gave up before forking.
             match child.try_wait() {
+                Ok(Some(status)) if status.code() == Some(i32::from(EXIT_ALREADY_RUNNING)) => {
+                    return Spawn::AlreadyRunning(format!(
+                        "another daemon still holds the lock: it exited with {status}"
+                    ));
+                }
                 Ok(Some(status)) if !status.success() => {
-                    return Err(fail(format!("it exited with {status}")));
+                    return Spawn::Failed(format!("it exited with {status}"));
                 }
                 Ok(Some(_)) => reaped = true,
                 Ok(None) => {}
-                Err(e) => return Err(fail(e.to_string())),
+                Err(e) => return Spawn::Failed(e.to_string()),
             }
         }
         if Instant::now() >= deadline {
-            return Err(fail(format!(
+            return Spawn::Failed(format!(
                 "no socket at {} after {}s",
                 socket.display(),
                 START_WAIT.as_secs()
-            )));
+            ));
         }
         thread::sleep(START_POLL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn welcome_with_the_right_protocol_is_accepted() {
+        let line = proto::encode(&ServerMessage::Welcome {
+            protocol: PROTOCOL_VERSION,
+            daemon: "d".into(),
+            instance: "i".into(),
+            pid: 42,
+            started_at: "t".into(),
+        })
+        .unwrap();
+        assert_eq!(check_welcome(&line).unwrap(), 42);
+    }
+
+    #[test]
+    fn mismatched_protocol_and_refusals_are_errors() {
+        let line = proto::encode(&ServerMessage::Welcome {
+            protocol: PROTOCOL_VERSION + 1,
+            daemon: "d".into(),
+            instance: "i".into(),
+            pid: 42,
+            started_at: "t".into(),
+        })
+        .unwrap();
+        let err = check_welcome(&line).unwrap_err().to_string();
+        assert!(err.contains("sluice daemon stop"), "{err}");
+        assert!(check_welcome("{not json").is_err());
+    }
+
+    #[test]
+    fn connecting_to_nothing_is_not_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("none.sock");
+        assert!(matches!(
+            Client::connect(&socket),
+            Err(ClientError::NotRunning(_))
+        ));
+        assert!(!reachable(&socket));
+        // The hit event never fails loudly.
+        send_hit_event(&socket, Path::new("/r"), "g", 1);
     }
 }

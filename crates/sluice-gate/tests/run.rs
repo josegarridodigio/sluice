@@ -561,3 +561,37 @@ cmd = "for i in 1 2; do echo run >> \"$SLUICE_TEST_COUNTER\"; done"
     sb.sluice().args(["run", "loop"]).assert().success();
     assert_eq!(sb.runs(), 2);
 }
+
+#[test]
+fn a_zero_timeout_means_no_timeout_in_process() {
+    let sb = Sandbox::new(
+        r#"
+[gates.zero]
+cmd = "sleep 0.3"
+timeout = "0s"
+"#,
+    );
+    // Unreachable socket: the in-process fallback runs the gate.
+    sb.sluice()
+        .env("SLUICE_SOCKET", "/dev/null/impossible")
+        .args(["run", "zero"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("zero PASS"));
+}
+
+#[test]
+fn the_state_and_logs_dirs_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::standard();
+    sb.sluice()
+        .env("SLUICE_SOCKET", "/dev/null/impossible")
+        .args(["run", "test"])
+        .assert()
+        .success();
+    let state = sb.home.join("state/sluice");
+    for dir in [state.clone(), state.join("logs")] {
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{}", dir.display());
+    }
+}

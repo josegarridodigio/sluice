@@ -111,3 +111,17 @@ coalescers never receive `started`. Most other differences are wording.
 
 Counts: Table 1 (documented but not implemented) = 3; Table 2 (implemented but
 not documented) = 22; Table 3 (mismatches) = 31.
+
+## Resolution (2026-10-22, lead)
+
+| Items | Resolution |
+|---|---|
+| 2.1, 3.17, 3.18 | Code: weight clamped to `min(budget, repo cap)` with one warning per job; reservation only when the head is blocked by the budget; cap and status identity per repository (git common dir). Docs: scheduler.md, ADR-0007. |
+| 1.3 | Code: late coalescers receive `queued{position 0}` then `started`. Docs: protocol.md, scheduler.md. |
+| 3.6 | Code: `daemon stop` waits for the drain; `sluice daemon` exits 75 when the lock is held and the client retries during a drain. Docs: executor.md, README. |
+| 3.10 | Code: zero timeout means no timeout on the in-process path too. Docs: executor.md. |
+| 3.11 | Code: `prune_logs` also removes old logs without a job row. Docs: executor.md. |
+| 2.17 | Code: state, logs and socket directories created `0700`. Docs: executor.md, architecture.md. |
+| 2.21 | Code: `KILLED before it started (job <id>): the daemon stopped`. Docs: executor.md, architecture.md. |
+| 1.1 | Code: the clamp is logged once per job. |
+| 1.2, 2.2–2.16, 2.18–2.20, 2.22, 3.1–3.5, 3.7–3.9, 3.12–3.16, 3.19–3.31 | Documented in protocol.md, scheduler.md, executor.md, architecture.md, config-format.md, README and the change notes (test counts corrected; design docs marked implemented). |

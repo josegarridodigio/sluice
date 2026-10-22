@@ -2,7 +2,9 @@
 //!
 //! See the "Directories" table in `kb/sluice/design/architecture.md`.
 
-use std::path::PathBuf;
+use std::fs::DirBuilder;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::Result;
@@ -78,6 +80,16 @@ pub fn start_lock_path(env: &EnvMap) -> Result<PathBuf> {
     Ok(runtime_dir(env)?.join("start.lock"))
 }
 
+/// Creates `path` and its missing parents with mode `0700` (private to the
+/// user). Existing directories keep their mode.
+///
+/// # Errors
+///
+/// The I/O error of the failing `mkdir`.
+pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    DirBuilder::new().recursive(true).mode(0o700).create(path)
+}
+
 /// Milliseconds since the Unix epoch.
 #[must_use]
 pub fn now_ms() -> u64 {
@@ -130,6 +142,19 @@ mod tests {
             database_path(&env),
             PathBuf::from("/tmp/state/sluice/sluice.db")
         );
+    }
+
+    #[test]
+    fn private_dirs_are_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("a/b");
+        create_private_dir(&dir).unwrap();
+        create_private_dir(&dir).unwrap();
+        for d in [tmp.path().join("a"), dir] {
+            let mode = std::fs::metadata(&d).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{}", d.display());
+        }
     }
 
     #[test]

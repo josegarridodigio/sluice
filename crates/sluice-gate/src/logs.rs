@@ -12,9 +12,9 @@ use std::process::ExitCode;
 use sluice_gate_core::dirs as core_dirs;
 use sluice_gate_core::git::EnvMap;
 
-use crate::client;
 use crate::dirs;
 use crate::run::EXIT_ERROR;
+use sluice_gate_proto::client;
 
 /// Prints the log of `job_id`, or of the newest job when `None`.
 /// With `lines`, only the last that many lines.

@@ -34,8 +34,8 @@ no `deny_unknown_fields`, defaults on optional fields.
 
 | File | What |
 |---|---|
-| `client.rs` | blocking std client: handshake, `run` streaming, `status`, `logs`, `stop`, best-effort `hit` event (20 ms), `ensure_daemon` with the start lock, detached spawn and a 5 s socket wait. |
-| `daemon_cmd.rs` | `sluice daemon [--foreground]` (builds `DaemonConfig` from the user config, detaches with `nix::unistd::daemon` before creating the tokio runtime, redirects stdio to `daemon.log`, `SLUICE_LOG` filter) and `sluice daemon stop [--force]`. |
+| proto `client.rs` (feature `client`, [[sluice/design/adr/0008-client-in-proto-crate.md]]) | blocking std client shared by the CLI and the MCP server: handshake, `run` streaming (`RunDone { job_id, outcome }`), `status`, `logs`, `stop`, best-effort `hit` event (20 ms), `ensure_daemon` with the start lock, detached spawn, a 5 s socket wait and retries while an old daemon drains. |
+| `daemon_cmd.rs` | `sluice daemon [--foreground]` (builds `DaemonConfig` from the user config, detaches with `nix::unistd::daemon` before creating the tokio runtime, redirects stdio to `daemon.log`, `SLUICE_LOG` filter; exit 75 when another daemon holds the lock) and `sluice daemon stop [--force]` (waits for the drain). |
 | `status.rs` | `sluice status [--json]`: text summary or the `StatusReport` JSON; `no daemon running` when absent. |
 | `run.rs` | on a miss with policy `wait`: `RunRequest` to the daemon, notices `queued (position N, U of B units busy)` / `running (job …)`, Phase 1 output on `done`; falls back to the in-process run with the `flock` semaphore when the daemon is unavailable (`running in-process` notice). Hits send the hit event. `"$@"` is appended to the command only when extra arguments exist. |
 | `logs.rs` | asks the daemon first, scans the directory otherwise. |

@@ -23,11 +23,13 @@ use sluice_gate_core::git::EnvMap;
 use sluice_gate_daemon::executor::{IoClass, IoPriority};
 use sluice_gate_daemon::server::{self, DaemonConfig};
 
-use crate::client::{self, ClientError};
 use crate::run::EXIT_ERROR;
+use sluice_gate_proto::client::{self, ClientError};
 
 /// How long `stop --force` waits for the daemon process to exit.
 const STOP_WAIT: Duration = Duration::from_secs(10);
+/// How long `stop` waits for a draining daemon to release its lock.
+const DRAIN_WAIT: Duration = Duration::from_secs(60);
 
 /// Builds the daemon configuration from the user config and the environment.
 fn daemon_config(env: &EnvMap, user: &UserConfig) -> Result<DaemonConfig> {
@@ -85,7 +87,7 @@ fn check_socket_path(socket: &Path) -> Result<()> {
     std::os::unix::net::SocketAddr::from_pathname(socket)
         .with_context(|| format!("unusable socket path {}", socket.display()))?;
     if let Some(parent) = socket.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
+        dirs::create_private_dir(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
     }
     Ok(())
@@ -95,7 +97,7 @@ fn check_socket_path(socket: &Path) -> Result<()> {
 fn detach(env: &EnvMap) -> Result<()> {
     let log_path = dirs::daemon_log_path(env);
     if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)
+        dirs::create_private_dir(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let log = OpenOptions::new()
@@ -153,7 +155,7 @@ pub fn start(foreground: bool) -> ExitCode {
             "sluice: a daemon is already running (lock {})",
             config.lock_path.display()
         );
-        return ExitCode::from(EXIT_ERROR);
+        return ExitCode::from(client::EXIT_ALREADY_RUNNING);
     }
     // Catch an unusable socket path before detaching, so an autostarting
     // client sees the failure as an exit code instead of waiting for it.
@@ -184,7 +186,7 @@ pub fn start(foreground: bool) -> ExitCode {
                 "sluice: a daemon is already running (lock {})",
                 lock.display()
             );
-            ExitCode::from(EXIT_ERROR)
+            ExitCode::from(client::EXIT_ALREADY_RUNNING)
         }
         Err(e) => {
             eprintln!("sluice: error: {e}");
@@ -200,6 +202,31 @@ fn alive(pid: u32) -> bool {
             .and_then(|i| stat[i + 1..].split_whitespace().next())
             .is_some_and(|state| state != "Z")
     })
+}
+
+/// Waits (100 ms polls, up to 60 s) until the stopping daemon releases
+/// `daemon.lock`, so the next client starts a fresh daemon.
+fn wait_for_drain(env: &EnvMap, running: usize) {
+    let Ok(lock) = dirs::daemon_lock_path(env) else {
+        return;
+    };
+    if !lock_is_held(&lock) {
+        return;
+    }
+    if running > 0 {
+        println!("sluice: waiting for {running} running jobs to finish");
+    }
+    let deadline = Instant::now() + DRAIN_WAIT;
+    while lock_is_held(&lock) {
+        if Instant::now() >= deadline {
+            eprintln!(
+                "sluice: the daemon is still finishing its jobs after {}s; not waiting any longer",
+                DRAIN_WAIT.as_secs()
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// `sluice daemon stop [--force]`.
@@ -231,6 +258,8 @@ pub fn stop(force: bool) -> ExitCode {
                 while alive(pid) && Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(50));
                 }
+            } else {
+                wait_for_drain(&env, running);
             }
             ExitCode::SUCCESS
         }

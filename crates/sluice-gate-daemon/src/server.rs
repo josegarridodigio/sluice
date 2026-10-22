@@ -117,6 +117,20 @@ struct JobEntry {
     coalesced: u32,
     cancelled: bool,
     handle: Option<RunningHandle>,
+    /// Start time (unix ms) once `started` was broadcast; late coalescers get
+    /// a `started` of their own from it.
+    started_at: Option<u64>,
+}
+
+/// What [`register`] hands to the connection handler.
+struct Registered {
+    job_id: String,
+    coalesced: bool,
+    position: usize,
+    weight: u32,
+    /// `Some` when the request joined a job that has already started.
+    started_at: Option<u64>,
+    events: broadcast::Receiver<JobEvent>,
 }
 
 /// Mutable scheduling state.
@@ -643,6 +657,7 @@ async fn start_job(shared: Arc<Shared>, id: String) {
         if entry.cancelled {
             handle.cancel();
         }
+        entry.started_at = Some(info.started_at);
         let _ = entry.events.send(JobEvent::Started {
             started_at: info.started_at,
         });
@@ -1155,12 +1170,22 @@ fn caller_str(caller: Caller) -> &'static str {
     }
 }
 
-/// Registers the request (new job or coalesced) and returns
-/// `(job_id, coalesced, position, weight, events)`, or an error message.
-fn register(
-    shared: &Shared,
-    request: RunRequest,
-) -> std::result::Result<(String, bool, usize, u32, broadcast::Receiver<JobEvent>), String> {
+/// Repository identity used for the per-repository cap and `status`: the
+/// parent of the git common dir when it is named `.git` (the main worktree),
+/// else the common dir itself (bare repositories), so every worktree of one
+/// repository shares it.
+fn repo_identity(repo: &proto::RepoInfo) -> PathBuf {
+    let common = &repo.common_dir;
+    if common.file_name().is_some_and(|n| n == ".git")
+        && let Some(parent) = common.parent()
+    {
+        return parent.to_path_buf();
+    }
+    common.clone()
+}
+
+/// Registers the request (new job or coalesced), or returns an error message.
+fn register(shared: &Shared, request: RunRequest) -> std::result::Result<Registered, String> {
     let now = now_ms();
     let mut st = shared.state();
     if !st.accepting {
@@ -1170,7 +1195,7 @@ fn register(
     let spec = JobSpec {
         id: id.clone(),
         key: request.key.clone(),
-        repo: request.repo.toplevel.clone(),
+        repo: repo_identity(&request.repo),
         gate: request.gate.name.clone(),
         weight: request.gate.weight,
         queued_at: now,
@@ -1213,9 +1238,17 @@ fn register(
                     coalesced: 0,
                     cancelled: false,
                     handle: None,
+                    started_at: None,
                 },
             );
-            Ok((id, false, position, weight, rx))
+            Ok(Registered {
+                job_id: id,
+                coalesced: false,
+                position,
+                weight,
+                started_at: None,
+                events: rx,
+            })
         }
         Enqueued::Coalesced { job_id, position } => {
             let weight = st.sched.spec(&job_id).map_or(1, |s| s.weight);
@@ -1226,11 +1259,19 @@ fn register(
             };
             entry.coalesced += 1;
             let coalesced = entry.coalesced;
+            let started_at = entry.started_at;
             let rx = entry.events.subscribe();
             shared.store("updating subscribers", |s| {
                 s.set_subscribers(&job_id, u32::try_from(max).unwrap_or(u32::MAX), coalesced)
             });
-            Ok((job_id, true, position.unwrap_or(0), weight, rx))
+            Ok(Registered {
+                job_id,
+                coalesced: true,
+                position: position.unwrap_or(0),
+                weight,
+                started_at,
+                events: rx,
+            })
         }
     }
 }
@@ -1376,7 +1417,14 @@ async fn handle_run(
     id: u64,
     request: RunRequest,
 ) {
-    let (job_id, coalesced, position, weight, mut events) = match register(shared, request) {
+    let Registered {
+        job_id,
+        coalesced,
+        position,
+        weight,
+        started_at,
+        mut events,
+    } = match register(shared, request) {
         Ok(r) => r,
         Err(message) => {
             send_error(&mut wr, id, ErrorCode::Internal, message).await;
@@ -1403,6 +1451,18 @@ async fn handle_run(
     if !send(&mut wr, &queued).await {
         detach(shared, &sub.job_id);
         return;
+    }
+    // A request that joins a running job never sees the broadcast `started`.
+    if let Some(started_at) = started_at {
+        let started = ServerMessage::Started {
+            id,
+            job_id: sub.job_id.clone(),
+            started_at: rfc3339(started_at),
+        };
+        if !send(&mut wr, &started).await {
+            detach(shared, &sub.job_id);
+            return;
+        }
     }
 
     let (reader, mut lines) = spawn_reader(rd);
