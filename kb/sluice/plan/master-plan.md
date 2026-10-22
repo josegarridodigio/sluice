@@ -23,7 +23,7 @@ Related: [[sluice/research/problem-statement.md]],
 | 2 | Daemon, scheduler, coalescing | **done** (2026-10-22) | [[sluice/changes/phase-2-daemon.md]], [[sluice/changes/phase-2-acceptance.md]]; design in [[sluice/design/protocol.md]], [[sluice/design/scheduler.md]], [[sluice/design/executor.md]], ADR-0007. |
 | 3 | MCP front-end and agent policy | **done** (2026-10-22) | [[sluice/changes/phase-3-mcp.md]], [[sluice/changes/phase-3-acceptance.md]] (end to end with real sessions via `scripts/phase3-e2e.sh`). |
 | 4 | Load-aware admission and observability | **done** (2026-10-22) | [[sluice/changes/phase-4-psi.md]], [[sluice/changes/phase-4-acceptance.md]]; design [[sluice/design/psi-admission.md]]. |
-| 5 | Packaging and real-world validation | **done except the first tag** (2026-10-22) | [[sluice/changes/packaging.md]], [[sluice/changes/phase-5-validation.md]] (benchmark on this repository), README demo. Tagging `v0.1.0` publishes a GitHub release: waits for the user. |
+| 5 | Packaging and real-world validation | **done** (2026-10-22) | [[sluice/changes/packaging.md]] (release `v0.1.0` published, installer verified against it), [[sluice/changes/phase-5-validation.md]] (benchmark on this repository), README demo. |
 | later | Local merge queue (mergetrain-inspired) | not planned | Ask before starting. |
 
 ## Phase 0 — Setup and research
@@ -166,8 +166,8 @@ Tasks:
 - [x] Sluice verifies itself: `.sluice.toml`, `.githooks/`, CONTRIBUTING.
 - [x] Reproducible multi-worktree benchmark `scripts/validation-bench.sh` and evidence ([[sluice/changes/phase-5-validation.md]]).
 - [x] README demo GIF (`scripts/demo/`).
-- [ ] Tag `v0.1.0` and watch the first release workflow run (user approval).
-- [ ] README install line with the release URL after the first tag.
+- [x] Tag `v0.1.0` and watch the first release workflow run (approved by the user; green on the first run).
+- [x] README install line with the release URL and the installer.
 
 Deliverables: release builds (Linux x86_64/arm64), install script,
 `cargo install sluice-gate`, man page / README. Validation on this
@@ -187,9 +187,8 @@ referenced here.
 
 ## Next steps
 
-1. Tag `v0.1.0` once the user approves; fix anything the release workflow reveals; README install line.
-2. Phase 6: the user answers the open questions of [[sluice/design/merge-queue.md]]; implement after approval.
-3. Final reconciliation over the whole KB and the final report.
+1. Phase 6: the user answers the open questions of [[sluice/design/merge-queue.md]]; implement after approval.
+2. Final reconciliation over the whole KB and the final report.
 
 Earlier plan for Phase 3: `sluice-gate-mcp` with rmcp per [[sluice/design/mcp-tools.md]]
    (`verify`, `status`, `gate_list`, `logs`), fail-fast message pointing to

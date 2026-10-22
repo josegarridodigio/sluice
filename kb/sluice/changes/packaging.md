@@ -6,8 +6,9 @@ tags: [sluice, change, phase-5]
 # Change: release workflow and installer (2026-10-22)
 
 Phase 5 packaging. Adds a tag-triggered release workflow and a POSIX
-installer. Nothing here publishes to crates.io, and nothing was tagged,
-released or pushed.
+installer. Nothing here publishes to crates.io. The first tag, `v0.1.0`,
+was pushed on 2026-10-22 with the user's approval (see "First release"
+below).
 
 ## Release workflow (`.github/workflows/release.yml`)
 
@@ -59,15 +60,30 @@ Uses `curl`, falling back to `wget`.
   the bundled SQLite). Not built locally; CI via `cross` will do it. The
   aarch64 target was not attempted for the same reason.
 
-## Remaining for the first tag
+## First release: `v0.1.0` (2026-10-22)
 
-- Push to GitHub and tag (`git tag v0.1.0 && git push --tags`); the
-  workflow is untested on GitHub. Watch the first run: `cross` builds,
-  artifact names, and the release step.
-- The tag should match the crate version (the workflow does not check).
-- `rust-version = "1.99"` and `rust-toolchain.toml` use stable; cross images
-  use their own host toolchain only for the C side, rustc comes from stable.
-- README Install section still only lists `cargo install --path`; add the
-  `curl | sh` line once a release exists.
-- Not published to crates.io (workspace crates are not published; a crates.io
-  release would be a separate step).
+Tag `v0.1.0` (annotated, matches the workspace version) pushed to
+`origin`; workflow run 39826813822 went green on the first attempt:
+`test`, both `build` jobs (`cross` with the musl images; only a Node 20
+deprecation warning from `download-artifact`/`action-gh-release`), and
+`release`. Published assets at
+https://github.com/josegarridodigio/sluice/releases/tag/v0.1.0:
+
+| Asset | Size |
+|---|---|
+| `sluice-0.1.0-x86_64-unknown-linux-musl.tar.gz` | 3.5 MB |
+| `sluice-0.1.0-aarch64-unknown-linux-musl.tar.gz` | 3.3 MB |
+| `SHA256SUMS` | 225 B |
+
+Verified from this machine: `scripts/install.sh` against the real release
+(latest and `SLUICE_VERSION=v0.1.0`, into a scratch `SLUICE_INSTALL_DIR`)
+prints `Checksum OK` and `Installed: sluice 0.1.0`; the binary is a
+static x86_64 ELF and `sluice --version` answers `sluice 0.1.0`; both
+archives match `SHA256SUMS` (`sha256sum -c`); the x86_64 archive holds
+`sluice`, `README.md` and `LICENSE` under `sluice-0.1.0-<target>/`.
+The README Install section now leads with the `curl | sh` line and the
+release page.
+
+Still open: the tag must match the crate version by hand (the workflow
+does not check), and the crates are not published to crates.io (separate
+step, needs the user's explicit "publish").

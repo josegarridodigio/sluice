@@ -4,5 +4,6 @@
 # Reference repositories cloned for research (see kb/sluice/research/references/)
 /refs/
 
-# Pando local state (the config .pando.toml and the kb/ documents are versioned)
+# Pando local state and config (the kb/ documents are versioned)
 /.pando/
+/.pando.toml

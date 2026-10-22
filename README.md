@@ -199,9 +199,9 @@ progress notifications and cancellation), `status`, `gate_list`, `logs`.
 | 0 | Research, design, ADRs, workspace | done |
 | 1 | Cache only, no daemon: `sluice run`, markers, TTL, hook snippets, agent detection and `agent_hook_policy`, a file-lock semaphore | done |
 | 2 | Daemon: budget scheduler, coalescing, process groups, timeouts, SQLite metrics, `sluice status` | done |
-| 3 | MCP server (`verify`, `status`, `gate_list`, `logs`), `docs/agents.md` | done (manual two-agent run pending) |
+| 3 | MCP server (`verify`, `status`, `gate_list`, `logs`), `docs/agents.md` | done |
 | 4 | PSI-based admission, stable `--json` schema (`sluice status --json` is the metrics export) | done |
-| 5 | Release builds, install script, real-world numbers | done (first release pending) |
+| 5 | Release builds, install script, real-world numbers | done |
 
 Design history lives in [`kb/`](kb/sluice/plan/master-plan.md): the plan,
 the architecture, one ADR per decision, and research notes on the projects
@@ -209,12 +209,25 @@ Sluice learned from.
 
 ## Install
 
-Not published yet. From source, with a stable Rust toolchain (git ≥ 2.31
-at runtime):
+Prebuilt static binaries for Linux x86_64 and aarch64 come with every
+[release](https://github.com/josegarridodigio/sluice/releases). The
+installer downloads the latest one into `~/.local/bin` (set
+`SLUICE_VERSION=v0.1.0` to pin, `SLUICE_INSTALL_DIR` to relocate):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/josegarridodigio/sluice/main/scripts/install.sh | sh
+```
+
+Or from source, with a stable Rust toolchain (git ≥ 2.31 at runtime):
 
 ```sh
 cargo install --path crates/sluice-gate
-cd your-repo && sluice init          # writes .sluice.toml, prints the hook snippet
+```
+
+Then, in your repository:
+
+```sh
+sluice init                          # writes .sluice.toml, prints the hook snippet
 sluice hook print husky              # or lefthook | pre-commit | plain
 ```
 
