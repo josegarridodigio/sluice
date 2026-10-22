@@ -20,6 +20,10 @@
 > `verify` tool that blocks safely. A first release and real-world numbers
 > come next; see the [roadmap](#roadmap).
 
+![Six requests, one run](docs/assets/demo.gif)
+
+*Six requests for the same tree: one run, five coalesced, and a repeat served from the cache.*
+
 ---
 
 ## The problem
