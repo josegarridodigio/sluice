@@ -94,6 +94,9 @@ psi_poll_interval = "1s"
 ttl_days = 30
 tail_lines = 40
 
+[scheduler]                # Phase 2
+head_reserve_after = "30s" # backfill behind the queue head only this long (ADR-0007)
+
 [agent_detection]
 env_any_set = ["CLAUDECODE", "SLUICE_AGENT"]   # any of these set and non-empty => agent
 env_any_equals = { CLAUDE_CODE_ENTRYPOINT = "cli" }
@@ -110,7 +113,7 @@ Environment variables (highest precedence):
 | `SLUICE_CACHE=0` / `1` | Force cache off / on (on overrides the `CI` rule). |
 | `CI` (any value) | Cache off unless `SLUICE_CACHE=1`. |
 | `SLUICE_AGENT=1` / `0` | Force agent / human detection. |
-| `SLUICE_SOCKET` | Override the daemon socket path. |
+| `SLUICE_SOCKET` | Override the daemon socket path (Phase 2). |
 | `SLUICE_CONFIG` | Override the user config path. |
 | `SLUICE_LOG` | Tracing filter for the client (`info`, `debug`, …). |
 
