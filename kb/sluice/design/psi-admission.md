@@ -5,7 +5,7 @@ tags: [sluice, design, psi, phase-4]
 
 # PSI-based admission (Phase 4)
 
-Status: design for Phase 4. Related: [[sluice/design/scheduler.md]],
+Status: implemented in Phase 4 (`sluice-gate-daemon::psi`), see [[sluice/changes/phase-4-psi.md]]. Related: [[sluice/design/scheduler.md]],
 [[sluice/design/protocol.md]] (`budget.psi` in `status`),
 [[sluice/design/config-format.md]] (`[admission]`).
 
@@ -22,9 +22,11 @@ on CPU or memory, which is exactly "is this machine already saturated".
   `some avg10=<f> avg60=<f> avg300=<f> total=<µs>` (and `full …` for
   memory). Sluice reads `some avg10` for both.
 - Availability: kernel ≥ 4.20 with `CONFIG_PSI=y`; some distributions boot
-  with `psi=0`. If the files are missing or unreadable, admission falls
-  back to budget-only and `status` reports `psi.enabled = false` with the
-  reason in the daemon log, once.
+  with `psi=0`. If a read fails (files missing or unreadable), admission
+  falls back to budget-only for the rest of the daemon's life and `status`
+  reports `psi.enabled = false` (the reason is logged once). A missing or
+  malformed value in an otherwise readable file counts as calm. The root
+  path (`/proc/pressure`) is a daemon config field so tests can fake it.
 
 ## Rule
 
@@ -43,9 +45,11 @@ blocking = psi_enabled
   below 80 % of their thresholds for two consecutive samples, so a job
   burst does not flap.
 - Starvation guard: if the queue head has waited more than
-  `admission.psi_max_wait` (default 5 min) while blocked only by PSI, one
-  job is admitted anyway (pressure caused by other users' work must not
-  stall Sluice forever). Logged at info.
+  `admission.psi_max_wait` (default 5 min, measured from its queue time)
+  while PSI blocks, the head is admitted anyway if it fits the budget and
+  its repository cap; at most one job per `psi_max_wait`, so a backlog does
+  not drain at once (pressure caused by other users' work must not stall
+  Sluice forever). Logged at info with the job id.
 - Weighted admission under moderate pressure is out of scope for v1
   (binary gate is enough to stop the "machine unresponsive" failure mode).
 
@@ -63,19 +67,25 @@ psi_max_wait = "5m"        # Phase 4 addition
 ## Observability
 
 `sluice status --json` → `budget.psi = { enabled, cpu_some_avg10,
-memory_some_avg10, blocking }`; text mode prints
-`pressure: cpu 12.3% mem 0.4% (ok)` or `(blocking admission)`.
-Metrics export (Phase 4) adds `psi_blocked_ms_total`.
+memory_some_avg10, blocking }` and `totals.psi_blocked_ms_total` (time the
+current daemon spent blocking; kept in memory, so it resets on restart,
+unlike the other totals); text mode prints `pressure: cpu 12.3% mem 0.4%
+(ok)`, `(blocking admission)` or `(unavailable)` (also shown when PSI is
+disabled in the config). The `status` JSON schema is pinned by
+`crates/sluice-gate-proto/tests/status_schema.rs` against a fixture;
+adding a field means updating the fixture deliberately.
 
 ## Acceptance (Phase 4)
 
 - Unit: parser for both files, including missing `full` lines and
   malformed input; the hysteresis and starvation-guard state machine with
   synthetic samples.
-- Integration: with thresholds set to 0.0 (always blocking) a queued job
-  waits and `status` says `psi`; with the thresholds raised it starts.
-  Synthetic CPU pressure (`stress`-like busy loops in the test, one per
-  CPU) must raise `cpu.some.avg10` above a low threshold within the
-  10-second window on CI and the queued job must wait, then resume when
-  the load stops. Numbers recorded in
-  [[sluice/changes/phase-4-acceptance.md]].
+- Integration (`tests/daemon.rs`): with the PSI root pointed at fake
+  files reporting `some avg10=99`, a queued job waits with `reason: psi`
+  and `budget.psi.blocking = true`, then starts after two calm samples;
+  with `psi_max_wait = 300 ms` the head starts while still blocking and
+  the log says so; with a missing root `psi.enabled == false` and jobs
+  start normally. Real pressure is measured with
+  `scripts/psi-pressure-demo.sh [loops] [seconds]` rather than in CI (busy
+  loops equal to `nproc` barely move `some avg10`; see the numbers in
+  [[sluice/changes/phase-4-acceptance.md]]).

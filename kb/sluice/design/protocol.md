@@ -109,7 +109,7 @@ A pass whose request had a `key` but no `tree` is reported with
  "running":[{"job_id":"...","repo":"/abs","gate":"test","weight":4,"started_at":"...","elapsed_ms":1200,"subscribers":2,"caller":"agent"}],
  "queued":[{"job_id":"...","repo":"/abs","gate":"lint","weight":1,"queued_at":"...","waiting_ms":300,"subscribers":1,"reason":"budget|psi|repo-cap|head-reserved"}],
  "totals":{"since":"...","runs":120,"passes":110,"failures":8,"timeouts":2,"hits":430,"coalesced":37,
-           "wait_ms_total":..., "run_ms_total":..., "time_saved_ms":...}}
+           "wait_ms_total":..., "run_ms_total":..., "time_saved_ms":..., "psi_blocked_ms_total":...}}
 ```
 
 `schema` is bumped when a field changes meaning; Phase 4 freezes it and

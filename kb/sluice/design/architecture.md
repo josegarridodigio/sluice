@@ -50,8 +50,8 @@ Three invariants:
 
 ```
 crates/
-  sluice-gate-core/     # config, cache key, markers, git tree computation. Sync, no tokio.
-  sluice-gate-proto/    # IPC message types (serde), versioned.
+  sluice-gate-core/     # config, cache key, markers, git tree computation, shared lookup. Sync, no tokio.
+  sluice-gate-proto/    # IPC message types (serde), versioned; blocking client behind the `client` feature.
   sluice-gate-daemon/   # scheduler, coalescing, executor, PSI, SQLite.
   sluice-gate-mcp/      # rmcp server; thin client of the daemon.
   sluice-gate/          # the `sluice` binary; subcommands; thin client; integration tests.
@@ -185,7 +185,8 @@ Authoritative in [[sluice/design/protocol.md]]; types in
 it performs the same hit check as the CLI (`sluice_gate_core::lookup`),
 and forwards misses to the daemon over its own async socket client,
 blocking as long as needed with progress notifications every
-`mcp.progress_interval` (no shell timeout applies to MCP tool calls; see
+`mcp.progress_interval` when the client sent a progress token (no shell
+timeout applies to MCP tool calls, only the client's idle window; see
 [[sluice/research/claude-code-facts.md]]). Tools: `verify`, `status`,
 `gate_list`, `logs`. Details and the decision on the MCP Tasks extension
 in [[sluice/design/mcp-tools.md]] and ADR-0005.
@@ -224,7 +225,7 @@ Agent detection: see [[sluice/design/adr/0004-agent-detection.md]].
   signal (`FAIL exit=signal`), by `daemon stop --force`, by cancellation
   or dropped from the queue by `daemon stop` (`KILLED`); 1 Sluice error (`sluice: error: <message>`
   on stderr: no repository, bad config, unknown gate, spawn or log
-  failure); 2 usage error; 70 command not implemented yet.
+  failure); 2 usage error.
 - Stderr notices on the way to an uncached run: `sluice: cache disabled
   (<reason>)`, `sluice: tree unknown (<reason>); running uncached`,
   `sluice: cannot snapshot the tree / derive the cache key / read the cache

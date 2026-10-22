@@ -54,6 +54,11 @@ Code declares the extension.
 
 ## Consequences
 
+- Progress notifications go out only when the client sent a
+  `progressToken`; whether Claude Code does is undocumented
+  ([[sluice/research/claude-code-facts.md]]), so the 30-minute idle window
+  is the practical limit until the manual test confirms it.
+
 - Correctness depends on Claude Code's documented idle-window behaviour;
   the manual end-to-end test in Phase 3 must include a gate longer than
   2 minutes (backgrounding) and, with a lowered

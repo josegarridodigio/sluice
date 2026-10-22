@@ -26,7 +26,9 @@ Status: implemented in Phase 2 (`sluice-gate-daemon::scheduler`). Decision on fa
   subscribers; requests never run anything themselves.
 - **Used** = Σ w of running jobs. A job is admissible when
   `used + w ≤ B`, the repository cap allows it (`repos.<path>.budget_share_max`,
-  counted over running jobs of that repo), and PSI is not blocking (Phase 4).
+  counted over running jobs of that repo), and PSI is not blocking
+  ([[sluice/design/psi-admission.md]]; the starvation guard may admit the
+  head alone through `admit_head`).
 
 ## Coalescing (G3)
 

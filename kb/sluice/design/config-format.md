@@ -101,10 +101,10 @@ psi_enabled = true
 cpu_some_avg10_max = 60.0  # percent; do not admit new jobs above this
 memory_some_avg10_max = 20.0
 psi_poll_interval = "1s"
-psi_max_wait = "5m"        # Phase 4: admit the head anyway after this long blocked by PSI
+psi_max_wait = "5m"        # admit the head anyway after this long blocked by PSI (must be > 0)
 
 [mcp]
-progress_interval = "15s"  # progress notifications while verify runs
+progress_interval = "15s"  # progress notifications while verify runs (floored at 1s, re-read per call)
 
 [cache]
 ttl_days = 30
@@ -125,7 +125,7 @@ Environment variables (highest precedence):
 
 | Variable | Effect |
 |---|---|
-| `SLUICE_DISABLE=1` | Bypass Sluice entirely: run the gate directly, no cache, no queue. |
+| `SLUICE_DISABLE=1` | `sluice run`: run the gate directly (needs the repo and `.sluice.toml`), no cache, no queue, no user config. Through `sluice mcp`: cache off, the gate still queues. |
 | `SLUICE_CACHE=0` / `1` | Force cache off / on (on overrides the `CI` rule). |
 | `CI` | Cache off unless `SLUICE_CACHE` is truthy. A falsy `CI` (`0`, `false`, `no`, `off`) does not count as set. |
 | `SLUICE_AGENT=1` / `0` | Force agent / human detection (truthy / falsy words as below; any other value is ignored). |
@@ -140,8 +140,8 @@ through to the `CI` rule.
 User config notes: every section and field is optional (a missing file
 means defaults); unknown fields are errors; validation: `daemon.budget >= 1`,
 `daemon.nice <= 19`, `daemon.ionice_level <= 7`, `admission.psi_poll_interval > 0`,
-`budget_share_max >= 1`. `admission.*` (Phase 4) and `daemon.idle_exit` (always "never" in v1)
-are parsed and validated but have no effect yet; everything else is live
+`budget_share_max >= 1`. `daemon.idle_exit` (always "never" in v1) is parsed and validated but has
+no effect; everything else is live
 (`log_retention_days` prunes job logs daily from the daemon;
 `mcp.progress_interval` paces `verify`'s progress notifications).
 

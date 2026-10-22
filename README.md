@@ -134,7 +134,7 @@ env        = { NODE_ENV = "test" }
 ## Command surface
 
 ```
-sluice run <gate> [--hook <hook>] [-v] [-- extra args]   # hooks, terminal, scripts   (Phase 1)
+sluice run <gate> [--hook <hook>] [-v] [--explain] [-- args]  # hooks, terminal, scripts (Phase 1)
 sluice cache status [--all] | clear [--gate <gate>]      # markers of the current repo (Phase 1)
 sluice init [--force]                                    # starter .sluice.toml + hook snippet (Phase 1)
 sluice hook print husky|lefthook|pre-commit|plain        # integration snippets         (Phase 1)
@@ -154,9 +154,8 @@ through its shell.
 
 Exit codes of `sluice run`: 0 pass or cache hit; the gate's own code on
 failure; 3 refused by `agent_hook_policy = "fail-fast"`; 124 timeout; 143
-gate killed by a signal; 1 Sluice error; 2 usage error. Commands of a later
-phase exit 70. `sluice run --explain <gate>` shows every decision Sluice
-would take without running anything.
+gate killed by a signal; 1 Sluice error; 2 usage error. `sluice run --explain <gate>` shows every
+decision Sluice would take without running anything.
 
 Defaults worth knowing: gate timeout 30 m, weight 1, cache TTL 30 days,
 budget `max(2, cpus - 1)`, 40 log lines shown on failure (set
@@ -164,14 +163,16 @@ budget `max(2, cpus - 1)`, 40 log lines shown on failure (set
 config). Full output of every run is kept in
 `~/.local/state/sluice/logs/`; `sluice logs` prints the newest one.
 
-Environment switches: `SLUICE_DISABLE=1` runs the gate directly (no
-cache, no budget, no log); `SLUICE_CACHE=0|1` forces the cache off or on
+Environment switches: `SLUICE_DISABLE=1` makes `sluice run` run the gate
+directly (no cache, no budget, no log; through the MCP server it only
+turns the cache off); `SLUICE_CACHE=0|1` forces the cache off or on
 (on overrides `CI`); `CI` (any value other than `0`/`false`/`no`/`off`)
 disables the cache; `SLUICE_AGENT=1|0` forces agent or human detection;
 `SLUICE_CONFIG` points at the user config
 (`~/.config/sluice/config.toml`); `SLUICE_SOCKET` moves the daemon socket;
-`SLUICE_LOG` sets the daemon's log filter (`info` by default, written to
-`~/.local/state/sluice/daemon.log`).
+`SLUICE_LOG` sets the log filter of `sluice daemon` (written to
+`~/.local/state/sluice/daemon.log`) and `sluice mcp` (stderr), `info` by
+default.
 
 `sluice status` prints the daemon (pid, version, uptime, socket), budget
 use, running and queued jobs with the reason each one waits, and all-time

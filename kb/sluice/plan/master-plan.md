@@ -22,8 +22,8 @@ Related: [[sluice/research/problem-statement.md]],
 | 1 | Cache only, no daemon | **done** (2026-10-22) | [[sluice/changes/phase-1-cache-only.md]], [[sluice/changes/phase-1-acceptance.md]], [[sluice/changes/hit-path-latency.md]]. |
 | 2 | Daemon, scheduler, coalescing | **done** (2026-10-22) | [[sluice/changes/phase-2-daemon.md]], [[sluice/changes/phase-2-acceptance.md]]; design in [[sluice/design/protocol.md]], [[sluice/design/scheduler.md]], [[sluice/design/executor.md]], ADR-0007. |
 | 3 | MCP front-end and agent policy | **done, manual run pending** (2026-10-22) | [[sluice/changes/phase-3-mcp.md]]; the two-agent manual test (`docs/manual-test-phase-3.md`) needs the user. |
-| 4 | Load-aware admission and observability | **in progress** (2026-10-22) | Design: [[sluice/design/psi-admission.md]]. |
-| 5 | Packaging and real-world validation | not started | |
+| 4 | Load-aware admission and observability | **done** (2026-10-22) | [[sluice/changes/phase-4-psi.md]], [[sluice/changes/phase-4-acceptance.md]]; design [[sluice/design/psi-admission.md]]. |
+| 5 | Packaging and real-world validation | **in progress** | Release workflow and installer done ([[sluice/changes/packaging.md]]); first tag and real-world validation pending. |
 | later | Local merge queue (mergetrain-inspired) | not planned | Ask before starting. |
 
 ## Phase 0 — Setup and research
@@ -129,7 +129,7 @@ Tasks:
 - [x] Fail-fast message points to `verify`; `[mcp] progress_interval`.
 - [x] `docs/agents.md`; `docs/manual-test-phase-3.md`.
 - [x] Automated MCP client tests (`crates/sluice-gate/tests/mcp.rs`).
-- [ ] Reconciliation pass ([[sluice/changes/phase-3-reconciliation.md]]).
+- [x] Reconciliation pass ([[sluice/changes/phase-3-reconciliation.md]]): 42 findings; `extra_args` now in the key, per-gate errors kept, coverage added; rest documented.
 - [ ] Manual two-agent run by the user, recorded in [[sluice/changes/phase-3-acceptance.md]].
 
 Deliverables: `sluice mcp` built with rmcp ([[sluice/design/mcp-tools.md]]),
@@ -141,6 +141,14 @@ two worktrees: one runs, the other coalesces; later `git commit` hooks hit the
 cache; on a miss the hook fails fast with the actionable message.
 
 ## Phase 4 — Load-aware admission and observability
+
+Tasks:
+
+- [x] Design [[sluice/design/psi-admission.md]].
+- [x] `psi.rs` sampler and admission state machine; server integration; `psi_max_wait`; status fields; `pressure:` line.
+- [x] Frozen `status --json` schema test with fixture.
+- [x] Integration tests with fake PSI files; `scripts/psi-pressure-demo.sh` measurements.
+- [ ] Reconciliation pass ([[sluice/changes/phase-4-reconciliation.md]]).
 
 Deliverables: PSI-based admission, stable `sluice status --json` schema,
 metrics export (time saved, hit rate, wait times) for the user's existing HTML
@@ -167,10 +175,10 @@ project(s) with before/after numbers.
 
 ## Next steps
 
-1. Phase 3 reconciliation; ask the user to run the manual test.
-2. Phase 4 per [[sluice/design/psi-admission.md]]: PSI sampler, admission hook, status fields, schema test, `psi_max_wait`.
-3. Phase 5: tag `v0.1.0` once Phase 4 closes; validate on the user's project.
-4. Phase 6: present [[sluice/design/merge-queue.md]] and its open questions to the user.
+1. Ask the user to run the Phase 3 manual test (`docs/manual-test-phase-3.md`).
+2. Phase 4 reconciliation pass.
+3. Phase 5: tag `v0.1.0`, verify the release workflow, README install line; validate on `the-external-repository` with the user (measurement script).
+4. Phase 6: present [[sluice/design/merge-queue.md]] and its open questions to the user; implement after approval.
 
 Earlier plan for Phase 3: `sluice-gate-mcp` with rmcp per [[sluice/design/mcp-tools.md]]
    (`verify`, `status`, `gate_list`, `logs`), fail-fast message pointing to

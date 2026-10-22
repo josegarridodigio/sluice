@@ -48,10 +48,10 @@ This is the Phase 3 acceptance run that needs a human. It takes about
 | # | Where | Do | Expected |
 |---|---|---|---|
 | 1 | Terminal | `sluice daemon stop; sluice status` | `no daemon running` |
-| 2 | Agent A (main worktree) | "Run the verify tool for the test gate." | The tool call lasts about 150 s. Claude Code moves it to the background after 2 min and reports the result later. Result line `test PASS 150.xs (job …)`. Counter has one line. |
+| 2 | Agent A (main worktree) | Make a trivial change to `README.md` first (unstaged), then: "Run the verify tool for the test gate." | The tool call lasts about 150 s. Claude Code moves it to the background after 2 min and reports the result later. Result line `test PASS 150.xs (job …)`. Counter has one line. |
 | 3 | Agent B (second worktree), started within 60 s of step 2 | same prompt | Result arrives at the same time as A's with `PASS` and `structured_content.results[0].coalesced = true`. Counter still has one line. |
 | 4 | Terminal, during 2–3 | `sluice status` | one running job, `subscribers 2`. |
-| 5 | Agent A | "Commit the file README.md with the message 'manual test'." (make a trivial change first) | `pre-commit` prints `sluice: test PASS (cached, passed …)` instantly; commit succeeds. |
+| 5 | Agent A | "Commit the file README.md with the message 'manual test'." (the change verified in step 2; the tree is unchanged) | `pre-commit` prints `sluice: test PASS (cached, passed …)` instantly; commit succeeds. |
 | 6 | Agent B | edit a file, then "commit it" | The hook misses (new tree) and exits 3 with the three-line fail-fast message; the agent calls `verify` and retries; the commit then succeeds. |
 | 7 | Terminal | `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=60000 claude` in the main worktree, edit a file, ask for `verify` | The 150 s gate completes although the idle window is 60 s (progress notifications every 15 s keep it alive). |
 | 8 | Terminal | `sluice status --json \| jq .totals` | `runs 2+`, `coalesced 1`, `hits 1+`. |

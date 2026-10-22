@@ -4,9 +4,10 @@ This guide is for developers who run coding agents (Claude Code first, others
 second) on a repository that uses Sluice. It assumes `.sluice.toml` and your
 git hooks are already set up (`sluice init`, `sluice hook print`).
 
-> Status: `sluice run` and the hook policy work today. `sluice mcp` (the MCP
-> server with the `verify`, `status`, `gate_list` and `logs` tools) arrives in
-> Phase 3; the MCP parts of this guide describe that design.
+> Status: `sluice run`, the hook policy and `sluice mcp` (the MCP server
+> with the `verify`, `status`, `gate_list` and `logs` tools) all work. The
+> manual two-agent run that proves the Claude Code side end to end is still
+> pending (`docs/manual-test-phase-3.md`).
 
 ## 1. Why agents need Sluice
 
@@ -18,9 +19,13 @@ hits its timeout is moved to the background rather than killed, and the agent
 then carries on without the commit result. The MCP `verify` tool blocks
 safely instead: Claude Code aborts an MCP call only if neither a response nor
 a progress notification arrives within the idle window (30 minutes by default
-for stdio servers), Sluice sends progress notifications every 15 seconds, and
-an interactive session that auto-backgrounds a call after 2 minutes delivers
-the result later instead of cancelling it.
+for stdio servers); Sluice sends progress notifications every 15 seconds
+when the call carries a progress token, and an interactive session that
+auto-backgrounds a call after 2 minutes delivers the result later instead of
+cancelling it (background tasks do not survive the session). Whether Claude
+Code sends a progress token is not documented, so budget for the 30-minute
+idle window: queue wait plus the longest gate should stay under it, or raise
+`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`.
 
 ## 2. Install the MCP server
 
@@ -37,17 +42,16 @@ or register it from the command line with `claude mcp add` (the command is
 claude mcp add sluice -- sluice mcp
 ```
 
-`sluice` must be in the `PATH` that Claude Code sees. `sluice mcp` arrives in
-Phase 3. Until then, `sluice run <gate>` works today from the agent's shell
-and from git hooks; the rest of this guide (hook policy, detection, caveats)
-applies to it unchanged.
+`sluice` must be in the `PATH` that Claude Code sees. The `claude mcp add`
+form above follows the documented `claude mcp add <name> <command> [args]`
+syntax; check `claude mcp list` afterwards.
 
 The server exposes four tools:
 
 | Tool | Purpose |
 |---|---|
 | `verify` | Run gates (default: those whose `hooks` contain `pre-commit`; if none is tagged, every gate). Blocks until they finish, returns one line per gate and the log tail of the first failure. |
-| `status` | Queued and running jobs, plus the cache state of the current tree. |
+| `status` | Queued and running jobs; with `working_directory`, also the cache state of that tree per gate. |
 | `gate_list` | Gates defined in `.sluice.toml`. |
 | `logs` | Tail of a job log (default: newest). |
 
@@ -103,7 +107,6 @@ sluice: <hook> was invoked by a coding agent (<rule>) and agent_hook_policy is "
 sluice: call the 'verify' MCP tool (or run 'sluice run <gate>') first, then retry the git command.
 ```
 
-Phase 3 changes the last line to point at the `verify` MCP tool ("call the
 'verify' MCP tool (or run 'sluice run <gate>') first"). The exit code is 3
 in both versions.
 
@@ -174,8 +177,11 @@ Two levers, in order:
    `bypassPermissions` mode.
 
 MCP tool rules use the form `mcp__<server>__<tool>`, so the `verify` tool is
-`mcp__sluice__verify`. A rule like `Bash(sluice:*)` can be allowed safely:
-`sluice run` is the queue, not a way around it.
+`mcp__sluice__verify`. A rule like `Bash(sluice run:*)` is reasonable:
+`sluice run` goes through the daemon queue (it only runs in-process when the
+daemon is unavailable, and `run-unqueued` must be configured explicitly).
+Prefer it to a blanket `Bash(sluice:*)`, which would also allow
+`sluice daemon stop --force`.
 
 ## 7. Running several agents
 
