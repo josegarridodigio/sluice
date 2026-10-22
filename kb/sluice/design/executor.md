@@ -55,13 +55,83 @@ Status: implemented in Phase 2 (`sluice-gate-daemon`, CLI `daemon_cmd`, proto `c
   `daemon started` (`(log level debug)` with `--debug`) on success.
 - **Idle:** never exits on its own in v1 (`daemon.idle_exit = 0s`, Q10).
 - **Restart reconciliation:** on start, rows in `jobs` with
-  `state = 'running'` from another `daemon_instance` are orphans (queued
-  rows of other instances are closed as `orphaned` too). For each,
-  if `/proc/<pgid>` exists and its `starttime` (field 22 of
-  `/proc/<pid>/stat`) equals the recorded `proc_start_ticks`, the process
-  group is killed (SIGTERM, 5 s, SIGKILL); the row is marked
-  `outcome = 'orphaned'`. Mismatching start time means the pid was reused:
-  only the row is updated.
+  `state = 'running'` from another `daemon_instance` are orphans. For each,
+  `executor::group_is_ours(pgid, proc_start_ticks)` decides whether the
+  group still holds processes of that run: the leader `/proc/<pgid>`
+  exists and its `starttime` (field 22 of `/proc/<pid>/stat`) equals the
+  recorded `proc_start_ticks`, or the leader is gone but members of the
+  group remain (Linux never hands out a pid number while it still names a
+  live process group, so those can only be the run's descendants; the
+  first version only looked at the leader and missed this case). A live
+  leader with another start time means the pid was reused: nothing is
+  signalled. Surviving groups are terminated together (SIGTERM, 5 s,
+  SIGKILL); then running rows are closed as `outcome = 'killed'` (they
+  count in `totals.runs`) and queued rows of other instances as `orphaned`
+  (`Store::close_orphans`). Reconciliation is the safety net; the reaper
+  below normally killed the groups seconds after the daemon died.
+
+## Daemon death (the gate reaper)
+
+Found by `s4_chaos.py` item 1 (task X1): a SIGKILLed daemon left all its
+gate process groups running, because gates run in their own process
+groups (so `killpg` reaches the whole tree) and nothing tied them to the
+daemon's life; only the next daemon start reconciled them, and the next
+start may be hours away.
+
+- The daemon starts one companion process at start-up through a
+  short-lived launcher, `sluice daemon reaper --detach` (hidden
+  subcommand; `crate::reaper`, executed through `/proc/self/exe` so it
+  works after `sluice update` replaced the file; own process group, empty
+  environment, cwd `/`, stdin a pipe, stderr the daemon log). The launcher
+  starts `sluice daemon reaper --daemon <daemon pid>` with the same stdin,
+  prints its pid and exits; the daemon waits for the launcher only. The
+  reaper is therefore reparented to init (or the session's subreaper) and
+  is not a descendant of the daemon: it supervises the gates and must
+  outlive the daemon, so it does not belong to the daemon's process tree
+  (the s4 harness counts that tree as "processes the daemon is
+  responsible for", and a reaper inside it survived a cancelled job by
+  design). `DaemonConfig::reaper = None` (tests) disables it.
+- For every job it spawns the daemon writes `+ <pgid> <start ticks>` to
+  the pipe, and `- <pgid>` when the job ended. The write end exists only
+  in the daemon (close-on-exec, never inherited by gates), so the kernel
+  closes it when the daemon exits for any reason, SIGKILL and OOM
+  included.
+- On end of file the reaper SIGTERMs every registered group that
+  `group_is_ours`, waits up to `KILL_GRACE` (5 s), SIGKILLs the rest and
+  exits. After a clean stop the daemon closes the pipe, nothing is
+  registered and the reaper exits at once.
+- Clients waiting on a daemon that died get `sluice: error: the daemon died
+  while running <gate>; it was killed` and exit 143 (`while <gate> was
+  queued; it did not run`, exit 1, when it had not started). Nothing is
+  cached: markers are only written by the daemon after a verdict.
+- If the reaper cannot be started (or dies) the daemon logs a warning and
+  keeps working; reconciliation at the next start still applies.
+
+Choice (recorded for X1). Options considered:
+
+1. `PR_SET_PDEATHSIG` on each gate: it must be set in the child between
+   `fork` and `exec`, i.e. in `CommandExt::pre_exec`, which is `unsafe`
+   (`unsafe_code = "forbid"`). `nix 0.31` (already in the tree) wraps
+   `prctl(PR_SET_PDEATHSIG)` safely, but only for the calling process.
+   It also fires when the *thread* that forked the child exits, not the
+   process: gates are spawned from tokio worker threads, so a retiring
+   thread would kill healthy gates. It covers only the leader, not its
+   descendants, and is cleared by `fork`. Rejected.
+2. A per-gate supervisor (`sluice` wrapper that sets PDEATHSIG on itself
+   and execs or forks the gate): one more process per gate, exit status
+   and signal forwarding to re-implement, and the thread caveat remains.
+   Rejected.
+3. A per-daemon reaper fed through a pipe (chosen): one process per
+   daemon, no `unsafe`, end of file on a pipe is a reliable process-death
+   signal, the whole group (descendants included) is killed, and pid
+   reuse is guarded exactly like reconciliation.
+4. Reconciliation only: gates of a dead daemon would run until the next
+   daemon start. Kept as the fallback, not enough on its own.
+
+Limit: a job spawned in the instant before the daemon dies may be missed
+by the reaper (registered right after the spawn); the next start
+reconciles it. If both the daemon and the reaper are SIGKILLed together
+(`pkill -9 sluice`), only reconciliation remains.
 
 ## Executor
 
@@ -99,6 +169,18 @@ Status: implemented in Phase 2 (`sluice-gate-daemon`, CLI `daemon_cmd`, proto `c
   `<state>/logs/<job-id>.log` (interleaved, 8 KiB chunks) with a header
   line (`# sluice job …`) and footer (`# exit: …`). `log_bytes` is reported
   in `progress`.
+- Unwritable log (read-only `logs/` or state directory; task X1): the gate
+  runs anyway. The output goes to `logfile::JobLog::Memory`, a buffer
+  keeping the last 256 KiB (`MEMORY_LOG_CAP`), which only feeds the `tail`
+  of `done`; `Finished::log_error` carries the error, the daemon logs it
+  and sends it once in `outcome.log_error` (optional field, omitted
+  otherwise), and the client prints it once as `sluice: warning: cannot
+  create …: Permission denied …; the output was kept in memory for the
+  tail only`. The verdict, the marker and the miss record are unaffected
+  (a pass marker is still only written after exit 0). The in-process path
+  does the same with the same type. `sluice exec` spools are still
+  required (the client replays the spool file), so an unwritable spool is
+  a start error.
 - Timeout: `gate.timeout` from the moment the process starts (queue wait
   excluded; `0` disables it). On expiry: `killpg(SIGTERM)`, 5 s grace,
   `killpg(SIGKILL)`, outcome `timeout`. If the leader exits but a
@@ -193,9 +275,12 @@ message naming the file. `totals(since)` filters jobs by `queued_at` and events 
    is omitted if it fails — then `sluice: test running (job <id>)`),
    stream nothing else unless `-v` (then poll the log file every 500 ms),
    print the `done` summary exactly as Phase 1 does, exit with the mapped
-   code. A connection lost after `queued` is final: `sluice: error: lost
-   the connection to the daemon`, exit 1, no fallback (the job may keep
-   running in the daemon). `killed` prints `KILLED after <s>s (job …)` and
+   code. A connection lost after `queued` is final, no fallback: when the
+   connection broke (end of file, I/O error) the daemon died and its reaper
+   kills the gate, so the client prints `sluice: error: the daemon died
+   while running <gate>; it was killed` (exit 143; before `started`:
+   `… while <gate> was queued; it did not run`, exit 1); other errors print
+   `lost the connection to the daemon: <why>`, exit 1. `killed` prints `KILLED after <s>s (job …)` and
    exits 143; a job dropped before it started prints `KILLED before it
    started (job <id>): the daemon stopped`.
 3. If the daemon cannot be reached or started (or refuses before
@@ -222,7 +307,7 @@ message naming the file. `totals(since)` filters jobs by `queued_at` and events 
 ## Properties to test (Phase 2 acceptance)
 
 - Kill the client mid-run with `cancel` policy → gate process group gone within 6 s; with `finish` → marker written.
-- Kill the daemon (SIGKILL) mid-run → next daemon start kills the orphaned group and marks the row `orphaned`; no stale `daemon.lock`/socket blocks the restart.
+- Kill the daemon (SIGKILL) mid-run → the reaper kills every gate group (descendants included) within seconds; the client reports the death as a kill; with the reaper gone too, the next daemon start kills the orphaned group and marks the row `killed`; no stale `daemon.lock`/socket blocks the restart.
 - Timeout → whole group dead, outcome `timeout`, exit 124 at the client.
 - Two daemons cannot run at once (second start exits with a clear message).
 - Client fallback when the socket directory is unwritable.

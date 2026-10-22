@@ -521,6 +521,7 @@ fn follow(
     let queued_at = Instant::now();
     let mut job_id = String::new();
     let mut replay: Option<Replay> = None;
+    let mut started = false;
     let mut msg = Ok(first);
     let result = loop {
         match msg {
@@ -544,6 +545,7 @@ fn follow(
                 }
             }
             Ok(ServerMessage::Started { spool, .. }) => {
+                started = true;
                 shared.set_phase(Phase::Running);
                 if shared.noticed.load(Ordering::SeqCst) {
                     job.info(&format!(
@@ -583,6 +585,10 @@ fn follow(
             }
             signal_code(signo)
         }
+        Err(e) if e.is_disconnect() && started => sluice_error(&format!(
+            "the daemon died while running exec '{}'; it was killed",
+            job.label
+        )),
         Err(e) => sluice_error(&format!("lost the connection to the daemon: {e}")),
     }
 }

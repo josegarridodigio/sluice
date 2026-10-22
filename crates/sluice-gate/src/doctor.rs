@@ -23,6 +23,7 @@ use sluice_gate_core::config::{Gate, REPO_CONFIG_FILE, RepoConfig, UserConfig};
 use sluice_gate_core::dirs;
 use sluice_gate_core::git::{self, EnvMap, RepoPaths};
 use sluice_gate_core::logfile;
+use sluice_gate_core::marker::MarkerStore;
 use sluice_gate_core::scope::{self, PathScope};
 use sluice_gate_core::tree::{self, SnapshotFull, StagedEntries};
 use sluice_gate_daemon::server::LEASE_NAME;
@@ -389,7 +390,34 @@ fn check_daemon(env: &EnvMap) -> Vec<Check> {
         )),
     }
     out.push(check_lease(env, live_pid));
+    out.push(check_database(env));
     out
+}
+
+/// Opens the database read-only, as the daemon would find it: a file the
+/// daemon cannot open (corrupt, foreign schema) is a failure, since the
+/// daemon then cannot start and every gate runs in-process.
+fn check_database(env: &EnvMap) -> Check {
+    let db = dirs::database_path(env);
+    if !db.exists() {
+        return check(
+            "database",
+            Status::Ok,
+            "no database yet (created on first use)",
+        );
+    }
+    match Store::open_read_only(&db) {
+        Ok(_) => check("database", Status::Ok, db.display().to_string()),
+        Err(e) => check(
+            "database",
+            Status::Fail,
+            format!(
+                "the daemon cannot open {}: {e}; move it aside (the daemon creates a fresh one, \
+                 job history is lost)",
+                db.display()
+            ),
+        ),
+    }
 }
 
 /// True while `pid` exists and is not a zombie.
@@ -746,8 +774,10 @@ fn dir_size(dir: &Path) -> (u64, usize) {
     total
 }
 
+/// Size, writability and damaged files of the marker directory.
 fn check_markers(paths: &RepoPaths) -> Check {
-    let dir = paths.common_dir.join("sluice").join("markers");
+    let store = MarkerStore::new(&paths.common_dir);
+    let dir = store.dir().to_path_buf();
     let (bytes, files) = dir_size(&dir);
     let detail = format!(
         "{} file(s), {} KiB in {}",
@@ -755,6 +785,35 @@ fn check_markers(paths: &RepoPaths) -> Check {
         bytes / 1024,
         dir.display()
     );
+    if dir.exists()
+        && let Err(e) = nix::unistd::access(
+            &dir,
+            nix::unistd::AccessFlags::W_OK | nix::unistd::AccessFlags::X_OK,
+        )
+    {
+        return check(
+            "markers",
+            Status::Fail,
+            format!(
+                "{} is not writable ({e}): passes are not cached, every gate runs again",
+                dir.display()
+            ),
+        );
+    }
+    let damaged = store.damaged().unwrap_or_default();
+    if let Some(first) = damaged.first() {
+        return check(
+            "markers",
+            Status::Warn,
+            format!(
+                "{detail}; {} damaged file(s) (corrupt, truncated or under the wrong key), \
+                 first {}: they are ignored and replaced by the next run; \
+                 'sluice cache clear' removes them",
+                damaged.len(),
+                first.display()
+            ),
+        );
+    }
     if bytes > MARKERS_WARN_BYTES {
         check(
             "markers",

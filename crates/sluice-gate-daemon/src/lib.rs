@@ -5,6 +5,7 @@
 //! - [`scheduler`]: pure admission logic (budget, backfill, reservation, coalescing).
 //! - [`psi`]: pressure stall information sampling and the PSI admission gate.
 //! - [`executor`]: runs one gate in a process group with log capture and timeout.
+//! - [`reaper`]: companion process that kills the gate groups when the daemon dies.
 //! - [`server`]: socket listener, protocol handling, subscribers, lifecycle.
 //!
 //! Design: `kb/sluice/design/executor.md`, `scheduler.md`, `protocol.md`,
@@ -13,6 +14,7 @@
 pub mod executor;
 mod meta;
 pub mod psi;
+pub mod reaper;
 pub mod scheduler;
 pub mod server;
 pub mod store;

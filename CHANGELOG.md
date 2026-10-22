@@ -59,6 +59,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A daemon killed by SIGKILL or the OOM killer no longer leaves its gates
+  running: a detached reaper terminates them within seconds, the next
+  daemon start kills any leftover group (also when only a background child
+  survives) and records the jobs as `killed`, and waiting clients see "the
+  daemon died while running <gate>; it was killed" (exit 143).
+- An unwritable logs or state directory no longer stops gates: the output
+  is kept in memory for the failure tail and the error is reported once.
+- `sluice doctor` reports an unwritable markers directory (fail), damaged
+  marker files (warn) and a database the daemon cannot open (fail).
 - The daemon and its clients fall back to `/tmp/sluice-<uid>/daemon.sock`
   (created 0700; refused when it is a symlink, owned by another user or
   group/world writable) when the runtime-dir socket path exceeds the Unix

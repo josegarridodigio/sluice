@@ -159,6 +159,7 @@ fn config(dir: &Path) -> DaemonConfig {
         user: server::UserConfig::default(),
         log: server::LogSettings::default(),
         extensions: Vec::new(),
+        reaper: None,
     }
 }
 

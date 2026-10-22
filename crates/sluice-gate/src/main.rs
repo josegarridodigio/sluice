@@ -334,6 +334,17 @@ enum DaemonCommand {
         #[arg(long)]
         force: bool,
     },
+    /// Internal: the gate reaper started by the daemon (kills the gates of a
+    /// daemon that died).
+    #[command(hide = true)]
+    Reaper {
+        /// Start the reaper in the background and print its pid.
+        #[arg(long)]
+        detach: bool,
+        /// Pid of the daemon the reaper works for (informational, for `ps`).
+        #[arg(long, value_name = "PID")]
+        daemon: Option<u32>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -413,6 +424,10 @@ fn main() -> ExitCode {
             command: Some(DaemonCommand::Restart { debug, force }),
             ..
         } => daemon_cmd::restart(debug, force),
+        Command::Daemon {
+            command: Some(DaemonCommand::Reaper { detach, .. }),
+            ..
+        } => daemon_cmd::reaper(detach),
         Command::Doctor { json, bundle } => doctor::run(&doctor::DoctorArgs { json, bundle }),
         Command::Daemon {
             foreground,

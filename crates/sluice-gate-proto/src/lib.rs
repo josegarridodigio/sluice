@@ -603,6 +603,10 @@ pub struct Outcome {
     /// absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signal: Option<i32>,
+    /// Why the job log could not be written (the output was kept in memory
+    /// for `tail` only); omitted when the log was written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_error: Option<String>,
 }
 
 /// Category of an [`Outcome`].
@@ -1190,6 +1194,7 @@ mod tests {
             coalesced_with: Some("j0".into()),
             message: "ok".into(),
             signal: None,
+            log_error: None,
         }
     }
 

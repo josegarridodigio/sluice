@@ -64,6 +64,20 @@ pub enum ClientError {
     Other(#[from] anyhow::Error),
 }
 
+impl ClientError {
+    /// True when the connection itself broke (end of file or an I/O error),
+    /// which after `queued` means the daemon died: it never closes a
+    /// subscriber's connection before `done`.
+    #[must_use]
+    pub fn is_disconnect(&self) -> bool {
+        match self {
+            Self::Closed => true,
+            Self::Other(e) => e.downcast_ref::<std::io::Error>().is_some(),
+            Self::NotRunning(_) | Self::Daemon(_) => false,
+        }
+    }
+}
+
 /// The final `done` of a `run` request.
 #[derive(Debug, Clone)]
 pub struct RunDone {

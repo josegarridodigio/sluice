@@ -113,6 +113,7 @@ fn config(dir: &Path, budget: u32, policy: LastSubscriberGone) -> DaemonConfig {
         user: server::UserConfig::default(),
         log: sluice_gate_daemon::server::LogSettings::default(),
         extensions: Vec::new(),
+        reaper: None,
     }
 }
 
@@ -899,8 +900,176 @@ async fn orphans_are_reconciled_on_start() {
         .job("orphan-1")
         .unwrap()
         .unwrap();
-    assert_eq!(row.outcome.as_deref(), Some("orphaned"));
+    assert_eq!(row.outcome.as_deref(), Some("killed"));
     assert_eq!(row.state, JobState::Done);
+    d.shutdown().await;
+}
+
+/// A running row of a previous instance whose leader already exited while
+/// a background child of the gate lives on in its process group.
+fn orphan_row(id: &str, pgid: i32, ticks: Option<u64>) -> JobRow {
+    JobRow {
+        id: id.into(),
+        key: None,
+        tree: None,
+        repo: "/r".into(),
+        gate: "g".into(),
+        cmd: "sleep 300 &".into(),
+        weight: 1,
+        caller: "human".into(),
+        session: None,
+        state: JobState::Running,
+        outcome: None,
+        exit_code: None,
+        queued_at: dirs::now_ms(),
+        started_at: Some(dirs::now_ms()),
+        finished_at: None,
+        log_path: None,
+        pgid: Some(pgid),
+        proc_start_ticks: ticks,
+        daemon_instance: "previous-2".into(),
+        subscribers_max: 1,
+        coalesced: 0,
+        marker_written: false,
+    }
+}
+
+/// Live members of process group `pgid` (zombies excluded).
+fn members(pgid: i32) -> Vec<i32> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+        let Ok(member) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(i) = stat.rfind(')') else { continue };
+        let f: Vec<&str> = stat[i + 1..].split_whitespace().collect();
+        if f.first() != Some(&"Z") && f.get(2) == Some(&pgid.to_string().as_str()) {
+            out.push(member);
+        }
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_surviving_group_whose_leader_exited_is_reconciled_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), 1, LastSubscriberGone::Cancel);
+    // The leader forks a child and exits at once: only the child keeps the
+    // group alive, as with a gate that left a background process behind.
+    let mut leader = std::process::Command::new("sh")
+        .args(["-c", "sleep 313.25 & echo started"])
+        .stdout(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let leader_pid = leader.id();
+    let ticks = executor::proc_start_ticks(leader_pid);
+    let pgid = i32::try_from(leader_pid).unwrap();
+    leader.wait().unwrap();
+    wait_for(
+        "the leader to be gone",
+        || executor::proc_start_ticks(leader_pid).is_none(),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(members(pgid).len(), 1, "the background child lives on");
+    // A row whose leader pid now belongs to an unrelated process (pid
+    // reuse) must leave that process alone.
+    let mut unrelated = std::process::Command::new("sleep")
+        .arg("313.5")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let other = i32::try_from(unrelated.id()).unwrap();
+    let other_ticks = executor::proc_start_ticks(unrelated.id()).map(|t| t + 1);
+    {
+        let store = Store::open(&cfg.db_path).unwrap();
+        store
+            .insert_job(&orphan_row("orphan-2", pgid, ticks))
+            .unwrap();
+        store
+            .insert_job(&orphan_row("reused-1", other, other_ticks))
+            .unwrap();
+    }
+    let d = start_in(dir, cfg).await;
+    wait_for(
+        "the background child to die",
+        || members(pgid).is_empty(),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        unrelated.try_wait().unwrap().is_none(),
+        "a reused pid must never be killed"
+    );
+    let store = Store::open_read_only(&d.config.db_path).unwrap();
+    for id in ["orphan-2", "reused-1"] {
+        let row = store.job(id).unwrap().unwrap();
+        assert_eq!(row.state, JobState::Done, "{id}");
+        assert_eq!(row.outcome.as_deref(), Some("killed"), "{id}");
+    }
+    unrelated.kill().unwrap();
+    unrelated.wait().unwrap();
+    d.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unwritable_logs_dir_still_runs_the_gate_with_the_tail_in_memory() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = make_repo();
+    let d = start(2, LastSubscriberGone::Cancel).await;
+    let logs = &d.config.logs_dir;
+    std::fs::create_dir_all(logs).unwrap();
+    std::fs::set_permissions(logs, std::fs::Permissions::from_mode(0o500)).unwrap();
+    if std::fs::write(logs.join("probe"), "").is_ok() {
+        // Root ignores permissions: nothing to prove.
+        std::fs::set_permissions(logs, std::fs::Permissions::from_mode(0o700)).unwrap();
+        d.shutdown().await;
+        return;
+    }
+    let msg = run_msg(
+        &repo,
+        "unlogged",
+        "echo visible-output; echo on-stderr >&2",
+        Some(key(9)),
+        Some(repo.tree.clone()),
+        0,
+    );
+    let (_w, mut r) = d.request(&msg).await;
+    let msgs = until_done(&mut r).await;
+    let Some(ServerMessage::Done { outcome, .. }) = msgs.last() else {
+        panic!("no done: {msgs:?}");
+    };
+    let fail_msg = run_msg(&repo, "unlogged-fail", "echo boom; exit 4", None, None, 0);
+    let (_w2, mut r2) = d.request(&fail_msg).await;
+    let fail_msgs = until_done(&mut r2).await;
+    std::fs::set_permissions(logs, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(outcome.status, OutcomeStatus::Pass, "{outcome:?}");
+    assert!(outcome.marker_written, "a real pass is still cached");
+    let err = outcome
+        .log_error
+        .as_deref()
+        .expect("the log error is reported");
+    assert!(err.contains("Permission denied"), "{err}");
+    assert!(
+        outcome.tail.iter().any(|l| l == "visible-output")
+            && outcome.tail.iter().any(|l| l == "on-stderr"),
+        "{:?}",
+        outcome.tail
+    );
+    let Some(ServerMessage::Done {
+        outcome: failed, ..
+    }) = fail_msgs.last()
+    else {
+        panic!("no done: {fail_msgs:?}");
+    };
+    assert_eq!(failed.status, OutcomeStatus::Fail);
+    assert_eq!(failed.exit_code, Some(4));
+    assert!(!failed.marker_written);
+    assert!(failed.tail.iter().any(|l| l == "boom"), "{:?}", failed.tail);
     d.shutdown().await;
 }
 

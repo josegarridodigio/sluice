@@ -114,6 +114,29 @@ fn is_miss_name(name: &str) -> bool {
     name.ends_with(".miss.json")
 }
 
+/// True when the marker (or miss record, `miss`) at `path` parses and is
+/// recorded under the key `stem` its file is named after. A file of another
+/// format version counts as sound (an upgrade leaves those behind).
+fn is_sound(path: &Path, stem: &str, miss: bool) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    match value.get("format").and_then(serde_json::Value::as_u64) {
+        Some(f) if f == u64::from(CACHE_FORMAT_VERSION) => {}
+        Some(_) => return true,
+        None => return false,
+    }
+    let key = if miss {
+        serde_json::from_value::<MissRecord>(value).map(|m| m.key)
+    } else {
+        serde_json::from_value::<Marker>(value).map(|m| m.key)
+    };
+    key.is_ok_and(|k| k.to_string() == stem)
+}
+
 impl MarkerStore {
     /// Store for the repository whose git common dir is `common_dir`.
     pub fn new(common_dir: &Path) -> Self {
@@ -260,6 +283,29 @@ impl MarkerStore {
                 (is_json && !name.starts_with('.')).then(|| (e.path(), name))
             })
             .collect())
+    }
+
+    /// Marker and miss files that cannot be used: unreadable, not valid JSON
+    /// of their kind (truncated, garbage) or recorded under a key other than
+    /// their file name. Lookups ignore and replace them; `doctor` reports
+    /// them. Files of another format version are not damaged (an upgrade
+    /// leaves them behind). Temporary and foreign files are not inspected.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when the directory cannot be read.
+    pub fn damaged(&self) -> Result<Vec<PathBuf>> {
+        let mut out = Vec::new();
+        for (path, name) in self.entries()? {
+            let miss = is_miss_name(&name);
+            let suffix = if miss { ".miss.json" } else { ".json" };
+            let stem = name.strip_suffix(suffix).unwrap_or(&name);
+            if !is_sound(&path, stem, miss) {
+                out.push(path);
+            }
+        }
+        out.sort();
+        Ok(out)
     }
 
     /// All valid markers, newest first. Corrupt files are skipped.
@@ -471,6 +517,29 @@ mod tests {
             Lookup::Miss(None)
         ));
         assert!(!p.exists());
+    }
+
+    #[test]
+    fn damaged_lists_truncated_garbage_and_misnamed_files() {
+        let (_d, s) = store();
+        s.write(&marker('a', "good")).unwrap();
+        s.write_miss(&miss('b', "good")).unwrap();
+        let mut old = marker('c', "old format");
+        old.format = CACHE_FORMAT_VERSION + 1;
+        s.write(&old).unwrap();
+        assert_eq!(s.damaged().unwrap(), Vec::<PathBuf>::new());
+        let good = fs::read(s.dir().join(format!("{}.json", key('a')))).unwrap();
+        let truncated = s.dir().join(format!("{}.json", key('d')));
+        fs::write(&truncated, &good[..25]).unwrap();
+        let garbage = s.dir().join(format!("{}.miss.json", key('e')));
+        fs::write(&garbage, [0xff_u8; 64]).unwrap();
+        let misnamed = s.dir().join(format!("{}.json", key('f')));
+        fs::write(&misnamed, &good).unwrap();
+        fs::write(s.dir().join(".tmp-1-2"), "half").unwrap();
+        fs::write(s.dir().join("notes.txt"), "stray").unwrap();
+        let mut want = vec![truncated, garbage, misnamed];
+        want.sort();
+        assert_eq!(s.damaged().unwrap(), want);
     }
 
     #[test]

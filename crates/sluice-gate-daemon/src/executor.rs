@@ -19,6 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
+use sluice_gate_core::logfile::{self, JobLog};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::sync::Notify;
@@ -148,7 +149,10 @@ pub struct ExecSpec {
     pub nice: u8,
     /// I/O priority, applied through the `ionice` binary when present.
     pub ionice: Option<IoPriority>,
-    /// Log file; created (with its parent directories) and truncated.
+    /// Log file; created (with its parent directories) and truncated. When
+    /// a gate's log ([`Sink::Log`]) cannot be created the gate runs anyway
+    /// with its output kept in memory for the tail ([`Finished::log_error`]);
+    /// a spool ([`Sink::Spool`]) is required.
     pub log_path: PathBuf,
 }
 
@@ -203,8 +207,25 @@ pub struct Finished {
     pub duration: Duration,
     /// Total bytes written to the log (header and footer included).
     pub log_bytes: u64,
-    /// The log file.
+    /// The log file (absent when [`Finished::log_error`] is set).
     pub log_path: PathBuf,
+    /// Why the log file could not be created; the output was then kept in
+    /// memory (the last [`logfile::MEMORY_LOG_CAP`] bytes) for the tail.
+    pub log_error: Option<String>,
+    /// The in-memory output when the log file could not be created.
+    memory: Option<Vec<u8>>,
+}
+
+impl Finished {
+    /// Last `n` lines of the output: from the log file, or from memory when
+    /// the file could not be created.
+    #[must_use]
+    pub fn tail(&self, n: usize) -> Vec<String> {
+        match &self.memory {
+            Some(bytes) => logfile::last_lines(bytes, n),
+            None => tail_lines(&self.log_path, n),
+        }
+    }
 }
 
 /// Identity of the spawned process, for persistence and orphan reconciliation.
@@ -246,7 +267,8 @@ pub struct Running {
     pumps: Vec<JoinHandle<()>>,
     handle: RunningHandle,
     info: ProcessInfo,
-    log: Arc<Mutex<File>>,
+    log: Arc<Mutex<JobLog>>,
+    log_error: Option<String>,
     sink: Sink,
     log_path: PathBuf,
     started: Instant,
@@ -332,15 +354,18 @@ impl Running {
             );
             write_log(&self.log, &self.handle.bytes, footer.as_bytes());
         }
-        if let Ok(mut file) = self.log.lock() {
-            let _ = file.flush();
-        }
+        let memory = self.log.lock().ok().and_then(|mut log| {
+            let _ = log.flush();
+            log.memory()
+        });
 
         Finished {
             status,
             duration,
             log_bytes: self.handle.log_bytes(),
             log_path: self.log_path,
+            log_error: self.log_error,
+            memory,
         }
     }
 }
@@ -374,20 +399,33 @@ async fn join_all(tasks: Vec<JoinHandle<()>>) {
 /// Priorities are applied right after the spawn through the `renice` and
 /// `ionice` binaries when they are in `PATH` (failures are ignored).
 ///
+/// A gate's log that cannot be created (read-only `logs/` or state
+/// directory) does not stop the gate: its output is kept in memory for the
+/// tail and [`Finished::log_error`] says why.
+///
 /// # Errors
 ///
-/// [`Error::Io`] when the log cannot be created or the process cannot start
+/// [`Error::Io`] when a spool cannot be created or the process cannot start
 /// (for example, a missing working directory).
 pub async fn spawn(spec: ExecSpec) -> Result<Running> {
     let io = |context: String| move |source| Error::Io { context, source };
 
-    if let Some(parent) = spec.log_path.parent() {
-        sluice_gate_core::dirs::create_private_dir(parent)
-            .map_err(io(format!("cannot create {}", parent.display())))?;
+    let (log, log_error) = match spec.sink {
+        Sink::Log => JobLog::create(&spec.log_path),
+        Sink::Spool => {
+            if let Some(parent) = spec.log_path.parent() {
+                sluice_gate_core::dirs::create_private_dir(parent)
+                    .map_err(io(format!("cannot create {}", parent.display())))?;
+            }
+            let file = File::create(&spec.log_path)
+                .map_err(io(format!("cannot create {}", spec.log_path.display())))?;
+            (JobLog::File(file), None)
+        }
+    };
+    if let Some(e) = &log_error {
+        tracing::warn!(job = %spec.job_id, "{e}; the output is kept in memory for the tail");
     }
-    let file = File::create(&spec.log_path)
-        .map_err(io(format!("cannot create {}", spec.log_path.display())))?;
-    let log = Arc::new(Mutex::new(file));
+    let log = Arc::new(Mutex::new(log));
     let bytes = Arc::new(AtomicU64::new(0));
     let mut command = command(&spec, &log, &bytes);
     let mut child = command
@@ -453,6 +491,7 @@ pub async fn spawn(spec: ExecSpec) -> Result<Running> {
             started_at,
         },
         log,
+        log_error,
         sink: spec.sink,
         log_path: spec.log_path,
         started,
@@ -461,7 +500,7 @@ pub async fn spawn(spec: ExecSpec) -> Result<Running> {
 }
 
 /// The command to spawn; writes the log header (gates) or the spool magic.
-fn command(spec: &ExecSpec, log: &Mutex<File>, bytes: &AtomicU64) -> Command {
+fn command(spec: &ExecSpec, log: &Mutex<JobLog>, bytes: &AtomicU64) -> Command {
     let command = match &spec.launch {
         Launch::Shell { cmd, extra } => {
             let header = format!(
@@ -554,7 +593,7 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
 }
 
 /// Appends `data` to the log and adds its length to the byte counter.
-fn write_log(log: &Mutex<File>, bytes: &AtomicU64, data: &[u8]) {
+fn write_log(log: &Mutex<JobLog>, bytes: &AtomicU64, data: &[u8]) {
     if let Ok(mut file) = log.lock()
         && file.write_all(data).is_ok()
     {
@@ -563,7 +602,7 @@ fn write_log(log: &Mutex<File>, bytes: &AtomicU64, data: &[u8]) {
 }
 
 /// Appends one spool record (header and data in one locked write).
-fn write_record(log: &Mutex<File>, bytes: &AtomicU64, stream: u8, data: &[u8]) {
+fn write_record(log: &Mutex<JobLog>, bytes: &AtomicU64, stream: u8, data: &[u8]) {
     let mut record = Vec::with_capacity(spool::HEADER + data.len());
     if spool::write_record(&mut record, stream, data).is_ok() {
         write_log(log, bytes, &record);
@@ -574,7 +613,7 @@ fn write_record(log: &Mutex<File>, bytes: &AtomicU64, stream: u8, data: &[u8]) {
 /// with `framed`, each chunk becomes a spool record of that stream.
 async fn pump<R: AsyncRead + Unpin>(
     mut reader: R,
-    log: Arc<Mutex<File>>,
+    log: Arc<Mutex<JobLog>>,
     bytes: Arc<AtomicU64>,
     framed: Option<u8>,
 ) {
@@ -618,6 +657,44 @@ pub async fn terminate_group(pgid: i32, grace: Duration) {
         tokio::time::sleep(POLL).await;
     }
     kill_group(pgid, Signal::SIGKILL);
+}
+
+/// True when the process group `pgid`, whose leader was recorded with start
+/// ticks `leader_ticks`, still holds processes of that run, so it may be
+/// killed: the leader itself is alive and [`process_matches`], or the leader
+/// is gone but members of the group remain (the kernel never hands out a pid
+/// number while it still names a live process group, so they can only be
+/// the run's descendants). A leader pid that now belongs to another process
+/// (pid reuse) is never matched. Used by the reaper and by the start-up
+/// reconciliation.
+pub fn group_is_ours(pgid: i32, leader_ticks: Option<u64>) -> bool {
+    let Ok(leader) = u32::try_from(pgid) else {
+        return false;
+    };
+    if pgid <= 1 || leader_ticks.is_none() {
+        return false;
+    }
+    match proc_start_ticks(leader) {
+        Some(ticks) => Some(ticks) == leader_ticks,
+        None => group_alive(pgid),
+    }
+}
+
+/// Sends SIGTERM to every group, then SIGKILL after `grace` to those still
+/// alive; blocking (the reaper process has no runtime).
+pub fn terminate_groups_blocking(pgids: &[i32], grace: Duration) {
+    for &pgid in pgids {
+        kill_group(pgid, Signal::SIGTERM);
+    }
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline && pgids.iter().any(|&p| group_alive(p)) {
+        std::thread::sleep(POLL);
+    }
+    for &pgid in pgids {
+        if group_alive(pgid) {
+            kill_group(pgid, Signal::SIGKILL);
+        }
+    }
 }
 
 /// True when `/proc/<pid>` exists and its start ticks equal `expected`

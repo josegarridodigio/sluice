@@ -131,6 +131,7 @@ fn config(dir: &Path, extensions: Vec<Arc<dyn Extension>>) -> DaemonConfig {
         user: UserConfig::default(),
         log: sluice_gate_daemon::server::LogSettings::default(),
         extensions,
+        reaper: None,
     }
 }
 

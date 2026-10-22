@@ -136,7 +136,10 @@ daemon that is stopping or has lost its lease refuses the request before
 an in-process run. A gate killed by a signal Sluice did not send is `fail`
 with `exit_code: null` (`<gate> was terminated by a signal`).
 `outcome` may carry an optional `signal` (number of the signal that killed
-the process; `exec` jobs only, omitted when absent).
+the process; `exec` jobs only, omitted when absent) and an optional
+`log_error` (the job log could not be created, so the output was kept in
+memory and only `tail` has it; omitted when the log was written; an old
+client ignores it). Both are optional fields, the protocol stays 1.
 `killed` is also what every subscriber of a queued job receives when the
 daemon stops (forced or not) or when the job's last subscriber left under
 the `cancel` policy. For a coalesced subscriber `done` carries
@@ -189,7 +192,8 @@ else `budget` when the job does not fit the budget, then `repo-cap`, then
 false both when PSI is disabled in the config and when the kernel offers
 none; `totals.psi_blocked_ms_total` is per daemon instance.
 `totals` are all-time over the database (`since` = oldest job or event);
-`runs` counts every finished job except `orphaned` (so `cached` and
+`runs` counts every finished job except `orphaned` (queued jobs a dead
+daemon left; its running jobs are closed as `killed` and count; `cached` and
 `error` outcomes count), `hits` counts only client `event`s, coalescing is
 credited as `coalesced × run time` on passed jobs, and `wait_ms_total`
 includes jobs still running.

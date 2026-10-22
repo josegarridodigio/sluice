@@ -61,12 +61,38 @@ exist (the runtime directory must be mode 0700); `socket-path`: the socket
 path fits the 107-byte Unix socket limit, or the short fallback is in use
 (see below), or it is too long; the daemon socket answers
 and the daemon runs the installed version (otherwise: `run 'sluice daemon
-restart'`); the lease row matches the live daemon pid; the user config
-parses; inside a repository, `.sluice.toml` parses, a hook in the hooks
-directory (`core.hooksPath` or `.git/hooks`) calls sluice, and the marker
-directory size; the `sluice` found in `PATH` is the binary you are running.
-It exits 1 when any check fails and never uses the network (it does not look
-for new releases; `sluice update --check` does).
+restart'`); the lease row matches the live daemon pid; `database`: the
+daemon's `sluice.db` opens (read-only, as `doctor` reads it) with the
+expected schema, otherwise `fail` with the SQLite error (a daemon that
+cannot open it does not start, and every gate then runs in-process; move
+the file aside and the next daemon creates a fresh one, losing the job
+history); the user config parses; inside a repository, `.sluice.toml`
+parses, a hook in the hooks directory (`core.hooksPath` or `.git/hooks`)
+calls sluice, and `markers`: the marker directory size, `fail` when the
+directory is not writable (passes are then never cached), `warn` with the
+count and the first path when marker or miss files are damaged (truncated,
+not valid JSON, or recorded under a key other than their file name; runs
+ignore and replace them, `sluice cache clear` removes them); the `sluice`
+found in `PATH` is the binary you are running. It exits 1 when any check
+fails and never uses the network (it does not look for new releases;
+`sluice update --check` does).
+
+## Damaged or read-only storage
+
+- A read-only `logs/` (or state) directory never stops a gate: it runs, its
+  output is kept in memory for the failure tail only, and the run prints
+  once `sluice: warning: cannot create <log>: Permission denied (os error
+  13); the output was kept in memory for the tail only`. `sluice logs`
+  has nothing to show for that job.
+- A read-only markers directory: the gate's verdict is returned, the pass
+  says `(not cached: cannot write the marker: …)`, and `doctor` fails the
+  `markers` check.
+- If the daemon is killed (SIGKILL, OOM), its gate reaper (`sluice daemon
+  reaper --daemon <pid>`, started with the daemon) terminates every gate it was running,
+  descendants included, within about 5 s; waiting clients print `the daemon
+  died while running <gate>; it was killed` and exit 143. The next client
+  starts a new daemon, which also kills any gate group a dead daemon left
+  behind and records those jobs as `killed`.
 
 ## Socket path too long
 

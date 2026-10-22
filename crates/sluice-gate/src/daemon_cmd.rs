@@ -1,4 +1,6 @@
-//! `sluice daemon [--foreground]` and `sluice daemon stop [--force]`.
+//! `sluice daemon [--foreground]`, `sluice daemon stop [--force]` and the
+//! hidden `sluice daemon reaper` (the gate reaper the daemon starts, see
+//! `sluice_gate_daemon::reaper`).
 //!
 //! Detaching: without `--foreground` the process calls
 //! `nix::unistd::daemon(true, false)` (fork, `setsid`, stdio to
@@ -29,7 +31,7 @@ use sluice_gate_core::dirs;
 use sluice_gate_core::git::EnvMap;
 use sluice_gate_core::logfile;
 use sluice_gate_daemon::executor::{IoClass, IoPriority};
-use sluice_gate_daemon::server::{self, DaemonConfig, LogSettings};
+use sluice_gate_daemon::server::{self, DaemonConfig, LogSettings, ReaperCommand};
 use sluice_gate_queue::{QueueExtension, QueueOptions};
 
 use crate::run::EXIT_ERROR;
@@ -82,7 +84,50 @@ fn daemon_config(env: &EnvMap, user: &UserConfig, detached: bool) -> Result<Daem
             max_bytes: log_max_bytes(user),
         },
         extensions: vec![Arc::new(QueueExtension::new(QueueOptions::default()))],
+        reaper: Some(reaper_command()),
     })
+}
+
+/// `sluice daemon reaper` through `/proc/self/exe`, so it still starts
+/// after `sluice update` replaced the binary under the running daemon.
+fn self_command(args: &[&str]) -> ReaperCommand {
+    ReaperCommand {
+        program: PathBuf::from("/proc/self/exe"),
+        arg0: "sluice".into(),
+        args: args.iter().map(Into::into).collect(),
+    }
+}
+
+/// What the daemon runs: the intermediate that starts the reaper.
+fn reaper_command() -> ReaperCommand {
+    self_command(&["daemon", "reaper", "--detach"])
+}
+
+/// `sluice daemon reaper [--detach]`: the gate reaper. With `--detach`
+/// (run by the daemon) it starts `sluice daemon reaper --daemon <daemon
+/// pid>` with the same stdin, prints its pid and exits, so the reaper is
+/// reparented away from the daemon's tree. Without it, it reads the
+/// daemon's gate registrations on stdin and, when the daemon is gone (end
+/// of file), terminates the gate process groups it left behind.
+pub fn reaper(detach: bool) -> ExitCode {
+    if detach {
+        let daemon = std::os::unix::process::parent_id().to_string();
+        return match sluice_gate_daemon::reaper::detach(&self_command(&[
+            "daemon", "reaper", "--daemon", &daemon,
+        ])) {
+            Ok(pid) => {
+                println!("{pid}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("sluice: cannot start the gate reaper: {e}");
+                ExitCode::from(EXIT_ERROR)
+            }
+        };
+    }
+    let stdin = std::io::stdin();
+    sluice_gate_daemon::reaper::serve(stdin.lock(), sluice_gate_daemon::executor::KILL_GRACE);
+    ExitCode::SUCCESS
 }
 
 /// The effective log filter: `SLUICE_LOG`, then `[debug] level`, then `info`.

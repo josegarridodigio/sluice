@@ -294,6 +294,7 @@ pub fn daemon_config_with(
             base_env: Some(base_env),
             push_program,
         }))],
+        reaper: None,
     }
 }
 

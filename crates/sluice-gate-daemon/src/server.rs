@@ -60,6 +60,8 @@ use crate::executor::{
     self, ExecSpec, ExecStatus, Finished, IoPriority, Launch, ProcessInfo, RunningHandle, Sink,
 };
 use crate::psi::{self, Admission};
+use crate::reaper::Reaper;
+pub use crate::reaper::ReaperCommand;
 use crate::scheduler::{Enqueued, JobSpec, Scheduler};
 use crate::store::{JobRow, JobState, Store};
 use crate::{Error, Result};
@@ -131,6 +133,9 @@ pub struct DaemonConfig {
     /// Extensions plugged into the daemon (the merge queue); empty for a
     /// plain daemon.
     pub extensions: Vec<Arc<dyn Extension>>,
+    /// The gate reaper to start ([`crate::reaper`]); `None` leaves gates of
+    /// a daemon that dies to the next daemon's start-up reconciliation.
+    pub reaper: Option<ReaperCommand>,
 }
 
 /// How many rotated generations of `daemon.log` are kept (`.1` to `.3`).
@@ -272,6 +277,8 @@ struct Shared {
     extensions: OnceLock<Extensions>,
     /// Connection id counter.
     next_conn: AtomicU64,
+    /// The gate reaper, when it could be started.
+    reaper: Option<Reaper>,
 }
 
 /// Extensions after start-up.
@@ -467,27 +474,66 @@ fn take_lock(path: &Path) -> Result<Flock<File>> {
     })
 }
 
-/// Kills the process groups of running jobs left by a previous instance and
-/// marks their rows `orphaned`.
+/// Reconciles every job row a previous instance left `running` (it died
+/// without finishing them: SIGKILL, OOM, crash): process groups that still
+/// hold processes of the run ([`executor::group_is_ours`], which never
+/// matches a reused pid) are terminated together (SIGTERM, 5 s, SIGKILL),
+/// then the rows are closed as `killed` (queued rows as `orphaned`).
 async fn reconcile_orphans(store: &Mutex<Store>, instance: &str) -> Result<()> {
     let orphans = lock(store).orphans(instance)?;
+    let mut alive = Vec::new();
     for row in &orphans {
         let Some(pgid) = row.pgid else { continue };
-        let Ok(leader) = u32::try_from(pgid) else {
-            continue;
-        };
-        if executor::process_matches(leader, row.proc_start_ticks) {
-            tracing::info!(job = %row.id, pgid, "killing orphaned gate process group");
-            executor::terminate_group(pgid, executor::KILL_GRACE).await;
+        if executor::group_is_ours(pgid, row.proc_start_ticks) {
+            tracing::warn!(job = %row.id, gate = %row.gate, pgid, "killing the surviving process group of a job of a previous daemon");
+            alive.push(pgid);
         } else {
-            tracing::info!(job = %row.id, pgid, "orphaned job is no longer running");
+            tracing::info!(job = %row.id, gate = %row.gate, pgid, "job of a previous daemon is no longer running");
         }
     }
-    let n = lock(store).mark_orphaned(instance, now_ms())?;
-    if n > 0 {
-        tracing::info!("marked {n} job(s) of previous daemons as orphaned");
+    if !alive.is_empty() {
+        tokio::task::spawn_blocking(move || {
+            executor::terminate_groups_blocking(&alive, executor::KILL_GRACE);
+        })
+        .await
+        .map_err(|e| Error::Io {
+            context: "terminating orphaned process groups".to_owned(),
+            source: std::io::Error::other(e),
+        })?;
+    }
+    let (killed, orphaned) = lock(store).close_orphans(instance, now_ms())?;
+    if killed + orphaned > 0 {
+        tracing::info!(
+            "closed {killed} running job(s) of previous daemons as killed and {orphaned} queued one(s) as orphaned"
+        );
     }
     Ok(())
+}
+
+/// Starts the gate reaper of `config`, if any; a failure only costs the
+/// prompt cleanup after a daemon death (reconciliation still runs).
+fn start_reaper(config: &DaemonConfig) -> Option<Reaper> {
+    let cmd = config.reaper.as_ref()?;
+    match Reaper::spawn(cmd) {
+        Ok(r) => {
+            tracing::info!(pid = r.pid(), "gate reaper started");
+            Some(r)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "cannot start the gate reaper ({e}); if this daemon dies, its gates live on \
+                 until the next daemon starts"
+            );
+            None
+        }
+    }
+}
+
+/// Lets the reaper exit (nothing is registered any more).
+fn close_reaper(shared: &Shared) {
+    if let Some(r) = &shared.reaper {
+        r.close();
+    }
 }
 
 /// Rotates `daemon.log` when it exceeds the cap, then points stdout and
@@ -557,6 +603,8 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
         tracing::warn!("orphan reconciliation failed: {e}");
     }
 
+    let reaper = start_reaper(&config);
+
     let (stop, _) = watch::channel(None);
     let (shutting_down, _) = watch::channel(false);
     let sanitised_env = tokio::task::spawn_blocking(sanitised_env)
@@ -578,6 +626,7 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
         sanitised_env,
         extensions: OnceLock::new(),
         next_conn: AtomicU64::new(1),
+        reaper,
         config,
     });
     prune_logs(&shared);
@@ -637,6 +686,7 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
     })
     .await;
     conns.abort_all();
+    close_reaper(&shared);
     tracing::info!(instance = %shared.instance, "daemon stopped");
     Ok(())
 }
@@ -986,6 +1036,9 @@ async fn launch(shared: &Shared, id: &str, spec: ExecSpec) -> Option<Finished> {
     };
     let info = running.info().clone();
     let handle = running.handle();
+    if let Some(r) = &shared.reaper {
+        r.track(info.pgid, info.proc_start_ticks);
+    }
     shared.store("recording the start", |s| {
         s.mark_started(
             id,
@@ -1019,7 +1072,7 @@ async fn launch(shared: &Shared, id: &str, spec: ExecSpec) -> Option<Finished> {
 
     let mut wait = std::pin::pin!(running.wait());
     let mut tick = interval_at(Instant::now() + PROGRESS_EVERY, PROGRESS_EVERY);
-    Some(loop {
+    let finished = loop {
         tokio::select! {
             f = &mut wait => break f,
             _ = tick.tick() => {
@@ -1029,7 +1082,11 @@ async fn launch(shared: &Shared, id: &str, spec: ExecSpec) -> Option<Finished> {
                 });
             }
         }
-    })
+    };
+    if let Some(r) = &shared.reaper {
+        r.untrack(info.pgid);
+    }
+    Some(finished)
 }
 
 /// Runs an `exec` job: its argv with the caller's environment plus
@@ -1299,6 +1356,10 @@ async fn conclude(
         duration_ms: duration_ms(finished.duration),
         log_path: Some(finished.log_path.clone()),
         message,
+        log_error: finished
+            .log_error
+            .as_ref()
+            .map(|e| format!("{e}; the output was kept in memory for the tail only")),
         ..Outcome::default()
     };
     // Queue-only gates (`no_marker`) never write a marker or a miss record.
@@ -1323,8 +1384,7 @@ async fn conclude(
         }
     }
     let tail = shared.config.tail_lines;
-    let log = finished.log_path;
-    outcome.tail = tokio::task::spawn_blocking(move || executor::tail_lines(&log, tail))
+    outcome.tail = tokio::task::spawn_blocking(move || finished.tail(tail))
         .await
         .unwrap_or_default();
     (outcome, exit_code)

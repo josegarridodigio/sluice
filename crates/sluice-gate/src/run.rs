@@ -40,6 +40,7 @@ use sluice_gate_core::agent::{self, Caller};
 use sluice_gate_core::config::HookPolicy;
 use sluice_gate_core::git::{self, EnvMap};
 use sluice_gate_core::key::CacheKey;
+use sluice_gate_core::logfile::{self, JobLog};
 use sluice_gate_core::lookup::{self, Lookup as CacheState, Resolved, RunMaterial};
 use sluice_gate_core::marker::{Lookup, Marker, MissRecord};
 use sluice_gate_core::mode::{CacheMode, cache_mode};
@@ -479,6 +480,7 @@ fn via_daemon(
     }
     let gate = &ctx.gate_name;
     let mut queued = false;
+    let mut started = false;
     let mut follower: Option<LogFollower> = None;
     let result = conn.run(request, |msg| match msg {
         ServerMessage::Queued {
@@ -501,6 +503,7 @@ fn via_daemon(
             eprintln!("sluice: {gate} queued (position {position}{busy}){sharing}");
         }
         ServerMessage::Started { job_id, .. } => {
+            started = true;
             eprintln!("sluice: {gate} running (job {job_id})");
             if args.verbose && follower.is_none() {
                 let path = dirs::logs_dir(&ctx.env).join(format!("{job_id}.log"));
@@ -524,6 +527,15 @@ fn via_daemon(
             Err("the daemon refused or dropped the request".to_owned())
         }
         Err(e) if !queued => Err(e.to_string()),
+        // The daemon died (SIGKILL, OOM, crash): its reaper kills the gate's
+        // process group, so the run is reported as killed, never as a pass.
+        Err(e) if e.is_disconnect() && started => {
+            eprintln!("sluice: error: the daemon died while running {gate}; it was killed");
+            Ok(ExitCode::from(EXIT_KILLED))
+        }
+        Err(e) if e.is_disconnect() => Ok(fail(&format!(
+            "the daemon died while {gate} was queued; it did not run"
+        ))),
         Err(e) => Ok(fail(&format!("lost the connection to the daemon: {e}"))),
     }
 }
@@ -553,6 +565,9 @@ fn report_outcome(
             ctx.gate_name
         );
         return ExitCode::from(EXIT_KILLED);
+    }
+    if let Some(e) = &outcome.log_error {
+        eprintln!("sluice: warning: {e}");
     }
     let finish = match outcome.status {
         OutcomeStatus::Cached => {
@@ -821,6 +836,8 @@ struct Execution {
     duration: Duration,
     log_path: PathBuf,
     job_id: String,
+    /// The output when the log file could not be created (kept in memory).
+    memory_tail: Vec<String>,
 }
 
 /// Runs the gate in-process with output captured to a log file, enforcing the timeout.
@@ -861,19 +878,20 @@ fn execute(ctx: &Context, args: &RunArgs, state: CacheState) -> ExitCode {
             duration: exec.duration,
             job_id: &exec.job_id,
             log_path: &exec.log_path,
-            tail: &[],
+            tail: &exec.memory_tail,
         },
     )
 }
 
 fn spawn_and_wait(ctx: &Context, args: &RunArgs) -> Result<Execution, String> {
-    let logs = dirs::logs_dir(&ctx.env);
-    sluice_gate_core::dirs::create_private_dir(&logs)
-        .map_err(|e| format!("cannot create {}: {e}", logs.display()))?;
     let job_id = dirs::job_id();
-    let log_path = logs.join(format!("{job_id}.log"));
-    let log = File::create(&log_path)
-        .map_err(|e| format!("cannot create {}: {e}", log_path.display()))?;
+    let log_path = dirs::logs_dir(&ctx.env).join(format!("{job_id}.log"));
+    // An unwritable log never stops the gate: the output is kept in memory
+    // for the tail and the error is reported once.
+    let (log, log_error) = JobLog::create(&log_path);
+    if let Some(e) = &log_error {
+        eprintln!("sluice: warning: {e}; the output was kept in memory for the tail only");
+    }
     let log = Arc::new(Mutex::new(log));
     {
         let mut l = log.lock().map_err(|_| "log lock poisoned".to_owned())?;
@@ -956,12 +974,19 @@ fn spawn_and_wait(ctx: &Context, args: &RunArgs) -> Result<Execution, String> {
             if timed_out { " (timed out)" } else { "" }
         );
     }
+    let memory_tail = log
+        .lock()
+        .ok()
+        .and_then(|l| l.memory())
+        .map(|bytes| logfile::last_lines(&bytes, usize::MAX))
+        .unwrap_or_default();
     Ok(Execution {
         exit_code: status.code(),
         timed_out,
         duration,
         log_path,
         job_id,
+        memory_tail,
     })
 }
 
@@ -1007,7 +1032,7 @@ fn kill_tree(root: Pid, signal: Signal) {
 }
 
 /// Copies a child stream into the log (and stderr when verbose).
-fn pump(reader: &mut dyn Read, log: &Mutex<File>, verbose: bool) {
+fn pump(reader: &mut dyn Read, log: &Mutex<JobLog>, verbose: bool) {
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf) {

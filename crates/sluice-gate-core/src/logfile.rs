@@ -1,8 +1,10 @@
 //! Append-only log files with size-based rotation, shared by the CLI
-//! (`client.log`) and the daemon (`daemon.log`).
+//! (`client.log`) and the daemon (`daemon.log`), and [`JobLog`], the
+//! output sink of a gate run.
 
-use std::fs::OpenOptions;
-use std::io::{self, Write as _};
+use std::collections::VecDeque;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// File name prefix of the MCP server logs (`mcp-<pid>.log`).
@@ -90,6 +92,86 @@ pub fn append_line(path: &Path, line: &str) -> io::Result<()> {
     file.write_all(&bytes)
 }
 
+/// Bytes of output a [`JobLog::Memory`] keeps (the most recent ones).
+pub const MEMORY_LOG_CAP: usize = 256 * 1024;
+
+/// Where the output of a gate run goes: its log file or, when the file
+/// cannot be created (read-only `logs/` or state directory), a bounded
+/// in-memory buffer that keeps the last [`MEMORY_LOG_CAP`] bytes for the
+/// tail only. A gate is never refused because its log cannot be written.
+#[derive(Debug)]
+pub enum JobLog {
+    /// The log file.
+    File(File),
+    /// The most recent output, in memory.
+    Memory(VecDeque<u8>),
+}
+
+impl JobLog {
+    /// Creates (truncates) `path`, creating its parent directory (`0700`)
+    /// first. On failure the log falls back to memory and the error is
+    /// returned as a one-line message for the caller to report once.
+    #[must_use]
+    pub fn create(path: &Path) -> (Self, Option<String>) {
+        let opened = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or(Ok(()), |parent| {
+                crate::dirs::create_private_dir(parent)
+                    .map_err(|e| format!("cannot create {}: {e}", parent.display()))
+            })
+            .and_then(|()| {
+                File::create(path).map_err(|e| format!("cannot create {}: {e}", path.display()))
+            });
+        match opened {
+            Ok(file) => (Self::File(file), None),
+            Err(e) => (Self::Memory(VecDeque::new()), Some(e)),
+        }
+    }
+
+    /// The in-memory output (`None` for a file log).
+    #[must_use]
+    pub fn memory(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::File(_) => None,
+            Self::Memory(buf) => Some(buf.iter().copied().collect()),
+        }
+    }
+}
+
+impl Write for JobLog {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::File(file) => file.write(data),
+            Self::Memory(buf) => {
+                let keep = data.len().min(MEMORY_LOG_CAP);
+                buf.extend(&data[data.len() - keep..]);
+                let excess = buf.len().saturating_sub(MEMORY_LOG_CAP);
+                buf.drain(..excess);
+                Ok(data.len())
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::File(file) => file.flush(),
+            Self::Memory(_) => Ok(()),
+        }
+    }
+}
+
+/// The last `n` lines of `bytes` (invalid UTF-8 replaced).
+#[must_use]
+pub fn last_lines(bytes: &[u8], n: usize) -> Vec<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let all: Vec<&str> = text.lines().collect();
+    all[all.len().saturating_sub(n)..]
+        .iter()
+        .map(|l| (*l).to_owned())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +212,29 @@ mod tests {
         assert!(!rotate_if_larger(&log, 0, 1).unwrap());
         assert!(rotate_if_larger(&log, 10, 1).unwrap());
         assert!(generation(&log, 1).exists() && !log.exists());
+    }
+
+    #[test]
+    fn an_unwritable_log_falls_back_to_a_bounded_memory_buffer() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir(&logs).unwrap();
+        std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let (mut log, err) = JobLog::create(&logs.join("1-x.log"));
+        std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let Some(err) = err else {
+            return; // running as root: permissions are not enforced
+        };
+        assert!(err.contains("Permission denied"), "{err}");
+        log.write_all(b"first\n").unwrap();
+        log.write_all(&vec![b'x'; MEMORY_LOG_CAP]).unwrap();
+        log.write_all(b"\nlast line\n").unwrap();
+        let mem = log.memory().unwrap();
+        assert_eq!(mem.len(), MEMORY_LOG_CAP);
+        assert_eq!(last_lines(&mem, 1), vec!["last line".to_owned()]);
+        let (file, err) = JobLog::create(&dir.path().join("ok/2-y.log"));
+        assert!(err.is_none() && file.memory().is_none());
     }
 
     #[test]

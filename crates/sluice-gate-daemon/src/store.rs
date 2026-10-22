@@ -598,18 +598,31 @@ impl Store {
         )
     }
 
-    /// Marks every queued/running job of other instances as done with outcome `orphaned`.
+    /// Closes every job left open by other instances: running ones become
+    /// `killed` (their process group was terminated by the reaper or by the
+    /// start-up reconciliation), queued ones `orphaned` (they never ran).
+    /// Returns `(killed, orphaned)`.
     ///
     /// # Errors
     /// SQLite or busy errors.
-    pub fn mark_orphaned(&self, instance: &str, finished_at: u64) -> Result<usize> {
-        self.conn
+    pub fn close_orphans(&self, instance: &str, finished_at: u64) -> Result<(usize, usize)> {
+        let tx = self.tx()?;
+        let killed = tx
             .execute(
-                "UPDATE jobs SET state = 'done', outcome = 'orphaned', finished_at = ?2 \
-                 WHERE daemon_instance <> ?1 AND state IN ('queued', 'running')",
+                "UPDATE jobs SET state = 'done', outcome = 'killed', finished_at = ?2 \
+                 WHERE daemon_instance <> ?1 AND state = 'running'",
                 params![instance, i(finished_at)],
             )
-            .map_err(db)
+            .map_err(db)?;
+        let orphaned = tx
+            .execute(
+                "UPDATE jobs SET state = 'done', outcome = 'orphaned', finished_at = ?2 \
+                 WHERE daemon_instance <> ?1 AND state = 'queued'",
+                params![instance, i(finished_at)],
+            )
+            .map_err(db)?;
+        tx.commit().map_err(db)?;
+        Ok((killed, orphaned))
     }
 
     // ---- Events and totals ----
@@ -975,7 +988,10 @@ mod tests {
         assert_eq!(o.len(), 1);
         assert_eq!(o[0].id, "a");
         assert_eq!(s.newest_job().unwrap().unwrap().id, "d");
-        assert_eq!(s.mark_orphaned("NEW", 99).unwrap(), 2);
+        assert_eq!(s.close_orphans("NEW", 99).unwrap(), (1, 1));
+        let was_running = s.job("a").unwrap().unwrap();
+        assert_eq!(was_running.state, JobState::Done);
+        assert_eq!(was_running.outcome.as_deref(), Some("killed"));
         let b = s.job("b").unwrap().unwrap();
         assert_eq!(b.state, JobState::Done);
         assert_eq!(b.outcome.as_deref(), Some("orphaned"));
