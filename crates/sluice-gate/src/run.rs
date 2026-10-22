@@ -1,24 +1,27 @@
 //! `sluice run <gate>`: the cache-hit fast path and, on a miss, the gate run.
 //!
-//! Phase 1 behaviour (no daemon yet):
-//!
 //! 1. Resolve the repository, `.sluice.toml`, the gate and the user config.
 //! 2. `SLUICE_DISABLE=1` runs the gate directly with inherited stdio.
 //! 3. Snapshot the working tree, derive the key, look for a marker: a hit
-//!    prints one line and exits 0 without running anything.
+//!    prints one line, sends a best-effort `hit` event to a running daemon
+//!    and exits 0 without running anything (no async runtime involved).
 //! 4. On a miss inside a hook invoked by an agent, apply `agent_hook_policy`
-//!    (`fail-fast` by default). Otherwise wait for a slot of the global
-//!    `flock` semaphore (one slot per budget unit; a gate takes `weight`
-//!    slots, all or nothing) and run the gate.
-//! 5. Output goes to `<state>/logs/<job-id>.log`; the caller gets one line
-//!    on success and the tail of the log on failure.
-//! 6. A pass whose tree is unchanged writes a marker; a pass that modified
-//!    the tree, and any failure, writes a miss record.
+//!    (`fail-fast` by default). `run-unqueued` runs the gate in-process
+//!    right away.
+//! 5. Policy `wait`: send a `run` request to the daemon (started on demand)
+//!    and print its outcome. When the daemon cannot be reached or started,
+//!    fall back to the Phase 1 in-process run under the global `flock`
+//!    semaphore (one slot per budget unit; a gate takes `weight` slots).
+//! 6. Output goes to `<state>/logs/<job-id>.log`; the caller gets one line
+//!    on success and the tail of the log on failure. A pass whose tree is
+//!    unchanged writes a marker; a pass that modified the tree, and any
+//!    failure, writes a miss record (the daemon does the same on its side).
 
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -34,7 +37,11 @@ use sluice_gate_core::mode::{CacheMode, cache_mode};
 use sluice_gate_core::semaphore::{Semaphore, SlotGuard};
 use sluice_gate_core::tree::{self, Snapshot, TreeHash};
 use sluice_gate_core::{CACHE_FORMAT_VERSION, SLUICE_VERSION};
+use sluice_gate_proto::{
+    self as proto, GateSpec, Outcome, OutcomeStatus, RepoInfo, RunRequest, ServerMessage,
+};
 
+use crate::client::{self, ClientError};
 use crate::dirs;
 
 /// Exit code when `agent_hook_policy = "fail-fast"` refuses to run.
@@ -43,6 +50,10 @@ pub const EXIT_FAIL_FAST: u8 = 3;
 pub const EXIT_TIMEOUT: u8 = 124;
 /// Exit code for Sluice's own errors (bad config, no repository, ...).
 pub const EXIT_ERROR: u8 = 1;
+/// Exit code when the gate was killed (128 + SIGTERM).
+pub const EXIT_KILLED: u8 = 143;
+/// Poll period of the log follower used by `-v` on the daemon path.
+const FOLLOW_EVERY: Duration = Duration::from_millis(500);
 
 /// Grace period between SIGTERM and SIGKILL on timeout.
 const KILL_GRACE: Duration = Duration::from_secs(5);
@@ -127,6 +138,16 @@ pub fn run(args: &RunArgs) -> ExitCode {
                 ctx.gate_name,
                 age(&hit.passed_at)
             );
+            if let Ok(socket) = sluice_gate_core::dirs::socket_path(&env)
+                && socket.exists()
+            {
+                client::send_hit_event(
+                    &socket,
+                    &ctx.paths.toplevel,
+                    &ctx.gate_name,
+                    hit.duration_ms,
+                );
+            }
             return ExitCode::SUCCESS;
         }
         Decision::Run(state) => state,
@@ -164,16 +185,281 @@ pub fn run(args: &RunArgs) -> ExitCode {
         return ExitCode::from(EXIT_FAIL_FAST);
     }
 
-    let _slots = if policy == HookPolicy::RunUnqueued {
-        Vec::new()
-    } else {
-        match acquire_budget(&ctx) {
-            Ok(slots) => slots,
-            Err(e) => return fail(&e),
-        }
-    };
+    if policy == HookPolicy::RunUnqueued {
+        return execute(&ctx, args, state);
+    }
 
+    let request = match run_request(&ctx, args, &caller, &state) {
+        Ok(r) => r,
+        Err(e) => return fail(&e),
+    };
+    match via_daemon(&ctx, args, request, &state) {
+        Ok(code) => return code,
+        Err(why) => eprintln!("sluice: daemon unavailable ({why}); running in-process"),
+    }
+    let _slots = match acquire_budget(&ctx) {
+        Ok(slots) => slots,
+        Err(e) => return fail(&e),
+    };
     execute(&ctx, args, state)
+}
+
+/// Builds the daemon `run` request with everything precomputed.
+fn run_request(
+    ctx: &Context,
+    args: &RunArgs,
+    caller: &Caller,
+    state: &CacheState,
+) -> Result<RunRequest, String> {
+    let (key, tree) = match state {
+        CacheState::Miss { tree, key, .. } => (Some(key.clone()), Some(tree.clone())),
+        CacheState::Off(_) => (None, None),
+    };
+    let committed_tree = if tree.is_some() && ctx.hook.as_deref() == Some("pre-commit") {
+        tree::index_tree(&ctx.paths, &ctx.probe_env, &ctx.scratch)
+            .ok()
+            .and_then(|s| s.tree().cloned())
+    } else {
+        None
+    };
+    Ok(RunRequest {
+        repo: RepoInfo {
+            toplevel: ctx.paths.toplevel.clone(),
+            common_dir: ctx.paths.common_dir.clone(),
+            git_dir: ctx.paths.git_dir.clone(),
+        },
+        gate: GateSpec {
+            name: ctx.gate_name.clone(),
+            cmd: ctx.gate.cmd.clone(),
+            weight: ctx.gate.weight,
+            timeout_ms: u64::try_from(ctx.gate.timeout.as_millis()).unwrap_or(u64::MAX),
+            env: ctx.gate.env.clone(),
+            cache: ctx.gate.cache,
+        },
+        key,
+        tree,
+        committed_tree,
+        // Trimmed, not whitespace-collapsed: newlines are significant to `sh -c`.
+        cmd: ctx.gate.cmd.trim().to_owned(),
+        extra: args.extra.clone(),
+        cwd: ctx.paths.toplevel.clone(),
+        child_env: ctx.child_env()?.clone(),
+        probe_env: ctx.probe_env.clone(),
+        caller: match caller {
+            Caller::Agent { .. } => proto::Caller::Agent,
+            Caller::Human => proto::Caller::Human,
+        },
+        session: ctx
+            .env
+            .get("CLAUDE_CODE_SESSION_ID")
+            .filter(|s| !s.is_empty())
+            .cloned(),
+        client_pid: std::process::id(),
+        hook: ctx.hook.clone(),
+    })
+}
+
+/// Copies new bytes of a log file to stderr every 500 ms (`-v` on the daemon path).
+struct LogFollower {
+    stop: Arc<AtomicBool>,
+    thread: thread::JoinHandle<()>,
+}
+
+impl LogFollower {
+    fn start(path: PathBuf) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            let mut offset = 0u64;
+            loop {
+                let last = flag.load(Ordering::Acquire);
+                if let Ok(mut file) = File::open(&path) {
+                    use std::io::Seek as _;
+                    if file.seek(std::io::SeekFrom::Start(offset)).is_ok() {
+                        let mut buf = Vec::new();
+                        if file.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+                            offset += buf.len() as u64;
+                            let _ = std::io::stderr().write_all(&buf);
+                        }
+                    }
+                }
+                if last {
+                    return;
+                }
+                thread::park_timeout(FOLLOW_EVERY);
+            }
+        });
+        Self { stop, thread }
+    }
+
+    fn finish(self) {
+        self.stop.store(true, Ordering::Release);
+        self.thread.thread().unpark();
+        let _ = self.thread.join();
+    }
+}
+
+/// Runs the gate through the daemon. `Err` carries why the daemon could
+/// not be used before the request was queued (the caller falls back to
+/// the in-process run); once queued, every result is final.
+fn via_daemon(
+    ctx: &Context,
+    args: &RunArgs,
+    request: RunRequest,
+    state: &CacheState,
+) -> Result<ExitCode, String> {
+    let socket = client::ensure_daemon(&ctx.env).map_err(|e| format!("{e:#}"))?;
+    let conn = client::connect(&socket).map_err(|e| e.to_string())?;
+    let gate = &ctx.gate_name;
+    let mut queued = false;
+    let mut follower: Option<LogFollower> = None;
+    let result = conn.run(request, |msg| match msg {
+        ServerMessage::Queued {
+            job_id,
+            position,
+            coalesced,
+            ..
+        } if !queued => {
+            queued = true;
+            let busy = client::connect(&socket)
+                .and_then(client::Client::status)
+                .map(|s| format!(", {} of {} units busy", s.budget.used, s.budget.total))
+                .unwrap_or_default();
+            let sharing = if *coalesced {
+                format!(", sharing job {job_id}")
+            } else {
+                String::new()
+            };
+            eprintln!("sluice: {gate} queued (position {position}{busy}){sharing}");
+        }
+        ServerMessage::Started { job_id, .. } => {
+            eprintln!("sluice: {gate} running (job {job_id})");
+            if args.verbose && follower.is_none() {
+                let path = dirs::logs_dir(&ctx.env).join(format!("{job_id}.log"));
+                follower = Some(LogFollower::start(path));
+            }
+        }
+        _ => {}
+    });
+    if let Some(f) = follower {
+        f.finish();
+    }
+    match result {
+        Ok(outcome) => Ok(report_outcome(ctx, state, &outcome)),
+        Err(ClientError::Closed | ClientError::Daemon(_)) if !queued => {
+            Err("the daemon refused or dropped the request".to_owned())
+        }
+        Err(e) if !queued => Err(e.to_string()),
+        Err(e) => Ok(fail(&format!("lost the connection to the daemon: {e}"))),
+    }
+}
+
+/// Prints a daemon outcome exactly as the in-process path would.
+fn report_outcome(ctx: &Context, state: &CacheState, outcome: &Outcome) -> ExitCode {
+    let job_id = outcome
+        .coalesced_with
+        .clone()
+        .or_else(|| {
+            outcome
+                .log_path
+                .as_ref()
+                .and_then(|p| p.file_stem())
+                .map(|s| s.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
+    let finish = match outcome.status {
+        OutcomeStatus::Cached => {
+            let passed = match state {
+                CacheState::Miss { key, .. } => match ctx.store.lookup(key, ctx.ttl) {
+                    Ok(Lookup::Hit(m)) => format!(", passed {} ago", age(&m.passed_at)),
+                    _ => String::new(),
+                },
+                CacheState::Off(_) => String::new(),
+            };
+            println!("sluice: {} PASS (cached{passed})", ctx.gate_name);
+            return ExitCode::SUCCESS;
+        }
+        OutcomeStatus::Error => return fail(&outcome.message),
+        OutcomeStatus::Pass => Finish::Pass {
+            note: match (state, &outcome.not_cached_reason) {
+                (CacheState::Off(reason), _) | (_, Some(reason)) => {
+                    format!(" (not cached: {reason})")
+                }
+                _ => String::new(),
+            },
+        },
+        OutcomeStatus::Fail => Finish::Fail,
+        OutcomeStatus::Timeout => Finish::Timeout,
+        OutcomeStatus::Killed => Finish::Killed,
+    };
+    report(
+        ctx,
+        &Report {
+            finish,
+            exit_code: outcome.exit_code,
+            duration: Duration::from_millis(outcome.duration_ms),
+            job_id: &job_id,
+            log_path: outcome.log_path.as_deref().unwrap_or(Path::new("-")),
+            tail: &outcome.tail,
+        },
+    )
+}
+
+/// How a gate run ended, for [`report`].
+enum Finish {
+    /// Exit 0; `note` is empty or ` (not cached: …)`.
+    Pass { note: String },
+    /// Non-zero exit or death by signal.
+    Fail,
+    /// Timeout exceeded.
+    Timeout,
+    /// Killed by Sluice (forced stop).
+    Killed,
+}
+
+/// Everything the summary lines need, from either execution path.
+struct Report<'a> {
+    finish: Finish,
+    exit_code: Option<i32>,
+    duration: Duration,
+    job_id: &'a str,
+    log_path: &'a Path,
+    /// Tail sent by the daemon, used when the log file cannot be read.
+    tail: &'a [String],
+}
+
+/// Prints the Phase 1 summary (and tail) of a run and returns its exit code.
+fn report(ctx: &Context, r: &Report<'_>) -> ExitCode {
+    let gate = &ctx.gate_name;
+    let secs = r.duration.as_secs_f64();
+    let (job, log) = (r.job_id, r.log_path.display());
+    match &r.finish {
+        Finish::Pass { note } => {
+            println!("sluice: {gate} PASS {secs:.1}s (job {job}){note}");
+            ExitCode::SUCCESS
+        }
+        Finish::Timeout => {
+            eprintln!(
+                "sluice: {gate} TIMEOUT after {} (job {job}) log={log}",
+                humantime::format_duration(ctx.gate.timeout)
+            );
+            print_tail_or(r.log_path, ctx.tail_lines, r.tail);
+            ExitCode::from(EXIT_TIMEOUT)
+        }
+        Finish::Killed => {
+            eprintln!("sluice: {gate} KILLED after {secs:.1}s (job {job}) log={log}");
+            print_tail_or(r.log_path, ctx.tail_lines, r.tail);
+            ExitCode::from(EXIT_KILLED)
+        }
+        Finish::Fail => {
+            let code = r
+                .exit_code
+                .map_or_else(|| "signal".to_owned(), |c| c.to_string());
+            eprintln!("sluice: {gate} FAIL exit={code} {secs:.1}s (job {job}) log={log}");
+            print_tail_or(r.log_path, ctx.tail_lines, r.tail);
+            exit_code_of(r.exit_code)
+        }
+    }
 }
 
 fn fail(message: &str) -> ExitCode {
@@ -448,7 +734,7 @@ fn run_inline(ctx: &Context, extra: &[String]) -> ExitCode {
 fn exit_code_of(code: Option<i32>) -> ExitCode {
     match code {
         Some(c) => ExitCode::from(u8::try_from(c & 0xff).unwrap_or(1)),
-        None => ExitCode::from(128 + 15),
+        None => ExitCode::from(EXIT_KILLED),
     }
 }
 
@@ -461,56 +747,45 @@ struct Execution {
     job_id: String,
 }
 
-/// Runs the gate with output captured to a log file, enforcing the timeout.
+/// Runs the gate in-process with output captured to a log file, enforcing the timeout.
 fn execute(ctx: &Context, args: &RunArgs, state: CacheState) -> ExitCode {
     let exec = match spawn_and_wait(ctx, args) {
         Ok(exec) => exec,
         Err(e) => return fail(&e),
     };
-    let secs = exec.duration.as_secs_f64();
-    let gate = &ctx.gate_name;
-
-    if exec.timed_out {
+    let finish = if exec.timed_out {
         if let CacheState::Miss { key, .. } = &state {
             record_miss(ctx, key, None, "timed out", &exec);
         }
-        eprintln!(
-            "sluice: {gate} TIMEOUT after {} (job {}) log={}",
-            humantime::format_duration(ctx.gate.timeout),
-            exec.job_id,
-            exec.log_path.display()
-        );
-        print_tail(&exec.log_path, ctx.tail_lines);
-        return ExitCode::from(EXIT_TIMEOUT);
-    }
-
-    if exec.exit_code != Some(0) {
+        Finish::Timeout
+    } else if exec.exit_code != Some(0) {
         if let CacheState::Miss { key, .. } = &state {
             record_miss(ctx, key, exec.exit_code, "gate failed", &exec);
         }
-        let code = exec
-            .exit_code
-            .map_or_else(|| "signal".to_owned(), |c| c.to_string());
-        eprintln!(
-            "sluice: {gate} FAIL exit={code} {secs:.1}s (job {}) log={}",
-            exec.job_id,
-            exec.log_path.display()
-        );
-        print_tail(&exec.log_path, ctx.tail_lines);
-        return exit_code_of(exec.exit_code);
-    }
-
-    let note = match state {
-        CacheState::Off(reason) => format!(" (not cached: {reason})"),
-        CacheState::Miss { tree, key, cmd, .. } => {
-            match write_marker(ctx, &tree, &key, &cmd, &exec) {
-                Ok(()) => String::new(),
-                Err(reason) => format!(" (not cached: {reason})"),
+        Finish::Fail
+    } else {
+        let note = match state {
+            CacheState::Off(reason) => format!(" (not cached: {reason})"),
+            CacheState::Miss { tree, key, cmd, .. } => {
+                match write_marker(ctx, &tree, &key, &cmd, &exec) {
+                    Ok(()) => String::new(),
+                    Err(reason) => format!(" (not cached: {reason})"),
+                }
             }
-        }
+        };
+        Finish::Pass { note }
     };
-    println!("sluice: {gate} PASS {secs:.1}s (job {}){note}", exec.job_id);
-    ExitCode::SUCCESS
+    report(
+        ctx,
+        &Report {
+            finish,
+            exit_code: exec.exit_code,
+            duration: exec.duration,
+            job_id: &exec.job_id,
+            log_path: &exec.log_path,
+            tail: &[],
+        },
+    )
 }
 
 fn spawn_and_wait(ctx: &Context, args: &RunArgs) -> Result<Execution, String> {
@@ -731,13 +1006,17 @@ fn record_miss(
     }
 }
 
-/// Prints the last `lines` lines of the log to stderr.
-pub fn print_tail(path: &Path, lines: usize) {
-    let Ok(file) = File::open(path) else { return };
+/// Prints the last `lines` lines of the log to stderr; `fallback` (the
+/// daemon's tail) is used when the log file cannot be read.
+fn print_tail_or(path: &Path, lines: usize, fallback: &[String]) {
+    let all: Vec<String> = match File::open(path) {
+        Ok(file) => BufReader::new(file).lines().map_while(Result::ok).collect(),
+        Err(_) if !fallback.is_empty() => fallback.to_vec(),
+        Err(_) => return,
+    };
     // Skip Sluice's own framing lines so the tail shows what the gate printed.
-    let mut all: Vec<String> = BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
+    let mut all: Vec<String> = all
+        .into_iter()
         .filter(|l| {
             !(l.starts_with("# sluice job ")
                 || l.starts_with("# command: ")

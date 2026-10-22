@@ -193,11 +193,42 @@ timeout = "1s"
         })
     }
 
+    /// Socket of this sandbox's daemon.
+    pub fn socket(&self) -> PathBuf {
+        self.home.join("runtime/sluice/daemon.sock")
+    }
+
+    /// Runs `sluice status --json` and parses it.
+    pub fn status_json(&self) -> serde_json::Value {
+        let out = self
+            .sluice()
+            .args(["status", "--json"])
+            .output()
+            .expect("status");
+        assert!(out.status.success(), "status failed: {out:?}");
+        serde_json::from_slice(&out.stdout).expect("status --json is JSON")
+    }
+
     pub fn miss_count(&self) -> usize {
         fs::read_dir(self.markers_dir()).map_or(0, |d| {
             d.filter_map(Result::ok)
                 .filter(|e| e.file_name().to_string_lossy().ends_with(".miss.json"))
                 .count()
         })
+    }
+}
+
+/// Stops the daemon a test may have started, so none outlives the test
+/// (and none keeps files open in the temporary directory).
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        if self.socket().exists() {
+            let _ = StdCommand::new(Self::binary())
+                .args(["daemon", "stop", "--force"])
+                .current_dir(&self.home)
+                .env_clear()
+                .envs(self.env())
+                .output();
+        }
     }
 }

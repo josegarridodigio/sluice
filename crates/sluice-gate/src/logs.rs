@@ -1,11 +1,18 @@
 //! `sluice logs [<job-id>] [-n <lines>]`: print a job log.
+//!
+//! The daemon is asked first (it knows every job it ran); without a daemon,
+//! or for a job it does not know (in-process fallback runs), the log
+//! directory is scanned as in Phase 1.
 
 use std::fs;
 use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use sluice_gate_core::dirs as core_dirs;
 use sluice_gate_core::git::EnvMap;
 
+use crate::client;
 use crate::dirs;
 use crate::run::EXIT_ERROR;
 
@@ -13,6 +20,12 @@ use crate::run::EXIT_ERROR;
 /// With `lines`, only the last that many lines.
 pub fn show(job_id: Option<&str>, lines: Option<usize>) -> ExitCode {
     let env: EnvMap = std::env::vars().collect();
+    if let Some((path, tail)) = from_daemon(&env, job_id, lines) {
+        // Without `-n` the whole file is printed; the daemon only sends a tail.
+        let all = read_lines(&path).unwrap_or(tail);
+        print_lines(&path, &all, lines);
+        return ExitCode::SUCCESS;
+    }
     let dir = dirs::logs_dir(&env);
     let path = if let Some(id) = job_id {
         dir.join(format!("{id}.log"))
@@ -31,18 +44,41 @@ pub fn show(job_id: Option<&str>, lines: Option<usize>) -> ExitCode {
         };
         newest
     };
-    let file = match fs::File::open(&path) {
-        Ok(f) => f,
+    match read_lines(&path) {
+        Ok(all) => {
+            print_lines(&path, &all, lines);
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("sluice: cannot open {}: {e}", path.display());
-            return ExitCode::from(EXIT_ERROR);
+            ExitCode::from(EXIT_ERROR)
         }
-    };
-    let all: Vec<String> = BufReader::new(file).lines().map_while(Result::ok).collect();
+    }
+}
+
+/// Asks a running daemon (never starts one) for the job's log.
+fn from_daemon(
+    env: &EnvMap,
+    job_id: Option<&str>,
+    lines: Option<usize>,
+) -> Option<(PathBuf, Vec<String>)> {
+    let socket = core_dirs::socket_path(env).ok()?;
+    if !socket.exists() {
+        return None;
+    }
+    let client = client::connect(&socket).ok()?;
+    client.logs(job_id, lines.unwrap_or(0)).ok()
+}
+
+fn read_lines(path: &Path) -> std::io::Result<Vec<String>> {
+    let file = fs::File::open(path)?;
+    Ok(BufReader::new(file).lines().map_while(Result::ok).collect())
+}
+
+fn print_lines(path: &Path, all: &[String], lines: Option<usize>) {
     let start = lines.map_or(0, |n| all.len().saturating_sub(n));
     eprintln!("# {}", path.display());
     for line in &all[start..] {
         println!("{line}");
     }
-    ExitCode::SUCCESS
 }

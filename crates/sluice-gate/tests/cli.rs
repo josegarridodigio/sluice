@@ -33,7 +33,7 @@ fn version_prints_crate_version() {
 #[test]
 fn unimplemented_command_exits_with_70() {
     sluice()
-        .args(["daemon"])
+        .args(["mcp"])
         .assert()
         .code(70)
         .stderr(predicate::str::contains("not implemented"));

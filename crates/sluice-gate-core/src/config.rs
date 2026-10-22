@@ -345,6 +345,8 @@ pub struct UserConfig {
     pub cache: CacheConfig,
     /// Agent detection settings.
     pub agent_detection: AgentDetectionConfig,
+    /// Scheduler settings.
+    pub scheduler: SchedulerConfig,
     /// Per-repository overrides keyed by repository path.
     pub repos: BTreeMap<PathBuf, RepoOverride>,
 }
@@ -405,6 +407,24 @@ pub struct AgentDetectionConfig {
     pub env_any_equals: BTreeMap<String, String>,
 }
 
+/// The `[scheduler]` table.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SchedulerConfig {
+    /// Once the head of the queue has waited this long, nothing behind it
+    /// starts until it does (head-of-line reservation).
+    #[serde(with = "humantime_serde")]
+    pub head_reserve_after: Duration,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            head_reserve_after: Duration::from_secs(30),
+        }
+    }
+}
+
 /// A `[repos."<path>"]` table.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -422,6 +442,7 @@ impl Default for UserConfig {
             admission: AdmissionConfig::default(),
             cache: CacheConfig::default(),
             agent_detection: AgentDetectionConfig::default(),
+            scheduler: SchedulerConfig::default(),
             repos: BTreeMap::new(),
         }
     }
@@ -864,6 +885,25 @@ budget_share_max = 4
         assert!(user_err("version = 1\n[daemon]\nbudget = 0").contains("daemon.budget"));
         assert!(user_err("version = 1\n[daemon]\nbogus = 1").contains("bogus"));
         assert!(user_err("version = 3").contains("version"));
+    }
+
+    #[test]
+    fn scheduler_table() {
+        let c = UserConfig::default();
+        assert_eq!(c.scheduler.head_reserve_after, Duration::from_secs(30));
+        let c = UserConfig::parse(
+            "version = 1\n[scheduler]\nhead_reserve_after = \"2m\"",
+            Path::new("/u.toml"),
+        )
+        .unwrap();
+        assert_eq!(c.scheduler.head_reserve_after, Duration::from_mins(2));
+        assert!(user_err("version = 1\n[scheduler]\nbogus = 1").contains("bogus"));
+        assert!(
+            user_err("version = 1\n[scheduler]\nhead_reserve_after = \"soon\"")
+                .contains("head_reserve_after")
+                || user_err("version = 1\n[scheduler]\nhead_reserve_after = \"soon\"")
+                    .contains("duration")
+        );
     }
 
     #[test]

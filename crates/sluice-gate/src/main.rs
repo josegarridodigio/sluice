@@ -2,8 +2,7 @@
 //!
 //! One binary, several modes: thin client for hooks and terminals
 //! (`sluice run`), MCP server for agents (`sluice mcp`), and the daemon
-//! itself (`sluice daemon`). Phase 1 implements the cache-only commands;
-//! `mcp`, `daemon` and `status` arrive with Phases 2 and 3.
+//! itself (`sluice daemon`). `mcp` arrives with Phase 3.
 
 use std::fs;
 use std::path::Path;
@@ -13,10 +12,13 @@ use clap::{Parser, Subcommand};
 use sluice_gate_core::config::{REPO_CONFIG_FILE, RepoConfig, starter_repo_config};
 
 mod cache;
+mod client;
+mod daemon_cmd;
 mod dirs;
 mod logs;
 mod run;
 mod snippets;
+mod status;
 
 use snippets::{HookManager, snippet};
 
@@ -31,16 +33,19 @@ const EXIT_NOT_IMPLEMENTED: u8 = 70;
     long_about = "Sluice runs named gates (tests, linters, type checks) under a global \
                   concurrency budget and caches results per git tree so each tree is verified \
                   once. Git hooks call `sluice run`; agents will call the MCP server started by \
-                  `sluice mcp` once Phase 3 lands.\n\n\
-                  Phase 1 ships `run`, `cache`, `init`, `hook print` and `logs`; `daemon` and \
-                  `status` (Phase 2) and `mcp` (Phase 3) exit 70 until then.\n\n\
+                  `sluice mcp` once Phase 3 lands (it exits 70 until then).\n\n\
+                  On a cache miss `sluice run` hands the gate to the per-user daemon \
+                  (`sluice daemon`), starting it on demand; when the daemon cannot be reached \
+                  or started the gate runs in-process. `sluice status` shows the queue.\n\n\
                   Exit codes of `sluice run`: 0 pass or cache hit; the gate's own code on \
                   failure; 3 refused by agent_hook_policy = \"fail-fast\"; 124 gate timeout; \
-                  143 gate killed by a signal; 1 Sluice error; 2 usage error.\n\n\
+                  143 gate killed (signal or `sluice daemon stop --force`); 1 Sluice error; \
+                  2 usage error.\n\n\
                   Environment: SLUICE_DISABLE=1 runs the gate directly (no cache, no queue); \
                   SLUICE_CACHE=0|1 forces the cache off or on (on overrides CI); CI disables \
                   the cache; SLUICE_AGENT=1|0 forces agent or human detection; SLUICE_CONFIG \
-                  points at the user config."
+                  points at the user config; SLUICE_SOCKET overrides the daemon socket path; \
+                  SLUICE_LOG sets the daemon's log filter (default info)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -49,7 +54,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run a gate: cache hit in milliseconds, otherwise run it under the concurrency budget.
+    /// Run a gate: cache hit in milliseconds, otherwise queue it in the daemon under the budget.
     Run {
         /// Gate name as defined in `.sluice.toml`.
         gate: String,
@@ -69,9 +74,15 @@ enum Command {
     },
     /// Start the MCP stdio server (spawned by the coding agent).
     Mcp,
-    /// Run the per-user daemon in the foreground.
-    Daemon,
-    /// Show queue, in-flight jobs and cache statistics.
+    /// Start the per-user daemon (detached unless --foreground), or stop it.
+    Daemon {
+        /// Stay attached to the terminal instead of detaching.
+        #[arg(long)]
+        foreground: bool,
+        #[command(subcommand)]
+        command: Option<DaemonCommand>,
+    },
+    /// Show the daemon, budget, running and queued jobs, and totals.
     Status {
         /// Print machine-readable JSON instead of text.
         #[arg(long)]
@@ -100,6 +111,16 @@ enum Command {
         /// Only print the last N lines.
         #[arg(short = 'n', long)]
         lines: Option<usize>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonCommand {
+    /// Ask the running daemon to stop (queued jobs are dropped, running jobs finish).
+    Stop {
+        /// Kill running jobs instead of letting them finish.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -156,8 +177,15 @@ fn main() -> ExitCode {
         } => hook_print(manager),
         Command::Logs { job_id, lines } => logs::show(job_id.as_deref(), lines),
         Command::Mcp => not_implemented("mcp"),
-        Command::Daemon => not_implemented("daemon"),
-        Command::Status { .. } => not_implemented("status"),
+        Command::Daemon {
+            command: Some(DaemonCommand::Stop { force }),
+            ..
+        } => daemon_cmd::stop(force),
+        Command::Daemon {
+            foreground,
+            command: None,
+        } => daemon_cmd::start(foreground),
+        Command::Status { json } => status::show(json),
     }
 }
 
