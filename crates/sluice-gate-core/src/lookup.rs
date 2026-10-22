@@ -176,7 +176,7 @@ impl Lookup {
 ///
 /// [`CacheMode::Bypass`] is treated like a disabled cache; callers handle
 /// bypass before calling this.
-pub fn lookup(r: &Resolved, mode: &CacheMode) -> Lookup {
+pub fn lookup(r: &Resolved, mode: &CacheMode, extra: &[String]) -> Lookup {
     match mode {
         CacheMode::Disabled { reason } => {
             return Lookup::off(reason.clone(), Some(format!("cache disabled ({reason})")));
@@ -207,7 +207,7 @@ pub fn lookup(r: &Resolved, mode: &CacheMode) -> Lookup {
             );
         }
     };
-    let (cmd, key) = match derive_key(r, &tree) {
+    let (cmd, key) = match derive_key(r, &tree, extra) {
         Ok(v) => v,
         Err(e) => {
             return Lookup::off(
@@ -267,13 +267,23 @@ pub fn child_env(r: &Resolved) -> Result<EnvMap> {
     r.child_env().cloned()
 }
 
-/// Derives the cache key of the gate for `tree`; returns the normalised
-/// command as well.
+/// The command that identifies a call: `normalize_cmd(gate.cmd)` followed,
+/// when `extra` is not empty, by one space and the extra arguments joined by
+/// single spaces. An argument is wrapped in single quotes (inner `'` written
+/// as `'\''`) only when it is empty or contains whitespace or quotes, so the
+/// result is deterministic and calls with different arguments never share a
+/// key. This string feeds the cache key and is stored in the marker.
+pub fn key_command(gate: &Gate, extra: &[String]) -> String {
+    crate::key::command_with_args(&gate.normalized_cmd(), extra)
+}
+
+/// Derives the cache key of the gate for `tree` and the extra arguments of
+/// the call; returns the key command ([`key_command`]) as well.
 ///
 /// # Errors
 ///
 /// When a `key_inputs` command or a `key_files` entry cannot be read.
-pub fn derive_key(r: &Resolved, tree: &TreeHash) -> Result<(String, CacheKey)> {
+pub fn derive_key(r: &Resolved, tree: &TreeHash, extra: &[String]) -> Result<(String, CacheKey)> {
     let (key_inputs, key_files) = if r.gate.key_inputs.is_empty() && r.gate.key_files.is_empty() {
         (Vec::new(), Vec::new())
     } else {
@@ -284,7 +294,7 @@ pub fn derive_key(r: &Resolved, tree: &TreeHash) -> Result<(String, CacheKey)> {
             r.child_env()?,
         )?
     };
-    let cmd = r.gate.normalized_cmd();
+    let cmd = key_command(&r.gate, extra);
     let material = KeyMaterial {
         tree: tree.clone(),
         gate_name: r.gate_name.clone(),
@@ -404,7 +414,7 @@ mod tests {
             repo("[gates.t]\ncmd = \"true\"\n[gates.n]\ncmd = \"true\"\ncache = false\n");
         let cwd = tmp.path().join("r");
         let r = resolve(&cwd, &env, "t", &CacheMode::Enabled).unwrap();
-        let Lookup::Miss { tree, key, cmd, .. } = lookup(&r, &CacheMode::Enabled) else {
+        let Lookup::Miss { tree, key, cmd, .. } = lookup(&r, &CacheMode::Enabled, &[]) else {
             panic!("expected a miss");
         };
         r.store
@@ -422,24 +432,43 @@ mod tests {
                 committed_tree: None,
             })
             .unwrap();
-        assert!(matches!(lookup(&r, &CacheMode::Enabled), Lookup::Hit(_)));
+        assert!(matches!(
+            lookup(&r, &CacheMode::Enabled, &[]),
+            Lookup::Hit(_)
+        ));
 
         let disabled = CacheMode::Disabled {
             reason: "CI is set".into(),
         };
-        let Lookup::Off { reason, notice } = lookup(&r, &disabled) else {
+        let Lookup::Off { reason, notice } = lookup(&r, &disabled, &[]) else {
             panic!("expected off");
         };
         assert_eq!(reason, "CI is set");
         assert_eq!(notice.as_deref(), Some("cache disabled (CI is set)"));
 
         let n = resolve(&cwd, &env, "n", &CacheMode::Enabled).unwrap();
-        let state = lookup(&n, &CacheMode::Enabled);
+        let state = lookup(&n, &CacheMode::Enabled, &[]);
         assert!(matches!(&state, Lookup::Off { notice: None, .. }));
         let m = run_material(&n, &state, &["-x".into()], Some("pre-commit")).unwrap();
         assert!(m.key.is_none() && m.committed_tree.is_none());
         assert_eq!(m.extra, vec!["-x".to_owned()]);
 
         assert!(resolve(&cwd, &env, "nope", &CacheMode::Enabled).is_err());
+    }
+
+    #[test]
+    fn extra_arguments_change_the_key_command() {
+        let (tmp, env) = repo("[gates.t]\ncmd = \"cargo  test\"\n");
+        let r = resolve(&tmp.path().join("r"), &env, "t", &CacheMode::Enabled).unwrap();
+        let k = |a: &[&str]| {
+            let a: Vec<String> = a.iter().map(|s| (*s).to_owned()).collect();
+            key_command(&r.gate, &a)
+        };
+        assert_eq!(k(&[]), "cargo test");
+        assert_eq!(
+            k(&["a", "b c", "", "it's"]),
+            "cargo test a 'b c' '' 'it'\\''s'"
+        );
+        assert_ne!(k(&["a"]), k(&["b"]));
     }
 }

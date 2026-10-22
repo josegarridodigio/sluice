@@ -43,7 +43,7 @@ pub fn status(all: bool) -> ExitCode {
                 }
                 let line = match repo
                     .select(name)
-                    .and_then(|r| lookup::derive_key(&r, &tree))
+                    .and_then(|r| lookup::derive_key(&r, &tree, &[]))
                 {
                     Ok((_, cache_key)) => match store.lookup(&cache_key, repo.ttl) {
                         Ok(Lookup::Hit(m)) => {

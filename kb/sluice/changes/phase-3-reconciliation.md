@@ -119,3 +119,16 @@ happy paths plus cancellation.
 
 Counts: Table 1 (documented but not implemented) = 4; Table 2 (implemented but
 not documented) = 16; Table 3 (mismatches) = 22.
+
+## Resolution (2026-10-22, lead)
+
+| Items | Resolution |
+|---|---|
+| 2.4 | Code: extra arguments are folded into the key command (`lookup::key_command`, `key::command_with_args`) for the CLI, the MCP server and the marker's `cmd`; tests in `tests/run.rs` and `tests/mcp.rs`. Docs: mcp-tools.md, cache-key.md. |
+| 3.3 | Code: a Sluice error on one gate becomes that gate's `error` result and the remaining gates still run; the call returns `is_error`. Test with an impossible socket. |
+| 3.19 | Code: tests added for coalescing, `timeout_seconds`, `extra_args`, a gate after a failure, `logs` limits and an unknown job; `cancelled: true` cannot be observed over the wire (rmcp drops the response of a cancelled request), covered by a unit test. |
+| 1.2, 3.13, 3.22 | README: exit 70 removed, stray fences removed, `--explain` listed. |
+| 1.3 | `docs/manual-test-phase-3.md`: the change is made before `verify` so the commit hits. |
+| 1.4, 3.9 | ADR-0005, architecture.md, `docs/agents.md`: progress notifications depend on a `progressToken`; the 30-minute idle window is the practical limit until the manual test confirms Claude Code sends one. |
+| 3.10, 3.11, 3.8, 3.16, 3.21, 3.12 | `docs/agents.md` and README updated (status, `status` needs a directory, `CLAUDE.md` block, narrower allow rule, `SLUICE_LOG`). |
+| 1.1, 2.1–2.3, 2.5–2.16, 3.1, 3.2, 3.4–3.7, 3.14, 3.15, 3.17, 3.18, 3.20 | Documented in mcp-tools.md, config-format.md, architecture.md (crate layout) and the change note. |

@@ -112,7 +112,7 @@ pub fn run(args: &RunArgs) -> ExitCode {
     };
 
     if args.explain {
-        return explain(&ctx, &env, &mode);
+        return explain(&ctx, &env, &mode, &args.extra);
     }
     if mode == CacheMode::Bypass {
         eprintln!(
@@ -122,7 +122,7 @@ pub fn run(args: &RunArgs) -> ExitCode {
         return run_inline(&ctx, &args.extra);
     }
 
-    let state = match lookup::lookup(&ctx, &mode) {
+    let state = match lookup::lookup(&ctx, &mode, &args.extra) {
         CacheState::Hit(hit) => {
             println!(
                 "sluice: {} PASS (cached, passed {} ago)",
@@ -503,7 +503,7 @@ fn decide_policy(ctx: &Context, env: &EnvMap, state: &CacheState) -> (Caller, bo
 }
 
 /// `sluice run --explain`: print every decision without running anything.
-fn explain(ctx: &Context, env: &EnvMap, mode: &CacheMode) -> ExitCode {
+fn explain(ctx: &Context, env: &EnvMap, mode: &CacheMode, extra: &[String]) -> ExitCode {
     println!("repository:   {}", ctx.paths.toplevel.display());
     println!("common dir:   {}", ctx.paths.common_dir.display());
     println!(
@@ -535,7 +535,7 @@ fn explain(ctx: &Context, env: &EnvMap, mode: &CacheMode) -> ExitCode {
     match tree::snapshot(&ctx.paths, &ctx.probe_env, &ctx.scratch) {
         Ok(Snapshot::Known(tree)) => {
             println!("tree:         {tree}");
-            match lookup::derive_key(ctx, &tree) {
+            match lookup::derive_key(ctx, &tree, extra) {
                 Ok((_, key)) => {
                     println!("key:          {key}");
                     match ctx.store.lookup(&key, ctx.ttl) {

@@ -29,7 +29,7 @@ use nix::fcntl::{Flock, FlockArg};
 pub use sluice_gate_core::config::{AdmissionConfig, LastSubscriberGone};
 use sluice_gate_core::dirs::{job_id as new_job_id, now_ms};
 use sluice_gate_core::git::RepoPaths;
-use sluice_gate_core::key::{CacheKey, normalize_cmd};
+use sluice_gate_core::key::{CacheKey, command_with_args, normalize_cmd};
 use sluice_gate_core::marker::{Lookup, Marker, MarkerStore, MissRecord};
 use sluice_gate_core::{CACHE_FORMAT_VERSION, tree};
 use sluice_gate_proto::{
@@ -854,7 +854,10 @@ impl CacheWrite {
                     key: self.key.clone(),
                     tree: tree_before,
                     gate: self.request.gate.name.clone(),
-                    cmd: normalize_cmd(&self.request.gate.cmd),
+                    cmd: command_with_args(
+                        &normalize_cmd(&self.request.gate.cmd),
+                        &self.request.extra,
+                    ),
                     passed_at: sluice_gate_core::dirs::now_rfc3339(),
                     duration_ms: self.duration_ms,
                     exit_code: 0,

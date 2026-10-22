@@ -410,7 +410,7 @@ fn prepare(
     extra: &[String],
     timeout_seconds: Option<u64>,
 ) -> Result<Prepared, String> {
-    let state = lookup::lookup(&res, mode);
+    let state = lookup::lookup(&res, mode, extra);
     if let Lookup::Hit(marker) = state {
         return Ok(Prepared::Hit(marker));
     }
@@ -524,6 +524,17 @@ fn cancelled_line(gate: &str, job_id: Option<String>) -> GateLine {
     result.job_id = job_id;
     result.message = Some("the verification was cancelled".to_owned());
     GateLine { result, line }
+}
+
+/// A Sluice-side failure of one gate (daemon unavailable, request refused,
+/// connection lost): that gate is an `error`, the remaining ones still run.
+fn error_line(gate: &str, why: &str) -> GateLine {
+    let mut result = GateResult::new(gate, GateStatus::Error);
+    result.message = Some(why.to_owned());
+    GateLine {
+        result,
+        line: format!("ERROR ({why})"),
+    }
 }
 
 /// Maps a daemon outcome to the result entry and the Phase 1 summary line.
@@ -672,6 +683,32 @@ impl Server {
         }
     }
 
+    /// Result of a cache hit; reports it to the daemon without waiting.
+    fn hit_line(&self, repo: &RepoContext, gate: &str, marker: &Marker) -> GateLine {
+        tracing::info!(gate, "cache hit");
+        let env = Arc::clone(&self.env);
+        let (repo_root, name, saved) = (
+            repo.paths.toplevel.clone(),
+            gate.to_owned(),
+            marker.duration_ms,
+        );
+        // Best-effort telemetry, never awaited (a hit never starts a daemon).
+        tokio::task::spawn_blocking(move || {
+            if let Ok(socket) = dirs::socket_path(&env)
+                && socket.exists()
+            {
+                client::send_hit_event(&socket, &repo_root, &name, saved);
+            }
+        });
+        let mut result = GateResult::new(gate, GateStatus::Pass);
+        result.cached = true;
+        result.job_id = Some(marker.job_id.clone());
+        GateLine {
+            result,
+            line: format!("PASS (cached, passed {} ago)", age(&marker.passed_at)),
+        }
+    }
+
     /// Runs one gate: cache hit, or a daemon job followed to the end.
     async fn verify_gate(
         &self,
@@ -692,31 +729,12 @@ impl Server {
         else {
             return Ok(cancelled_line(gate, None));
         };
-        let (request, res, off_reason) = match prepared.map_err(internal)? {
-            Prepared::Hit(marker) => {
-                tracing::info!(gate, "cache hit");
-                let env = Arc::clone(&self.env);
-                let (repo_root, name, saved) = (
-                    repo.paths.toplevel.clone(),
-                    gate.to_owned(),
-                    marker.duration_ms,
-                );
-                // Best-effort telemetry, never awaited (a hit never starts a daemon).
-                tokio::task::spawn_blocking(move || {
-                    if let Ok(socket) = dirs::socket_path(&env)
-                        && socket.exists()
-                    {
-                        client::send_hit_event(&socket, &repo_root, &name, saved);
-                    }
-                });
-                let mut result = GateResult::new(gate, GateStatus::Pass);
-                result.cached = true;
-                result.job_id = Some(marker.job_id.clone());
-                return Ok(GateLine {
-                    result,
-                    line: format!("PASS (cached, passed {} ago)", age(&marker.passed_at)),
-                });
-            }
+        let prepared = match prepared {
+            Ok(p) => p,
+            Err(e) => return Ok(error_line(gate, &e)),
+        };
+        let (request, res, off_reason) = match prepared {
+            Prepared::Hit(marker) => return Ok(self.hit_line(repo, gate, &marker)),
             Prepared::Run {
                 request,
                 res,
@@ -732,8 +750,15 @@ impl Server {
         else {
             return Ok(cancelled_line(gate, None));
         };
-        let socket =
-            socket.map_err(|e| internal(format!("the Sluice daemon is unavailable: {e:#}")))?;
+        let socket = match socket {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(error_line(
+                    gate,
+                    &format!("the Sluice daemon is unavailable: {e:#}"),
+                ));
+            }
+        };
 
         tracing::info!(gate, "running through the daemon");
         let state = Mutex::new(JobState::default());
@@ -772,7 +797,9 @@ impl Server {
                 (job_id, outcome, coalesced),
             )),
             Ok(RunEnd::Cancelled { job_id }) => Ok(cancelled_line(gate, job_id)),
-            Err(e @ (RunError::NotQueued(_) | RunError::Lost(_))) => Err(internal(e.to_string())),
+            Err(e @ (RunError::NotQueued(_) | RunError::Lost(_))) => {
+                Ok(error_line(gate, &e.to_string()))
+            }
         }
     }
 
@@ -1046,7 +1073,7 @@ fn cache_state(dir: &Path, env: &EnvMap) -> Result<(PathBuf, String, serde_json:
             let line = if gate.cache {
                 match repo
                     .select(name)
-                    .and_then(|r| lookup::derive_key(&r, tree))
+                    .and_then(|r| lookup::derive_key(&r, tree, &[]))
                     .and_then(|(_, key)| repo.store.lookup(&key, repo.ttl))
                 {
                     Ok(marker::Lookup::Hit(m)) => {
@@ -1141,6 +1168,16 @@ fn find_log(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_and_error_lines_fail_the_report() {
+        let c = cancelled_line("g", Some("j1".into()));
+        assert_eq!(c.result.status, GateStatus::Cancelled);
+        assert!(verify_text(&[c], true).contains("was cancelled"));
+        let e = error_line("g", "the Sluice daemon is unavailable");
+        assert_eq!(e.result.status, GateStatus::Error);
+        assert!(e.result.message.is_some() && e.line.starts_with("ERROR"));
+    }
 
     #[test]
     fn job_ids_are_checked() {

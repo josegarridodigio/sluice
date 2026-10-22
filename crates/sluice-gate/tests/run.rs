@@ -533,6 +533,30 @@ cache = false
 }
 
 #[test]
+fn extra_arguments_are_part_of_the_cache_key() {
+    let sb = Sandbox::new(
+        r#"
+[gates.args]
+cmd = "echo run >> \"$SLUICE_TEST_COUNTER\"; true"
+"#,
+    );
+    let run = |extra: &str| {
+        sb.sluice()
+            .args(["run", "args", "--", extra])
+            .assert()
+            .success()
+    };
+    run("a");
+    assert_eq!(sb.runs(), 1);
+    run("b");
+    assert_eq!(sb.runs(), 2, "other arguments must not hit the cached pass");
+    run("a").stdout(predicate::str::contains("cached"));
+    assert_eq!(sb.runs(), 2, "the same arguments hit");
+    sb.sluice().args(["run", "args"]).assert().success();
+    assert_eq!(sb.runs(), 3, "the plain gate has its own key");
+}
+
+#[test]
 fn unknown_gate_and_missing_config_are_reported() {
     let sb = Sandbox::standard();
     sb.sluice()

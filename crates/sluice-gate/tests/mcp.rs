@@ -38,11 +38,16 @@ impl ClientHandler for Counter {
 type Client = RunningService<RoleClient, Counter>;
 
 async fn connect(sb: &Sandbox, counter: Counter) -> Client {
+    connect_with(sb, counter, &[]).await
+}
+
+async fn connect_with(sb: &Sandbox, counter: Counter, extra_env: &[(&str, &str)]) -> Client {
     let mut cmd = tokio::process::Command::new(Sandbox::binary());
     cmd.arg("mcp")
         .current_dir(&sb.home)
         .env_clear()
-        .envs(sb.env());
+        .envs(sb.env())
+        .envs(extra_env.iter().copied());
     let (transport, _stderr) = TokioChildProcess::builder(cmd)
         .stderr(Stdio::null())
         .spawn()
@@ -281,5 +286,141 @@ cmd = "echo $$ > \"$SLUICE_TEST_COUNTER.pid\"; exec sleep 30"
         wait_for(Duration::from_secs(7), || !alive(pid)),
         "the sleep process survived the cancellation"
     );
+    client.cancel().await.expect("shutdown");
+}
+
+const EXTRA: &str = r#"
+[gates.counted]
+cmd = "echo run >> \"$SLUICE_TEST_COUNTER\"; true"
+
+[gates.nap]
+cmd = "echo run >> \"$SLUICE_TEST_COUNTER\"; sleep 1"
+
+[gates.stuck]
+cmd = "sleep 5"
+
+[gates.bad]
+cmd = "exit 3"
+
+[gates.after]
+cmd = "echo run >> \"$SLUICE_TEST_COUNTER\""
+
+[gates.noisy]
+cmd = "seq 1 3000"
+"#;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn extra_args_are_part_of_the_cache_key() {
+    let sb = Sandbox::new(EXTRA);
+    let client = connect(&sb, Counter::default()).await;
+    let dir = repo_arg(&sb);
+    let plain = json!({"working_directory": dir, "gates": ["counted"]});
+    let with_x = json!({"working_directory": dir, "gates": ["counted"], "extra_args": ["x"]});
+
+    call(&client, "verify", &plain).await;
+    assert_eq!(sb.runs(), 1);
+    let r = call(&client, "verify", &with_x).await;
+    assert_eq!(r.is_error, Some(false), "{}", text(&r));
+    assert_eq!(structured(&r)["results"][0]["cached"], false);
+    assert_eq!(sb.runs(), 2, "extra arguments must miss the plain pass");
+    let r = call(&client, "verify", &with_x).await;
+    assert_eq!(structured(&r)["results"][0]["cached"], true);
+    assert_eq!(sb.runs(), 2);
+    client.cancel().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unavailable_daemon_is_an_error_per_gate_not_an_mcp_error() {
+    let sb = Sandbox::new(EXTRA);
+    let client = connect_with(
+        &sb,
+        Counter::default(),
+        &[("SLUICE_SOCKET", "/dev/null/impossible")],
+    )
+    .await;
+    let r = client
+        .call_tool(params(
+            "verify",
+            &json!({"working_directory": repo_arg(&sb), "gates": ["counted", "after"]}),
+        ))
+        .await
+        .expect("a Sluice failure is a tool result, not an MCP error");
+    assert_eq!(r.is_error, Some(true), "{}", text(&r));
+    let s = structured(&r);
+    assert_eq!(s["all_passed"], false, "{s}");
+    let results = s["results"].as_array().expect("results");
+    assert_eq!(results.len(), 2, "{s}");
+    for g in results {
+        assert_eq!(g["status"], "error", "{s}");
+        assert!(g["message"].is_string(), "{s}");
+    }
+    assert_eq!(sb.runs(), 0);
+    client.cancel().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn parallel_verifies_coalesce_and_a_failure_does_not_stop_the_next_gate() {
+    let sb = Sandbox::new(EXTRA);
+    let client = connect(&sb, Counter::default()).await;
+    let dir = repo_arg(&sb);
+    let args = json!({"working_directory": dir, "gates": ["nap"]});
+    let (a, b) = tokio::join!(
+        call(&client, "verify", &args),
+        call(&client, "verify", &args)
+    );
+    let coalesced = [&a, &b]
+        .iter()
+        .filter(|r| structured(r)["results"][0]["coalesced"] == true)
+        .count();
+    assert_eq!(coalesced, 1, "{} / {}", text(&a), text(&b));
+    assert_eq!(sb.runs(), 1, "one execution for both calls");
+
+    let before = sb.runs();
+    let r = call(
+        &client,
+        "verify",
+        &json!({"working_directory": dir, "gates": ["bad", "after"]}),
+    )
+    .await;
+    assert_eq!(r.is_error, Some(true), "{}", text(&r));
+    let s = structured(&r);
+    assert_eq!(s["all_passed"], false, "{s}");
+    assert_eq!(s["results"][0]["status"], "fail");
+    assert_eq!(s["results"][1]["status"], "pass");
+    assert_eq!(sb.runs(), before + 1, "the gate after the failure ran");
+    client.cancel().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeout_seconds_and_logs_limits() {
+    let sb = Sandbox::new(EXTRA);
+    let client = connect(&sb, Counter::default()).await;
+    let dir = repo_arg(&sb);
+    let r = call(
+        &client,
+        "verify",
+        &json!({"working_directory": dir, "gates": ["stuck"], "timeout_seconds": 1}),
+    )
+    .await;
+    assert_eq!(r.is_error, Some(true), "{}", text(&r));
+    assert_eq!(structured(&r)["results"][0]["status"], "timeout");
+
+    let r = call(
+        &client,
+        "verify",
+        &json!({"working_directory": dir, "gates": ["noisy"]}),
+    )
+    .await;
+    let job = structured(&r)["results"][0]["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_owned();
+    let r = call(&client, "logs", &json!({"job_id": job, "tail": 5000})).await;
+    assert_eq!(r.is_error, Some(false), "{}", text(&r));
+    let n = structured(&r)["lines"].as_array().expect("lines").len();
+    assert!(n <= 2000 && n > 100, "{n} lines");
+
+    let r = call(&client, "logs", &json!({"job_id": "1-1-deadbeef"})).await;
+    assert_eq!(r.is_error, Some(true), "{}", text(&r));
     client.cancel().await.expect("shutdown");
 }

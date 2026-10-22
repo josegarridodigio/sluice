@@ -96,6 +96,30 @@ pub fn derive(material: &KeyMaterial) -> CacheKey {
     CacheKey(hex::encode(h.finalize()))
 }
 
+/// Appends extra arguments to an already normalised command for key and
+/// marker purposes: one space before each argument; an argument is wrapped
+/// in single quotes (inner `'` written as `'\''`) only when it is empty or
+/// contains whitespace or quotes, so the result is deterministic.
+#[must_use]
+pub fn command_with_args(normalized_cmd: &str, extra: &[String]) -> String {
+    let mut cmd = normalized_cmd.to_owned();
+    for arg in extra {
+        cmd.push(' ');
+        if arg.is_empty()
+            || arg
+                .chars()
+                .any(|c| c.is_whitespace() || c == '\'' || c == '"')
+        {
+            cmd.push('\'');
+            cmd.push_str(&arg.replace('\'', "'\\''"));
+            cmd.push('\'');
+        } else {
+            cmd.push_str(arg);
+        }
+    }
+    cmd
+}
+
 /// Trim a command and collapse every whitespace run into one space.
 pub fn normalize_cmd(cmd: &str) -> String {
     cmd.split_whitespace().collect::<Vec<_>>().join(" ")
