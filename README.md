@@ -201,7 +201,7 @@ progress notifications and cancellation), `status`, `gate_list`, `logs`.
 | 2 | Daemon: budget scheduler, coalescing, process groups, timeouts, SQLite metrics, `sluice status` | done |
 | 3 | MCP server (`verify`, `status`, `gate_list`, `logs`), `docs/agents.md` | done (manual two-agent run pending) |
 | 4 | PSI-based admission, stable `--json` schema (`sluice status --json` is the metrics export) | done |
-| 5 | Release builds, install script, real-world numbers | |
+| 5 | Release builds, install script, real-world numbers | done (first release pending) |
 
 Design history lives in [`kb/`](kb/sluice/plan/master-plan.md): the plan,
 the architecture, one ADR per decision, and research notes on the projects

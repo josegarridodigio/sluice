@@ -38,5 +38,6 @@ recorded in [[sluice/changes/phase-3-acceptance.md]].
 `#[tool_handler(router = self.tool_router)]` is needed because the macro
 defaults to `Self::tool_router()`; `#[tool(output_schema = …)]` works with
 a hand-built `CallToolResult`; dropping a client `call_tool` future sends
-`notifications/cancelled`. Whether Claude Code sends a `progressToken` is
-still unverified (manual test step 7).
+`notifications/cancelled`. Claude Code sends a `progressToken` and resets
+its idle window on progress: confirmed end to end on 2026-10-22
+([[sluice/changes/phase-3-acceptance.md]]).

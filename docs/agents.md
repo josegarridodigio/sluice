@@ -20,12 +20,12 @@ then carries on without the commit result. The MCP `verify` tool blocks
 safely instead: Claude Code aborts an MCP call only if neither a response nor
 a progress notification arrives within the idle window (30 minutes by default
 for stdio servers); Sluice sends progress notifications every 15 seconds
-when the call carries a progress token, and an interactive session that
-auto-backgrounds a call after 2 minutes delivers the result later instead of
-cancelling it (background tasks do not survive the session). Whether Claude
-Code sends a progress token is not documented, so budget for the 30-minute
-idle window: queue wait plus the longest gate should stay under it, or raise
-`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`.
+(Claude Code sends the progress token and resets its idle window on each
+notification; verified with `scripts/phase3-e2e.sh`), and an interactive
+session that auto-backgrounds a call after 2 minutes delivers the result
+later instead of cancelling it (background tasks do not survive the
+session). If you lower `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`, keep it above
+`[mcp] progress_interval` (15 s by default).
 
 ## 2. Install the MCP server
 

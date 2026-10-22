@@ -176,8 +176,12 @@ result; a job id with unsafe characters is `invalid_params`.
   `verify` (miss then hit), `status` and `logs` against a throwaway
   repository and a daemon on a temporary socket; a cancelled `verify`
   leaves no gate process.
-- Manual (documented with output): two Claude Code agents in two
-  worktrees call `verify`; one runs, the other coalesces; later commits
-  hit; a miss in an agent hook fails fast; a gate longer than 2 minutes
-  survives auto-backgrounding; with `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`
-  lowered to 60 s, progress notifications keep a 3-minute gate alive.
+- End to end with real sessions (`scripts/phase3-e2e.sh`, evidence in
+  [[sluice/changes/phase-3-acceptance.md]]): two non-interactive Claude
+  Code sessions in two worktrees call `verify` at once; one runs the gate,
+  the other coalesces; an agent-invoked `pre-commit` on the verified tree
+  hits; on a new tree it fails fast; with
+  `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=60000` a 90 s gate completes only
+  when progress notifications are sent. Auto-backgrounding (interactive
+  sessions, 2 min) is documented by Claude Code and not exercised by the
+  script.

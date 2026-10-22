@@ -1,5 +1,10 @@
 # Manual end-to-end test: two Claude Code agents, one verification
 
+> `scripts/phase3-e2e.sh` automates this run with two non-interactive
+> sessions (evidence in `kb/sluice/changes/phase-3-acceptance.md`). The
+> steps below remain useful to see the interactive behaviour, in
+> particular auto-backgrounding after 2 minutes.
+
 This is the Phase 3 acceptance run that needs a human. It takes about
 15 minutes. Record the output of every step in
 `kb/sluice/changes/phase-3-acceptance.md` (a template is at the end).

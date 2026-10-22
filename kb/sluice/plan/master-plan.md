@@ -21,9 +21,9 @@ Related: [[sluice/research/problem-statement.md]],
 | 0 | Setup and research | **done** (2026-10-22) | Questions answered, decisions recorded in ADR-0001..0005, workspace scaffolded and green. See [[sluice/changes/phase-0-scaffold.md]]. |
 | 1 | Cache only, no daemon | **done** (2026-10-22) | [[sluice/changes/phase-1-cache-only.md]], [[sluice/changes/phase-1-acceptance.md]], [[sluice/changes/hit-path-latency.md]]. |
 | 2 | Daemon, scheduler, coalescing | **done** (2026-10-22) | [[sluice/changes/phase-2-daemon.md]], [[sluice/changes/phase-2-acceptance.md]]; design in [[sluice/design/protocol.md]], [[sluice/design/scheduler.md]], [[sluice/design/executor.md]], ADR-0007. |
-| 3 | MCP front-end and agent policy | **done, manual run pending** (2026-10-22) | [[sluice/changes/phase-3-mcp.md]]; the two-agent manual test (`docs/manual-test-phase-3.md`) needs the user. |
+| 3 | MCP front-end and agent policy | **done** (2026-10-22) | [[sluice/changes/phase-3-mcp.md]], [[sluice/changes/phase-3-acceptance.md]] (end to end with real sessions via `scripts/phase3-e2e.sh`). |
 | 4 | Load-aware admission and observability | **done** (2026-10-22) | [[sluice/changes/phase-4-psi.md]], [[sluice/changes/phase-4-acceptance.md]]; design [[sluice/design/psi-admission.md]]. |
-| 5 | Packaging and real-world validation | **in progress** | Release workflow and installer done ([[sluice/changes/packaging.md]]); first tag and real-world validation pending. |
+| 5 | Packaging and real-world validation | **done except the first tag** (2026-10-22) | [[sluice/changes/packaging.md]], [[sluice/changes/phase-5-validation.md]] (benchmark on this repository), README demo. Tagging `v0.1.0` publishes a GitHub release: waits for the user. |
 | later | Local merge queue (mergetrain-inspired) | not planned | Ask before starting. |
 
 ## Phase 0 — Setup and research
@@ -130,7 +130,7 @@ Tasks:
 - [x] `docs/agents.md`; `docs/manual-test-phase-3.md`.
 - [x] Automated MCP client tests (`crates/sluice-gate/tests/mcp.rs`).
 - [x] Reconciliation pass ([[sluice/changes/phase-3-reconciliation.md]]): 42 findings; `extra_args` now in the key, per-gate errors kept, coverage added; rest documented.
-- [ ] Manual two-agent run by the user, recorded in [[sluice/changes/phase-3-acceptance.md]].
+- [x] End-to-end run with two real Claude Code sessions in this repository (`scripts/phase3-e2e.sh`), recorded in [[sluice/changes/phase-3-acceptance.md]]; progress tokens confirmed.
 
 Deliverables: `sluice mcp` built with rmcp ([[sluice/design/mcp-tools.md]]),
 tools `verify`, `status`, `gate_list`, `logs`; agent detection and
@@ -160,6 +160,15 @@ with measurements.
 
 ## Phase 5 — Packaging and real-world validation
 
+Tasks:
+
+- [x] Release workflow (`cross`, musl x86_64/aarch64, checksums) and `scripts/install.sh` ([[sluice/changes/packaging.md]]).
+- [x] Sluice verifies itself: `.sluice.toml`, `.githooks/`, CONTRIBUTING.
+- [x] Reproducible multi-worktree benchmark `scripts/validation-bench.sh` and evidence ([[sluice/changes/phase-5-validation.md]]).
+- [x] README demo GIF (`scripts/demo/`).
+- [ ] Tag `v0.1.0` and watch the first release workflow run (user approval).
+- [ ] README install line with the release URL after the first tag.
+
 Deliverables: release builds (Linux x86_64/arm64), install script,
 `cargo install sluice-gate`, man page / README. Validation on this
 repository (Sluice runs its own gates) with before/after numbers from a
@@ -178,10 +187,9 @@ referenced here.
 
 ## Next steps
 
-1. Ask the user to run the Phase 3 manual test (`docs/manual-test-phase-3.md`).
-2. Phase 4 reconciliation pass.
-3. Phase 5: tag `v0.1.0`, verify the release workflow, README install line; validate on this repository with the multi-worktree benchmark (`scripts/validation-bench.sh`).
-4. Phase 6: present [[sluice/design/merge-queue.md]] and its open questions to the user; implement after approval.
+1. Tag `v0.1.0` once the user approves; fix anything the release workflow reveals; README install line.
+2. Phase 6: the user answers the open questions of [[sluice/design/merge-queue.md]]; implement after approval.
+3. Final reconciliation over the whole KB and the final report.
 
 Earlier plan for Phase 3: `sluice-gate-mcp` with rmcp per [[sluice/design/mcp-tools.md]]
    (`verify`, `status`, `gate_list`, `logs`), fail-fast message pointing to

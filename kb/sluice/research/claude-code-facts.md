@@ -18,12 +18,16 @@ it is documented or only observed. Re-verify when Claude Code changes.
 | Progress notifications reset the idle window but do not extend the wall-clock limit. | documented | mcp.md |
 | Auto-backgrounding: in an interactive session a call still running after 2 min becomes a background task; the model gets a task id and the result arrives later as a notification. Threshold `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS`. Not applied in non-interactive mode unless `CLAUDE_AUTO_BACKGROUND_TASKS=1`. The task does not survive session exit. | documented | mcp.md |
 | `MCP_TIMEOUT` is the server **startup** timeout, not a per-call limit. | documented | mcp.md |
-| Whether Claude Code sends `progressToken` in `_meta`. | not documented | — |
+| Claude Code sends a `progressToken` with tool calls and resets the idle window on each `notifications/progress`. | **verified 2026-10-22** with `scripts/phase3-e2e.sh` (Claude Code 2.1.308, `claude -p`, `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=60000`): a 90 s gate completed with progress every 15 s; with progress disabled the call was aborted at 60 s with `MCP server "sluice" tool "verify" sent no response or progress for 60s; aborting. If this server is configured in your MCP settings, set a per-server "timeout" (ms) …` | [[sluice/changes/phase-3-acceptance.md]] |
 | MCP Tasks extension (SEP-2663) support in Claude Code. | not documented; do not rely on it | SEP-2663 |
 
 Consequence: a blocking `verify` tool is safe as long as the server emits
-progress notifications well under 30 min apart (Sluice will send one every
-10–30 s). See [[sluice/design/adr/0005-mcp-verify-blocking-or-handle.md]].
+progress notifications well under the idle window (Sluice sends one every
+15 s by default, `[mcp] progress_interval`); without them the call dies at
+the idle window and the daemon then cancels the job (last subscriber
+gone). See [[sluice/design/adr/0005-mcp-verify-blocking-or-handle.md]].
+Claude Code also logs `unknown format "uint64" ignored in schema` for the
+integer formats schemars emits; harmless.
 
 ## Bash tool
 
