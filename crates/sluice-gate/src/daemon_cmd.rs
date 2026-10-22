@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -64,6 +64,8 @@ fn daemon_config(env: &EnvMap, user: &UserConfig) -> Result<DaemonConfig> {
         tail_lines: user.cache.tail_lines,
         marker_ttl: Duration::from_hours(u64::from(user.cache.ttl_days) * 24),
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        admission: user.admission.clone(),
+        psi_root: PathBuf::from(sluice_gate_daemon::psi::DEFAULT_ROOT),
     })
 }
 

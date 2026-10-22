@@ -3,12 +3,15 @@
 //!
 //! Design: `kb/sluice/design/protocol.md` (wire protocol),
 //! `kb/sluice/design/scheduler.md` (coalescing, admission, subscribers) and
-//! `kb/sluice/design/executor.md` (lifecycle, executor, persistence).
+//! `kb/sluice/design/executor.md` (lifecycle, executor, persistence) and
+//! `kb/sluice/design/psi-admission.md` (load-aware admission).
 //!
 //! Concurrency model: one task per connection, one scheduling task, one
-//! task per started job and one heartbeat task. Shared state lives in
-//! [`Shared`] behind two `std::sync::Mutex`es (scheduler state, then
-//! store; always taken in that order and never held across an `.await`).
+//! task per started job, one heartbeat task and (when PSI admission is on)
+//! one PSI sampling task. Shared state lives in [`Shared`] behind
+//! `std::sync::Mutex`es (scheduler state, then store; always taken in that
+//! order and never held across an `.await`; the PSI admission mutex is
+//! never held together with another one).
 //! Each job has a `broadcast` channel of [`JobEvent`]s; every subscriber
 //! rewrites them into [`ServerMessage`]s carrying its own request id.
 
@@ -23,7 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
-pub use sluice_gate_core::config::LastSubscriberGone;
+pub use sluice_gate_core::config::{AdmissionConfig, LastSubscriberGone};
 use sluice_gate_core::dirs::{job_id as new_job_id, now_ms};
 use sluice_gate_core::git::RepoPaths;
 use sluice_gate_core::key::{CacheKey, normalize_cmd};
@@ -31,8 +34,8 @@ use sluice_gate_core::marker::{Lookup, Marker, MarkerStore, MissRecord};
 use sluice_gate_core::{CACHE_FORMAT_VERSION, tree};
 use sluice_gate_proto::{
     self as proto, BudgetInfo, Caller, ClientEvent, ClientMessage, DaemonInfo, ErrorCode,
-    MAX_LINE_BYTES, Outcome, OutcomeStatus, PROTOCOL_VERSION, PsiInfo, QueuedJob, RunRequest,
-    RunningJob, STATUS_SCHEMA_VERSION, ServerMessage, StatusReport,
+    MAX_LINE_BYTES, Outcome, OutcomeStatus, PROTOCOL_VERSION, QueuedJob, RunRequest, RunningJob,
+    STATUS_SCHEMA_VERSION, ServerMessage, StatusReport,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -42,6 +45,7 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, interval_at, sleep, timeout};
 
 use crate::executor::{self, ExecSpec, ExecStatus, Finished, IoPriority, RunningHandle};
+use crate::psi::{self, Admission};
 use crate::scheduler::{Enqueued, JobSpec, Scheduler};
 use crate::store::{JobRow, JobState, Store};
 use crate::{Error, Result};
@@ -98,6 +102,11 @@ pub struct DaemonConfig {
     pub marker_ttl: Duration,
     /// Sluice version (welcome, status, markers).
     pub version: String,
+    /// PSI admission settings (`[admission]`).
+    pub admission: AdmissionConfig,
+    /// Directory holding the PSI files `cpu` and `memory` (normally
+    /// [`psi::DEFAULT_ROOT`]; tests point it at a temporary directory).
+    pub psi_root: PathBuf,
 }
 
 /// Event of one job, broadcast to all its subscribers.
@@ -151,6 +160,7 @@ struct Shared {
     started_at: String,
     state: Mutex<State>,
     store: Mutex<Store>,
+    psi: Mutex<Admission>,
     wake: Notify,
     idle: Notify,
     stop: watch::Sender<Option<bool>>,
@@ -304,6 +314,7 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
             refusal: "",
         }),
         store,
+        psi: Mutex::new(Admission::new(&config.admission)),
         instance,
         pid,
         started_at: rfc3339(started_ms),
@@ -330,6 +341,9 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
 
     let scheduling = tokio::spawn(scheduling_loop(Arc::clone(&shared)));
     let heartbeat = tokio::spawn(heartbeat_loop(Arc::clone(&shared), token.clone()));
+    let sampler = lock(&shared.psi)
+        .enabled
+        .then(|| tokio::spawn(psi_loop(Arc::clone(&shared))));
 
     let mut conns = JoinSet::new();
     let force = accept_loop(&shared, &listener, &mut conns, shutdown).await;
@@ -339,6 +353,9 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
     drain(&shared, force).await;
     scheduling.abort();
     heartbeat.abort();
+    if let Some(sampler) = sampler {
+        sampler.abort();
+    }
     release_lease(&shared, &token);
     let _ = timeout(CONNECTION_DRAIN, async {
         while conns.join_next().await.is_some() {}
@@ -495,13 +512,64 @@ async fn heartbeat_loop(shared: Arc<Shared>, token: String) {
 // Scheduling and job execution
 // ---------------------------------------------------------------------------
 
+/// Samples PSI every `psi_poll_interval` and wakes the scheduling loop when
+/// the blocking state changes; exits once PSI turns out to be unavailable.
+async fn psi_loop(shared: Arc<Shared>) {
+    let period = shared.config.admission.psi_poll_interval;
+    let mut tick = tokio::time::interval(period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let sample = psi::read_sample(&shared.config.psi_root);
+        let (changed, enabled) = {
+            let mut adm = lock(&shared.psi);
+            let before = adm.blocking();
+            let after = adm.observe(sample, now_ms());
+            (before != after, adm.enabled)
+        };
+        if changed {
+            shared.wake.notify_one();
+        }
+        if !enabled {
+            return;
+        }
+    }
+}
+
+/// One admission pass: the budget scheduler gated by PSI, plus the PSI
+/// starvation guard (admit the queue head alone when it has waited longer
+/// than `psi_max_wait` while PSI blocks).
+fn admit(shared: &Shared, now: u64) -> Vec<String> {
+    let blocking = lock(&shared.psi).blocking();
+    let mut started = shared.state().sched.admit(now, blocking);
+    if !blocking {
+        return started;
+    }
+    let Some(head_queued_at) = shared.state().sched.head_queued_at() else {
+        return started;
+    };
+    if !lock(&shared.psi).starvation_override(head_queued_at, now) {
+        return started;
+    }
+    if let Some(id) = shared.state().sched.admit_head(now) {
+        lock(&shared.psi).record_override(now);
+        tracing::info!(
+            job = %id,
+            waited_ms = now.saturating_sub(head_queued_at),
+            "PSI starvation guard: starting the queue head despite system pressure"
+        );
+        started.push(id);
+    }
+    started
+}
+
 async fn scheduling_loop(shared: Arc<Shared>) {
     loop {
         tokio::select! {
             () = shared.wake.notified() => {}
             () = sleep(ADMIT_TICK) => {}
         }
-        let started = shared.state().sched.admit(now_ms(), false);
+        let started = admit(&shared, now_ms());
         for id in started {
             tracing::debug!(job = %id, "admitted");
             tokio::spawn(start_job(Arc::clone(&shared), id));
@@ -1058,9 +1126,13 @@ async fn handle_connection(shared: Arc<Shared>, stream: UnixStream) {
 
 fn status_report(shared: &Shared) -> StatusReport {
     let now = now_ms();
+    let (psi, psi_blocked_ms_total, psi_blocking) = {
+        let adm = lock(&shared.psi);
+        (adm.info(), adm.blocked_ms_total(), adm.blocking())
+    };
     let (running, queued, total, used) = {
         let st = shared.state();
-        let (running, queued) = st.sched.snapshot(now, false);
+        let (running, queued) = st.sched.snapshot(now, psi_blocking);
         let caller = |id: &str| {
             st.jobs
                 .get(id)
@@ -1094,9 +1166,11 @@ fn status_report(shared: &Shared) -> StatusReport {
             .collect();
         (running, queued, st.sched.budget(), st.sched.used())
     };
-    let totals = shared
+    let mut totals = shared
         .store("reading totals", |s| s.totals(None))
         .unwrap_or_default();
+    // Kept in memory: covers this daemon instance only.
+    totals.psi_blocked_ms_total = psi_blocked_ms_total;
     StatusReport {
         schema: STATUS_SCHEMA_VERSION,
         daemon: DaemonInfo {
@@ -1106,11 +1180,7 @@ fn status_report(shared: &Shared) -> StatusReport {
             version: shared.config.version.clone(),
             socket: shared.config.socket_path.clone(),
         },
-        budget: BudgetInfo {
-            total,
-            used,
-            psi: PsiInfo::default(),
-        },
+        budget: BudgetInfo { total, used, psi },
         running,
         queued,
         totals,

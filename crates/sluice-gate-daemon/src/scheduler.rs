@@ -207,6 +207,25 @@ impl Scheduler {
         started
     }
 
+    /// Queue time of the queue head, if any.
+    pub fn head_queued_at(&self) -> Option<u64> {
+        self.queue.front().map(|j| j.spec.queued_at)
+    }
+
+    /// Starts the queue head alone, ignoring PSI (the starvation guard), when
+    /// it fits the budget and its repository cap; returns its id.
+    pub fn admit_head(&mut self, now: u64) -> Option<String> {
+        let head = self.queue.front()?;
+        if !(self.fits_budget(head) && self.fits_repo_cap(head)) {
+            return None;
+        }
+        let mut job = self.queue.pop_front()?;
+        job.started_at = now;
+        let id = job.spec.id.clone();
+        self.running.push(job);
+        Some(id)
+    }
+
     /// Removes a running job and returns its spec; `None` if not running.
     pub fn finish(&mut self, id: &str) -> Option<JobSpec> {
         let idx = self.running.iter().position(|j| j.spec.id == id)?;
@@ -518,6 +537,22 @@ mod tests {
         assert_eq!(running, Vec::new());
         assert!(queued.iter().all(|q| q.reason == WaitReason::Psi));
         assert_eq!(s.admit(1, false), vec!["j0", "j1"]);
+    }
+
+    #[test]
+    fn admit_head_only_when_it_fits() {
+        let mut s = sched(4);
+        assert_eq!(s.head_queued_at(), None);
+        assert_eq!(s.admit_head(0), None);
+        s.enqueue(spec("big", None, "/r", 3, 5));
+        s.enqueue(spec("small", None, "/r", 1, 6));
+        s.enqueue(spec("next", None, "/r", 3, 7));
+        assert_eq!(s.head_queued_at(), Some(5));
+        assert_eq!(s.admit_head(10).as_deref(), Some("big"));
+        assert!(s.is_running("big") && s.is_queued("small"));
+        assert_eq!(s.admit_head(11).as_deref(), Some("small"));
+        assert_eq!(s.admit_head(12), None, "next does not fit the budget");
+        assert_eq!(s.head_queued_at(), Some(7));
     }
 
     #[test]

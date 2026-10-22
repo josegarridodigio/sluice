@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use sluice_gate_core::dirs;
 use sluice_gate_core::git::EnvMap;
-use sluice_gate_proto::{StatusReport, WaitReason};
+use sluice_gate_proto::{PsiInfo, StatusReport, WaitReason};
 
 use crate::run::{EXIT_ERROR, age};
 use sluice_gate_proto::client::{self, ClientError};
@@ -74,6 +74,23 @@ fn reason(r: WaitReason) -> &'static str {
     }
 }
 
+/// The `pressure:` line: `cpu 12.3% mem 0.4% (ok)`.
+fn pressure(psi: &PsiInfo) -> String {
+    let pct = |v: Option<f64>| v.map_or_else(|| "n/a".to_owned(), |v| format!("{v:.1}%"));
+    let state = if !psi.enabled {
+        "unavailable"
+    } else if psi.blocking {
+        "blocking admission"
+    } else {
+        "ok"
+    };
+    format!(
+        "cpu {} mem {} ({state})",
+        pct(psi.cpu_some_avg10),
+        pct(psi.memory_some_avg10)
+    )
+}
+
 /// Renders the text form of a status report.
 fn render(r: &StatusReport) -> String {
     use std::fmt::Write as _;
@@ -91,6 +108,7 @@ fn render(r: &StatusReport) -> String {
         "budget:   {} of {} units busy",
         r.budget.used, r.budget.total
     );
+    let _ = writeln!(out, "pressure: {}", pressure(&r.budget.psi));
     let _ = writeln!(out, "running:  {}", r.running.len());
     for j in &r.running {
         let _ = writeln!(
@@ -172,5 +190,23 @@ mod tests {
             text.contains("3 runs") && text.contains("1m30s saved"),
             "{text}"
         );
+        assert!(
+            text.contains("pressure: cpu n/a mem n/a (unavailable)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn pressure_line() {
+        let mut psi = PsiInfo {
+            enabled: true,
+            cpu_some_avg10: Some(12.34),
+            memory_some_avg10: Some(0.4),
+            blocking: false,
+        };
+        assert_eq!(pressure(&psi), "cpu 12.3% mem 0.4% (ok)");
+        psi.blocking = true;
+        psi.cpu_some_avg10 = Some(75.0);
+        assert_eq!(pressure(&psi), "cpu 75.0% mem 0.4% (blocking admission)");
     }
 }

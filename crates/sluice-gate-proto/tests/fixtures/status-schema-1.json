@@ -1,0 +1,57 @@
+{
+  "schema": 1,
+  "daemon": {
+    "instance": "4242-1760000000000",
+    "pid": 4242,
+    "started_at": "2026-10-22T10:00:00Z",
+    "version": "0.1.0",
+    "socket": "/run/user/1000/sluice/sluice.sock"
+  },
+  "budget": {
+    "total": 8,
+    "used": 5,
+    "psi": {
+      "enabled": true,
+      "cpu_some_avg10": 12.5,
+      "memory_some_avg10": 0.5,
+      "blocking": false
+    }
+  },
+  "running": [
+    {
+      "job_id": "j-run",
+      "repo": "/abs/repo",
+      "gate": "test",
+      "weight": 4,
+      "started_at": "2026-10-22T10:01:00Z",
+      "elapsed_ms": 1200,
+      "subscribers": 2,
+      "caller": "agent"
+    }
+  ],
+  "queued": [
+    {
+      "job_id": "j-queued",
+      "repo": "/abs/repo",
+      "gate": "lint",
+      "weight": 1,
+      "queued_at": "2026-10-22T10:01:30Z",
+      "waiting_ms": 300,
+      "subscribers": 1,
+      "reason": "psi"
+    }
+  ],
+  "totals": {
+    "since": "2026-10-01T00:00:00Z",
+    "runs": 120,
+    "passes": 110,
+    "failures": 8,
+    "timeouts": 2,
+    "hits": 430,
+    "coalesced": 37,
+    "wait_ms_total": 5000,
+    "run_ms_total": 900000,
+    "time_saved_ms": 3600000,
+    "psi_blocked_ms_total": 42000
+  }
+}

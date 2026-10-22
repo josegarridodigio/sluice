@@ -701,6 +701,8 @@ impl Store {
             wait_ms_total: u(wait),
             run_ms_total: u(run),
             time_saved_ms: u(saved_events).saturating_add(u(saved_jobs)),
+            // Not persisted: the server fills it from its in-memory PSI state.
+            psi_blocked_ms_total: 0,
         })
     }
 

@@ -515,6 +515,9 @@ pub struct Totals {
     pub run_ms_total: u64,
     /// Estimated time saved by caching and coalescing, in milliseconds.
     pub time_saved_ms: u64,
+    /// Time PSI admission spent blocking new jobs, in milliseconds (current
+    /// daemon instance only; 0 when PSI is unavailable).
+    pub psi_blocked_ms_total: u64,
 }
 
 /// Serialises a message as compact JSON followed by `\n`.

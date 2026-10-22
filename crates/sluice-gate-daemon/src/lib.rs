@@ -3,12 +3,15 @@
 //! Modules:
 //! - [`store`]: SQLite persistence (jobs, lease, events, totals).
 //! - [`scheduler`]: pure admission logic (budget, backfill, reservation, coalescing).
+//! - [`psi`]: pressure stall information sampling and the PSI admission gate.
 //! - [`executor`]: runs one gate in a process group with log capture and timeout.
 //! - [`server`]: socket listener, protocol handling, subscribers, lifecycle.
 //!
-//! Design: `kb/sluice/design/executor.md`, `scheduler.md`, `protocol.md`.
+//! Design: `kb/sluice/design/executor.md`, `scheduler.md`, `protocol.md`,
+//! `psi-admission.md`.
 
 pub mod executor;
+pub mod psi;
 pub mod scheduler;
 pub mod server;
 pub mod store;

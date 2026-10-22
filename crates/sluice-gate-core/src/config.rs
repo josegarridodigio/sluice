@@ -387,6 +387,10 @@ pub struct AdmissionConfig {
     /// How often PSI is sampled.
     #[serde(with = "humantime_serde")]
     pub psi_poll_interval: Duration,
+    /// Starvation guard: once the queue head has waited this long while
+    /// blocked only by PSI, one job is admitted anyway.
+    #[serde(with = "humantime_serde")]
+    pub psi_max_wait: Duration,
 }
 
 /// The `[cache]` table.
@@ -491,6 +495,7 @@ impl Default for AdmissionConfig {
             cpu_some_avg10_max: 60.0,
             memory_some_avg10_max: 20.0,
             psi_poll_interval: Duration::from_secs(1),
+            psi_max_wait: Duration::from_mins(5),
         }
     }
 }
@@ -564,6 +569,12 @@ impl UserConfig {
             return Err(config_err(
                 path,
                 "admission.psi_poll_interval must be greater than zero",
+            ));
+        }
+        if cfg.admission.psi_max_wait.is_zero() {
+            return Err(config_err(
+                path,
+                "admission.psi_max_wait must be greater than zero",
             ));
         }
         for (repo, over) in &cfg.repos {
@@ -827,6 +838,7 @@ psi_enabled = true
 cpu_some_avg10_max = 60.0
 memory_some_avg10_max = 20.0
 psi_poll_interval = "1s"
+psi_max_wait = "5m"
 
 [cache]
 ttl_days = 30
@@ -862,6 +874,7 @@ budget_share_max = 4
         assert!((c.admission.cpu_some_avg10_max - 60.0).abs() < f64::EPSILON);
         assert!((c.admission.memory_some_avg10_max - 20.0).abs() < f64::EPSILON);
         assert_eq!(c.admission.psi_poll_interval, Duration::from_secs(1));
+        assert_eq!(c.admission.psi_max_wait, Duration::from_mins(5));
         assert_eq!(c.cache.ttl_days, 30);
         assert_eq!(c.cache.tail_lines, 40);
         assert_eq!(c.agent_detection.env_any_set, ["CLAUDECODE"]);
@@ -969,5 +982,24 @@ budget_share_max = 4
         let mut env = EnvMap::new();
         env.insert("SLUICE_CONFIG".into(), file.display().to_string());
         assert_eq!(UserConfig::load(&env).unwrap().daemon.budget, 8);
+    }
+
+    #[test]
+    fn psi_max_wait_parses_and_validates() {
+        let c = UserConfig::parse(
+            "version = 1\n[admission]\npsi_max_wait = \"90s\"\n",
+            Path::new("/u.toml"),
+        )
+        .unwrap();
+        assert_eq!(c.admission.psi_max_wait, Duration::from_secs(90));
+        assert!(
+            user_err("version = 1\n[admission]\npsi_max_wait = \"0s\"\n").contains("psi_max_wait")
+        );
+        assert!(
+            user_err("version = 1\n[admission]\npsi_max_wait = \"soon\"\n")
+                .contains("psi_max_wait")
+                || user_err("version = 1\n[admission]\npsi_max_wait = \"soon\"\n")
+                    .contains("invalid")
+        );
     }
 }

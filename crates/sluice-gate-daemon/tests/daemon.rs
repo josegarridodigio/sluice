@@ -15,7 +15,7 @@ use sluice_gate_core::tree::{self, TreeHash};
 use sluice_gate_core::{CACHE_FORMAT_VERSION, dirs};
 use sluice_gate_daemon::Error;
 use sluice_gate_daemon::executor;
-use sluice_gate_daemon::server::{self, DaemonConfig, LastSubscriberGone};
+use sluice_gate_daemon::server::{self, AdmissionConfig, DaemonConfig, LastSubscriberGone};
 use sluice_gate_daemon::store::{JobRow, JobState, Store};
 use sluice_gate_proto::{
     Caller, ClientEvent, ClientMessage, ErrorCode, GateSpec, OutcomeStatus, PROTOCOL_VERSION,
@@ -102,6 +102,13 @@ fn config(dir: &Path, budget: u32, policy: LastSubscriberGone) -> DaemonConfig {
         tail_lines: 20,
         marker_ttl: Duration::from_hours(7 * 24),
         version: "0.0.0-test".to_owned(),
+        // PSI off by default so the host's real pressure (e.g. a parallel
+        // build) cannot hold jobs back; the PSI tests turn it on.
+        admission: AdmissionConfig {
+            psi_enabled: false,
+            ..AdmissionConfig::default()
+        },
+        psi_root: dir.join("pressure"),
     }
 }
 
@@ -836,5 +843,166 @@ async fn worktrees_of_one_repository_share_its_cap() {
     assert_eq!(st.queued[0].reason, sluice_gate_proto::WaitReason::RepoCap);
     assert_eq!(done_status(&until_done(&mut ra).await), OutcomeStatus::Pass);
     assert_eq!(done_status(&until_done(&mut rb).await), OutcomeStatus::Pass);
+    d.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// PSI admission (Phase 4)
+// ---------------------------------------------------------------------------
+
+/// Daemon log lines captured by a process-wide tracing subscriber.
+static LOG: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+struct Capture;
+
+impl std::io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        LOG.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn capture_logs() {
+    let _ = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+        .with_writer(|| Capture)
+        .try_init();
+}
+
+fn captured() -> String {
+    String::from_utf8_lossy(
+        &LOG.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+    .into_owned()
+}
+
+/// Writes `<root>/cpu` atomically with the given `some avg10`.
+fn write_cpu(root: &Path, avg10: f64) {
+    std::fs::create_dir_all(root).unwrap();
+    let tmp = root.join("cpu.tmp");
+    std::fs::write(
+        &tmp,
+        format!("some avg10={avg10:.2} avg60=1.00 avg300=0.50 total=123456\n"),
+    )
+    .unwrap();
+    std::fs::rename(&tmp, root.join("cpu")).unwrap();
+}
+
+fn psi_config(dir: &Path, max_wait: Duration) -> DaemonConfig {
+    let mut cfg = config(dir, 2, LastSubscriberGone::Cancel);
+    cfg.admission = AdmissionConfig {
+        psi_enabled: true,
+        psi_poll_interval: Duration::from_millis(50),
+        psi_max_wait: max_wait,
+        ..AdmissionConfig::default()
+    };
+    cfg
+}
+
+/// Polls `status` until `cond` holds.
+async fn status_until(
+    d: &Daemon,
+    what: &str,
+    cond: impl Fn(&sluice_gate_proto::StatusReport) -> bool,
+) -> sluice_gate_proto::StatusReport {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let s = status(d).await;
+        if cond(&s) {
+            return s;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}: {s:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn psi_pressure_holds_jobs_until_it_drops() {
+    let repo = make_repo();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("pressure");
+    write_cpu(&root, 99.0);
+    let cfg = psi_config(dir.path(), Duration::from_mins(10));
+    let d = start_in(dir, cfg).await;
+    status_until(&d, "PSI to block", |s| s.budget.psi.blocking).await;
+
+    let (_w, mut r) = d
+        .request(&run_msg(&repo, "held", "true", None, None, 0))
+        .await;
+    assert!(matches!(
+        next(&mut r).await,
+        Some(ServerMessage::Queued { .. })
+    ));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let s = status_until(&d, "the queued job", |s| !s.queued.is_empty()).await;
+    assert!(s.running.is_empty(), "{s:?}");
+    assert_eq!(s.queued[0].reason, sluice_gate_proto::WaitReason::Psi);
+    assert!(s.budget.psi.enabled && s.budget.psi.blocking);
+    assert_eq!(s.budget.psi.cpu_some_avg10, Some(99.0));
+    assert_eq!(s.budget.psi.memory_some_avg10, None, "no memory file");
+
+    write_cpu(&root, 0.0);
+    until_started(&mut r).await;
+    assert_eq!(done_status(&until_done(&mut r).await), OutcomeStatus::Pass);
+    let s = status(&d).await;
+    assert!(!s.budget.psi.blocking);
+    assert_eq!(s.budget.psi.cpu_some_avg10, Some(0.0));
+    assert!(s.totals.psi_blocked_ms_total >= 400, "{:?}", s.totals);
+    d.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn psi_starvation_guard_admits_the_head() {
+    capture_logs();
+    let repo = make_repo();
+    let dir = tempfile::tempdir().unwrap();
+    write_cpu(&dir.path().join("pressure"), 99.0);
+    let cfg = psi_config(dir.path(), Duration::from_millis(300));
+    let d = start_in(dir, cfg).await;
+    status_until(&d, "PSI to block", |s| s.budget.psi.blocking).await;
+
+    let (_w, mut r) = d
+        .request(&run_msg(&repo, "starved", "true", None, None, 0))
+        .await;
+    let job_id = until_started(&mut r).await;
+    assert_eq!(done_status(&until_done(&mut r).await), OutcomeStatus::Pass);
+    assert!(status(&d).await.budget.psi.blocking, "still blocking");
+    let log = captured();
+    assert!(
+        log.lines()
+            .any(|l| l.contains("starvation guard") && l.contains(&job_id)),
+        "{log}"
+    );
+    d.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn psi_unavailable_falls_back_to_the_budget() {
+    let repo = make_repo();
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = psi_config(dir.path(), Duration::from_mins(10));
+    cfg.psi_root = dir.path().join("no-such-dir");
+    let d = start_in(dir, cfg).await;
+    // The first sample fails and disables PSI admission.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let s = status(&d).await;
+    assert!(!s.budget.psi.enabled, "{:?}", s.budget.psi);
+    assert_eq!(s.budget.psi.cpu_some_avg10, None);
+    assert!(!s.budget.psi.blocking);
+    let (_w, mut r) = d
+        .request(&run_msg(&repo, "free", "true", None, None, 0))
+        .await;
+    assert_eq!(done_status(&until_done(&mut r).await), OutcomeStatus::Pass);
     d.shutdown().await;
 }
