@@ -87,3 +87,23 @@ release page.
 Still open: the tag must match the crate version by hand (the workflow
 does not check), and the crates are not published to crates.io (separate
 step, needs the user's explicit "publish").
+
+## Release guard and release script (2026-10-22)
+
+- `.github/workflows/release.yml`, job `test`, first step "Tag matches the
+  workspace version": reads `version` from `[workspace.package]` in
+  `Cargo.toml` and fails the run when `v<version>` differs from the pushed
+  tag, so a mislabelled binary is never published (it would make
+  `sluice update` see no update, or the wrong one).
+- `scripts/release.sh <X.Y.Z>`: refuses a dirty tree, a branch other than
+  `main`, an existing tag and a non `X.Y.Z` version; bumps the workspace
+  version and the five internal dependency versions, `cargo update
+  --workspace`, bumps `plugin/.claude-plugin/plugin.json` when present,
+  runs `sluice run fmt|clippy|test`, commits `chore(release): vX.Y.Z` and
+  creates the annotated tag. It never pushes; it prints
+  `git push origin main vX.Y.Z`.
+- Verified: `sh -n`; argument validation (`1.x` and no argument refused);
+  the two `sed` expressions applied to a copy of `Cargo.toml` change
+  exactly the workspace version and the five internal dependency lines;
+  the workflow's extraction prints `0.1.0` on the current tree. The full
+  script and the workflow step run for real at the next release.
