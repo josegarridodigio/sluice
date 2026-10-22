@@ -17,17 +17,22 @@ Status: design for Phase 2. Related: [[sluice/design/protocol.md]],
   `setsid`, stdio to `<state>/daemon.log`). No `unsafe` is needed.
 - **Single instance:** the daemon takes an exclusive `flock` on
   `<runtime>/daemon.lock` for its whole life and writes a lease row in
-  SQLite (`owner = "<user>:<pid>"`, random `token`, `heartbeat_at`,
+  SQLite (`owner = "<uid>:<pid>"`, random `token`, `heartbeat_at`,
   `expires_at = now + 90 s`, heartbeat every 15 s). Every write to `jobs`
   that matters (state transitions) is fenced with `WHERE daemon_instance = ?`.
+  A lost lease (heartbeat rejected) does not stop the daemon: it keeps
+  serving its running jobs and refuses new `run` requests with
+  `error{internal}`. The daily log pruning runs from the heartbeat task
+  (and once at start).
 - **Autostart from clients:** a client that cannot connect takes a short
   `flock` on `<runtime>/start.lock`, re-checks the socket, spawns
   `sluice daemon` (detached), waits up to 5 s for the socket with 20 ms
   polls, releases the lock. Failure to start is reported; the client then
   runs the gate itself (Phase 1 path) so a broken daemon never blocks work.
 - **Stop:** `sluice daemon stop [--force]` sends `stop`; the daemon removes
-  the socket file first (so new clients start a fresh one), finishes or
-  kills jobs, releases the lease, exits 0.
+  the socket file first (so new clients start a fresh one), drops queued
+  jobs (`done{killed}`), finishes or (with `--force`, SIGTERM or SIGINT)
+  kills running jobs, releases the lease, exits 0.
 - **Idle:** never exits on its own in v1 (`daemon.idle_exit = 0s`, Q10).
 - **Restart reconciliation:** on start, rows in `jobs` with
   `state = 'running'` from another `daemon_instance` are orphans. For each,
@@ -44,22 +49,33 @@ Status: design for Phase 2. Related: [[sluice/design/protocol.md]],
   `process_group(0)` (new group; the daemon owns the gate, no terminal).
 - Record `pgid`, `proc_start_ticks` and `log_path` in SQLite before the
   first byte of output is read.
-- Priority: `setpriority(PRIO_PROCESS, child_pid, daemon.nice)` right after
-  spawn; I/O class through the `ionice` binary when present
-  (`ionice -c <class> -n <level> -p <pid>`), skipped silently otherwise.
+- Priority: the `nix` crate exposes no `setpriority`, and calling libc
+  directly needs `unsafe`, so the CPU priority is applied with the
+  `renice` binary right after spawn (`renice -n <nice> -p <pid>`, skipped
+  when `nice = 0` or the binary is absent); the I/O class through the
+  `ionice` binary when present (`ionice -c <2|3> -n <level> -p <pid>`),
+  skipped silently otherwise. Results are ignored (debug log).
 - Output: both pipes drained concurrently into one append-only log
   `<state>/logs/<job-id>.log` (interleaved, 8 KiB chunks) with a header
   line (`# sluice job …`) and footer (`# exit: …`). `log_bytes` is reported
   in `progress`.
 - Timeout: `gate.timeout` from the moment the process starts (queue wait
-  excluded). On expiry: `killpg(SIGTERM)`, 5 s grace, `killpg(SIGKILL)`,
-  outcome `timeout`.
+  excluded; `0` disables it). On expiry: `killpg(SIGTERM)`, 5 s grace,
+  `killpg(SIGKILL)`, outcome `timeout`. If the leader exits but a
+  grandchild keeps the pipes open, the same deadline applies to the pumps
+  and the group is SIGKILLed, so `wait` never hangs.
 - Cancel (last subscriber gone with `cancel`, `stop --force`): same kill
-  sequence, outcome `killed`.
+  sequence, outcome `killed`; the log footer says `(killed)`. Under
+  `finish`, a job whose last subscriber left keeps running (or stays
+  queued and still runs later).
 - After exit 0 with a key: re-snapshot the tree with `probe_env` from the
-  request (`tree::snapshot`); unchanged → `MarkerStore::write`, `prune`;
-  changed → miss record `the gate modified the tree`, `not_cached_reason`.
-  Non-zero → miss record with exit code.
+  request (`tree::snapshot`, scratch dir from the daemon's own
+  `XDG_RUNTIME_DIR`); unchanged → `MarkerStore::write` (`cmd` normalised,
+  `committed_tree` taken from the request, `sluice_version` the daemon's),
+  `prune`; changed → miss record `the gate modified the tree`,
+  `not_cached_reason`. Non-zero → miss record `gate failed` with the exit
+  code; timeouts `timed out`; cancellations `killed`. The gate environment
+  is the request's `child_env` with `gate.env` laid over it.
 - The `tail` in `done` is the last `cache.tail_lines` lines of the log.
 - Log retention: on start and daily, delete logs older than
   `daemon.log_retention_days` whose job row is terminal.
@@ -93,7 +109,8 @@ CREATE TABLE events (                 -- client-side hits
 Timestamps are unix milliseconds (integers), never strings. Busy timeouts
 map to a typed retryable error, never to a gate failure. The database is
 never deleted automatically; a schema mismatch is a hard error with a
-message naming the file.
+message naming the file. `totals(since)` filters jobs by `queued_at` and events by `at`;
+`prune_logs` refuses job ids containing path separators or `..`.
 
 ## Client side (`sluice run` on a miss)
 

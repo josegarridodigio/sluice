@@ -76,7 +76,15 @@ Server events on that connection, in order:
 queued (another client finished the same tree): the daemon re-checks the
 marker store right before starting a job ([[sluice/design/scheduler.md]]).
 `error` carries a `message` and means Sluice itself failed (cannot spawn,
-cannot write the log); the client exits 1.
+cannot write the log, daemon stopping or lease lost); the client exits 1.
+`killed` is also what every subscriber of a queued job receives when the
+daemon stops (forced or not) or when the job's last subscriber left under
+the `cancel` policy. For a coalesced subscriber `done` carries
+`coalesced_with = <job_id>`. While a request is queued, `progress` is sent
+per subscriber with its `position`; while it runs, `progress` is broadcast
+with `elapsed_ms` and `log_bytes`. `gate.timeout_ms = 0` means no timeout.
+A pass whose request had a `key` but no `tree` is reported with
+`not_cached_reason: "the tree is unknown"`.
 
 ### `status`
 
@@ -106,15 +114,18 @@ client falls back to reading `<state>/logs/` directly (Phase 1 behaviour).
 
 Best-effort, fire-and-forget telemetry from clients that did not need the
 daemon: `{"type":"event","id":0,"event":"hit","repo":"/abs","gate":"test","saved_ms":32100}`.
-The client connects with a 20 ms timeout, writes one line and closes; any
-failure is ignored. It feeds `totals.hits` and `time_saved_ms`.
+The client connects with a 20 ms timeout, writes one line and closes; the
+daemon sends no reply; any failure is ignored. It feeds `totals.hits` and
+`time_saved_ms`.
 
 ### `stop`
 
 `{"type":"stop","id":4,"force":false}` → `{"type":"stopping","id":4,"running":2}`.
-Without `force` the daemon stops accepting work, lets running jobs finish
-and exits; with `force` it kills running jobs (their subscribers get
-`done` with `status:"killed"`).
+Without `force` the daemon stops accepting work, drops queued jobs
+(`done{killed}` to their subscribers), lets running jobs finish and exits;
+with `force` it also kills running jobs (their subscribers get `done` with
+`status:"killed"`). A SIGTERM/SIGINT to the daemon behaves like
+`stop --force`.
 
 ### `cancel`
 
@@ -132,7 +143,11 @@ completion and write the marker so the next request hits).
 ## Errors
 
 `{"type":"error","id":N,"code":"protocol|bad-request|not-found|internal","message":"..."}`.
-Unknown `type` → `bad-request`. The server never panics on malformed input.
+Unknown `type` or malformed JSON → `bad-request`; a `hello` with another
+protocol → `protocol` (no `id`); a `run` while the daemon is stopping or
+has lost its lease → `internal`. Both the `hello` and the request line
+must arrive within 10 s or the connection is closed. The server never
+panics on malformed input.
 
 ## Versioning rules
 
