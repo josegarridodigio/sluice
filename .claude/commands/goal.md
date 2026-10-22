@@ -98,7 +98,7 @@ a clean container or temp `CARGO_HOME`, man page or `--help` export in
 `docs/`, README updated with real install instructions and a demo (GIF or
 asciinema) of six requests becoming one run.
 Acceptance:
-- Validated on `the-external-repository` and its worktrees: before/after numbers (wall time per commit and per push, suite runs per day) recorded in `kb/sluice/changes/phase-5-validation.md`. Ask the user to run the agents during the measurement window; prepare the hook snippets and the measurement script yourself.
+- Validated on **this repository** (Sluice dogfoods its own `fmt`, `clippy` and `test` gates; never reference the user's private repositories in this public repo): before/after numbers (wall time per commit and per push, suite runs) from the reproducible multi-worktree benchmark `scripts/validation-bench.sh`, recorded in `kb/sluice/changes/phase-5-validation.md`.
 - Crates are **not** published to crates.io without an explicit "publish" from the user; everything else in the phase proceeds autonomously.
 
 ### Phase 6 — Local merge queue (previously "later", now in scope)

@@ -1,0 +1,28 @@
+# Sluice verifies itself. These gates run from the repository's own hooks
+# (see .githooks/ and CONTRIBUTING.md) and from the validation benchmark.
+version = 1
+
+[defaults]
+agent_hook_policy = "fail-fast"
+human_hook_policy = "wait"
+
+[gates.fmt]
+cmd = "cargo fmt --all --check"
+weight = 1
+timeout = "2m"
+hooks = ["pre-commit"]
+key_inputs = ["rustc --version"]
+
+[gates.clippy]
+cmd = "cargo clippy --workspace --all-targets -- -D warnings"
+weight = 4
+timeout = "15m"
+hooks = ["pre-commit"]
+key_inputs = ["rustc --version"]
+
+[gates.test]
+cmd = "cargo test --workspace"
+weight = 6
+timeout = "30m"
+hooks = ["pre-push"]
+key_inputs = ["rustc --version"]

@@ -1,0 +1,9 @@
+#!/bin/sh
+# Sluice runs the pre-push gate of .sluice.toml (the full test suite).
+set -e
+if command -v sluice >/dev/null 2>&1; then
+    sluice run --hook pre-push test
+else
+    echo "sluice not found in PATH; running the gate directly (cargo install --path crates/sluice-gate)" >&2
+    cargo test --workspace
+fi

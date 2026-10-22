@@ -1,0 +1,13 @@
+#!/bin/sh
+# Sluice runs the pre-commit gates of .sluice.toml (fmt, clippy). A tree that
+# already passed is answered from the cache. Without sluice in PATH the gates
+# run directly so the hook still protects the repository.
+set -e
+if command -v sluice >/dev/null 2>&1; then
+    sluice run --hook pre-commit fmt
+    sluice run --hook pre-commit clippy
+else
+    echo "sluice not found in PATH; running the gates directly (cargo install --path crates/sluice-gate)" >&2
+    cargo fmt --all --check
+    cargo clippy --workspace --all-targets -- -D warnings
+fi

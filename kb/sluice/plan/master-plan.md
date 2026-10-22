@@ -161,8 +161,10 @@ with measurements.
 ## Phase 5 — Packaging and real-world validation
 
 Deliverables: release builds (Linux x86_64/arm64), install script,
-`cargo install sluice-gate`, man page / README. Validation on the user's real
-project(s) with before/after numbers.
+`cargo install sluice-gate`, man page / README. Validation on this
+repository (Sluice runs its own gates) with before/after numbers from a
+reproducible multi-worktree benchmark; private repositories are never
+referenced here.
 
 ## Working agreements
 
@@ -178,7 +180,7 @@ project(s) with before/after numbers.
 
 1. Ask the user to run the Phase 3 manual test (`docs/manual-test-phase-3.md`).
 2. Phase 4 reconciliation pass.
-3. Phase 5: tag `v0.1.0`, verify the release workflow, README install line; validate on `the-external-repository` with the user (measurement script).
+3. Phase 5: tag `v0.1.0`, verify the release workflow, README install line; validate on this repository with the multi-worktree benchmark (`scripts/validation-bench.sh`).
 4. Phase 6: present [[sluice/design/merge-queue.md]] and its open questions to the user; implement after approval.
 
 Earlier plan for Phase 3: `sluice-gate-mcp` with rmcp per [[sluice/design/mcp-tools.md]]

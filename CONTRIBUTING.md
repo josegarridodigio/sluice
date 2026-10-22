@@ -26,6 +26,23 @@ cargo test --workspace
 Clippy runs with `pedantic` enabled. If a lint is wrong for a specific
 case, allow it locally with a one-line reason; do not disable it globally.
 
+## Sluice verifies itself
+
+The repository ships its own gates (`.sluice.toml`: `fmt`, `clippy`,
+`test`) and plain hooks under `.githooks/`. To use them:
+
+```sh
+cargo install --path crates/sluice-gate     # puts `sluice` in ~/.cargo/bin
+git config core.hooksPath .githooks         # pre-commit: fmt + clippy; pre-push: test
+```
+
+A tree that already passed is answered from the cache, so repeated
+commits and pushes of the same content cost milliseconds. Without
+`sluice` in `PATH` the hooks run the gates directly. Agents working on
+this repository register the MCP server as described in
+[docs/agents.md](docs/agents.md). `docs/validation.md` explains the
+multi-worktree benchmark that produces the before/after numbers.
+
 ## Rules of the house
 
 - Everything in English: code, comments, commits, docs.
