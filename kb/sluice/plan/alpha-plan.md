@@ -44,8 +44,18 @@ Done when:
 4. CHANGELOG, issue templates, README limitations and the alpha badge are in.
 5. `v0.3.0` is released with `scripts/release.sh 0.3.0`, the release
    workflow is green, and `sluice update` moves the user's install to 0.3.0.
+6. Latency (workstream L): the overload targets are met, or the tuning
+   loop L3 has run its three rounds and the numbers, the remaining gap and
+   its cause are recorded; "idle CPU while jobs wait" is measured and below
+   its target.
+7. Beta hardening that does not need outside users (workstream H) is done:
+   CI matrix, authenticated remotes for the merge queue, the written
+   compatibility promise with golden-file tests, crates.io readiness
+   (dry run only), and command control for agents other than the agent
+   plugin (shell shims).
 
-Non-goals: crates.io publication (declined by the user for now); macOS or
+Non-goals: crates.io publication (declined by the user for now; H4 only
+proves readiness with `cargo publish --dry-run`); macOS or
 Windows; caching build artifacts (outputs) — Sluice caches verdicts, and
 build commands get queue-only treatment instead.
 
@@ -84,21 +94,28 @@ build commands get queue-only treatment instead.
 ## 4. Orchestration waves
 
 ```
-Wave 1 (parallel, independent)      Wave 2 (design gate)         Wave 3 (implementation)            Wave 4 (prove)           Wave 5 (ship)
-C socket fallback      [opus]       A0 command-control design    A1 sluice exec + queue-only        E2 s2 rerun + targets    R1 adversarial review
-F intake + CHANGELOG   [sonnet]     B0 scheduler design          A2 guard rewrite + equivalences    E3 s7 command control    R2 fixes
-E1 harness s3,s4,s6    [sonnet]     D0 path scoping design       B1 scheduler changes               E4 s5 merge queue        R3 reconciliation
-G  docker/build docs   [sonnet]     (lead writes ADRs 0010-0012) D1 path-scoped keys                E5 full harness run      R4 release v0.3.0
+Wave 1 (parallel, independent)   Wave 2 (design gate)            Wave 3 (implementation)           Wave 4 (prove and tune)          Wave 5 (ship)
+C  socket fallback     [opus]    A0 command-control design       A1 sluice exec + queue-only       E2 s2 rerun + targets            R1 adversarial review
+F  intake + CHANGELOG  [sonnet]  B0 scheduler + latency design   A2 guard rewrite + equivalences   L2 latency policies              R2 fixes
+E1 harness s3,s4,s6    [sonnet]  D0 path scoping design          B1 scheduler changes              L3 tuning loop (<= 3 rounds)     R3 reconciliation
+G  docker/build docs   [sonnet]  H3 compatibility promise draft  L1 timeline + idle-CPU metric     E3 s7 command control            R4 release v0.3.0
+H1 CI matrix           [sonnet]  (lead writes ADRs 0010-0013)    D1 path-scoped keys               E4 s5 merge queue
+H4 crates.io dry run   [sonnet]                                  H5 shell shims (other agents)     H2 authenticated remotes
+                                                                 H3 golden-file tests              E5 full harness run
 ```
 
-Wave 2 is a lead step: the three design agents report, the lead writes and
-accepts ADR-0010 (command control), ADR-0011 (scheduler throughput),
-ADR-0012 (path-scoped keys). No stop for the user unless a frozen format
-would change.
+Wave 2 is a lead step: the design agents report, the lead writes and
+accepts ADR-0010 (command control, including shell shims), ADR-0011
+(scheduler throughput and latency), ADR-0012 (path-scoped keys) and
+ADR-0013 (compatibility promise). No stop for the user unless a frozen
+format would change.
 
-Within wave 3: A1 → A2 (A2 depends on `sluice exec`); B1 after A1 (both
-touch the scheduler); D1 in parallel with A (core key derivation and
-config, separate files), in a worktree.
+Within wave 3: A1 → A2 and A1 → H5 (both build on `sluice exec`); B1 and
+L1 after A1 and together in one agent (both touch the scheduler and the
+store); D1 in parallel with A in a worktree; H3 golden files in parallel
+(tests and fixtures only). Within wave 4: L2 → L3 strictly after E2 has
+produced the first numbers; H2 in parallel with L (queue crate and test
+servers only).
 
 ## 5. Tasks
 
@@ -302,6 +319,97 @@ Build on `scripts/alpha/lib.py` and `mcp_agent.py`; each scenario writes
   `src/` misses; config change always misses; `paths_ignore`; rename across
   the filter boundary; old markers of unscoped gates still hit.
 
+### L — Latency and wasted waiting (waves 3–4)
+
+Problem: under overload, jobs waited while CPUs were idle (two weight-8
+jobs in a 19-unit budget on 20 CPUs) and p95 `verify` latency doubled.
+Waiting is fine while the CPU is full; waiting with idle CPU is waste.
+
+- L1 instrumentation (wave 3, Opus, with B1): per-job timeline
+  (requested, queued, admitted, started, finished, subscribers, wait
+  reason) kept in SQLite and exposed in `status --json` (optional
+  fields) and `sluice logs --timeline`; a daemon-side utilisation sampler
+  (`/proc/stat` busy vs idle every second) so the daemon can report
+  "idle CPU while the queue was not empty" (`totals.idle_while_waiting_ms`,
+  optional field). The harness reads both instead of guessing.
+- L2 latency policies (wave 4, Opus): on top of B1, implement and measure
+  in this order, keeping each only if it helps E2:
+  1. shortest-expected-job-first with ageing, using learned durations per
+     gate (median of the last runs), never starving a job beyond
+     `max_wait`;
+  2. per-session fairness (round-robin across sessions/worktrees at equal
+     priority);
+  3. supersede (queued older tree of the same session and gate is
+     cancelled; its subscribers move to the newer job only if they asked
+     for "latest");
+  4. early verdict: a `verify` with several gates returns as soon as one
+     fails, cancelling the others that nobody else waits for;
+  5. human-waiting priority: a hook run by a human in `wait` policy is
+     admitted before agent requests of equal weight.
+- L3 tuning loop (wave 4, lead + Opus): after each change run E2 (normal,
+  overload, low-core). Targets: wall ≤ baseline; p95 verify latency ≤ 1.2x
+  baseline; heavy suite executions = distinct-tree count; idle CPU while
+  jobs wait < 10 % of the run's wall time; peak load under Sluice not
+  above the baseline's. Up to three rounds of hypothesis → change → rerun,
+  each recorded in [[sluice/changes/alpha-readiness.md]] (numbers before
+  and after, what was kept, what was reverted). If a target is still
+  missed after round three, stop tuning and record the gap and its cause.
+
+### H — Beta hardening that does not need outside users
+
+- H1 CI matrix (wave 1, Sonnet): `.github/workflows/ci.yml` gains a matrix
+  of containers running `cargo test --workspace` (Sluice itself is not
+  available inside CI, so CI keeps cargo): Ubuntu 22.04 (git 2.34),
+  Ubuntu 24.04 (git 2.43), Debian 12 (git 2.39), Fedora latest, Alpine
+  latest (musl); a job that builds git 2.31.0 from source and runs the
+  core and CLI integration tests against it (the declared minimum); a
+  native aarch64 job on `ubuntu-24.04-arm` running the full suite; PSI
+  absent containers must pass (the fallback path). Keep the main job
+  fast; the matrix may run on push to main and on tags only.
+- H2 authenticated remotes for the merge queue (wave 4, Opus): tests and
+  an `s5` variant where the bare remote is reached through (a) SSH: an
+  unprivileged `sshd` on a high port with a generated host key and an
+  authorised client key loaded in a test `ssh-agent`, the approver's
+  `SSH_AUTH_SOCK` reaching the push through the allowlist; (b) smart HTTP:
+  `git http-backend` behind a small Python CGI server with basic auth and
+  a `GIT_ASKPASS` helper. Cases: push lands; wrong key or password fails
+  definitively without hanging (bounded by `network_timeout`); credentials
+  never appear in the database, logs or `doctor --bundle`; reconcile works
+  over both transports. Skip cleanly with a reason when `sshd` is not
+  installed.
+- H3 compatibility promise (draft in wave 2, tests in wave 3, Sonnet with
+  the lead deciding): `docs/compatibility.md` and ADR-0013 state what is
+  stable from 0.3.0 (`.sluice.toml` version 1 with optional additions
+  only, marker files, protocol 1, status JSON schema 1, queue status
+  schema 1, user config, exit codes, CLI flags), how changes are made
+  (additive only; breaking changes need a new version number, a migration
+  path and one release of deprecation warnings), and how the database
+  migrates. Golden files under `crates/*/tests/fixtures/compat/`: configs,
+  markers and miss records written by v0.1.0 and v0.2.0 (generated with the
+  release binaries), protocol transcripts recorded from v0.1.0/v0.2.0
+  clients and servers (hello/run/status/logs), status JSON from each
+  version; tests prove the current code reads and answers them.
+- H4 crates.io readiness (wave 1, Sonnet, no publishing): `cargo publish
+  --dry-run` for each crate in dependency order (core, proto, daemon,
+  queue, mcp, gate), complete package metadata (description, readme,
+  keywords, categories, documentation), a short README per library crate,
+  `cargo package --list` reviewed for stray files; results in
+  [[sluice/changes/packaging.md]]. Publishing stays a user decision.
+- H5 other agents (wave 3, Opus, after A1): agent-agnostic command control
+  through shell shims: `sluice shim install [--dir DIR]` writes small
+  wrappers named after the heavy commands of the A0 list (or the user
+  config list) into `~/.local/share/sluice/shims`; each wrapper resolves
+  the real binary further down `PATH` (never itself), and when it runs
+  inside an agent session (agent detection) or with `SLUICE_SHIMS=1`
+  executes `sluice exec --label <cmd> -- <real> "$@"`, otherwise execs the
+  real binary unchanged; `sluice shim uninstall`, `sluice shim status`;
+  docs show how to put the shim dir first in `PATH` for agent shells
+  (Codex, Cursor, Aider and others that run a shell) plus a ready-to-paste
+  `AGENTS.md` block. Tests: wrapper resolution with nested PATHs, no
+  recursion, exit codes and stdin/stdout/tty fidelity, human sessions
+  untouched, concurrency bounded when 10 shells call a shimmed `make` at
+  once. E3 gains a shim variant.
+
 ### E2–E5 — Prove (wave 4, Sonnet for scripts, lead runs and interprets)
 
 - E2: rerun `s2_problem.py` normal and overload variants with the new
@@ -326,10 +434,12 @@ Build on `scripts/alpha/lib.py` and `mcp_agent.py`; each scenario writes
 
 ### R1–R4 — Ship (wave 5)
 
-- R1 adversarial review (Opus, read-only) of A1, A2, B1, D1 and C: races,
-  signal handling, guard rewrite injection (a crafted command must never
-  produce a rewritten command that does more than the original), key
-  correctness of path scoping.
+- R1 adversarial review (Opus, read-only) of A1, A2, B1, L1, L2, D1, C,
+  H2 and H5: races, signal handling, guard rewrite and shim injection (a
+  crafted command must never produce a rewritten command that does more
+  than the original; a shim must never recurse or run something other than
+  the next real binary in `PATH`), key correctness of path scoping,
+  starvation in the latency policies, credential leaks in H2.
 - R2 fixes (Opus), each with a regression test; rerun E5.
 - R3 reconciliation (Sonnet): design docs, ADRs 0010–0012, README,
   `docs/`, `--help`, skill, CHANGELOG vs code; report in
@@ -350,7 +460,8 @@ Build on `scripts/alpha/lib.py` and `mcp_agent.py`; each scenario writes
 | Chaos | `s4_chaos.py` | E1 |
 | Merge queue on a real project | `s5_merge_queue.py` | E4 |
 | Upgrade with live state | `s6_upgrade.py` | E1, rerun at R4 |
-| Command control (exec, guard rewrite) | `s7_command_control.py` | E3 |
+| Command control (exec, guard rewrite, shell shims) | `s7_command_control.py` | E3, H5 variant |
+| Merge queue over SSH and smart HTTP | `s5_merge_queue.py --transport ssh|http` | H2 |
 
 Test beds: `sindresorhus/slugify` (Node, xo + ava) and
 `pallets/itsdangerous` (Python, pytest + mypy), cloned into the scratch
@@ -372,3 +483,11 @@ knobs documented at the top of each script.
   key.
 - The v0.1.0 → v0.3.0 upgrade crosses two queue/database schema changes:
   covered by `s6_upgrade.py`.
+- Latency policies interact (SJF can starve long gates, supersede can
+  surprise an agent waiting on an old tree): ageing bound, opt-out per
+  gate, and every policy measured on its own in L3.
+- Shell shims sit in the agent's `PATH`: a wrong resolution could recurse
+  or shadow a binary for humans; shims are inert outside agent sessions
+  unless `SLUICE_SHIMS=1`, and R1 attacks the resolution.
+- The CI matrix lengthens CI; it runs on main and tags only, not on every
+  pull request.
