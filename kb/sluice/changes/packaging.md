@@ -107,3 +107,21 @@ step, needs the user's explicit "publish").
   exactly the workspace version and the five internal dependency lines;
   the workflow's extraction prints `0.1.0` on the current tree. The full
   script and the workflow step run for real at the next release.
+
+## Second release: `v0.2.0` (2026-10-22)
+
+Cut with `scripts/release.sh 0.2.0` (first real run of the script: version
+bump in `Cargo.toml`, `Cargo.lock` and `plugin/.claude-plugin/plugin.json`,
+gates through Sluice, commit `chore(release): v0.2.0`, annotated tag) and
+pushed with the user's approval. Workflow run 39847226061: the new
+"Tag matches the workspace version" step passed, then `test`, both
+`build` jobs and `release` succeeded. Assets: x86_64 4.8 MB, aarch64
+4.4 MB, `SHA256SUMS`.
+
+First real `sluice update`: the user's installed 0.1.0 (built from source
+in `~/.cargo/bin`) reported `update available: 0.1.0 -> 0.2.0` with
+`--check`, then `--yes` downloaded the x86_64 archive, verified the
+checksum, replaced the binary (now the static release build, `sluice
+0.2.0`), printed the cargo-metadata note, stopped the idle daemon and
+reminded that running MCP servers keep the old binary. `sluice doctor`
+afterwards: no failures.
