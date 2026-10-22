@@ -1,0 +1,95 @@
+name: Matrix
+
+# The wide compatibility matrix. Slower than the fast job in ci.yml, so it runs
+# on main, on release tags, weekly and on demand, not on every pull request.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  distros:
+    name: test (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ubuntu:22.04
+          - ubuntu:24.04
+          - debian:12
+          - fedora:latest
+          - alpine:latest
+    steps:
+      - uses: actions/checkout@v4
+      # The tests run inside the container, but checkout and caching stay on
+      # the runner (JavaScript actions do not run reliably in every image,
+      # Alpine in particular). Cargo's registry and target/ are mounted in.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.image }}
+      - name: Test in ${{ matrix.image }}
+        run: |
+          mkdir -p "$HOME/.cargo/registry" "$HOME/.cargo/git" target
+          docker run --rm \
+            -v "$PWD:/work" \
+            -v "$HOME/.cargo/registry:/opt/cargo/registry" \
+            -v "$HOME/.cargo/git:/opt/cargo/git" \
+            -e RUSTFLAGS -e CARGO_TERM_COLOR \
+            -e CI_OWNER="$(id -u):$(id -g)" \
+            "${{ matrix.image }}" sh /work/scripts/ci/container-test.sh
+
+  git-minimum:
+    name: test (git 2.31.0, the declared minimum)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GIT_VERSION: "2.31.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache git ${{ env.GIT_VERSION }}
+        id: git-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/git-${{ env.GIT_VERSION }}
+          key: git-${{ env.GIT_VERSION }}-${{ runner.os }}-${{ runner.arch }}-v1
+      - name: Build git ${{ env.GIT_VERSION }} from source
+        if: steps.git-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libcurl4-gnutls-dev libssl-dev zlib1g-dev libexpat1-dev
+          scripts/ci/build-git.sh "$GIT_VERSION" "$HOME/git-$GIT_VERSION"
+      - name: Put git ${{ env.GIT_VERSION }} first in PATH
+        run: echo "$HOME/git-$GIT_VERSION/bin" >> "$GITHUB_PATH"
+      - name: Prove which git the tests use
+        run: |
+          git --version
+          test "$(git --version)" = "git version $GIT_VERSION"
+          git config --global user.name ci
+          git config --global user.email ci@example.invalid
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: git-${{ env.GIT_VERSION }}
+      # The core crate wraps git; the CLI crate drives it end to end.
+      - run: cargo test --locked -p sluice-gate-core -p sluice-gate
+
+  aarch64:
+    name: test (aarch64, native)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64
+      - run: cargo test --workspace --locked
