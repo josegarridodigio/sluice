@@ -8,7 +8,7 @@
 //! ```
 //!
 //! `hook` and `tree` are `-` when there is none. `decision` is one of
-//! `hit`, `miss-run`, `miss-fail-fast`, `coalesced`, `in-process`,
+//! `hit`, `miss-run`, `miss-fail-fast`, `coalesced`, `in-process`, `nested`,
 //! `disabled`, `error`. The file is appended with one `O_APPEND` write per
 //! line, so concurrent invocations never interleave inside a line; above
 //! 5 MiB it is rotated to `client.log.1` (one generation is kept). Writing

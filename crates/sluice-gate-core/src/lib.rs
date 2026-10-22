@@ -14,6 +14,7 @@
 //! - [`semaphore`]: `flock`-based counting semaphore (Phase 1 global guard).
 //! - [`mode`]: `CI` / `SLUICE_CACHE` / `SLUICE_DISABLE` handling.
 //! - [`dirs`]: state, runtime and socket paths, job ids.
+//! - [`which`]: `PATH` resolution that skips Sluice's own shims.
 
 pub mod agent;
 pub mod config;
@@ -27,11 +28,18 @@ pub mod marker;
 pub mod mode;
 pub mod semaphore;
 pub mod tree;
+pub mod which;
 
 pub use error::{Error, Result};
 
 /// Version of the on-disk cache format. Bumping it invalidates every marker.
 pub const CACHE_FORMAT_VERSION: u32 = 1;
+
+/// Environment variable carrying the job id on every process Sluice runs
+/// (gates, `sluice exec` commands, in-process fallbacks). A nested
+/// `sluice exec` or `sluice run` that sees it runs directly, unqueued: the
+/// parent job's weight already covers it.
+pub const JOB_ENV_VAR: &str = "SLUICE_JOB";
 
 /// Version of the Sluice crates, embedded in markers.
 pub const SLUICE_VERSION: &str = env!("CARGO_PKG_VERSION");

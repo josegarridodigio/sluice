@@ -18,8 +18,9 @@ use sluice_gate_daemon::executor;
 use sluice_gate_daemon::server::{self, AdmissionConfig, DaemonConfig, LastSubscriberGone};
 use sluice_gate_daemon::store::{JobRow, JobState, Store};
 use sluice_gate_proto::{
-    Caller, ClientEvent, ClientMessage, ErrorCode, GateSpec, OutcomeStatus, PROTOCOL_VERSION,
-    RepoInfo, RunRequest, STATUS_SCHEMA_VERSION, ServerMessage, decode_server, encode,
+    Caller, ClientEvent, ClientMessage, ErrorCode, ExecRequest, ExecSignal, FEATURE_EXEC,
+    FEATURE_QUEUE_ONLY, GateSpec, OutcomeStatus, PROTOCOL_VERSION, RepoInfo, RunRequest,
+    STATUS_SCHEMA_VERSION, ServerMessage, decode_server, encode,
 };
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -205,6 +206,7 @@ fn run_msg(
             session: None,
             client_pid: std::process::id(),
             hook: None,
+            no_marker: false,
         },
     }
 }
@@ -322,6 +324,164 @@ async fn handshake_checks_the_protocol() {
             assert!(next(&mut lines).await.is_none(), "connection closed");
         }
     }
+    d.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn welcome_announces_exec_and_queue_only() {
+    let d = start(2, LastSubscriberGone::Cancel).await;
+    let stream = UnixStream::connect(&d.socket).await.unwrap();
+    let (rd, mut wr) = stream.into_split();
+    let hello = encode(&ClientMessage::Hello {
+        protocol: PROTOCOL_VERSION,
+        client: "t".into(),
+        pid: 1,
+    })
+    .unwrap();
+    wr.write_all(hello.as_bytes()).await.unwrap();
+    let mut lines = BufReader::new(rd).lines();
+    let Some(ServerMessage::Welcome { features, .. }) = next(&mut lines).await else {
+        panic!("no welcome");
+    };
+    assert!(features.iter().any(|f| f == FEATURE_EXEC), "{features:?}");
+    assert!(
+        features.iter().any(|f| f == FEATURE_QUEUE_ONLY),
+        "{features:?}"
+    );
+    d.shutdown().await;
+}
+
+fn exec_msg(dir: &Path, script: &str) -> ClientMessage {
+    ClientMessage::Exec {
+        id: 3,
+        request: ExecRequest {
+            argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
+            cwd: dir.to_path_buf(),
+            env: host_env(),
+            label: "sh -c".into(),
+            weight: 1,
+            timeout_ms: 0,
+            coalesce: None,
+            repo: None,
+            caller: Caller::Agent,
+            session: None,
+            client_pid: std::process::id(),
+        },
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exec_runs_an_argv_into_a_spool_with_sluice_job_set() {
+    let d = start(2, LastSubscriberGone::Cancel).await;
+    let msg = exec_msg(
+        d.dir.path(),
+        "printf out; printf \"$SLUICE_JOB\" >&2; pwd > cwd.txt; exit 5",
+    );
+    let (_w, mut r) = d.request(&msg).await;
+    let msgs = until_done(&mut r).await;
+    let spool = msgs
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::Started { spool, .. } => spool.clone(),
+            _ => None,
+        })
+        .expect("started carries the spool");
+    let Some(ServerMessage::Done {
+        job_id, outcome, ..
+    }) = msgs.last()
+    else {
+        panic!("no done");
+    };
+    assert_eq!(outcome.status, OutcomeStatus::Fail);
+    assert_eq!(outcome.exit_code, Some(5));
+    assert_eq!(outcome.signal, None);
+    assert!(!outcome.marker_written);
+    assert_eq!(spool, d.config.logs_dir.join(format!("{job_id}.exec")));
+    let bytes = std::fs::read(&spool).unwrap();
+    let body = bytes.strip_prefix(executor::spool::MAGIC).expect("magic");
+    let (records, _) = executor::spool::parse(body);
+    let stream = |id: u8| -> String {
+        records
+            .iter()
+            .filter(|(s, _)| *s == id)
+            .map(|(_, d)| String::from_utf8_lossy(d).into_owned())
+            .collect()
+    };
+    assert_eq!(stream(executor::spool::STDOUT), "out");
+    assert_eq!(&stream(executor::spool::STDERR), job_id);
+    assert_eq!(
+        std::fs::read_to_string(d.path("cwd.txt")).unwrap().trim(),
+        d.dir.path().canonicalize().unwrap().display().to_string()
+    );
+    // `logs` decodes the spool.
+    let (_w, mut r) = d
+        .request(&ClientMessage::Logs {
+            id: 4,
+            job_id: Some(job_id.clone()),
+            tail: 0,
+        })
+        .await;
+    let Some(ServerMessage::Log { lines, .. }) = next(&mut r).await else {
+        panic!("no log");
+    };
+    assert_eq!(lines.concat(), format!("out{job_id}"));
+    // A signal outside an exec connection is refused.
+    let (_w, mut r) = d
+        .request(&ClientMessage::Signal {
+            id: 5,
+            signal: ExecSignal::Int,
+        })
+        .await;
+    assert!(matches!(
+        next(&mut r).await,
+        Some(ServerMessage::Error {
+            code: ErrorCode::BadRequest,
+            ..
+        })
+    ));
+    d.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_marker_runs_write_nothing_to_the_cache_and_gates_see_sluice_job() {
+    let repo = make_repo();
+    let d = start(2, LastSubscriberGone::Cancel).await;
+    let seen = d.path("job.txt");
+    for (cmd, status) in [
+        (
+            format!("echo \"$SLUICE_JOB\" > {}", seen.display()),
+            OutcomeStatus::Pass,
+        ),
+        ("exit 4".to_owned(), OutcomeStatus::Fail),
+    ] {
+        let mut msg = run_msg(
+            &repo,
+            "build",
+            &cmd,
+            Some(key(9)),
+            Some(repo.tree.clone()),
+            0,
+        );
+        if let ClientMessage::Run { request, .. } = &mut msg {
+            request.no_marker = true;
+        }
+        let (_w, mut r) = d.request(&msg).await;
+        let msgs = until_done(&mut r).await;
+        assert_eq!(done_status(&msgs), status);
+        let Some(ServerMessage::Done {
+            job_id, outcome, ..
+        }) = msgs.last()
+        else {
+            panic!("no done");
+        };
+        assert!(!outcome.marker_written);
+        if status == OutcomeStatus::Pass {
+            assert_eq!(std::fs::read_to_string(&seen).unwrap().trim(), job_id);
+        }
+    }
+    let store = MarkerStore::new(&repo.paths.common_dir);
+    let files = std::fs::read_dir(store.dir()).map_or(0, Iterator::count);
+    assert_eq!(files, 0, "no marker and no miss record");
     d.shutdown().await;
 }
 

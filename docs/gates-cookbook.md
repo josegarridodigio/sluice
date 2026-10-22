@@ -223,9 +223,38 @@ A `cache = false` gate always runs but still goes through the queue, so two
 agents do not build at the same time beyond the budget. Docker's own layer
 cache still applies, which is usually what you want.
 
+From 0.3.0, `mode = "queue-only"` says the same thing more precisely: the
+gate always runs under the budget, never writes a marker or a miss record,
+and two simultaneous identical requests (same tree, same gate, same extra
+arguments) share one run instead of building twice. An agent's pre-commit
+hook waits for it instead of failing fast (no `verify` could ever cache it).
+Do not combine it with `cache = true` (that is an error); older binaries
+refuse a file with `mode`.
+
+```toml
+[gates.image]
+cmd = "docker build -t myapp:dev ."
+weight = 4
+timeout = "30m"
+mode = "queue-only"
+```
+
 Docker commands that are not gates (`docker build` typed in a shell, `docker
-compose build`) are not controlled by Sluice today. Running arbitrary commands
-under the budget (`sluice exec`) is planned for 0.3.0.
+compose build`) go through the same budget with `sluice exec` (0.3.0):
+
+```sh
+sluice exec --weight 4 -- docker build -t myapp:dev .
+sluice exec --label "compose build" -- docker compose build
+sluice exec --timeout 20m -- sh -c 'cd services/api && make image'
+```
+
+The command runs in the daemon under the budget with your environment and
+directory; its stdout and stderr come back byte for byte, its exit code is
+yours, and Ctrl-C reaches the whole build. Stdin is `/dev/null` and there is
+no terminal (use `SLUICE_DISABLE=1` for an interactive run). The default
+weight is half the budget, rounded up. Add `--coalesce-key <k>` to let
+simultaneous identical requests (same key, command and directory) share one
+run. Without a daemon it runs in-process under the same budget semaphore.
 
 ## Monorepos with several packages
 
@@ -282,7 +311,11 @@ Notes:
 - `[queue] gates` is what a merge-queue train must pass. Without it, the gates
   with a `pre-push` hook are used, which is already right here; the list makes
   the choice explicit.
-- Gates that run only in the queue and never in hooks are planned for 0.3.0.
+- A gate that should run in the merge queue but never in hooks simply has no
+  `hooks` and is listed in `[queue] gates`. For a build whose output you need
+  every time (never answered from the cache), use `mode = "queue-only"`
+  (0.3.0); `sluice hook print` and `sluice doctor` warn when such a gate is
+  also listed in `hooks`, since every commit would then run it in full.
 
 ## Per-worktree caches
 

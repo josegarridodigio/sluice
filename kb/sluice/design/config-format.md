@@ -71,6 +71,7 @@ Field reference:
 | `gates.<name>.env` | table | `{}` | Added to the gate's environment and to the key. |
 | `gates.<name>.depends_on` | list | `[]` | Gate names; validated (must exist, no self-reference) but not scheduled in v1. |
 | `gates.<name>.cache` | bool | `true` | `false` makes the gate always run (still queued). |
+| `gates.<name>.mode` | `"gate"` \| `"queue-only"` | `"gate"` | Needs sluice ≥ 0.3.0 (older binaries refuse the file: ``unknown field `mode` ``). `queue-only`: the gate always runs under the budget, never looks up, writes a marker or a miss record, and simultaneous identical requests (same tree, definition and extra arguments) share one run; the agent `fail-fast` hook policy does not apply (the hook waits). Its `cache` is treated as `false`; an explicit `cache = true` is an error (`gates.<name>: mode = "queue-only" never caches; remove cache = true`), `cache = false` is accepted. `sluice hook print` and `sluice doctor` warn when a queue-only gate has `hooks`. |
 | `queue.remote` | string | `origin` | Remote of the default merge-queue target (Phase 6, [[sluice/design/merge-queue.md]]). Must not be empty, start with `-` or contain whitespace/control characters (it reaches git as an argument); at enqueue it must also be a configured remote of the repository (`invalid_remote`). |
 | `queue.target` | string | the remote's HEAD branch | Default target branch for `sluice queue enqueue`. |
 | `queue.gates` | list | gates with a `pre-push` hook, else every gate | Gates a train must pass; each must exist. |
@@ -167,6 +168,7 @@ Environment variables (highest precedence):
 | `CI` | Cache off unless `SLUICE_CACHE` is truthy. A falsy `CI` (`0`, `false`, `no`, `off`) does not count as set. |
 | `SLUICE_AGENT=1` / `0` | Force agent / human detection (truthy / falsy words as below; any other value is ignored). |
 | `SLUICE_SOCKET` | Override the daemon socket path. |
+| `SLUICE_JOB` | Set by Sluice on every process it runs (`<job id>`, or `inproc-<pid>` for in-process runs). When set, `sluice exec` runs the command directly and a `sluice run` miss runs in-process, unqueued (the parent job holds the budget). Not meant to be set by hand. |
 | `SLUICE_LOG` | Log filter of the daemon (`sluice daemon`), MCP (`sluice mcp`) and CLI (`sluice run`) processes, e.g. `debug`. Precedence: `SLUICE_LOG` (when valid), then `[debug] level`, then `info`. Written to stderr (the daemon's goes to `daemon.log`, the MCP server's also to `logs/mcp-<pid>.log`). |
 | `SLUICE_TEST_CLIENT_LOG_CAP` | Test-only: byte cap that triggers the `client.log` rotation instead of 5 MiB. Not a user setting. |
 | `SLUICE_CONFIG` | Override the user config path (ignored when empty). |

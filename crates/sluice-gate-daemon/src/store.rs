@@ -731,11 +731,14 @@ impl Store {
             if id.is_empty() || id.contains(['/', '\\']) || id.contains("..") {
                 continue;
             }
-            let file = logs_dir.join(format!("{id}.log"));
-            match std::fs::remove_file(&file) {
-                Ok(()) => deleted += 1,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(io(format!("removing {}", file.display()), e)),
+            // `<id>.log` for gates, `<id>.exec` (the output spool) for exec jobs.
+            for ext in ["log", "exec"] {
+                let file = logs_dir.join(format!("{id}.{ext}"));
+                match std::fs::remove_file(&file) {
+                    Ok(()) => deleted += 1,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(io(format!("removing {}", file.display()), e)),
+                }
             }
         }
         deleted += self.prune_unowned_logs(logs_dir, older_than_ms)?;
@@ -1022,8 +1025,12 @@ mod tests {
         for id in ["old", "new", "queued"] {
             std::fs::write(logs.join(format!("{id}.log")), "x").unwrap();
         }
-        assert_eq!(s.prune_logs(&logs, 500).unwrap(), 1);
+        std::fs::write(logs.join("old.exec"), "x").unwrap();
+        std::fs::write(logs.join("new.exec"), "x").unwrap();
+        assert_eq!(s.prune_logs(&logs, 500).unwrap(), 2);
         assert!(!logs.join("old.log").exists());
+        assert!(!logs.join("old.exec").exists());
+        assert!(logs.join("new.exec").exists());
         assert!(logs.join("new.log").exists());
         assert!(logs.join("queued.log").exists());
         assert_eq!(s.prune_logs(&logs, 500).unwrap(), 0);

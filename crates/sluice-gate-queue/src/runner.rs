@@ -992,6 +992,7 @@ async fn build_inner(core: &Arc<Core>, train: &TrainRow, config: Option<RepoConf
                 session: Some(format!("queue:{}", train.id)),
                 client_pid: std::process::id(),
                 hook: None,
+                no_marker: false,
             };
             let sub = core.handle.submit_run(req);
             views[idx].job_id = (!sub.job_id().is_empty()).then(|| sub.job_id().to_owned());

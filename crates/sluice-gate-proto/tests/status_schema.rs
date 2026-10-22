@@ -43,6 +43,8 @@ fn report() -> StatusReport {
             elapsed_ms: 1200,
             subscribers: 2,
             caller: Caller::Agent,
+            kind: None,
+            label: None,
         }],
         queued: vec![QueuedJob {
             job_id: "j-queued".into(),
@@ -53,6 +55,8 @@ fn report() -> StatusReport {
             waiting_ms: 300,
             subscribers: 1,
             reason: WaitReason::Psi,
+            kind: None,
+            label: None,
         }],
         totals: Totals {
             since: "2026-10-01T00:00:00Z".into(),
@@ -114,6 +118,26 @@ fn queue_summary_is_an_additive_optional_field() {
     let back: StatusReport =
         serde_json::from_value(serde_json::to_value(&with_queue).unwrap()).unwrap();
     assert_eq!(back, with_queue);
+}
+
+#[test]
+fn exec_kind_and_label_are_additive_optional_fields() {
+    let mut with_exec = report();
+    with_exec.running[0].kind = Some(sluice_gate_proto::JOB_KIND_EXEC.into());
+    with_exec.running[0].label = Some("cargo build".into());
+    with_exec.queued[0].kind = Some(sluice_gate_proto::JOB_KIND_EXEC.into());
+    with_exec.queued[0].label = Some("make".into());
+    let mut actual = serde_json::to_value(&with_exec).unwrap();
+    for (list, label) in [("running", "cargo build"), ("queued", "make")] {
+        let entry = actual[list][0].as_object_mut().unwrap();
+        assert_eq!(entry.remove("kind").unwrap(), serde_json::json!("exec"));
+        assert_eq!(entry.remove("label").unwrap(), serde_json::json!(label));
+    }
+    let expected: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+    assert_eq!(actual, expected);
+    let back: StatusReport =
+        serde_json::from_value(serde_json::to_value(&with_exec).unwrap()).unwrap();
+    assert_eq!(back, with_exec);
 }
 
 #[test]

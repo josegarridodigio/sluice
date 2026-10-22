@@ -48,6 +48,17 @@ pub const QUEUE_STATUS_SCHEMA_VERSION: u32 = 1;
 /// that serves the merge-queue messages (`queue-*`).
 pub const FEATURE_QUEUE: &str = "queue";
 
+/// Feature announced by a daemon that serves `exec` and `signal`
+/// (`sluice exec`, ADR-0010). Clients send `exec` only to a daemon listing it.
+pub const FEATURE_EXEC: &str = "exec";
+
+/// Feature announced by a daemon that honours [`RunRequest::no_marker`]
+/// (queue-only gates). Clients set `no_marker` only for a daemon listing it.
+pub const FEATURE_QUEUE_ONLY: &str = "queue-only";
+
+/// Value of [`RunningJob::kind`] / [`QueuedJob::kind`] for `sluice exec` jobs.
+pub const JOB_KIND_EXEC: &str = "exec";
+
 /// Maximum accepted length of one protocol line, in bytes (1 MiB).
 pub const MAX_LINE_BYTES: usize = 1 << 20;
 
@@ -112,6 +123,23 @@ pub enum ClientMessage {
     Cancel {
         /// Id of the `run` request to detach from.
         id: u64,
+    },
+    /// Run an arbitrary command under the budget, without cache (`sluice
+    /// exec`). Only sent to a daemon announcing [`FEATURE_EXEC`].
+    Exec {
+        /// Client-chosen request id, echoed in every reply.
+        id: u64,
+        /// The exec request payload.
+        #[serde(flatten)]
+        request: ExecRequest,
+    },
+    /// Forward a signal to the job of an `exec` connection (valid on such a
+    /// connection only; `bad-request` elsewhere).
+    Signal {
+        /// Id of the `exec` request.
+        id: u64,
+        /// Signal received by the client.
+        signal: ExecSignal,
     },
     /// Merge queue: enqueue a branch. Reply: `queue-job`.
     QueueEnqueue {
@@ -261,6 +289,81 @@ pub struct RunRequest {
     /// Git hook that triggered the run, if any.
     #[serde(default)]
     pub hook: Option<String>,
+    /// Queue-only gate: skip the marker double-check and never write a
+    /// marker or a miss record. Only set for a daemon announcing
+    /// [`FEATURE_QUEUE_ONLY`]; omitted from the wire when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_marker: bool,
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if signature"
+)]
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Payload of an `exec` request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecRequest {
+    /// Command and arguments; `argv[0]` is already resolved to an absolute
+    /// path by the client. No shell is involved.
+    pub argv: Vec<String>,
+    /// Working directory (the caller's).
+    pub cwd: PathBuf,
+    /// Complete environment of the command (the caller's, verbatim).
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Short label shown in `status` and messages (`cargo build`).
+    #[serde(default)]
+    pub label: String,
+    /// Budget units (clamped by the daemon as for gates).
+    #[serde(default)]
+    pub weight: u32,
+    /// Timeout in milliseconds; 0 means none.
+    #[serde(default)]
+    pub timeout_ms: u64,
+    /// Coalescing key (`--coalesce-key`); `None` never coalesces. Requests
+    /// coalesce only when key, `cwd` and `argv` are all equal.
+    #[serde(default)]
+    pub coalesce: Option<String>,
+    /// Repository identity (main worktree or common dir) for the
+    /// per-repository cap; `None` outside a repository.
+    #[serde(default)]
+    pub repo: Option<PathBuf>,
+    /// Who asked.
+    #[serde(default)]
+    pub caller: Caller,
+    /// Agent session identifier, if any.
+    #[serde(default)]
+    pub session: Option<String>,
+    /// Client process id.
+    #[serde(default)]
+    pub client_pid: u32,
+}
+
+/// A signal forwarded by an `exec` client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum ExecSignal {
+    /// SIGINT (Ctrl-C).
+    Int,
+    /// SIGTERM.
+    Term,
+    /// SIGHUP.
+    Hup,
+}
+
+impl ExecSignal {
+    /// The Linux signal number.
+    pub fn number(self) -> i32 {
+        match self {
+            Self::Hup => 1,
+            Self::Int => 2,
+            Self::Term => 15,
+        }
+    }
 }
 
 /// Repository paths.
@@ -366,6 +469,10 @@ pub enum ServerMessage {
         job_id: String,
         /// Start time (RFC 3339).
         started_at: String,
+        /// `exec` only: absolute path of the framed output spool the client
+        /// replays (format in `kb/sluice/design/protocol.md`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spool: Option<PathBuf>,
     },
     /// Periodic progress while queued or running.
     Progress {
@@ -489,6 +596,10 @@ pub struct Outcome {
     pub coalesced_with: Option<String>,
     /// Human-readable one-liner.
     pub message: String,
+    /// Number of the signal that killed the process (`exec`); omitted when
+    /// absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
 }
 
 /// Category of an [`Outcome`].
@@ -634,6 +745,12 @@ pub struct RunningJob {
     pub subscribers: usize,
     /// Who requested it.
     pub caller: Caller,
+    /// `"exec"` for `sluice exec` jobs; omitted for gates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Label of an `exec` job (its `gate` is `exec:<label>`); omitted for gates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// A queued job in a status report.
@@ -656,6 +773,12 @@ pub struct QueuedJob {
     pub subscribers: usize,
     /// Why it is still waiting.
     pub reason: WaitReason,
+    /// `"exec"` for `sluice exec` jobs; omitted for gates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Label of an `exec` job (its `gate` is `exec:<label>`); omitted for gates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// Why a queued job is not running yet.
@@ -998,6 +1121,7 @@ mod tests {
             session: Some("s1".into()),
             client_pid: 4242,
             hook: Some("pre-commit".into()),
+            no_marker: false,
         }
     }
 
@@ -1012,6 +1136,7 @@ mod tests {
             not_cached_reason: None,
             coalesced_with: Some("j0".into()),
             message: "ok".into(),
+            signal: None,
         }
     }
 
@@ -1045,17 +1170,30 @@ mod tests {
                 elapsed_ms: 1200,
                 subscribers: 2,
                 caller: Caller::Human,
+                kind: None,
+                label: None,
             }],
-            queued: vec![QueuedJob {
-                job_id: "k".into(),
-                repo: "/abs".into(),
-                gate: "lint".into(),
-                weight: 1,
-                queued_at: "t".into(),
-                waiting_ms: 300,
-                subscribers: 1,
-                reason: WaitReason::HeadReserved,
-            }],
+            queued: vec![
+                QueuedJob {
+                    job_id: "k".into(),
+                    repo: "/abs".into(),
+                    gate: "lint".into(),
+                    weight: 1,
+                    queued_at: "t".into(),
+                    waiting_ms: 300,
+                    subscribers: 1,
+                    reason: WaitReason::HeadReserved,
+                    kind: None,
+                    label: None,
+                },
+                QueuedJob {
+                    job_id: "x".into(),
+                    gate: "exec:cargo build".into(),
+                    kind: Some(JOB_KIND_EXEC.into()),
+                    label: Some("cargo build".into()),
+                    ..QueuedJob::default()
+                },
+            ],
             totals: Totals {
                 runs: 120,
                 ..Totals::default()
@@ -1233,6 +1371,13 @@ mod tests {
                 id: 1,
                 job_id: "j".into(),
                 started_at: "t".into(),
+                spool: None,
+            },
+            ServerMessage::Started {
+                id: 1,
+                job_id: "j".into(),
+                started_at: "t".into(),
+                spool: Some("/s/logs/j.exec".into()),
             },
             ServerMessage::Progress {
                 id: 1,
@@ -1422,6 +1567,111 @@ mod tests {
         );
         assert_eq!(request.caller, Caller::Human);
         assert_eq!(request.gate.timeout_ms, 1_200_000);
+    }
+
+    fn exec_request() -> ExecRequest {
+        ExecRequest {
+            argv: vec!["/usr/bin/cargo".into(), "build".into(), "--release".into()],
+            cwd: "/abs/worktree".into(),
+            env: BTreeMap::from([("CLAUDECODE".into(), "1".into())]),
+            label: "cargo build".into(),
+            weight: 4,
+            timeout_ms: 0,
+            coalesce: None,
+            repo: Some("/abs/main".into()),
+            caller: Caller::Agent,
+            session: None,
+            client_pid: 4242,
+        }
+    }
+
+    #[test]
+    fn exec_messages_round_trip_and_match_the_spec() {
+        let msgs = [
+            ClientMessage::Exec {
+                id: 1,
+                request: exec_request(),
+            },
+            ClientMessage::Exec {
+                id: 1,
+                request: ExecRequest {
+                    coalesce: Some("k".into()),
+                    repo: None,
+                    ..exec_request()
+                },
+            },
+            ClientMessage::Signal {
+                id: 1,
+                signal: ExecSignal::Int,
+            },
+        ];
+        for m in msgs {
+            assert_eq!(decode_client(&encode(&m).unwrap()).unwrap(), m);
+        }
+        let line = r#"{"type":"exec","id":1,"argv":["/usr/bin/cargo","build","--release"],
+ "cwd":"/abs/worktree","env":{"CLAUDECODE":"1"},
+ "label":"cargo build","weight":4,"timeout_ms":0,"coalesce":null,
+ "repo":"/abs/main","caller":"agent","session":null,"client_pid":4242}"#;
+        assert_eq!(
+            decode_client(line).unwrap(),
+            ClientMessage::Exec {
+                id: 1,
+                request: exec_request()
+            }
+        );
+        for (text, sig, n) in [
+            ("INT", ExecSignal::Int, 2),
+            ("TERM", ExecSignal::Term, 15),
+            ("HUP", ExecSignal::Hup, 1),
+        ] {
+            let m =
+                decode_client(&format!(r#"{{"type":"signal","id":1,"signal":"{text}"}}"#)).unwrap();
+            assert_eq!(m, ClientMessage::Signal { id: 1, signal: sig });
+            assert_eq!(sig.number(), n);
+        }
+    }
+
+    #[test]
+    fn additive_exec_fields_stay_off_the_wire_when_unset() {
+        // Golden lines of v0.2: `run`, `started`, `done` and `status` entries
+        // serialise exactly as before when the new optional fields are unset.
+        let run = encode(&ClientMessage::Run {
+            id: 1,
+            request: run_request(),
+        })
+        .unwrap();
+        assert!(!run.contains("no_marker"), "{run}");
+        let mut req = run_request();
+        req.no_marker = true;
+        let run = encode(&ClientMessage::Run {
+            id: 1,
+            request: req,
+        })
+        .unwrap();
+        assert!(run.contains(r#""no_marker":true"#), "{run}");
+        let started = encode(&ServerMessage::Started {
+            id: 1,
+            job_id: "j".into(),
+            started_at: "t".into(),
+            spool: None,
+        })
+        .unwrap();
+        assert_eq!(
+            started,
+            "{\"type\":\"started\",\"id\":1,\"job_id\":\"j\",\"started_at\":\"t\"}\n"
+        );
+        let done = encode(&outcome()).unwrap();
+        assert!(!done.contains("signal"), "{done}");
+        let running = serde_json::to_string(&RunningJob::default()).unwrap();
+        assert!(
+            !running.contains("kind") && !running.contains("label"),
+            "{running}"
+        );
+        let queued = serde_json::to_string(&QueuedJob::default()).unwrap();
+        assert!(
+            !queued.contains("kind") && !queued.contains("label"),
+            "{queued}"
+        );
     }
 
     #[test]

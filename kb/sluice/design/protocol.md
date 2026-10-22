@@ -57,12 +57,16 @@ Server → `{"type":"welcome","protocol":1,"daemon":"sluice-gate 0.1.0","instanc
 
 `instance` is also the value fenced into `jobs.daemon_instance`.
 
-`welcome` has an optional `features` array of strings, omitted when empty
-(so a daemon without extensions sends exactly the line above). A daemon
-running the merge-queue extension sends `"features":["queue"]`
-(`sluice_gate_proto::FEATURE_QUEUE`); the blocking client exposes it as
-`Client::features()` / `Client::supports("queue")`. A `welcome` without
-`features` parses as an empty list.
+`welcome` has an optional `features` array of strings, omitted when empty.
+From 0.3.0 every daemon announces `"exec"` (`FEATURE_EXEC`: serves `exec`
+and `signal`) and `"queue-only"` (`FEATURE_QUEUE_ONLY`: honours
+`run.no_marker`), followed by the features of its extensions; a daemon
+running the merge-queue extension adds `"queue"`
+(`sluice_gate_proto::FEATURE_QUEUE`), so it sends
+`"features":["exec","queue-only","queue"]`. The blocking client exposes
+them as `Client::features()` / `Client::supports(..)`. A `welcome` without
+`features` (a v0.2 daemon) parses as an empty list; clients send `exec` and
+`no_marker` only to a daemon listing the matching feature.
 
 A daemon that does not speak the client's `protocol` answers
 `{"type":"error","id":0,"code":"protocol","message":"..."}` and closes. A
@@ -94,6 +98,16 @@ the client, echoed in every reply so multiplexing can be added later).
 daemon then runs the gate without coalescing and without writing a marker.
 `child_env` is already sanitised by the client ([[sluice/design/cache-key.md]]).
 
+Optional `"no_marker": true` (omitted when false; only sent to a daemon
+announcing `queue-only`) marks a queue-only gate: the daemon skips the
+marker double-check before the start and never writes a marker or a miss
+record. The client then sends `key = sha256("queue-only\0" K)` (K the
+gate's normal key on the tree), a namespace no marker can match, so
+simultaneous identical requests still coalesce. To a daemon without
+`queue-only` the client sends `key: null` (runs, never coalesces, never
+cached). Every gate process the daemon starts carries
+`SLUICE_JOB=<job id>` in its environment.
+
 Server events on that connection, in order:
 
 | Event | Fields | When |
@@ -121,6 +135,8 @@ daemon that is stopping or has lost its lease refuses the request before
 `queued` with a top-level `error{internal}`, and the client falls back to
 an in-process run. A gate killed by a signal Sluice did not send is `fail`
 with `exit_code: null` (`<gate> was terminated by a signal`).
+`outcome` may carry an optional `signal` (number of the signal that killed
+the process; `exec` jobs only, omitted when absent).
 `killed` is also what every subscriber of a queued job receives when the
 daemon stops (forced or not) or when the job's last subscriber left under
 the `cancel` policy. For a coalesced subscriber `done` carries
@@ -149,6 +165,12 @@ for example `info` or `debug`), omitted when the daemon does not report it,
 so the frozen fixture is unchanged and the protocol stays at version 1; a
 second additive test (`log_level_is_an_additive_optional_field`) pins its
 shape. `sluice status` prints it as `log:      level <level>, <path>/daemon.log`.
+
+Entries of `running` and `queued` have optional `kind` and `label`, omitted
+for gates: an exec job shows `"kind":"exec","label":"cargo build"` and
+`"gate":"exec:cargo build"` (so a v0.2 client prints something meaningful).
+The fixture is unchanged; `exec_kind_and_label_are_additive_optional_fields`
+pins their shape.
 
 `status` has an optional `queue` object, omitted when no extension provides
 one (so the frozen fixture `status-schema-1.json` is unchanged):
@@ -207,6 +229,58 @@ with `force` it also kills running jobs (their subscribers get `done` with
 the daemon then closes its side. Equivalent to closing the connection
 (what the CLI does; the MCP server sends `cancel`). Any other message on a
 `run` connection is answered with `error{bad-request}` and ignored.
+
+### `exec` (`sluice exec`, from 0.3.0)
+
+Runs an arbitrary command under the budget, without cache
+([[sluice/design/command-control.md]] section 2). Only sent to a daemon
+announcing `"exec"`; an older daemon answers `error{bad-request}` (unknown
+type) before `queued` and the client runs the command in-process.
+
+```json
+{"type":"exec","id":1,"argv":["/usr/bin/cargo","build","--release"],
+ "cwd":"/abs/worktree","env":{"PATH":"...","HOME":"...","CLAUDECODE":"1"},
+ "label":"cargo build","weight":4,"timeout_ms":0,"coalesce":null,
+ "repo":"/abs/main-worktree|null","caller":"agent","session":"<id|null>","client_pid":4242}
+```
+
+`argv[0]` is resolved by the client (absolute path, shims skipped); no
+shell is involved. `env` is the caller's environment, verbatim, plus
+`SLUICE_JOB=<job id>` added by the daemon; `cwd` is the caller's. `repo`
+(main worktree or common dir) feeds the per-repository cap; `null` uses
+`cwd`. `weight` is clamped like a gate's. `timeout_ms = 0` means none.
+
+Events are those of `run` (`queued`, `started`, `progress`, `done`).
+`started` carries an optional `spool`: the absolute path of the output
+spool `<logs>/<job>.exec`, which the client replays to its stdout and
+stderr. Spool format: the magic `SLUICEX1\n`, then records `[stream: u8
+(1 = stdout, 2 = stderr)][len: u32 big-endian][bytes]`, appended whole by
+the two output pumps under one mutex in chunks of up to 8 KiB. `done` is
+sent only after both pumps finished, so the client reads to EOF after it.
+`done.outcome`: `pass` (exit 0), `fail` with `exit_code` (non-zero exit) or
+with `signal` and `exit_code: null` (killed by a signal), `timeout`,
+`killed` (daemon stop, lost lease, cancel), `error`. `marker_written` is
+always false; `tail` and `logs` decode the spool (streams merged).
+
+Coalescing only with `coalesce: K`: requests coalesce when the SHA-256 of
+`"sluice-exec-v1\0" K "\0" cwd "\0" argv joined by NUL` is equal (the
+environment is ignored). A late subscriber gets `started` (with `spool`)
+right after `queued` and replays from offset 0.
+
+An exec job ignores `last_subscriber_gone = "finish"`: when its last
+subscriber leaves it is killed (nothing to cache).
+
+### `signal`
+
+`{"type":"signal","id":1,"signal":"INT|TERM|HUP"}` is valid on an `exec`
+connection only (elsewhere `error{bad-request}`, `signal outside an exec
+connection`). When the job runs and this connection is its only
+subscriber, the daemon sends the signal to the job's process group; once
+the leader is gone it SIGKILLs what is left of the group (background
+children that ignore SIGINT and hold the output pipes); if the leader is
+still alive `KILL_GRACE` + 5 s later, the cancel sequence terminates the
+group. Otherwise (queued, or other subscribers) the subscriber is detached
+and the connection closed.
 
 ### Merge queue (`queue-*`)
 
@@ -287,7 +361,9 @@ base or remote), `not-found` (unknown job or train) and `internal` (lease
 lost, store failure, queue failed to start).
 Unknown `type`, malformed JSON, a line over 1 MiB or invalid UTF-8 →
 `bad-request` (`id` 0 when unknown); a `cancel` outside a `run` connection
-→ `bad-request` (`cancel outside a run connection`); a first line that is not `hello` →
+→ `bad-request` (`cancel outside a run connection`); a `signal` outside an
+`exec` connection → `bad-request`; an `exec` with an empty `argv` →
+`bad-request`; a first line that is not `hello` →
 `protocol` (`expected hello`), a malformed first line → `bad-request`
 (`malformed hello: ...`), a second `hello` → `protocol` (`duplicate hello`); a
 `hello` with another protocol → `protocol`; a `run` while the daemon is
@@ -308,5 +384,10 @@ panics on malformed input.
   timeouts) keep `protocol` at 1: old clients
   never send `queue-*`, and the new fields are optional and omitted when
   empty.
+- The command-control additions of 0.3.0 (`exec`, `signal`, the welcome
+  features `exec` and `queue-only`, `started.spool`, `outcome.signal`,
+  `run.no_marker`, `status` entries' `kind` and `label`) keep `protocol` at
+  1 and `status` schema at 1: all optional, omitted when unset; old daemons
+  are detected through `welcome.features`.
 - `sluice-gate-proto` exposes `PROTOCOL_VERSION` and the typed enums
   `ClientMessage` / `ServerMessage`, each `#[serde(tag = "type", rename_all = "kebab-case")]`.

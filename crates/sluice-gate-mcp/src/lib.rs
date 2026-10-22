@@ -435,6 +435,7 @@ fn to_request(m: RunMaterial) -> RunRequest {
         session: m.session,
         client_pid: std::process::id(),
         hook: m.hook,
+        no_marker: false,
     }
 }
 
@@ -495,8 +496,9 @@ fn prepare(
     if let Lookup::Hit(marker) = state {
         return Ok(Prepared::Hit(marker));
     }
+    // A queue-only gate is never cached by design: no "not cached" note.
     let off_reason = match &state {
-        Lookup::Off { reason, .. } => Some(reason.clone()),
+        Lookup::Off { reason, .. } if !res.gate.is_queue_only() => Some(reason.clone()),
         _ => None,
     };
     let mut material =

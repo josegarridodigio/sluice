@@ -16,6 +16,13 @@
 //!    on success and the tail of the log on failure. A pass whose tree is
 //!    unchanged writes a marker; a pass that modified the tree, and any
 //!    failure, writes a miss record (the daemon does the same on its side).
+//!
+//! Queue-only gates (`mode = "queue-only"`) skip the marker lookup and the
+//! fail-fast hook policy and always run under the budget; simultaneous
+//! identical requests coalesce through a key in its own namespace, and
+//! nothing is ever written to the cache. Inside a Sluice job (`SLUICE_JOB`
+//! set) a miss runs in-process right away, unqueued (decision `nested`): the
+//! parent job already holds the budget.
 
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -28,6 +35,7 @@ use std::time::{Duration, Instant};
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
+use sha2::{Digest, Sha256};
 use sluice_gate_core::agent::{self, Caller};
 use sluice_gate_core::config::HookPolicy;
 use sluice_gate_core::git::{self, EnvMap};
@@ -35,11 +43,11 @@ use sluice_gate_core::key::CacheKey;
 use sluice_gate_core::lookup::{self, Lookup as CacheState, Resolved, RunMaterial};
 use sluice_gate_core::marker::{Lookup, Marker, MissRecord};
 use sluice_gate_core::mode::{CacheMode, cache_mode};
-use sluice_gate_core::semaphore::{Semaphore, SlotGuard};
 use sluice_gate_core::tree::{self, Snapshot, TreeHash};
-use sluice_gate_core::{CACHE_FORMAT_VERSION, SLUICE_VERSION};
+use sluice_gate_core::{CACHE_FORMAT_VERSION, JOB_ENV_VAR, SLUICE_VERSION};
 use sluice_gate_proto::{
-    self as proto, GateSpec, Outcome, OutcomeStatus, RepoInfo, RunRequest, ServerMessage,
+    self as proto, FEATURE_QUEUE_ONLY, GateSpec, Outcome, OutcomeStatus, RepoInfo, RunRequest,
+    ServerMessage,
 };
 
 use crate::clientlog;
@@ -189,7 +197,20 @@ fn run_traced(args: &RunArgs, trace: &mut Trace) -> ExitCode {
         return run_inline(&ctx, &args.extra);
     }
 
-    let state = match lookup::lookup(&ctx, &mode, &args.extra) {
+    // Queue-only: no marker lookup; the coalescing key in its own namespace.
+    let queue_only = ctx
+        .gate
+        .is_queue_only()
+        .then(|| queue_only_key(&ctx, &args.extra));
+    let lookup_state = if queue_only.is_some() {
+        CacheState::Off {
+            reason: "queue-only gate".to_owned(),
+            notice: None,
+        }
+    } else {
+        lookup::lookup(&ctx, &mode, &args.extra)
+    };
+    let state = match lookup_state {
         CacheState::Hit(hit) => {
             trace.decision = Some("hit");
             trace.tree = Some(hit.tree.as_str().to_owned());
@@ -229,6 +250,15 @@ fn run_traced(args: &RunArgs, trace: &mut Trace) -> ExitCode {
     if let CacheState::Miss { tree, .. } = &state {
         trace.tree = Some(tree.as_str().to_owned());
     }
+    if let Some(parent) = env.get(JOB_ENV_VAR).filter(|v| !v.is_empty()) {
+        // Inside a Sluice job: queueing would wait for budget the parent holds.
+        trace.decision = Some("nested");
+        eprintln!(
+            "sluice: inside Sluice job {parent}; running '{}' directly",
+            ctx.gate_name
+        );
+        return execute(&ctx, args, state);
+    }
     let (caller, in_hook, policy) = decide_policy(&ctx, &env, &state);
     if policy == HookPolicy::FailFast {
         trace.decision = Some("miss-fail-fast");
@@ -240,8 +270,20 @@ fn run_traced(args: &RunArgs, trace: &mut Trace) -> ExitCode {
         trace.decision = Some("in-process");
         return execute(&ctx, args, state);
     }
+    run_queued(&ctx, args, &caller, state, queue_only.flatten(), trace)
+}
 
-    let request = match run_request(&ctx, args, &caller, &state) {
+/// Policy `wait`: the daemon, else the in-process run under the semaphore.
+fn run_queued(
+    ctx: &Context,
+    args: &RunArgs,
+    caller: &Caller,
+    state: CacheState,
+    queue_only: Option<(TreeHash, CacheKey)>,
+    trace: &mut Trace,
+) -> ExitCode {
+    let env = &ctx.env;
+    let request = match run_request(ctx, args, caller, &state) {
         Ok(r) => r,
         Err(e) => return fail(&e),
     };
@@ -249,20 +291,42 @@ fn run_traced(args: &RunArgs, trace: &mut Trace) -> ExitCode {
     // unsafe fallback directory) is a configuration error to fix, not a
     // reason to lose the queue silently with an in-process run.
     if let Err(e @ sluice_gate_core::Error::SocketPath { .. }) =
-        sluice_gate_core::dirs::socket_path(&env)
+        sluice_gate_core::dirs::socket_path(env)
     {
         return fail(&e.to_string());
     }
-    match via_daemon(&ctx, args, request, &state, trace) {
+    match via_daemon(ctx, args, request, queue_only, &state, trace) {
         Ok(code) => return code,
         Err(why) => eprintln!("sluice: daemon unavailable ({why}); running in-process"),
     }
     trace.decision = Some("in-process");
-    let _slots = match acquire_budget(&ctx) {
+    let _slots = match crate::budget::acquire(
+        &ctx.scratch,
+        ctx.user.daemon.budget,
+        ctx.gate.weight,
+        &ctx.gate_name,
+        false,
+    ) {
         Ok(slots) => slots,
         Err(e) => return fail(&e),
     };
-    execute(&ctx, args, state)
+    execute(ctx, args, state)
+}
+
+/// Tree and coalescing key of a queue-only gate: `sha256("queue-only\0" K)`
+/// where K is the gate's normal key on the current tree, so it can never
+/// match a marker. `None` when the tree or K is unknown (no coalescing).
+fn queue_only_key(ctx: &Context, extra: &[String]) -> Option<(TreeHash, CacheKey)> {
+    let Ok(Snapshot::Known(tree)) = tree::snapshot(&ctx.paths, &ctx.probe_env, &ctx.scratch) else {
+        return None;
+    };
+    let (_, key) = lookup::derive_key(ctx, &tree, extra).ok()?;
+    let digest = Sha256::new()
+        .chain_update(b"queue-only\0")
+        .chain_update(key.as_str().as_bytes())
+        .finalize();
+    let key = CacheKey::try_from(hex::encode(digest)).ok()?;
+    Some((tree, key))
 }
 
 /// Explains on stderr why `agent_hook_policy = "fail-fast"` refused to run.
@@ -338,6 +402,7 @@ fn to_request(m: RunMaterial, caller: proto::Caller) -> RunRequest {
         session: m.session,
         client_pid: std::process::id(),
         hook: m.hook,
+        no_marker: false,
     }
 }
 
@@ -383,16 +448,27 @@ impl LogFollower {
 
 /// Runs the gate through the daemon. `Err` carries why the daemon could
 /// not be used before the request was queued (the caller falls back to
-/// the in-process run); once queued, every result is final.
+/// the in-process run); once queued, every result is final. `queue_only`
+/// carries the tree and coalescing key of a queue-only gate; they are sent
+/// (with `no_marker`) only to a daemon announcing `queue-only`, otherwise
+/// the request goes without a key (runs, never coalesces, never cached).
 fn via_daemon(
     ctx: &Context,
     args: &RunArgs,
-    request: RunRequest,
+    mut request: RunRequest,
+    queue_only: Option<(TreeHash, CacheKey)>,
     state: &CacheState,
     trace: &mut Trace,
 ) -> Result<ExitCode, String> {
     let socket = client::ensure_daemon(&ctx.env).map_err(|e| format!("{e:#}"))?;
     let conn = client::connect(&socket).map_err(|e| e.to_string())?;
+    if let Some((tree, key)) = queue_only
+        && conn.supports(FEATURE_QUEUE_ONLY)
+    {
+        request.tree = Some(tree);
+        request.key = Some(key);
+        request.no_marker = true;
+    }
     let gate = &ctx.gate_name;
     let mut queued = false;
     let mut follower: Option<LogFollower> = None;
@@ -485,6 +561,7 @@ fn report_outcome(
         OutcomeStatus::Error => return fail(&outcome.message),
         OutcomeStatus::Pass => Finish::Pass {
             note: match (state, &outcome.not_cached_reason) {
+                _ if ctx.gate.is_queue_only() => String::new(),
                 (CacheState::Off { reason, .. }, _) | (_, Some(reason)) => {
                     format!(" (not cached: {reason})")
                 }
@@ -581,6 +658,14 @@ fn decide_policy(ctx: &Context, env: &EnvMap, state: &CacheState) -> (Caller, bo
     );
     let policy = match (&caller, in_hook, state) {
         (_, false, _) => HookPolicy::Wait,
+        // No `verify` can ever satisfy fail-fast for a queue-only gate (it is
+        // never cached): the hook waits instead of looping.
+        (Caller::Agent { .. }, true, _) if ctx.gate.is_queue_only() => {
+            match ctx.config.defaults.agent_hook_policy {
+                HookPolicy::FailFast => HookPolicy::Wait,
+                other => other,
+            }
+        }
         (Caller::Agent { .. }, true, CacheState::Miss { .. } | CacheState::Hit(_)) => {
             ctx.config.defaults.agent_hook_policy
         }
@@ -666,42 +751,11 @@ fn resolve(env: &EnvMap, cwd: &Path, args: &RunArgs, mode: &CacheMode) -> Result
     })
 }
 
-/// Takes `weight` slots of the global semaphore, all or nothing.
-fn acquire_budget(ctx: &Context) -> Result<Vec<SlotGuard>, String> {
-    let slots = ctx.user.daemon.budget.max(1);
-    let needed = ctx.gate.weight.clamp(1, slots) as usize;
-    let semaphore =
-        Semaphore::new(&ctx.scratch.join("semaphore"), slots).map_err(|e| e.to_string())?;
-    let mut backoff = Duration::from_millis(25);
-    let mut announced = false;
-    loop {
-        let mut guards = Vec::with_capacity(needed);
-        while guards.len() < needed {
-            match semaphore.try_acquire().map_err(|e| e.to_string())? {
-                Some(guard) => guards.push(guard),
-                None => break,
-            }
-        }
-        if guards.len() == needed {
-            return Ok(guards);
-        }
-        drop(guards);
-        if !announced {
-            eprintln!(
-                "sluice: waiting for {needed} of {slots} budget units for '{}'",
-                ctx.gate_name
-            );
-            announced = true;
-        }
-        thread::sleep(backoff);
-        backoff = (backoff * 2).min(Duration::from_millis(500));
-    }
-}
-
 /// Builds the gate command: `sh -c '<cmd>'`, or `sh -c '<cmd> "$@"' sh <extra...>`
 /// when extra arguments are given (appending `"$@"` to a compound command such
 /// as a `for` loop would be a syntax error, so it is only added when needed).
-fn gate_command(ctx: &Context, extra: &[String]) -> Result<Command, String> {
+/// The process carries `SLUICE_JOB=<job_id>`.
+fn gate_command(ctx: &Context, extra: &[String], job_id: &str) -> Result<Command, String> {
     let mut cmd = Command::new("sh");
     let script = if extra.is_empty() {
         ctx.gate.cmd.trim().to_owned()
@@ -714,13 +768,15 @@ fn gate_command(ctx: &Context, extra: &[String]) -> Result<Command, String> {
         .args(extra)
         .current_dir(&ctx.paths.toplevel)
         .env_clear()
-        .envs(ctx.child_env()?);
+        .envs(ctx.child_env()?)
+        .env(JOB_ENV_VAR, job_id);
     Ok(cmd)
 }
 
 /// `SLUICE_DISABLE=1`: run the gate with inherited stdio and exit with its code.
 fn run_inline(ctx: &Context, extra: &[String]) -> ExitCode {
-    let mut cmd = match gate_command(ctx, extra) {
+    let job_id = format!("inproc-{}", std::process::id());
+    let mut cmd = match gate_command(ctx, extra, &job_id) {
         Ok(cmd) => cmd,
         Err(e) => return fail(&e),
     };
@@ -764,6 +820,7 @@ fn execute(ctx: &Context, args: &RunArgs, state: CacheState) -> ExitCode {
         Finish::Fail
     } else {
         let note = match state {
+            _ if ctx.gate.is_queue_only() => String::new(),
             CacheState::Off { reason, .. } => format!(" (not cached: {reason})"),
             CacheState::Hit(_) => String::new(),
             CacheState::Miss { tree, key, cmd, .. } => {
@@ -808,7 +865,7 @@ fn spawn_and_wait(ctx: &Context, args: &RunArgs) -> Result<Execution, String> {
         );
     }
 
-    let mut child = gate_command(ctx, &args.extra)?
+    let mut child = gate_command(ctx, &args.extra, &job_id)?
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

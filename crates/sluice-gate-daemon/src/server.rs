@@ -36,15 +36,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
+use sha2::{Digest, Sha256};
 pub use sluice_gate_core::config::{AdmissionConfig, LastSubscriberGone, UserConfig};
 use sluice_gate_core::dirs::{job_id as new_job_id, now_ms};
 use sluice_gate_core::git::{self, RepoPaths};
 use sluice_gate_core::key::{CacheKey, command_with_args, normalize_cmd};
 use sluice_gate_core::marker::{Lookup, Marker, MarkerStore, MissRecord};
-use sluice_gate_core::{CACHE_FORMAT_VERSION, tree};
+use sluice_gate_core::{CACHE_FORMAT_VERSION, JOB_ENV_VAR, tree};
 use sluice_gate_proto::{
     self as proto, BudgetInfo, Caller, ClientEvent, ClientMessage, DaemonInfo, ErrorCode,
-    MAX_LINE_BYTES, Outcome, OutcomeStatus, PROTOCOL_VERSION, QueuedJob, RunRequest, RunningJob,
+    ExecRequest, ExecSignal, FEATURE_EXEC, FEATURE_QUEUE_ONLY, JOB_KIND_EXEC, MAX_LINE_BYTES,
+    Outcome, OutcomeStatus, PROTOCOL_VERSION, QueuedJob, RunRequest, RunningJob,
     STATUS_SCHEMA_VERSION, ServerMessage, StatusReport,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
@@ -54,7 +56,9 @@ use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, interval_at, sleep, timeout};
 
-use crate::executor::{self, ExecSpec, ExecStatus, Finished, IoPriority, RunningHandle};
+use crate::executor::{
+    self, ExecSpec, ExecStatus, Finished, IoPriority, Launch, ProcessInfo, RunningHandle, Sink,
+};
 use crate::psi::{self, Admission};
 use crate::scheduler::{Enqueued, JobSpec, Scheduler};
 use crate::store::{JobRow, JobState, Store};
@@ -145,18 +149,64 @@ pub struct LogSettings {
     pub max_bytes: u64,
 }
 
+/// Extra time, after [`executor::KILL_GRACE`], that a job gets to exit
+/// after a forwarded signal before its whole group is terminated.
+const SIGNAL_ESCALATE_AFTER: Duration = Duration::from_secs(5);
+
 /// Event of one job, broadcast to all its subscribers.
 #[derive(Debug, Clone)]
 enum JobEvent {
-    Started { started_at: u64 },
-    Progress { elapsed_ms: u64, log_bytes: u64 },
+    Started {
+        started_at: u64,
+        spool: Option<PathBuf>,
+    },
+    Progress {
+        elapsed_ms: u64,
+        log_bytes: u64,
+    },
     Done(Box<Outcome>),
+}
+
+/// What a job runs: a gate (`run`) or an arbitrary command (`exec`).
+#[derive(Debug, Clone)]
+enum JobRequest {
+    Gate(Arc<RunRequest>),
+    Exec(Arc<ExecRequest>),
+}
+
+impl JobRequest {
+    /// Gate name, or `exec:<label>` for exec jobs (what v0.2 clients show).
+    fn name(&self) -> String {
+        match self {
+            Self::Gate(r) => r.gate.name.clone(),
+            Self::Exec(r) => format!("exec:{}", r.label),
+        }
+    }
+
+    fn caller(&self) -> Caller {
+        match self {
+            Self::Gate(r) => r.caller,
+            Self::Exec(r) => r.caller,
+        }
+    }
+
+    fn is_exec(&self) -> bool {
+        matches!(self, Self::Exec(_))
+    }
+
+    /// `(kind, label)` for `status`: `None` for gates.
+    fn kind_label(&self) -> (Option<String>, Option<String>) {
+        match self {
+            Self::Gate(_) => (None, None),
+            Self::Exec(r) => (Some(JOB_KIND_EXEC.to_owned()), Some(r.label.clone())),
+        }
+    }
 }
 
 /// A job known to the daemon (queued or running).
 #[derive(Debug)]
 struct JobEntry {
-    request: Arc<RunRequest>,
+    request: JobRequest,
     queued_at: u64,
     events: broadcast::Sender<JobEvent>,
     coalesced: u32,
@@ -165,6 +215,12 @@ struct JobEntry {
     /// Start time (unix ms) once `started` was broadcast; late coalescers get
     /// a `started` of their own from it.
     started_at: Option<u64>,
+    /// Spool of an exec job once started (sent to late coalescers too).
+    spool: Option<PathBuf>,
+    /// The spawned leader, once started (signal forwarding).
+    process: Option<ProcessInfo>,
+    /// Exec coalescing identity, removed from [`State::exec_inflight`] on finish.
+    exec_identity: Option<String>,
 }
 
 /// What [`register`] hands to the connection handler.
@@ -175,6 +231,8 @@ struct Registered {
     weight: u32,
     /// `Some` when the request joined a job that has already started.
     started_at: Option<u64>,
+    /// Spool of an exec job that has already started.
+    spool: Option<PathBuf>,
     events: broadcast::Receiver<JobEvent>,
 }
 
@@ -183,6 +241,8 @@ struct Registered {
 struct State {
     sched: Scheduler,
     jobs: HashMap<String, JobEntry>,
+    /// Exec coalescing identity (`--coalesce-key`, cwd, argv) to job id.
+    exec_inflight: HashMap<String, String>,
     accepting: bool,
     refusal: &'static str,
 }
@@ -222,6 +282,19 @@ struct Extensions {
     failures: Vec<String>,
     /// Concatenated features of the active extensions.
     features: Vec<String>,
+}
+
+impl State {
+    fn new(config: &DaemonConfig) -> Self {
+        let head_ms = u64::try_from(config.head_reserve_after.as_millis()).unwrap_or(u64::MAX);
+        Self {
+            sched: Scheduler::new(config.budget, head_ms, config.repo_caps.clone()),
+            jobs: HashMap::new(),
+            exec_inflight: HashMap::new(),
+            accepting: true,
+            refusal: "",
+        }
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -489,14 +562,8 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
     let sanitised_env = tokio::task::spawn_blocking(sanitised_env)
         .await
         .unwrap_or_default();
-    let head_ms = u64::try_from(config.head_reserve_after.as_millis()).unwrap_or(u64::MAX);
     let shared = Arc::new(Shared {
-        state: Mutex::new(State {
-            sched: Scheduler::new(config.budget, head_ms, config.repo_caps.clone()),
-            jobs: HashMap::new(),
-            accepting: true,
-            refusal: "",
-        }),
+        state: Mutex::new(State::new(&config)),
         store,
         psi: Mutex::new(Admission::new(&config.admission)),
         instance,
@@ -690,7 +757,7 @@ fn gate_name(shared: &Shared, id: &str) -> String {
         .state()
         .jobs
         .get(id)
-        .map(|e| e.request.gate.name.clone())
+        .map(|e| e.request.name())
         .unwrap_or_default()
 }
 
@@ -804,6 +871,11 @@ fn finish_job(shared: &Shared, id: &str, outcome: Outcome, exit_code: Option<i32
             st.sched.remove_queued(id);
         }
         let entry = st.jobs.remove(id);
+        if let Some(identity) = entry.as_ref().and_then(|e| e.exec_identity.as_ref())
+            && st.exec_inflight.get(identity).is_some_and(|j| j == id)
+        {
+            st.exec_inflight.remove(identity);
+        }
         let coalesced = entry.as_ref().map_or(0, |e| e.coalesced);
         shared.store("recording the outcome", |s| {
             s.set_subscribers(id, u32::try_from(max).unwrap_or(u32::MAX), coalesced)?;
@@ -851,21 +923,29 @@ async fn marker_hit(shared: &Shared, request: &RunRequest) -> Option<Marker> {
     }
 }
 
+fn timeout_of(ms: u64) -> Duration {
+    if ms == 0 {
+        NO_TIMEOUT
+    } else {
+        Duration::from_millis(ms)
+    }
+}
+
 fn exec_spec(shared: &Shared, request: &RunRequest, id: &str, log_path: &Path) -> ExecSpec {
     let mut env = request.child_env.clone();
     env.extend(request.gate.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    env.insert(JOB_ENV_VAR.to_owned(), id.to_owned());
     ExecSpec {
         job_id: id.to_owned(),
         gate: request.gate.name.clone(),
-        cmd: request.cmd.clone(),
-        extra: request.extra.clone(),
+        launch: Launch::Shell {
+            cmd: request.cmd.clone(),
+            extra: request.extra.clone(),
+        },
+        sink: Sink::Log,
         cwd: request.cwd.clone(),
         env,
-        timeout: if request.gate.timeout_ms == 0 {
-            NO_TIMEOUT
-        } else {
-            Duration::from_millis(request.gate.timeout_ms)
-        },
+        timeout: timeout_of(request.gate.timeout_ms),
         nice: shared.config.nice,
         ionice: shared.config.ionice,
         log_path: log_path.to_path_buf(),
@@ -873,12 +953,175 @@ fn exec_spec(shared: &Shared, request: &RunRequest, id: &str, log_path: &Path) -
 }
 
 async fn start_job(shared: Arc<Shared>, id: String) {
-    let Some(request) = shared.state().jobs.get(&id).map(|e| Arc::clone(&e.request)) else {
+    let Some(request) = shared.state().jobs.get(&id).map(|e| e.request.clone()) else {
         return;
     };
+    match request {
+        JobRequest::Gate(request) => start_gate(shared, id, request).await,
+        JobRequest::Exec(request) => start_exec(shared, id, request).await,
+    }
+}
+
+/// Spawns a job, records its start, broadcasts `started` and waits for it
+/// with periodic `progress`. `None` when it could not start (the job is
+/// then already finished with an `error` outcome).
+async fn launch(shared: &Shared, id: &str, spec: ExecSpec) -> Option<Finished> {
+    let name = spec.gate.clone();
+    let log_path = spec.log_path.clone();
+    let spool = (spec.sink == Sink::Spool).then(|| log_path.clone());
+    let running = match executor::spawn(spec).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(job = %id, "cannot start the job: {e}");
+            let outcome = Outcome {
+                status: OutcomeStatus::Error,
+                log_path: Some(log_path),
+                message: format!("{name}: cannot start: {e}"),
+                ..Outcome::default()
+            };
+            finish_job(shared, id, outcome, None);
+            return None;
+        }
+    };
+    let info = running.info().clone();
+    let handle = running.handle();
+    shared.store("recording the start", |s| {
+        s.mark_started(
+            id,
+            &shared.instance,
+            info.started_at,
+            Some(info.pgid),
+            info.proc_start_ticks,
+            &log_path,
+        )
+    });
+    let events = {
+        let mut st = shared.state();
+        let Some(entry) = st.jobs.get_mut(id) else {
+            handle.cancel();
+            return None;
+        };
+        entry.handle = Some(handle.clone());
+        if entry.cancelled {
+            handle.cancel();
+        }
+        entry.started_at = Some(info.started_at);
+        entry.spool.clone_from(&spool);
+        entry.process = Some(info.clone());
+        let _ = entry.events.send(JobEvent::Started {
+            started_at: info.started_at,
+            spool,
+        });
+        entry.events.clone()
+    };
+    tracing::info!(job = %id, name = %name, pgid = info.pgid, "job started");
+
+    let mut wait = std::pin::pin!(running.wait());
+    let mut tick = interval_at(Instant::now() + PROGRESS_EVERY, PROGRESS_EVERY);
+    Some(loop {
+        tokio::select! {
+            f = &mut wait => break f,
+            _ = tick.tick() => {
+                let _ = events.send(JobEvent::Progress {
+                    elapsed_ms: now_ms().saturating_sub(info.started_at),
+                    log_bytes: handle.log_bytes(),
+                });
+            }
+        }
+    })
+}
+
+/// Runs an `exec` job: its argv with the caller's environment plus
+/// `SLUICE_JOB`, output framed into `<logs>/<job>.exec`.
+async fn start_exec(shared: Arc<Shared>, id: String, request: Arc<ExecRequest>) {
+    let name = format!("exec '{}'", request.label);
+    if shared.state().jobs.get(&id).is_none_or(|e| e.cancelled) {
+        finish_job(&shared, &id, killed_outcome(&name), None);
+        return;
+    }
+    let Some((program, args)) = request.argv.split_first() else {
+        let outcome = Outcome {
+            status: OutcomeStatus::Error,
+            message: format!("{name}: empty argv"),
+            ..Outcome::default()
+        };
+        finish_job(&shared, &id, outcome, None);
+        return;
+    };
+    let mut env = request.env.clone();
+    env.insert(JOB_ENV_VAR.to_owned(), id.clone());
+    let spec = ExecSpec {
+        job_id: id.clone(),
+        gate: name.clone(),
+        launch: Launch::Argv {
+            program: program.clone(),
+            args: args.to_vec(),
+        },
+        sink: Sink::Spool,
+        cwd: request.cwd.clone(),
+        env,
+        timeout: timeout_of(request.timeout_ms),
+        nice: shared.config.nice,
+        ionice: shared.config.ionice,
+        log_path: shared.config.logs_dir.join(format!("{id}.exec")),
+    };
+    let Some(finished) = launch(&shared, &id, spec).await else {
+        return;
+    };
+    let secs = finished.duration.as_secs_f64();
+    let mut outcome = Outcome {
+        duration_ms: duration_ms(finished.duration),
+        log_path: Some(finished.log_path.clone()),
+        ..Outcome::default()
+    };
+    (outcome.status, outcome.message) = match finished.status {
+        ExecStatus::Exited(0) => (
+            OutcomeStatus::Pass,
+            format!("{name} exited 0 in {secs:.1}s"),
+        ),
+        ExecStatus::Exited(n) => (
+            OutcomeStatus::Fail,
+            format!("{name} exited {n} after {secs:.1}s"),
+        ),
+        ExecStatus::Signaled(s) => (
+            OutcomeStatus::Fail,
+            format!("{name} was killed by signal {s} after {secs:.1}s"),
+        ),
+        ExecStatus::Timeout => (
+            OutcomeStatus::Timeout,
+            format!(
+                "{name} timed out after {}",
+                humantime::format_duration(Duration::from_millis(request.timeout_ms))
+            ),
+        ),
+        ExecStatus::Killed => (
+            OutcomeStatus::Killed,
+            format!("{name} was killed after {secs:.1}s"),
+        ),
+    };
+    match finished.status {
+        ExecStatus::Exited(n) => outcome.exit_code = Some(n),
+        ExecStatus::Signaled(s) => outcome.signal = Some(s),
+        ExecStatus::Timeout | ExecStatus::Killed => {}
+    }
+    let tail = shared.config.tail_lines;
+    let log = finished.log_path;
+    outcome.tail = tokio::task::spawn_blocking(move || executor::tail_lines(&log, tail))
+        .await
+        .unwrap_or_default();
+    let exit_code = outcome.exit_code;
+    finish_job(&shared, &id, outcome, exit_code);
+}
+
+async fn start_gate(shared: Arc<Shared>, id: String, request: Arc<RunRequest>) {
     let gate = request.gate.name.clone();
 
-    if let Some(marker) = marker_hit(&shared, &request).await {
+    let marker = if request.no_marker {
+        None
+    } else {
+        marker_hit(&shared, &request).await
+    };
+    if let Some(marker) = marker {
         let outcome = Outcome {
             status: OutcomeStatus::Cached,
             exit_code: Some(0),
@@ -898,62 +1141,9 @@ async fn start_job(shared: Arc<Shared>, id: String) {
     }
 
     let log_path = shared.config.logs_dir.join(format!("{id}.log"));
-    let running = match executor::spawn(exec_spec(&shared, &request, &id, &log_path)).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(job = %id, "cannot start the gate: {e}");
-            let outcome = Outcome {
-                status: OutcomeStatus::Error,
-                log_path: Some(log_path),
-                message: format!("{gate}: cannot start the gate: {e}"),
-                ..Outcome::default()
-            };
-            finish_job(&shared, &id, outcome, None);
-            return;
-        }
-    };
-    let info = running.info().clone();
-    let handle = running.handle();
-    shared.store("recording the start", |s| {
-        s.mark_started(
-            &id,
-            &shared.instance,
-            info.started_at,
-            Some(info.pgid),
-            info.proc_start_ticks,
-            &log_path,
-        )
-    });
-    let events = {
-        let mut st = shared.state();
-        let Some(entry) = st.jobs.get_mut(&id) else {
-            handle.cancel();
-            return;
-        };
-        entry.handle = Some(handle.clone());
-        if entry.cancelled {
-            handle.cancel();
-        }
-        entry.started_at = Some(info.started_at);
-        let _ = entry.events.send(JobEvent::Started {
-            started_at: info.started_at,
-        });
-        entry.events.clone()
-    };
-    tracing::info!(job = %id, gate = %gate, pgid = info.pgid, "gate started");
-
-    let mut wait = std::pin::pin!(running.wait());
-    let mut tick = interval_at(Instant::now() + PROGRESS_EVERY, PROGRESS_EVERY);
-    let finished = loop {
-        tokio::select! {
-            f = &mut wait => break f,
-            _ = tick.tick() => {
-                let _ = events.send(JobEvent::Progress {
-                    elapsed_ms: now_ms().saturating_sub(info.started_at),
-                    log_bytes: handle.log_bytes(),
-                });
-            }
-        }
+    let Some(finished) = launch(&shared, &id, exec_spec(&shared, &request, &id, &log_path)).await
+    else {
+        return;
     };
     let (outcome, exit_code) = conclude(&shared, &request, &id, finished).await;
     finish_job(&shared, &id, outcome, exit_code);
@@ -987,7 +1177,7 @@ fn classify(
             format!("{gate} failed with exit code {n} after {secs:.1}s"),
             Some("gate failed"),
         ),
-        ExecStatus::Signaled => (
+        ExecStatus::Signaled(_) => (
             OutcomeStatus::Fail,
             None,
             format!("{gate} was terminated by a signal after {secs:.1}s"),
@@ -1110,7 +1300,8 @@ async fn conclude(
         message,
         ..Outcome::default()
     };
-    if let Some(key) = request.key.clone() {
+    // Queue-only gates (`no_marker`) never write a marker or a miss record.
+    if let Some(key) = request.key.clone().filter(|_| !request.no_marker) {
         let write = CacheWrite {
             request: Arc::clone(request),
             key,
@@ -1259,13 +1450,15 @@ async fn handshake(
             return None;
         }
     };
+    let mut features = vec![FEATURE_EXEC.to_owned(), FEATURE_QUEUE_ONLY.to_owned()];
+    features.extend(shared.extensions().features.iter().cloned());
     let welcome = ServerMessage::Welcome {
         protocol: PROTOCOL_VERSION,
         daemon: format!("sluice-gate {}", shared.config.version),
         instance: shared.instance.clone(),
         pid: shared.pid,
         started_at: shared.started_at.clone(),
-        features: shared.extensions().features.clone(),
+        features,
     };
     send(wr, &welcome).await.then_some(client)
 }
@@ -1323,6 +1516,7 @@ async fn handle_connection(shared: Arc<Shared>, stream: UnixStream) {
     };
     match request {
         ClientMessage::Run { id, request } => handle_run(&shared, rd, wr, id, request).await,
+        ClientMessage::Exec { id, request } => handle_exec(&shared, rd, wr, id, request).await,
         ClientMessage::Status { id } => {
             let mut status = status_report(&shared);
             for e in &shared.extensions().active {
@@ -1381,6 +1575,15 @@ async fn handle_connection(shared: Arc<Shared>, stream: UnixStream) {
             )
             .await;
         }
+        ClientMessage::Signal { id, .. } => {
+            send_error(
+                &mut wr,
+                id,
+                ErrorCode::BadRequest,
+                "signal outside an exec connection",
+            )
+            .await;
+        }
         ClientMessage::Hello { .. } => {
             send_error(&mut wr, 0, ErrorCode::Protocol, "duplicate hello").await;
         }
@@ -1399,32 +1602,47 @@ fn status_report(shared: &Shared) -> StatusReport {
         let caller = |id: &str| {
             st.jobs
                 .get(id)
-                .map_or(Caller::default(), |e| e.request.caller)
+                .map_or(Caller::default(), |e| e.request.caller())
+        };
+        let kind_label = |id: &str| {
+            st.jobs
+                .get(id)
+                .map_or((None, None), |e| e.request.kind_label())
         };
         let running: Vec<RunningJob> = running
             .into_iter()
-            .map(|v| RunningJob {
-                caller: caller(&v.id),
-                job_id: v.id,
-                repo: v.repo,
-                gate: v.gate,
-                weight: v.weight,
-                started_at: rfc3339(v.started_at),
-                elapsed_ms: now.saturating_sub(v.started_at),
-                subscribers: v.subscribers,
+            .map(|v| {
+                let (kind, label) = kind_label(&v.id);
+                RunningJob {
+                    caller: caller(&v.id),
+                    kind,
+                    label,
+                    job_id: v.id,
+                    repo: v.repo,
+                    gate: v.gate,
+                    weight: v.weight,
+                    started_at: rfc3339(v.started_at),
+                    elapsed_ms: now.saturating_sub(v.started_at),
+                    subscribers: v.subscribers,
+                }
             })
             .collect();
         let queued: Vec<QueuedJob> = queued
             .into_iter()
-            .map(|v| QueuedJob {
-                job_id: v.id,
-                repo: v.repo,
-                gate: v.gate,
-                weight: v.weight,
-                queued_at: rfc3339(v.queued_at),
-                waiting_ms: now.saturating_sub(v.queued_at),
-                subscribers: v.subscribers,
-                reason: v.reason,
+            .map(|v| {
+                let (kind, label) = kind_label(&v.id);
+                QueuedJob {
+                    kind,
+                    label,
+                    job_id: v.id,
+                    repo: v.repo,
+                    gate: v.gate,
+                    weight: v.weight,
+                    queued_at: rfc3339(v.queued_at),
+                    waiting_ms: now.saturating_sub(v.queued_at),
+                    subscribers: v.subscribers,
+                    reason: v.reason,
+                }
             })
             .collect();
         (running, queued, st.sched.budget(), st.sched.used())
@@ -1519,20 +1737,156 @@ fn repo_identity(repo: &proto::RepoInfo) -> PathBuf {
     common.clone()
 }
 
-/// Registers the request (new job or coalesced), or returns an error message.
+/// A job about to be registered, gate or exec.
+struct NewJob {
+    request: JobRequest,
+    /// Scheduler coalescing key (gates only).
+    key: Option<CacheKey>,
+    /// Exec coalescing identity (exec with `--coalesce-key` only).
+    exec_identity: Option<String>,
+    /// Repository identity for the per-repository cap and `status`.
+    repo: PathBuf,
+    weight: u32,
+    /// Database columns.
+    row_key: Option<String>,
+    row_tree: Option<String>,
+    row_repo: PathBuf,
+    cmd: String,
+    session: Option<String>,
+}
+
+/// Registers a `run` request (new job or coalesced), or returns an error message.
 fn register(shared: &Shared, request: RunRequest) -> std::result::Result<Registered, String> {
+    register_job(
+        shared,
+        NewJob {
+            key: request.key.clone(),
+            exec_identity: None,
+            repo: repo_identity(&request.repo),
+            weight: request.gate.weight,
+            row_key: request.key.as_ref().map(|k| k.as_str().to_owned()),
+            row_tree: request.tree.as_ref().map(|t| t.as_str().to_owned()),
+            row_repo: request.repo.toplevel.clone(),
+            cmd: request.cmd.clone(),
+            session: request.session.clone(),
+            request: JobRequest::Gate(Arc::new(request)),
+        },
+    )
+}
+
+/// Identity of an exec request with `--coalesce-key K`: SHA-256 of
+/// `"sluice-exec-v1\0" K "\0" cwd "\0" argv joined by NUL`. The environment
+/// is deliberately not part of it.
+fn exec_identity(request: &ExecRequest) -> Option<String> {
+    let key = request.coalesce.as_ref()?;
+    let mut h = Sha256::new();
+    h.update(b"sluice-exec-v1\0");
+    h.update(key.as_bytes());
+    h.update(b"\0");
+    h.update(request.cwd.as_os_str().as_encoded_bytes());
+    h.update(b"\0");
+    h.update(request.argv.join("\0").as_bytes());
+    Some(
+        h.finalize()
+            .iter()
+            .fold(String::with_capacity(64), |mut s, b| {
+                use std::fmt::Write as _;
+                let _ = write!(s, "{b:02x}");
+                s
+            }),
+    )
+}
+
+/// `argv` quoted for display (the `cmd` column of exec jobs).
+fn shell_quote(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| {
+            let plain = !a.is_empty()
+                && a.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_./=:,+@%".contains(c));
+            if plain {
+                a.clone()
+            } else {
+                format!("'{}'", a.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Registers an `exec` request (new job or coalesced), or returns an error message.
+fn register_exec(shared: &Shared, request: ExecRequest) -> std::result::Result<Registered, String> {
+    let repo = request.repo.clone().unwrap_or_else(|| request.cwd.clone());
+    register_job(
+        shared,
+        NewJob {
+            key: None,
+            exec_identity: exec_identity(&request),
+            repo: repo.clone(),
+            weight: request.weight,
+            row_key: None,
+            row_tree: None,
+            row_repo: repo,
+            cmd: shell_quote(&request.argv),
+            session: request.session.clone(),
+            request: JobRequest::Exec(Arc::new(request)),
+        },
+    )
+}
+
+/// Attaches one more subscriber (already counted by the scheduler) to `job_id`.
+fn coalesce_into(
+    shared: &Shared,
+    st: &mut State,
+    job_id: String,
+    position: Option<usize>,
+) -> std::result::Result<Registered, String> {
+    let weight = st.sched.spec(&job_id).map_or(1, |s| s.weight);
+    let max = st.sched.subscribers_max(&job_id).unwrap_or(1);
+    let Some(entry) = st.jobs.get_mut(&job_id) else {
+        st.sched.unsubscribe(&job_id);
+        return Err("internal error: coalesced into an unknown job".to_owned());
+    };
+    entry.coalesced += 1;
+    let coalesced = entry.coalesced;
+    let started_at = entry.started_at;
+    let spool = entry.spool.clone();
+    let rx = entry.events.subscribe();
+    shared.store("updating subscribers", |s| {
+        s.set_subscribers(&job_id, u32::try_from(max).unwrap_or(u32::MAX), coalesced)
+    });
+    Ok(Registered {
+        job_id,
+        coalesced: true,
+        position: position.unwrap_or(0),
+        weight,
+        started_at,
+        spool,
+        events: rx,
+    })
+}
+
+/// Registers a new job or attaches the request to an identical one.
+fn register_job(shared: &Shared, job: NewJob) -> std::result::Result<Registered, String> {
     let now = now_ms();
     let mut st = shared.state();
     if !st.accepting {
         return Err(st.refusal.to_owned());
     }
+    if let Some(identity) = &job.exec_identity
+        && let Some(existing) = st.exec_inflight.get(identity).cloned()
+        && st.sched.subscribe(&existing).is_some()
+    {
+        let position = st.sched.position(&existing);
+        return coalesce_into(shared, &mut st, existing, position);
+    }
     let id = new_job_id();
     let spec = JobSpec {
         id: id.clone(),
-        key: request.key.clone(),
-        repo: repo_identity(&request.repo),
-        gate: request.gate.name.clone(),
-        weight: request.gate.weight,
+        key: job.key.clone(),
+        repo: job.repo.clone(),
+        gate: job.request.name(),
+        weight: job.weight,
         queued_at: now,
     };
     match st.sched.enqueue(spec) {
@@ -1540,14 +1894,14 @@ fn register(shared: &Shared, request: RunRequest) -> std::result::Result<Registe
             let weight = st.sched.spec(&id).map_or(1, |s| s.weight);
             let row = JobRow {
                 id: id.clone(),
-                key: request.key.as_ref().map(|k| k.as_str().to_owned()),
-                tree: request.tree.as_ref().map(|t| t.as_str().to_owned()),
-                repo: request.repo.toplevel.clone(),
-                gate: request.gate.name.clone(),
-                cmd: request.cmd.clone(),
+                key: job.row_key,
+                tree: job.row_tree,
+                repo: job.row_repo,
+                gate: job.request.name(),
+                cmd: job.cmd,
                 weight,
-                caller: caller_str(request.caller).to_owned(),
-                session: request.session.clone(),
+                caller: caller_str(job.request.caller()).to_owned(),
+                session: job.session,
                 state: JobState::Queued,
                 outcome: None,
                 exit_code: None,
@@ -1564,16 +1918,22 @@ fn register(shared: &Shared, request: RunRequest) -> std::result::Result<Registe
             };
             shared.store("inserting a job", |s| s.insert_job(&row));
             let (events, rx) = broadcast::channel(CHANNEL_CAPACITY);
+            if let Some(identity) = &job.exec_identity {
+                st.exec_inflight.insert(identity.clone(), id.clone());
+            }
             st.jobs.insert(
                 id.clone(),
                 JobEntry {
-                    request: Arc::new(request),
+                    request: job.request,
                     queued_at: now,
                     events,
                     coalesced: 0,
                     cancelled: false,
                     handle: None,
                     started_at: None,
+                    spool: None,
+                    process: None,
+                    exec_identity: job.exec_identity,
                 },
             );
             Ok(Registered {
@@ -1582,31 +1942,12 @@ fn register(shared: &Shared, request: RunRequest) -> std::result::Result<Registe
                 position,
                 weight,
                 started_at: None,
+                spool: None,
                 events: rx,
             })
         }
         Enqueued::Coalesced { job_id, position } => {
-            let weight = st.sched.spec(&job_id).map_or(1, |s| s.weight);
-            let max = st.sched.subscribers_max(&job_id).unwrap_or(1);
-            let Some(entry) = st.jobs.get_mut(&job_id) else {
-                st.sched.unsubscribe(&job_id);
-                return Err("internal error: coalesced into an unknown job".to_owned());
-            };
-            entry.coalesced += 1;
-            let coalesced = entry.coalesced;
-            let started_at = entry.started_at;
-            let rx = entry.events.subscribe();
-            shared.store("updating subscribers", |s| {
-                s.set_subscribers(&job_id, u32::try_from(max).unwrap_or(u32::MAX), coalesced)
-            });
-            Ok(Registered {
-                job_id,
-                coalesced: true,
-                position: position.unwrap_or(0),
-                weight,
-                started_at,
-                events: rx,
-            })
+            coalesce_into(shared, &mut st, job_id, position)
         }
     }
 }
@@ -1619,7 +1960,12 @@ fn detach(shared: &Shared, job_id: &str) {
             return;
         };
         tracing::debug!(job = %job_id, remaining, "subscriber detached");
-        if remaining > 0 || shared.config.last_subscriber_gone == LastSubscriberGone::Finish {
+        // `finish` keeps a gate running to cache its result; an exec job
+        // has nothing to cache, so losing its last subscriber always kills it.
+        let is_exec = st.jobs.get(job_id).is_some_and(|e| e.request.is_exec());
+        if remaining > 0
+            || (shared.config.last_subscriber_gone == LastSubscriberGone::Finish && !is_exec)
+        {
             return;
         }
         if st.sched.is_queued(job_id) {
@@ -1676,11 +2022,12 @@ impl Subscriber<'_> {
     ) -> Option<(ServerMessage, bool)> {
         let (id, job_id) = (self.id, self.job_id.clone());
         match event {
-            Ok(JobEvent::Started { started_at }) => Some((
+            Ok(JobEvent::Started { started_at, spool }) => Some((
                 ServerMessage::Started {
                     id,
                     job_id,
                     started_at: rfc3339(started_at),
+                    spool,
                 },
                 false,
             )),
@@ -1759,6 +2106,7 @@ async fn handle_run(
         weight,
         started_at,
         mut events,
+        ..
     } = match register(shared, request) {
         Ok(r) => r,
         Err(message) => {
@@ -1793,6 +2141,7 @@ async fn handle_run(
             id,
             job_id: sub.job_id.clone(),
             started_at: rfc3339(started_at),
+            spool: None,
         };
         if !send(&mut wr, &started).await {
             detach(shared, &sub.job_id);
@@ -1820,6 +2169,179 @@ async fn handle_run(
                 }
                 Some(Ok(_)) => {
                     send_error(&mut wr, id, ErrorCode::BadRequest, "only cancel is accepted during a run").await;
+                    continue;
+                }
+                Some(Err(e)) => {
+                    send_error(&mut wr, id, ErrorCode::BadRequest, format!("malformed message: {e}")).await;
+                    continue;
+                }
+            },
+        };
+        if !send(&mut wr, &msg).await && !last {
+            detach(shared, &sub.job_id);
+            break;
+        }
+        if last {
+            break;
+        }
+    }
+    reader.abort();
+}
+
+/// What a forwarded signal did.
+enum SignalAction {
+    /// Sent to the job's process group; keep serving the connection.
+    Forwarded,
+    /// The subscriber was detached (queued job, or other subscribers left
+    /// running); close the connection.
+    Detached,
+}
+
+/// Forwards `signal` from an exec client: `killpg(sig)` when the job is
+/// running and this is its only subscriber (then, once the leader is gone,
+/// SIGKILL to what is left of the group; after `KILL_GRACE` + 5 s with the
+/// leader still alive, the cancel sequence). Otherwise the subscriber is
+/// detached, which drops a queued job left without subscribers.
+fn forward_signal(shared: &Arc<Shared>, job_id: &str, signal: ExecSignal) -> SignalAction {
+    let target = {
+        let st = shared.state();
+        let alone = st.sched.subscribers(job_id) == Some(1);
+        st.jobs
+            .get(job_id)
+            .and_then(|e| e.process.clone())
+            .filter(|_| alone && st.sched.is_running(job_id))
+    };
+    let Some(info) = target else {
+        detach(shared, job_id);
+        return SignalAction::Detached;
+    };
+    let Ok(sig) = nix::sys::signal::Signal::try_from(signal.number()) else {
+        detach(shared, job_id);
+        return SignalAction::Detached;
+    };
+    tracing::info!(job = %job_id, ?signal, pgid = info.pgid, "forwarding a signal");
+    executor::kill_group(info.pgid, sig);
+    let shared = Arc::clone(shared);
+    let job_id = job_id.to_owned();
+    tokio::spawn(async move {
+        let deadline = Instant::now() + executor::KILL_GRACE + SIGNAL_ESCALATE_AFTER;
+        loop {
+            sleep(Duration::from_millis(50)).await;
+            let handle = {
+                let st = shared.state();
+                match st.jobs.get(&job_id) {
+                    Some(e) if e.process.as_ref().is_some_and(|p| p.pid == info.pid) => {
+                        e.handle.clone()
+                    }
+                    _ => return,
+                }
+            };
+            let reused = info.proc_start_ticks.is_some()
+                && !executor::process_matches(info.pid, info.proc_start_ticks);
+            if reused || process_is_gone(info.pid) {
+                // The leader is gone: kill whatever it left behind (background
+                // children that ignore SIGINT and hold the output pipes).
+                executor::kill_group(info.pgid, nix::sys::signal::Signal::SIGKILL);
+                return;
+            }
+            if Instant::now() >= deadline {
+                tracing::info!(job = %job_id, "still running after a forwarded signal; terminating");
+                if let Some(h) = handle {
+                    h.cancel();
+                }
+                return;
+            }
+        }
+    });
+    SignalAction::Forwarded
+}
+
+async fn handle_exec(
+    shared: &Arc<Shared>,
+    rd: BufReader<OwnedReadHalf>,
+    mut wr: OwnedWriteHalf,
+    id: u64,
+    request: ExecRequest,
+) {
+    if request.argv.is_empty() || request.argv[0].is_empty() {
+        send_error(&mut wr, id, ErrorCode::BadRequest, "exec needs a command").await;
+        return;
+    }
+    let Registered {
+        job_id,
+        coalesced,
+        position,
+        weight,
+        started_at,
+        spool,
+        mut events,
+    } = match register_exec(shared, request) {
+        Ok(r) => r,
+        Err(message) => {
+            send_error(&mut wr, id, ErrorCode::Internal, message).await;
+            return;
+        }
+    };
+    tracing::info!(job = %job_id, coalesced, position, "exec request queued");
+    if !coalesced {
+        shared.wake.notify_one();
+    }
+    let sub = Subscriber {
+        shared,
+        id,
+        job_id,
+        coalesced,
+    };
+    let queued = ServerMessage::Queued {
+        id,
+        job_id: sub.job_id.clone(),
+        position,
+        coalesced,
+        weight,
+    };
+    if !send(&mut wr, &queued).await {
+        detach(shared, &sub.job_id);
+        return;
+    }
+    if let Some(started_at) = started_at {
+        let started = ServerMessage::Started {
+            id,
+            job_id: sub.job_id.clone(),
+            started_at: rfc3339(started_at),
+            spool,
+        };
+        if !send(&mut wr, &started).await {
+            detach(shared, &sub.job_id);
+            return;
+        }
+    }
+
+    let (reader, mut lines) = spawn_reader(rd);
+    let mut tick = interval_at(Instant::now() + PROGRESS_EVERY, PROGRESS_EVERY);
+    loop {
+        let (msg, last) = tokio::select! {
+            ev = events.recv() => match sub.message(ev) {
+                Some(m) => m,
+                None => continue,
+            },
+            _ = tick.tick() => match sub.queued_progress() {
+                Some(m) => (m, false),
+                None => continue,
+            },
+            line = lines.recv() => match line.flatten().map(|l| proto::decode_client(&l)) {
+                None | Some(Ok(ClientMessage::Cancel { .. })) => {
+                    tracing::debug!(job = %sub.job_id, "exec subscriber left");
+                    detach(shared, &sub.job_id);
+                    break;
+                }
+                Some(Ok(ClientMessage::Signal { signal, .. })) => {
+                    match forward_signal(shared, &sub.job_id, signal) {
+                        SignalAction::Forwarded => continue,
+                        SignalAction::Detached => break,
+                    }
+                }
+                Some(Ok(_)) => {
+                    send_error(&mut wr, id, ErrorCode::BadRequest, "only signal and cancel are accepted during an exec").await;
                     continue;
                 }
                 Some(Err(e)) => {

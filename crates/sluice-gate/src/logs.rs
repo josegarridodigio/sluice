@@ -5,7 +5,7 @@
 //! directory is scanned as in Phase 1.
 
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -14,6 +14,7 @@ use sluice_gate_core::git::EnvMap;
 
 use crate::dirs;
 use crate::run::EXIT_ERROR;
+use sluice_gate_daemon::executor::spool;
 use sluice_gate_proto::client;
 
 /// Prints the log of `job_id`, or of the newest job when `None`.
@@ -28,7 +29,13 @@ pub fn show(job_id: Option<&str>, lines: Option<usize>) -> ExitCode {
     }
     let dir = dirs::logs_dir(&env);
     let path = if let Some(id) = job_id {
-        dir.join(format!("{id}.log"))
+        let log = dir.join(format!("{id}.log"));
+        let spool = dir.join(format!("{id}.exec"));
+        if !log.exists() && spool.exists() {
+            spool
+        } else {
+            log
+        }
     } else {
         let newest = fs::read_dir(&dir)
             .ok()
@@ -74,9 +81,20 @@ fn from_daemon(
     client.logs(job_id, lines.unwrap_or(0)).ok()
 }
 
+/// Lines of a job log; the output spool of an exec job (`<job>.exec`) is
+/// decoded with stdout and stderr merged in arrival order.
 fn read_lines(path: &Path) -> std::io::Result<Vec<String>> {
-    let file = fs::File::open(path)?;
-    Ok(BufReader::new(file).lines().map_while(Result::ok).collect())
+    let mut reader = BufReader::new(fs::File::open(path)?);
+    if reader.fill_buf()?.starts_with(spool::MAGIC) {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        let merged = spool::merged(&bytes).unwrap_or_default();
+        return Ok(String::from_utf8_lossy(&merged)
+            .lines()
+            .map(str::to_owned)
+            .collect());
+    }
+    Ok(reader.lines().map_while(Result::ok).collect())
 }
 
 fn print_lines(path: &Path, all: &[String], lines: Option<usize>) {

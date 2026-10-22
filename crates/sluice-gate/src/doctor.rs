@@ -459,20 +459,44 @@ fn check_user_config(env: &EnvMap) -> Check {
 }
 
 /// Checks that need a repository.
+/// Queue-only gates listed in hooks: every commit or push runs them in full.
+pub fn queue_only_hook_warning(cfg: &RepoConfig) -> Option<String> {
+    let names: Vec<&str> = cfg
+        .gates
+        .iter()
+        .filter(|(_, g)| g.is_queue_only() && !g.hooks.is_empty())
+        .map(|(n, _)| n.as_str())
+        .collect();
+    (!names.is_empty()).then(|| {
+        format!(
+            "queue-only gate(s) {} run in full on every hook call (never cached); \
+             consider removing them from `hooks`",
+            names.join(", ")
+        )
+    })
+}
+
 fn check_repo(env: &EnvMap, paths: &RepoPaths) -> Vec<Check> {
     let mut out = Vec::new();
+    let mut warning = None;
     out.push(match RepoConfig::load(&paths.toplevel) {
-        Ok(cfg) => check(
-            "repo-config",
-            Status::Ok,
-            format!(
-                "{} parses ({} gate(s))",
-                paths.toplevel.join(REPO_CONFIG_FILE).display(),
-                cfg.gates.len()
-            ),
-        ),
+        Ok(cfg) => {
+            warning = queue_only_hook_warning(&cfg);
+            check(
+                "repo-config",
+                Status::Ok,
+                format!(
+                    "{} parses ({} gate(s))",
+                    paths.toplevel.join(REPO_CONFIG_FILE).display(),
+                    cfg.gates.len()
+                ),
+            )
+        }
         Err(e) => check("repo-config", Status::Fail, e.to_string()),
     });
+    if let Some(w) = warning {
+        out.push(check("queue-only-hooks", Status::Warn, w));
+    }
     out.push(check_hooks(env, paths));
     out.push(check_markers(paths));
     out

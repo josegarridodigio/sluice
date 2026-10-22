@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `sluice exec [--weight N] [--label L] [--coalesce-key K] [--timeout DUR]
+  [-q] -- <cmd>` runs any command under the budget without cache, replays
+  its output byte for byte, propagates the exit code (128+N on signals),
+  forwards signals to the job's process group and falls back in-process
+  when the daemon is down or older than 0.3.0.
+- Gate field `mode = "queue-only"`: the gate always runs, is never cached,
+  coalesces simultaneous identical requests, and an agent hook waits for
+  it instead of failing fast.
+- `SLUICE_JOB` on every process Sluice runs, so a nested `exec` or `run`
+  runs directly; welcome features `exec` and `queue-only`; `kind` and
+  `label` in `status --json`.
 - `docs/gates-cookbook.md`: per-stack `.sluice.toml` examples (Node,
   Python, Rust, Go, Docker, monorepos) and guidance on per-worktree caches,
   verdicts versus build artifacts and choosing hooks.
@@ -22,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing published).
 
 ### Changed
+
+- `sluice logs` and log retention handle `.exec` spools; `doctor` and
+  `hook print` warn when a queue-only gate is listed in `hooks`.
 
 ### Fixed
 

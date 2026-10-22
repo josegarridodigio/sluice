@@ -11,11 +11,13 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use sluice_gate_core::config::{REPO_CONFIG_FILE, RepoConfig, starter_repo_config};
 
+mod budget;
 mod cache;
 mod clientlog;
 mod daemon_cmd;
 mod dirs;
 mod doctor;
+mod exec;
 mod logging;
 mod logs;
 mod queue;
@@ -38,7 +40,9 @@ use snippets::{HookManager, snippet};
                   queue_enqueue, queue_status, queue_approve, queue_retry, queue_cancel).\n\n\
                   On a cache miss `sluice run` hands the gate to the per-user daemon \
                   (`sluice daemon`), starting it on demand; when the daemon cannot be reached \
-                  or started the gate runs in-process. `sluice status` shows the queue.\n\n\
+                  or started the gate runs in-process. `sluice status` shows the queue. \
+                  `sluice exec -- <cmd>` runs any other heavy command under the same budget, \
+                  without cache.\n\n\
                   Exit codes of `sluice run`: 0 pass or cache hit; the gate's own code on \
                   failure; 3 refused by agent_hook_policy = \"fail-fast\"; 124 gate timeout; \
                   143 gate killed (signal or `sluice daemon stop --force`); 1 Sluice error; \
@@ -74,6 +78,49 @@ enum Command {
         /// Extra arguments appended to the gate command.
         #[arg(last = true)]
         extra: Vec<String>,
+    },
+    /// Run any command under the budget, without cache (builds, test runs, docker builds).
+    ///
+    /// The command (an argv, no shell: use `sluice exec -- sh -c '...'` for a script)
+    /// is queued in the daemon like a gate and runs in its own process group with the
+    /// caller's environment and directory, stdin `/dev/null` and no terminal. Its stdout
+    /// and stderr are replayed byte for byte to this process's stdout and stderr;
+    /// SIGINT, SIGTERM and SIGHUP are forwarded to the whole process group.
+    ///
+    /// Exit codes: the command's own code; 128+N when it was killed by signal N; 124
+    /// on --timeout; 143 when the daemon stopped and killed it; 127 command not found;
+    /// 126 not executable; 125 Sluice error after the request was accepted.
+    ///
+    /// Without a usable daemon (not running and not startable, or older than 0.3.0) the
+    /// command runs in-process under the same budget semaphore with inherited stdio.
+    /// Inside a Sluice job (`SLUICE_JOB` set) it runs directly, without queueing.
+    /// `SLUICE_DISABLE=1` always runs it in-process (with a terminal, if any).
+    Exec {
+        /// Budget units the command takes; default half the budget, rounded up.
+        #[arg(long, value_name = "N")]
+        weight: Option<u32>,
+        /// Label shown in `sluice status` and messages; default the first two words.
+        #[arg(long, value_name = "L")]
+        label: Option<String>,
+        /// Share one run between simultaneous requests with this key and the same
+        /// command and directory (environment differences are ignored).
+        #[arg(long, value_name = "K")]
+        coalesce_key: Option<String>,
+        /// Kill the command after this long (for example `90s`, `20m`); exit 124.
+        #[arg(long, value_name = "DUR", value_parser = humantime::parse_duration)]
+        timeout: Option<std::time::Duration>,
+        /// Do not print Sluice's informational lines (errors are still printed).
+        #[arg(short, long)]
+        quiet: bool,
+        /// The command and its arguments (after `--`).
+        #[arg(
+            required = true,
+            num_args = 1..,
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "CMD"
+        )]
+        argv: Vec<String>,
     },
     /// Start the MCP stdio server (spawned by the coding agent).
     ///
@@ -306,6 +353,21 @@ fn main() -> ExitCode {
             verbose,
             explain,
         }),
+        Command::Exec {
+            weight,
+            label,
+            coalesce_key,
+            timeout,
+            quiet,
+            argv,
+        } => exec::exec(&exec::ExecArgs {
+            weight,
+            label,
+            coalesce_key,
+            timeout,
+            quiet,
+            argv,
+        }),
         Command::Cache {
             command: CacheCommand::Status { all },
         } => cache::status(all),
@@ -404,7 +466,12 @@ fn hook_gates(config: &RepoConfig) -> HookGates {
 fn hook_print(manager: HookManager) -> ExitCode {
     let (preface, gates) = match fs::read_to_string(REPO_CONFIG_FILE) {
         Ok(text) => match RepoConfig::parse(&text, Path::new(REPO_CONFIG_FILE)) {
-            Ok(config) => (String::new(), hook_gates(&config)),
+            Ok(config) => {
+                if let Some(warning) = doctor::queue_only_hook_warning(&config) {
+                    eprintln!("sluice: warning: {warning}");
+                }
+                (String::new(), hook_gates(&config))
+            }
             Err(e) => {
                 eprintln!("sluice: error: {e}");
                 return ExitCode::from(run::EXIT_ERROR);

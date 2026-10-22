@@ -15,8 +15,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::{
-    self as proto, ClientEvent, ClientMessage, Outcome, PROTOCOL_VERSION, RunRequest,
-    ServerMessage, StatusReport,
+    self as proto, ClientEvent, ClientMessage, ExecRequest, ExecSignal, Outcome, PROTOCOL_VERSION,
+    RunRequest, ServerMessage, StatusReport,
 };
 use anyhow::{Context as _, Result, anyhow};
 use nix::errno::Errno;
@@ -263,6 +263,24 @@ impl Client {
         }
     }
 
+    /// Sends `exec` and returns the connection that streams its events.
+    /// Only meaningful with a daemon announcing [`proto::FEATURE_EXEC`].
+    ///
+    /// # Errors
+    ///
+    /// I/O errors while sending.
+    pub fn exec(mut self, request: ExecRequest) -> std::result::Result<ExecConn, ClientError> {
+        self.send(&ClientMessage::Exec { id: 1, request })?;
+        self.reader
+            .get_ref()
+            .set_read_timeout(None)
+            .context("configuring the socket")?;
+        Ok(ExecConn {
+            reader: self.reader,
+            writer: self.writer,
+        })
+    }
+
     /// Asks for the status report.
     ///
     /// # Errors
@@ -346,6 +364,83 @@ impl Client {
             ServerMessage::Stopping { running, .. } => Ok(running),
             other => Err(anyhow!("unexpected reply to stop: {other:?}").into()),
         }
+    }
+}
+
+/// An `exec` request in flight: read its events with [`ExecConn::recv`];
+/// forward signals or hang up from another thread with an [`ExecControl`].
+#[derive(Debug)]
+pub struct ExecConn {
+    reader: BufReader<UnixStream>,
+    writer: UnixStream,
+}
+
+impl ExecConn {
+    /// Next server message (an `error` reply is returned as
+    /// [`ClientError::Daemon`]); EOF is [`ClientError::Closed`].
+    ///
+    /// # Errors
+    ///
+    /// I/O or protocol errors, [`ClientError::Daemon`] or [`ClientError::Closed`].
+    pub fn recv(&mut self) -> std::result::Result<ServerMessage, ClientError> {
+        let mut line = String::new();
+        match self.reader.read_line(&mut line) {
+            Ok(0) => return Err(ClientError::Closed),
+            Ok(_) => {}
+            Err(e) => {
+                return Err(anyhow::Error::from(e)
+                    .context("reading from the daemon")
+                    .into());
+            }
+        }
+        if proto::line_too_long(&line) {
+            return Err(anyhow!("the daemon sent a line longer than 1 MiB").into());
+        }
+        let msg = proto::decode_server(&line).context("malformed reply from the daemon")?;
+        if let ServerMessage::Error { message, .. } = msg {
+            return Err(ClientError::Daemon(message));
+        }
+        Ok(msg)
+    }
+
+    /// A handle to forward signals or hang up while another thread reads.
+    ///
+    /// # Errors
+    ///
+    /// When the socket cannot be duplicated.
+    pub fn control(&self) -> std::result::Result<ExecControl, ClientError> {
+        Ok(ExecControl {
+            writer: self.writer.try_clone().context("cloning the socket")?,
+        })
+    }
+}
+
+/// Writer side of an [`ExecConn`], usable from a signal-handling thread.
+#[derive(Debug)]
+pub struct ExecControl {
+    writer: UnixStream,
+}
+
+impl ExecControl {
+    /// Sends `signal{sig}` for the `exec` request.
+    ///
+    /// # Errors
+    ///
+    /// I/O errors (the daemon is gone).
+    pub fn signal(&self, signal: ExecSignal) -> std::result::Result<(), ClientError> {
+        let line =
+            proto::encode(&ClientMessage::Signal { id: 1, signal }).context("encoding a signal")?;
+        (&self.writer)
+            .write_all(line.as_bytes())
+            .context("writing to the daemon")?;
+        Ok(())
+    }
+
+    /// Closes the connection in both directions: the daemon detaches this
+    /// subscriber (its cancel path kills a job left without subscribers) and
+    /// a blocked [`ExecConn::recv`] returns.
+    pub fn hang_up(&self) {
+        let _ = self.writer.shutdown(std::net::Shutdown::Both);
     }
 }
 

@@ -143,6 +143,7 @@ env        = { NODE_ENV = "test" }
 
 ```
 sluice run <gate> [--hook <hook>] [-v] [--explain] [-- args]  # hooks, terminal, scripts (Phase 1)
+sluice exec [--weight N] [--label L] [--coalesce-key K] [--timeout DUR] [-q] -- <cmd> [args...]  # any command under the budget, no cache (0.3.0)
 sluice cache status [--all] | clear [--gate <gate>]      # markers of the current repo (Phase 1)
 sluice init [--force]                                    # starter .sluice.toml + hook snippet (Phase 1)
 sluice hook print husky|lefthook|pre-commit|plain        # integration snippets         (Phase 1)
@@ -175,6 +176,18 @@ failure; 3 refused by `agent_hook_policy = "fail-fast"`; 124 timeout; 143
 gate killed by a signal; 1 Sluice error; 2 usage error. `sluice run --explain <gate>` shows every
 decision Sluice would take without running anything.
 
+`sluice exec -- <cmd>` runs a command that is not a gate (`docker build`,
+`make`, a full build) under the same budget, without cache: it is queued in
+the daemon, its stdout and stderr are replayed byte for byte and Ctrl-C or
+SIGTERM reach its whole process group. Exit codes: the command's own code;
+128+N when killed by signal N; 124 on `--timeout`; 143 when the daemon
+stopped and killed it; 127 not found; 126 not executable; 125 Sluice error
+after the request was accepted. Stdin is `/dev/null`, there is no terminal,
+and the default weight is half the budget. Without a daemon it runs
+in-process under the budget semaphore. A gate with `mode = "queue-only"`
+behaves the same way for `sluice run`: always run, never cached, identical
+simultaneous requests share one run.
+
 Defaults worth knowing: gate timeout 30 m, weight 1, cache TTL 30 days,
 budget `max(2, cpus - 1)`, 40 log lines shown on failure (set
 `defaults.tail_lines` per repository or `cache.tail_lines` in the user
@@ -186,6 +199,9 @@ directly (no cache, no budget, no log; through the MCP server it only
 turns the cache off); `SLUICE_CACHE=0|1` forces the cache off or on
 (on overrides `CI`); `CI` (any value other than `0`/`false`/`no`/`off`)
 disables the cache; `SLUICE_AGENT=1|0` forces agent or human detection;
+`SLUICE_JOB` (set by Sluice on every process it runs) makes a nested
+`sluice exec` or `sluice run` run directly instead of queueing behind its
+own parent;
 `SLUICE_CONFIG` points at the user config
 (`~/.config/sluice/config.toml`); `SLUICE_SOCKET` moves the daemon socket;
 `SLUICE_LOG` sets the log filter of `sluice daemon` (written to
@@ -312,10 +328,11 @@ is in the [final report](kb/sluice/changes/final-report.md) and the
 - **Verdicts, not artifacts.** A cache hit says a gate passed on this tree;
   it does not restore build outputs, so a hit on a build command produces
   no files.
-- **Only declared gates are controlled.** Raw commands that are not gates
-  (`docker build`, `make`, anything inside `sh -c` or a script) bypass the
-  queue until command control lands. The agent plugin's guard hook and your
-  forge's branch protection are the enforcement, not the daemon.
+- **Only declared gates and `sluice exec` are controlled.** Raw commands
+  that are neither (`docker build`, `make`, anything inside `sh -c` or a
+  script) bypass the queue unless they are wrapped in `sluice exec`. The
+  agent plugin's guard hook and your forge's branch protection are the
+  enforcement, not the daemon.
 - **Per-worktree caches.** Tools that keep state inside the checkout, such
   as `node_modules/.cache`, break when worktrees share one `node_modules`.
   Give each worktree its own caches; Sluice cannot fix this.

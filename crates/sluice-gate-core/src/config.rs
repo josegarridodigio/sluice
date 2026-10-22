@@ -201,9 +201,31 @@ pub struct Gate {
     /// `false` makes the gate always run.
     #[serde(default = "default_true")]
     pub cache: bool,
+    /// `gate` (default) or `queue-only`: a queue-only gate always runs under
+    /// the budget and is never cached (its `cache` is forced to `false` at
+    /// parse time). Needs sluice >= 0.3.0.
+    #[serde(default)]
+    pub mode: GateMode,
+}
+
+/// The `mode` of a gate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GateMode {
+    /// A cached gate (the default).
+    #[default]
+    Gate,
+    /// Always runs under the budget: no marker lookup, no marker, no miss
+    /// record; simultaneous identical requests still coalesce.
+    QueueOnly,
 }
 
 impl Gate {
+    /// True for `mode = "queue-only"`.
+    pub fn is_queue_only(&self) -> bool {
+        self.mode == GateMode::QueueOnly
+    }
+
     /// The command with surrounding whitespace trimmed and every whitespace
     /// run collapsed to a single space; this is what enters the cache key.
     pub fn normalized_cmd(&self) -> String {
@@ -227,9 +249,42 @@ impl RepoConfig {
     /// # Errors
     /// [`Error::Config`] on syntax errors, unknown fields or failed validation.
     pub fn parse(text: &str, path: &Path) -> Result<Self> {
-        let cfg: Self = toml::from_str(text).map_err(|e| config_err(path, e.to_string()))?;
+        let mut cfg: Self = toml::from_str(text).map_err(|e| config_err(path, e.to_string()))?;
         cfg.validate(path)?;
+        cfg.check_queue_only(text, path)?;
         Ok(cfg)
+    }
+
+    /// Rejects `mode = "queue-only"` combined with an explicit `cache =
+    /// true`, then forces `cache = false` on every queue-only gate so every
+    /// cache path treats it as uncached.
+    fn check_queue_only(&mut self, text: &str, path: &Path) -> Result<()> {
+        if !self.gates.values().any(Gate::is_queue_only) {
+            return Ok(());
+        }
+        // `cache` defaults to true, so only the raw document tells whether it
+        // was written explicitly.
+        let raw: toml::Table = toml::from_str(text).map_err(|e| config_err(path, e.to_string()))?;
+        for (name, gate) in &mut self.gates {
+            if !gate.is_queue_only() {
+                continue;
+            }
+            let explicit_cache = raw
+                .get("gates")
+                .and_then(|g| g.get(name.as_str()))
+                .and_then(|g| g.get("cache"))
+                .and_then(toml::Value::as_bool);
+            if explicit_cache == Some(true) {
+                return Err(config_err(
+                    path,
+                    format!(
+                        "gates.{name}: mode = \"queue-only\" never caches; remove cache = true"
+                    ),
+                ));
+            }
+            gate.cache = false;
+        }
+        Ok(())
     }
 
     /// Load `<repo_root>/.sluice.toml`.
@@ -842,6 +897,31 @@ depends_on = ["lint"]
         assert!(g.hooks.is_empty() && g.key_inputs.is_empty() && g.key_files.is_empty());
         assert!(g.env.is_empty() && g.depends_on.is_empty());
         assert!(g.cache);
+        assert_eq!(g.mode, GateMode::Gate);
+        assert!(!g.is_queue_only());
+    }
+
+    #[test]
+    fn queue_only_mode() {
+        let c = parse(&gate_with("cmd = \"make\"\nmode = \"queue-only\"")).unwrap();
+        let g = c.gate("g").unwrap();
+        assert!(g.is_queue_only());
+        assert!(!g.cache, "a queue-only gate is never cached");
+        let c = parse(&gate_with(
+            "cmd = \"make\"\nmode = \"queue-only\"\ncache = false",
+        ))
+        .unwrap();
+        assert!(c.gate("g").unwrap().is_queue_only());
+        let m = msg(&gate_with(
+            "cmd = \"make\"\nmode = \"queue-only\"\ncache = true",
+        ));
+        assert!(
+            m.contains("gates.g: mode = \"queue-only\" never caches; remove cache = true"),
+            "{m}"
+        );
+        let c = parse(&gate_with("cmd = \"make\"\nmode = \"gate\"\ncache = true")).unwrap();
+        assert!(c.gate("g").unwrap().cache);
+        assert!(msg(&gate_with("cmd = \"make\"\nmode = \"other\"")).contains("mode"));
     }
 
     #[test]

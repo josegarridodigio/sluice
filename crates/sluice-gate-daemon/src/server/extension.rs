@@ -189,6 +189,7 @@ impl DaemonHandle {
                 weight,
                 started_at,
                 events,
+                ..
             }) => {
                 tracing::info!(job = %job_id, coalesced, position, "extension run queued");
                 if !coalesced {
@@ -206,6 +207,7 @@ impl DaemonHandle {
                         id: 0,
                         job_id: job_id.clone(),
                         started_at: rfc3339(started_at),
+                        spool: None,
                     });
                 }
                 RunSubscription {

@@ -1,9 +1,12 @@
-//! Runs one gate process: a new process group, CPU and I/O priority, both
-//! output pipes captured into one log, a timeout and a cancel sequence.
+//! Runs one job process: a new process group, CPU and I/O priority, both
+//! output pipes captured, a timeout and a cancel sequence.
 //!
-//! Design: `kb/sluice/design/executor.md`, section "Executor". The log keeps
-//! the Phase 1 framing: a `# sluice job …` / `# command: …` header followed
-//! by a blank line, the interleaved output, and a `# exit: …` footer.
+//! Design: `kb/sluice/design/executor.md`, section "Executor". A gate
+//! ([`Launch::Shell`], [`Sink::Log`]) writes a log with the Phase 1 framing:
+//! a `# sluice job …` / `# command: …` header followed by a blank line, the
+//! interleaved output, and a `# exit: …` footer. A `sluice exec` job
+//! ([`Launch::Argv`], [`Sink::Spool`]) writes the framed spool of [`spool`]
+//! instead, keeping stdout and stderr apart.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -32,17 +35,109 @@ const CHUNK: usize = 8 * 1024;
 /// Polling interval while waiting for a process group to disappear.
 const POLL: Duration = Duration::from_millis(20);
 
-/// Everything needed to run one gate.
+/// Framed output spool of `sluice exec` jobs.
+///
+/// Format: the magic [`MAGIC`], then records `[stream: u8 (1|2)][len: u32
+/// big-endian][bytes]`. Stream 1 is stdout, 2 is stderr. Records are
+/// appended whole under one mutex, so a reader that sees a partial record
+/// only has to wait for the rest.
+pub mod spool {
+    use std::io::Write;
+
+    /// First bytes of every spool file.
+    pub const MAGIC: &[u8] = b"SLUICEX1\n";
+    /// Stream id of stdout.
+    pub const STDOUT: u8 = 1;
+    /// Stream id of stderr.
+    pub const STDERR: u8 = 2;
+    /// Size of a record header.
+    pub const HEADER: usize = 5;
+
+    /// Appends one record.
+    ///
+    /// # Errors
+    ///
+    /// I/O errors of `out`.
+    pub fn write_record(out: &mut impl Write, stream: u8, data: &[u8]) -> std::io::Result<()> {
+        let len = u32::try_from(data.len()).map_err(std::io::Error::other)?;
+        let mut header = [0u8; HEADER];
+        header[0] = stream;
+        header[1..].copy_from_slice(&len.to_be_bytes());
+        out.write_all(&header)?;
+        out.write_all(data)
+    }
+
+    /// Splits `buf` (without the magic) into complete records; returns them
+    /// and the number of bytes consumed (a trailing partial record is left).
+    pub fn parse(buf: &[u8]) -> (Vec<(u8, &[u8])>, usize) {
+        let mut out = Vec::new();
+        let mut at = 0;
+        while buf.len() - at >= HEADER {
+            let mut len = [0u8; 4];
+            len.copy_from_slice(&buf[at + 1..at + HEADER]);
+            let len = u32::from_be_bytes(len) as usize;
+            if buf.len() - at - HEADER < len {
+                break;
+            }
+            out.push((buf[at], &buf[at + HEADER..at + HEADER + len]));
+            at += HEADER + len;
+        }
+        (out, at)
+    }
+
+    /// Both streams of a spool file merged in arrival order (for `logs` and
+    /// the `done` tail); `None` when `bytes` is not a spool.
+    pub fn merged(bytes: &[u8]) -> Option<Vec<u8>> {
+        let body = bytes.strip_prefix(MAGIC)?;
+        let (records, _) = parse(body);
+        Some(
+            records
+                .into_iter()
+                .flat_map(|(_, d)| d.iter().copied())
+                .collect(),
+        )
+    }
+}
+
+/// What to start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Launch {
+    /// A gate: `sh -c '<cmd>'`, or `sh -c '<cmd> "$@"' sh <extra...>`.
+    Shell {
+        /// Shell command.
+        cmd: String,
+        /// Extra arguments appended as `"$@"`.
+        extra: Vec<String>,
+    },
+    /// `sluice exec`: an argv run directly, no shell.
+    Argv {
+        /// Program (absolute path resolved by the client).
+        program: String,
+        /// Arguments after the program.
+        args: Vec<String>,
+    },
+}
+
+/// Where the output goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sink {
+    /// One interleaved log with the Phase 1 header and footer.
+    Log,
+    /// The framed [`spool`], streams kept apart, no header or footer.
+    Spool,
+}
+
+/// Everything needed to run one job.
 #[derive(Debug, Clone)]
 pub struct ExecSpec {
     /// Job identifier (used in the log header).
     pub job_id: String,
-    /// Gate name (used in the log header).
+    /// Gate name or exec label (used in the log header and messages).
     pub gate: String,
-    /// Shell command of the gate.
-    pub cmd: String,
-    /// Extra arguments appended to the command as `"$@"`.
-    pub extra: Vec<String>,
+    /// What to start.
+    pub launch: Launch,
+    /// Where the output goes.
+    pub sink: Sink,
     /// Working directory of the gate.
     pub cwd: PathBuf,
     /// Complete environment of the gate (nothing else is inherited).
@@ -90,8 +185,9 @@ impl IoClass {
 pub enum ExecStatus {
     /// The gate exited on its own with this code.
     Exited(i32),
-    /// The gate was terminated by a signal it did not get from us.
-    Signaled,
+    /// The leader was terminated by this signal, not sent by our timeout or
+    /// cancel sequence.
+    Signaled(i32),
     /// The timeout expired and the group was killed.
     Timeout,
     /// The run was cancelled and the group was killed.
@@ -151,6 +247,7 @@ pub struct Running {
     handle: RunningHandle,
     info: ProcessInfo,
     log: Arc<Mutex<File>>,
+    sink: Sink,
     log_path: PathBuf,
     started: Instant,
     timeout: Duration,
@@ -220,19 +317,21 @@ impl Running {
         }
 
         let status = forced.unwrap_or_else(|| exit_status(exit));
-        let code = exit
-            .and_then(|s| s.code())
-            .map_or_else(|| "signal".to_owned(), |c| c.to_string());
-        let suffix = match status {
-            ExecStatus::Timeout => " (timed out)",
-            ExecStatus::Killed => " (killed)",
-            ExecStatus::Exited(_) | ExecStatus::Signaled => "",
-        };
-        let footer = format!(
-            "\n# exit: {code} after {:.1}s{suffix}\n",
-            duration.as_secs_f64()
-        );
-        write_log(&self.log, &self.handle.bytes, footer.as_bytes());
+        if self.sink == Sink::Log {
+            let code = exit
+                .and_then(|s| s.code())
+                .map_or_else(|| "signal".to_owned(), |c| c.to_string());
+            let suffix = match status {
+                ExecStatus::Timeout => " (timed out)",
+                ExecStatus::Killed => " (killed)",
+                ExecStatus::Exited(_) | ExecStatus::Signaled(_) => "",
+            };
+            let footer = format!(
+                "\n# exit: {code} after {:.1}s{suffix}\n",
+                duration.as_secs_f64()
+            );
+            write_log(&self.log, &self.handle.bytes, footer.as_bytes());
+        }
         if let Ok(mut file) = self.log.lock() {
             let _ = file.flush();
         }
@@ -248,8 +347,14 @@ impl Running {
 
 /// Maps the leader's exit status to an [`ExecStatus`].
 fn exit_status(exit: Option<ExitStatus>) -> ExecStatus {
-    exit.and_then(|s| s.code())
-        .map_or(ExecStatus::Signaled, ExecStatus::Exited)
+    use std::os::unix::process::ExitStatusExt;
+    match exit {
+        Some(s) => s.code().map_or_else(
+            || ExecStatus::Signaled(s.signal().unwrap_or(0)),
+            ExecStatus::Exited,
+        ),
+        None => ExecStatus::Signaled(0),
+    }
 }
 
 /// Awaits every task, ignoring panics.
@@ -259,10 +364,12 @@ async fn join_all(tasks: Vec<JoinHandle<()>>) {
     }
 }
 
-/// Spawns `sh -c '<cmd>'` (or `sh -c '<cmd> "$@"' sh <extra...>` when extra
-/// arguments are given) in its own process group, with
-/// exactly `spec.env` as environment, stdin null and both outputs captured
-/// into `spec.log_path` behind the Phase 1 header.
+/// Spawns the job in its own process group, with exactly `spec.env` as
+/// environment and stdin null: `sh -c '<cmd>'` (or `sh -c '<cmd> "$@"' sh
+/// <extra...>` when extra arguments are given) for [`Launch::Shell`], the
+/// argv itself for [`Launch::Argv`]. Both outputs are captured into
+/// `spec.log_path`: behind the Phase 1 header for [`Sink::Log`], as framed
+/// records for [`Sink::Spool`].
 ///
 /// Priorities are applied right after the spawn through the `renice` and
 /// `ionice` binaries when they are in `PATH` (failures are ignored).
@@ -282,27 +389,8 @@ pub async fn spawn(spec: ExecSpec) -> Result<Running> {
         .map_err(io(format!("cannot create {}", spec.log_path.display())))?;
     let log = Arc::new(Mutex::new(file));
     let bytes = Arc::new(AtomicU64::new(0));
-    let header = format!(
-        "# sluice job {}: gate '{}' in {}\n# command: {}\n\n",
-        spec.job_id,
-        spec.gate,
-        spec.cwd.display(),
-        spec.cmd
-    );
-    write_log(&log, &bytes, header.as_bytes());
-
-    // `"$@"` is appended only when extra arguments exist: a compound command
-    // (`for … done`) followed by `"$@"` would be a shell syntax error.
-    let script = if spec.extra.is_empty() {
-        spec.cmd.trim().to_owned()
-    } else {
-        format!("{} \"$@\"", spec.cmd.trim())
-    };
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(script)
-        .arg("sh")
-        .args(&spec.extra)
+    let mut command = command(&spec, &log, &bytes);
+    let mut child = command
         .current_dir(&spec.cwd)
         .env_clear()
         .envs(&spec.env)
@@ -332,12 +420,14 @@ pub async fn spawn(spec: ExecSpec) -> Result<Running> {
 
     apply_priority(pid, spec.nice, spec.ionice).await;
 
+    let framed = |stream: u8| (spec.sink == Sink::Spool).then_some(stream);
     let mut pumps = Vec::with_capacity(2);
     if let Some(out) = child.stdout.take() {
         pumps.push(tokio::spawn(pump(
             out,
             Arc::clone(&log),
             Arc::clone(&bytes),
+            framed(spool::STDOUT),
         )));
     }
     if let Some(err) = child.stderr.take() {
@@ -345,6 +435,7 @@ pub async fn spawn(spec: ExecSpec) -> Result<Running> {
             err,
             Arc::clone(&log),
             Arc::clone(&bytes),
+            framed(spool::STDERR),
         )));
     }
 
@@ -362,10 +453,47 @@ pub async fn spawn(spec: ExecSpec) -> Result<Running> {
             started_at,
         },
         log,
+        sink: spec.sink,
         log_path: spec.log_path,
         started,
         timeout: spec.timeout,
     })
+}
+
+/// The command to spawn; writes the log header (gates) or the spool magic.
+fn command(spec: &ExecSpec, log: &Mutex<File>, bytes: &AtomicU64) -> Command {
+    let command = match &spec.launch {
+        Launch::Shell { cmd, extra } => {
+            let header = format!(
+                "# sluice job {}: gate '{}' in {}\n# command: {}\n\n",
+                spec.job_id,
+                spec.gate,
+                spec.cwd.display(),
+                cmd
+            );
+            write_log(log, bytes, header.as_bytes());
+            // `"$@"` is appended only when extra arguments exist: a compound
+            // command (`for … done`) followed by `"$@"` would be a shell
+            // syntax error.
+            let script = if extra.is_empty() {
+                cmd.trim().to_owned()
+            } else {
+                format!("{} \"$@\"", cmd.trim())
+            };
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(script).arg("sh").args(extra);
+            c
+        }
+        Launch::Argv { program, args } => {
+            let mut c = Command::new(program);
+            c.args(args);
+            c
+        }
+    };
+    if spec.sink == Sink::Spool {
+        write_log(log, bytes, spool::MAGIC);
+    }
+    command
 }
 
 /// Lowers the CPU and I/O priority of `pid` with the `renice` and `ionice`
@@ -434,13 +562,30 @@ fn write_log(log: &Mutex<File>, bytes: &AtomicU64, data: &[u8]) {
     }
 }
 
-/// Copies a child stream into the log in 8 KiB chunks until end of file.
-async fn pump<R: AsyncRead + Unpin>(mut reader: R, log: Arc<Mutex<File>>, bytes: Arc<AtomicU64>) {
+/// Appends one spool record (header and data in one locked write).
+fn write_record(log: &Mutex<File>, bytes: &AtomicU64, stream: u8, data: &[u8]) {
+    let mut record = Vec::with_capacity(spool::HEADER + data.len());
+    if spool::write_record(&mut record, stream, data).is_ok() {
+        write_log(log, bytes, &record);
+    }
+}
+
+/// Copies a child stream into the log in 8 KiB chunks until end of file;
+/// with `framed`, each chunk becomes a spool record of that stream.
+async fn pump<R: AsyncRead + Unpin>(
+    mut reader: R,
+    log: Arc<Mutex<File>>,
+    bytes: Arc<AtomicU64>,
+    framed: Option<u8>,
+) {
     let mut buf = vec![0u8; CHUNK];
     loop {
         match reader.read(&mut buf).await {
             Ok(0) | Err(_) => break,
-            Ok(n) => write_log(&log, &bytes, &buf[..n]),
+            Ok(n) => match framed {
+                Some(stream) => write_record(&log, &bytes, stream, &buf[..n]),
+                None => write_log(&log, &bytes, &buf[..n]),
+            },
         }
     }
 }
@@ -492,15 +637,29 @@ pub fn proc_start_ticks(pid: u32) -> Option<u64> {
     rest.split_whitespace().nth(19)?.parse().ok()
 }
 
-/// Last `n` lines of a file (empty when it cannot be read).
+/// Last `n` lines of a file (empty when it cannot be read). A [`spool`]
+/// file is decoded first (both streams merged, invalid UTF-8 replaced).
 pub fn tail_lines(path: &Path, n: usize) -> Vec<String> {
     let Ok(file) = File::open(path) else {
         return Vec::new();
     };
-    let mut all: Vec<String> = BufReader::new(file)
-        .lines()
-        .map_while(std::result::Result::ok)
-        .collect();
+    let mut reader = BufReader::new(file);
+    let is_spool = reader
+        .fill_buf()
+        .is_ok_and(|head| head.starts_with(spool::MAGIC));
+    let mut all: Vec<String> = if is_spool {
+        let mut bytes = Vec::new();
+        if std::io::Read::read_to_end(&mut reader, &mut bytes).is_err() {
+            return Vec::new();
+        }
+        let merged = spool::merged(&bytes).unwrap_or_default();
+        String::from_utf8_lossy(&merged)
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    } else {
+        reader.lines().map_while(std::result::Result::ok).collect()
+    };
     let start = all.len().saturating_sub(n);
     all.split_off(start)
 }
@@ -518,8 +677,11 @@ mod tests {
         ExecSpec {
             job_id: "j1".to_owned(),
             gate: "test".to_owned(),
-            cmd: cmd.to_owned(),
-            extra: Vec::new(),
+            launch: Launch::Shell {
+                cmd: cmd.to_owned(),
+                extra: Vec::new(),
+            },
+            sink: Sink::Log,
             cwd: dir.to_path_buf(),
             env,
             timeout: Duration::from_secs(20),
@@ -582,7 +744,10 @@ mod tests {
     async fn extra_args_reach_the_command() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = spec(dir.path(), "echo");
-        s.extra = vec!["a".to_owned(), "b".to_owned()];
+        s.launch = Launch::Shell {
+            cmd: "echo".to_owned(),
+            extra: vec!["a".to_owned(), "b".to_owned()],
+        };
         let done = spawn(s).await.unwrap().wait().await;
         assert_eq!(done.status, ExecStatus::Exited(0));
         assert!(read(&done.log_path).contains("\na b\n"));
@@ -686,6 +851,64 @@ mod tests {
         let log = read(&done.log_path);
         assert!(log.contains("\nSLUICE_MARKER=yes\n"));
         assert!(!log.contains("\nHOME="), "{log}");
+    }
+
+    #[tokio::test]
+    async fn argv_with_spool_keeps_streams_apart_and_reports_signals() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = spec(dir.path(), "");
+        s.launch = Launch::Argv {
+            program: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "printf out1; printf err1 >&2; printf out2".to_owned(),
+            ],
+        };
+        s.sink = Sink::Spool;
+        s.log_path = dir.path().join("logs").join("j1.exec");
+        let done = spawn(s.clone()).await.unwrap().wait().await;
+        assert_eq!(done.status, ExecStatus::Exited(0));
+        let bytes = fs::read(&done.log_path).unwrap();
+        assert!(bytes.starts_with(spool::MAGIC));
+        let (records, used) = spool::parse(&bytes[spool::MAGIC.len()..]);
+        assert_eq!(used, bytes.len() - spool::MAGIC.len());
+        let stream = |id: u8| -> Vec<u8> {
+            records
+                .iter()
+                .filter(|(s, _)| *s == id)
+                .flat_map(|(_, d)| d.iter().copied())
+                .collect()
+        };
+        assert_eq!(stream(spool::STDOUT), b"out1out2");
+        assert_eq!(stream(spool::STDERR), b"err1");
+        assert_eq!(done.log_bytes, bytes.len() as u64);
+        let tail = tail_lines(&done.log_path, 5).join("\n");
+        assert!(tail.contains("out1") && tail.contains("err1"), "{tail}");
+
+        s.launch = Launch::Argv {
+            program: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), "kill -KILL $$".to_owned()],
+        };
+        let done = spawn(s).await.unwrap().wait().await;
+        assert_eq!(done.status, ExecStatus::Signaled(9));
+    }
+
+    #[test]
+    fn spool_parse_leaves_partial_records() {
+        let mut buf = Vec::new();
+        spool::write_record(&mut buf, spool::STDOUT, b"abc").unwrap();
+        spool::write_record(&mut buf, spool::STDERR, b"").unwrap();
+        spool::write_record(&mut buf, spool::STDOUT, b"xyz").unwrap();
+        let (records, used) = spool::parse(&buf[..buf.len() - 1]);
+        assert_eq!(
+            records,
+            vec![(spool::STDOUT, &b"abc"[..]), (spool::STDERR, &b""[..])]
+        );
+        assert_eq!(used, 13);
+        let mut file = spool::MAGIC.to_vec();
+        file.extend_from_slice(&buf);
+        assert_eq!(spool::merged(&file).unwrap(), b"abcxyz");
+        assert!(spool::merged(b"plain log").is_none());
     }
 
     #[tokio::test]

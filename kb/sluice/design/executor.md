@@ -68,6 +68,24 @@ Status: implemented in Phase 2 (`sluice-gate-daemon`, CLI `daemon_cmd`, proto `c
 - Spawn: `sh -c '<cmd> "$@"' sh <extra…>` with `current_dir = request.cwd`,
   `env_clear().envs(child_env)`, `stdin = null`, stdout and stderr piped,
   `process_group(0)` (new group; the daemon owns the gate, no terminal).
+  `ExecSpec` says what and where: `launch: Launch` (`Shell { cmd, extra }`
+  for gates, `Argv { program, args }` for `sluice exec`) and `sink: Sink`
+  (`Log` for gates, `Spool` for exec). Every job's environment gets
+  `SLUICE_JOB=<job id>` (gates too), which turns a nested `sluice exec` or
+  `sluice run` into a direct, unqueued run.
+- `sluice exec` jobs ([[sluice/design/command-control.md]] section 2): the
+  argv runs directly (no shell) with the caller's environment (plus
+  `SLUICE_JOB`) and cwd, same group, priorities, timeout (`timeout_ms`, 0 =
+  none) and kill sequence as gates. Output goes to `<logs>/<job>.exec` in
+  the spool format of `executor::spool` (magic `SLUICEX1\n`, records
+  `[stream u8][len u32 BE][bytes]`, streams kept apart, no header or
+  footer); `done` is sent after both pumps finished. The leader's death by
+  a signal is `ExecStatus::Signaled(n)` and reaches the client as
+  `outcome.signal`. Exec jobs never write markers or miss records and
+  ignore `last_subscriber_gone = "finish"` (the last subscriber leaving
+  kills them). A forwarded `signal` is sent to the group with `killpg`;
+  once the leader is gone the rest of the group is SIGKILLed, and after
+  `KILL_GRACE` + 5 s with the leader alive the cancel sequence runs.
 - Record `pgid`, `proc_start_ticks` and `log_path` in SQLite right after
   the spawn (the output pumps are already running; a queued row has a null
   `log_path`).
@@ -90,6 +108,8 @@ Status: implemented in Phase 2 (`sluice-gate-daemon`, CLI `daemon_cmd`, proto `c
   sequence, outcome `killed`; the log footer says `(killed)`. Under
   `finish`, a job whose last subscriber left keeps running (or stays
   queued and still runs later).
+- A `run` with `no_marker` (queue-only gate) skips the pre-start marker
+  double-check and the whole bookkeeping below: no marker, no miss record.
 - After exit 0 with a key: re-snapshot the tree with `probe_env` from the
   request (`tree::snapshot`, scratch dir from the daemon's own
   `XDG_RUNTIME_DIR`); unchanged → `MarkerStore::write` (`cmd` normalised,
@@ -98,9 +118,11 @@ Status: implemented in Phase 2 (`sluice-gate-daemon`, CLI `daemon_cmd`, proto `c
   `not_cached_reason`. Non-zero → miss record `gate failed` with the exit
   code; timeouts `timed out`; cancellations `killed`. The gate environment
   is the request's `child_env` with `gate.env` laid over it.
-- The `tail` in `done` is the last `cache.tail_lines` lines of the log.
+- The `tail` in `done` is the last `cache.tail_lines` lines of the log (a
+  spool is decoded first, streams merged; `logs` does the same).
 - Log retention: on start and daily (from the heartbeat task, so it stops
-  if the lease is lost), delete job logs older than
+  if the lease is lost), delete job logs (`<id>.log`, and `<id>.exec` for
+  exec jobs) older than
   `daemon.log_retention_days` whose job row is terminal or that belong to
   no row at all (in-process fallback runs). The same pass deletes
   `mcp-<pid>.log` files (the `sluice mcp` logs) older than the retention by
@@ -185,6 +207,17 @@ message naming the file. `totals(since)` filters jobs by `queued_at` and events 
 4. `run-unqueued` policy never touches the daemon.
 5. On a hit, send the best-effort `hit` event (20 ms budget) when the
    socket file exists.
+6. Inside a Sluice job (`SLUICE_JOB` set) a miss runs in-process right
+   away, without the semaphore and without the daemon (client log decision
+   `nested`): the parent job already holds the budget, so queueing could
+   wait for it forever. The in-process gate processes also carry
+   `SLUICE_JOB` (`<job id>`, or `inproc-<pid>` under `SLUICE_DISABLE`).
+7. Queue-only gates skip the marker lookup and the agent `fail-fast`
+   policy (the hook waits) and always run; to a daemon announcing
+   `queue-only` the request carries `no_marker` and the namespaced key
+   `sha256("queue-only\0" K)` so simultaneous identical requests coalesce.
+   The in-process budget code is shared with `sluice exec`
+   (`crates/sluice-gate/src/budget.rs`).
 
 ## Properties to test (Phase 2 acceptance)
 

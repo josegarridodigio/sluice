@@ -12,10 +12,13 @@ use sluice_gate_daemon::server::{
     LastSubscriberGone, UserConfig,
 };
 use sluice_gate_proto::{
-    Caller, ClientMessage, ErrorCode, FEATURE_QUEUE, GateSpec, OutcomeStatus, PROTOCOL_VERSION,
-    QueueStatusReport, QueueSummary, RepoInfo, RunRequest, ServerMessage, StatusReport,
-    decode_server, encode,
+    Caller, ClientMessage, ErrorCode, FEATURE_EXEC, FEATURE_QUEUE, FEATURE_QUEUE_ONLY, GateSpec,
+    OutcomeStatus, PROTOCOL_VERSION, QueueStatusReport, QueueSummary, RepoInfo, RunRequest,
+    ServerMessage, StatusReport, decode_server, encode,
 };
+
+/// Features every daemon announces, before those of its extensions.
+const BUILTIN: [&str; 2] = [FEATURE_EXEC, FEATURE_QUEUE_ONLY];
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -233,6 +236,7 @@ fn run_request(dir: &Path, cmd: &str) -> RunRequest {
         session: Some("queue:t-test".to_owned()),
         client_pid: std::process::id(),
         hook: None,
+        no_marker: false,
     }
 }
 
@@ -243,7 +247,7 @@ fn queue_status() -> ClientMessage {
 #[tokio::test(flavor = "multi_thread")]
 async fn without_extensions_queue_requests_are_not_supported() {
     let d = start(Vec::new()).await;
-    assert_eq!(d.welcome_features().await, Vec::<String>::new());
+    assert_eq!(d.welcome_features().await, BUILTIN);
     match d.ask(&queue_status()).await {
         ServerMessage::Error { id, code, message } => {
             assert_eq!((id, code), (11, ErrorCode::NotSupported));
@@ -262,7 +266,10 @@ async fn without_extensions_queue_requests_are_not_supported() {
 async fn queue_requests_are_routed_to_the_extension() {
     let fake = Arc::new(FakeQueue::default());
     let d = start(vec![fake.clone()]).await;
-    assert_eq!(d.welcome_features().await, [FEATURE_QUEUE]);
+    assert_eq!(
+        d.welcome_features().await,
+        [FEATURE_EXEC, FEATURE_QUEUE_ONLY, FEATURE_QUEUE]
+    );
 
     match d.ask(&queue_status()).await {
         ServerMessage::QueueStatus { id, status } => {
@@ -318,7 +325,7 @@ async fn a_failed_on_start_disables_the_extension() {
         ..FakeQueue::default()
     });
     let d = start(vec![fake.clone()]).await;
-    assert_eq!(d.welcome_features().await, Vec::<String>::new());
+    assert_eq!(d.welcome_features().await, BUILTIN);
     match d.ask(&queue_status()).await {
         ServerMessage::Error { code, message, .. } => {
             assert_eq!(code, ErrorCode::Internal);
