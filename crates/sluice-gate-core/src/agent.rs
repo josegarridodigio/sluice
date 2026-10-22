@@ -21,7 +21,9 @@ impl Caller {
     }
 }
 
-fn parse_bool(value: &str) -> Option<bool> {
+/// Parses a boolean environment value: `1 true yes on` / `0 false no off`
+/// (any case, surrounding spaces ignored); anything else is `None`.
+pub fn parse_bool(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),

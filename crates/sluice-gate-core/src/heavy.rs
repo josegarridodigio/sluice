@@ -253,6 +253,59 @@ impl HeavyMatcher {
     pub fn matches<S: AsRef<str>>(&self, canonical: &[S]) -> bool {
         self.matching_entry(canonical).is_some()
     }
+
+    /// Executable names a shell shim must intercept so that every entry of
+    /// the list can be caught: the first word of each entry, with `run`
+    /// (package scripts) expanded to `npm pnpm yarn bun`, `gradle` and `mvn`
+    /// also as their wrappers `gradlew` and `mvnw`, plus `npx` (which can
+    /// launch any entry). Names that are not plain file names are dropped.
+    /// Sorted, without duplicates.
+    pub fn shim_names(&self) -> Vec<String> {
+        let mut names = std::collections::BTreeSet::new();
+        for entry in &self.entries {
+            let first = entry[0].as_str();
+            let expanded: &[&str] = match first {
+                "run" => &["npm", "pnpm", "yarn", "bun"],
+                "gradle" => &["gradle", "gradlew"],
+                "mvn" => &["mvn", "mvnw"],
+                other => &[other][..],
+            };
+            for name in expanded {
+                if is_shim_name(name) {
+                    names.insert((*name).to_owned());
+                }
+            }
+        }
+        if !names.is_empty() {
+            names.insert("npx".to_owned());
+        }
+        names.into_iter().collect()
+    }
+}
+
+/// True for a name a shim file can carry: ASCII letters, digits and `._-`,
+/// not starting with `.` or `-`, at most 64 bytes.
+pub fn is_shim_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with(['.', '-'])
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+/// Canonical words of `name args...` as a shim sees them: the wrapper
+/// names `gradlew` and `mvnw` count as `./gradlew` and `./mvnw`.
+pub fn shim_canonical_words<S: AsRef<str>>(name: &str, args: &[S]) -> Vec<String> {
+    let first = match name {
+        "gradlew" => "./gradlew",
+        "mvnw" => "./mvnw",
+        other => other,
+    };
+    let words: Vec<&str> = std::iter::once(first)
+        .chain(args.iter().map(AsRef::as_ref))
+        .collect();
+    canonical_words(&words)
 }
 
 #[cfg(test)]
@@ -261,6 +314,40 @@ mod tests {
 
     fn canon(cmd: &str) -> String {
         canonical_words(&cmd.split_whitespace().collect::<Vec<_>>()).join(" ")
+    }
+
+    #[test]
+    fn shim_names_cover_the_default_list() {
+        assert_eq!(
+            HeavyMatcher::default().shim_names(),
+            [
+                "bun", "cargo", "docker", "go", "gradle", "gradlew", "jest", "make", "mvn", "mvnw",
+                "next", "npm", "npx", "pnpm", "pytest", "tsc", "vite", "vitest", "webpack", "yarn",
+            ]
+        );
+        assert_eq!(
+            HeavyMatcher::new(["make", "./build.sh x", "bazel build"]).shim_names(),
+            ["bazel", "make", "npx"]
+        );
+        assert_eq!(
+            HeavyMatcher::new(Vec::<String>::new()).shim_names(),
+            Vec::<String>::new()
+        );
+        assert!(is_shim_name("docker-compose") && !is_shim_name("../x") && !is_shim_name(""));
+    }
+
+    #[test]
+    fn shim_canonical_words_fold_wrappers() {
+        let m = HeavyMatcher::default();
+        assert_eq!(
+            shim_canonical_words("gradlew", &["build"]),
+            ["gradle", "build"]
+        );
+        assert_eq!(shim_canonical_words("mvnw", &["-q"]), ["mvn", "-q"]);
+        assert!(m.matches(&shim_canonical_words("pnpm", &["build"])));
+        assert!(!m.matches(&shim_canonical_words("pnpm", &["install"])));
+        assert!(!m.matches(&shim_canonical_words("docker", &["ps"])));
+        assert!(m.matches(&shim_canonical_words("npx", &["tsc", "--noEmit"])));
     }
 
     #[test]

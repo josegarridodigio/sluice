@@ -23,6 +23,7 @@ mod logging;
 mod logs;
 mod queue;
 mod run;
+mod shim;
 mod snippets;
 mod status;
 mod update;
@@ -146,6 +147,19 @@ enum Command {
         #[arg(long)]
         hook: bool,
     },
+    /// Shell shims: route heavy commands of agents that only have a shell through the queue.
+    ///
+    /// For agents other than Claude Code (Codex, Cursor, Aider, ...): small `sh`
+    /// wrappers named after the heavy commands (`make`, `cargo`, `pnpm`, `docker`,
+    /// ...) that, put first in an agent shell's PATH, run those commands as
+    /// `sluice exec --label <words> -- <real binary> <args>` in agent sessions
+    /// (agent detection or `SLUICE_SHIMS=1`) and exec the real binary unchanged
+    /// otherwise (human shells, `SLUICE_SHIMS=0`, inside a Sluice job, subcommands
+    /// that are not heavy such as `docker ps` or `npm install`).
+    Shim {
+        #[command(subcommand)]
+        command: ShimCommand,
+    },
     /// Start the MCP stdio server (spawned by the coding agent).
     ///
     /// Tools: `verify` (run gates through the cache and the daemon, blocking with
@@ -246,6 +260,49 @@ enum Command {
         /// Do not stop the daemon after updating.
         #[arg(long)]
         no_restart: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ShimCommand {
+    /// Write one wrapper per command of the heavy list into the shim directory.
+    ///
+    /// Default directory `$XDG_DATA_HOME/sluice/shims` or `~/.local/share/sluice/shims`
+    /// (created with mode 0700; wrappers 0755, written atomically). Idempotent:
+    /// existing Sluice shims are refreshed and shims of commands no longer in the list
+    /// are removed. A file Sluice did not write is never overwritten unless --force.
+    Install {
+        /// Shim directory to use instead of the default.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<std::path::PathBuf>,
+        /// Replace files with a shim's name that Sluice did not write.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove the shims (only files Sluice wrote; the directory only when empty).
+    Uninstall {
+        /// Shim directory to use instead of the default.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<std::path::PathBuf>,
+    },
+    /// Show the shims, whether their directory is in PATH before the real binaries,
+    /// which real binary each one runs, and what this shell would do.
+    Status {
+        /// Shim directory to use instead of the default.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<std::path::PathBuf>,
+        /// Print machine-readable JSON (`schema: 1`).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run <NAME> as a shim would (called by the wrappers).
+    #[command(hide = true)]
+    Exec {
+        /// The command name (the shim's file name).
+        name: String,
+        /// Its arguments (after `--`).
+        #[arg(last = true)]
+        args: Vec<String>,
     },
 }
 
@@ -415,6 +472,12 @@ fn main() -> ExitCode {
         } => hook_print(manager),
         Command::Logs { job_id, lines } => logs::show(job_id.as_deref(), lines),
         Command::Guard { hook: _ } => guard::run_hook(),
+        Command::Shim { command } => match command {
+            ShimCommand::Install { dir, force } => shim::install(dir.as_deref(), force),
+            ShimCommand::Uninstall { dir } => shim::uninstall(dir.as_deref()),
+            ShimCommand::Status { dir, json } => shim::status(dir.as_deref(), json),
+            ShimCommand::Exec { name, args } => shim::exec(&name, &args),
+        },
         Command::Mcp => mcp(),
         Command::Daemon {
             command: Some(DaemonCommand::Stop { force }),

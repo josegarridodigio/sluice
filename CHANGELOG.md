@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `sluice shim install|uninstall|status`: PATH shims that route the heavy
+  commands (make, cargo build, pnpm build, docker build, …) of agents
+  without hook support (Codex, Cursor, Aider) through the queue in agent
+  sessions or with `SLUICE_SHIMS=1`, and run the real binary unchanged for
+  humans.
 - `sluice guard`: the agent plugin's PreToolUse hook now rewrites gate
   commands to `sluice run <gate> -v` and heavy commands to
   `sluice exec -- …` by inserting a fixed prefix in front of the untouched

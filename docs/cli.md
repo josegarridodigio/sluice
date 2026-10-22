@@ -9,6 +9,7 @@ authoritative.
 |---|---|
 | [`sluice run`](#sluice-run) | Run a gate: cache hit in milliseconds, otherwise queue it in the daemon under the budget. |
 | [`sluice exec`](#sluice-exec) | Run any command under the budget, without cache. |
+| [`sluice shim`](#sluice-shim) | Shell shims that route heavy commands of non-Claude agents through the queue. |
 | [`sluice mcp`](#sluice-mcp) | Start the MCP stdio server (spawned by the coding agent). |
 | [`sluice daemon`](#sluice-daemon) | Start the per-user daemon, or stop or restart it. |
 | [`sluice status`](#sluice-status) | Show the daemon, budget, system pressure, jobs and totals. |
@@ -39,6 +40,8 @@ Usage: sluice <COMMAND>
 Commands:
   run     Run a gate: cache hit in milliseconds, otherwise queue it in the daemon under the budget
   exec    Run any command under the budget, without cache (builds, test runs, docker builds)
+  guard   `PreToolUse` hook of the agent plugin: read the hook JSON on stdin, print a decision
+  shim    Shell shims: route heavy commands of agents that only have a shell through the queue
   mcp     Start the MCP stdio server (spawned by the coding agent)
   daemon  Start the per-user daemon (detached unless --foreground), or stop it
   doctor  Check the installation (git, PSI, daemon, lease, configs, hooks) and optionally collect a redacted diagnostics bundle for bug reports
@@ -128,6 +131,99 @@ Options:
 
   -h, --help
           Print help (see a summary with '-h')
+```
+
+</details>
+
+### `sluice shim`
+
+Shell shims: route heavy commands of agents that only have a shell through the queue. Setup and examples: [agents.md, section 9](agents.md#9-agents-other-than-claude-code-shell-shims). The hidden `sluice shim exec <name> -- <args>` is what each wrapper runs; it is not meant to be typed by hand.
+
+<details>
+<summary>Full help</summary>
+
+```text
+Shell shims: route heavy commands of agents that only have a shell through the queue.
+
+For agents other than Claude Code (Codex, Cursor, Aider, ...): small `sh` wrappers named after the heavy commands (`make`, `cargo`, `pnpm`, `docker`, ...) that, put first in an agent shell's PATH, run those commands as `sluice exec --label <words> -- <real binary> <args>` in agent sessions (agent detection or `SLUICE_SHIMS=1`) and exec the real binary unchanged otherwise (human shells, `SLUICE_SHIMS=0`, inside a Sluice job, subcommands that are not heavy such as `docker ps` or `npm install`).
+
+Usage: sluice shim <COMMAND>
+
+Commands:
+  install    Write one wrapper per command of the heavy list into the shim directory
+  uninstall  Remove the shims (only files Sluice wrote; the directory only when empty)
+  status     Show the shims, whether their directory is in PATH before the real binaries, which real binary each one runs, and what this shell would do
+  help       Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+</details>
+
+#### `sluice shim install`
+
+Write one wrapper per command of the heavy list into the shim directory.
+
+<details>
+<summary>Full help</summary>
+
+```text
+Write one wrapper per command of the heavy list into the shim directory.
+
+Default directory `$XDG_DATA_HOME/sluice/shims` or `~/.local/share/sluice/shims` (created with mode 0700; wrappers 0755, written atomically). Idempotent: existing Sluice shims are refreshed and shims of commands no longer in the list are removed. A file Sluice did not write is never overwritten unless --force.
+
+Usage: sluice shim install [OPTIONS]
+
+Options:
+      --dir <DIR>
+          Shim directory to use instead of the default
+
+      --force
+          Replace files with a shim's name that Sluice did not write
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+</details>
+
+#### `sluice shim uninstall`
+
+Remove the shims (only files Sluice wrote; the directory only when empty).
+
+<details>
+<summary>Full help</summary>
+
+```text
+Remove the shims (only files Sluice wrote; the directory only when empty)
+
+Usage: sluice shim uninstall [OPTIONS]
+
+Options:
+      --dir <DIR>  Shim directory to use instead of the default
+  -h, --help       Print help
+```
+
+</details>
+
+#### `sluice shim status`
+
+Show the shims, whether their directory is in PATH before the real binaries, which real binary each one runs, and what this shell would do. `--json` prints `schema`, `dir`, `exists`, `in_path`, `path_index`, `sluice`, `this_shell {queue, reason}`, `shims [{name, state, real, active}]` (`state`: `current`, `stale`, `missing`, `foreign`) and `unlisted`.
+
+<details>
+<summary>Full help</summary>
+
+```text
+Show the shims, whether their directory is in PATH before the real binaries, which real binary each one runs, and what this shell would do
+
+Usage: sluice shim status [OPTIONS]
+
+Options:
+      --dir <DIR>  Shim directory to use instead of the default
+      --json       Print machine-readable JSON (`schema: 1`)
+  -h, --help       Print help
 ```
 
 </details>
@@ -669,6 +765,8 @@ detection, policy, tree, key, cache lookup) without running anything.
 | `CI` | Any value other than `0`, `false`, `no` or `off` disables the cache. |
 | `SLUICE_AGENT=1\|0` | Force agent or human detection. |
 | `SLUICE_JOB` | Set by Sluice on every process it runs. A nested `sluice exec` or `sluice run` then runs directly instead of queueing behind its own parent. Not meant to be set by hand. |
+| `SLUICE_SHIMS=1\|0` | Shell shims: `1` routes heavy commands through the queue even when no agent is detected; `0` makes every shim run the real binary directly. |
+| `SLUICE_SHIM_DIR` | Set by each shim to its own directory, so `sluice shim exec` skips it when resolving the real binary. |
 | `SLUICE_CONFIG` | Path of the user config (default `~/.config/sluice/config.toml`). |
 | `SLUICE_SOCKET` | Override the daemon socket path. |
 | `SLUICE_LOG` | Log filter of `sluice daemon` (written to `~/.local/state/sluice/daemon.log`), `sluice mcp` (stderr and a log file) and `sluice run`; then `[debug] level` of the user config; then `info`. |

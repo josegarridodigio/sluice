@@ -6,7 +6,8 @@ git hooks are already set up (`sluice init`, `sluice hook print`).
 
 For Claude Code, the recommended path is the Sluice plugin (section 2): one
 install per user, no block to paste into every repository. Other agents use
-the MCP server and a short instruction block (section 3).
+the MCP server and a short instruction block (section 3), plus shell shims
+for agents that only have a shell (section 9).
 
 ## 1. Why agents need Sluice
 
@@ -317,4 +318,125 @@ today, because hooks do not care who triggered them: add the agent's marker
 to `[agent_detection]` (section 5) so the fail-fast policy applies. Agents that
 support MCP can use `sluice mcp` the same way as Claude Code (manual registration), with the same
 `mcpServers` entry in their own config format. For agents that expose no
-reliable marker, export `SLUICE_AGENT=1` in the shell the agent uses.
+reliable marker, export `SLUICE_AGENT=1` in the shell the agent uses. To put
+their builds and test runs under the budget too, use the shell shims (section 9).
+
+
+## 9. Agents other than Claude Code: shell shims
+
+Claude Code users do not need this section: the plugin's guard (section 2)
+already rewrites heavy commands into the queue. Agents that only have a shell
+(Codex, Cursor's agent, Aider, OpenCode, Gemini CLI and others) run `make`,
+`cargo build` or `pnpm build` directly, outside the budget. Shell shims give
+them the same control without any support from the agent.
+
+A shim is a small `sh` script named after a command of the heavy list
+(`[agent] heavy_commands` in the user config, see [configuration.md](configuration.md)):
+`docker cargo go make gradle gradlew mvn mvnw tsc vite webpack next pytest
+jest vitest npm pnpm yarn bun npx` by default. With the shim directory first
+in `PATH`, `make all` runs the shim, which runs `sluice shim exec make -- all`:
+
+- In an agent session (agent detection, or `SLUICE_SHIMS=1`) and for a heavy
+  command (`make`, `cargo build`, `pnpm build`, `docker build`), it runs
+  `sluice exec --label "make all" -- /usr/bin/make all`: queued under the
+  budget, visible in `sluice status`, output replayed byte for byte, the
+  command's own exit code.
+- Otherwise it replaces itself with the real binary, unchanged: human shells,
+  `SLUICE_SHIMS=0`, commands already running inside a Sluice job
+  (`SLUICE_JOB` set, so nothing is queued twice), subcommands that are not
+  heavy (`docker ps`, `npm install`, `cargo fmt`), and commands with a `-`
+  argument (they read stdin).
+
+The real binary is the next one with that name further down `PATH`; the shim
+directory (wherever it appears, however often, or through a symlink) and any
+other Sluice shim are skipped, so a shim never calls itself. If there is no
+real binary, the shim prints `make: command not found` and exits 127, as a
+shell would.
+
+### Install
+
+```sh
+sluice shim install          # writes ~/.local/share/sluice/shims/{make,cargo,...}
+sluice shim status           # where they are, PATH order, real binaries, this shell's mode
+```
+
+`install` is idempotent (run it again after changing `[agent]
+heavy_commands` or moving the `sluice` binary; `status` shows such shims as
+`stale`). It never overwrites a file it did not write unless `--force`, and
+`sluice shim uninstall` only removes its own files. `--dir DIR` uses another
+directory.
+
+### Put the directory first in PATH, for agent shells only
+
+The shims are inert for humans (they run the real binary unless an agent is
+detected or `SLUICE_SHIMS=1`), so having the directory in your own `PATH` is
+harmless; still, the clean setup is to add it only where agents run, together
+with `SLUICE_SHIMS=1` for agents that set no variable Sluice recognises:
+
+```sh
+# ~/.bashrc or ~/.zshrc: start agents through a launcher
+sluice_agent() {
+    PATH="$HOME/.local/share/sluice/shims:$PATH" SLUICE_SHIMS=1 "$@"
+}
+alias codex='sluice_agent codex'
+alias aider='sluice_agent aider'
+alias opencode='sluice_agent opencode'
+```
+
+Codex, Aider, OpenCode and similar CLIs run their shell commands with the
+environment they were started with (by default), so the launcher is all they need. For
+Cursor (a VS Code fork) the agent's terminal uses the integrated terminal
+environment; in the workspace's `.vscode/settings.json`:
+
+```json
+{
+  "terminal.integrated.env.linux": {
+    "PATH": "${env:HOME}/.local/share/sluice/shims:${env:PATH}",
+    "SLUICE_SHIMS": "1"
+  }
+}
+```
+
+That also routes the heavy commands you type in Cursor's own terminal
+through the queue; drop `SLUICE_SHIMS` there if your agent sets a variable
+you can add to `[agent_detection]` (section 5) instead.
+
+With [direnv](https://direnv.net/), per repository (`.envrc`, then
+`direnv allow`): the shims only queue when the agent's launcher sets
+`SLUICE_SHIMS=1` or detection fires, so this is safe for humans too.
+
+```sh
+# .envrc
+PATH_add "$HOME/.local/share/sluice/shims"
+```
+
+Check from inside the agent (ask it to run `sluice shim status`): `in PATH:
+yes (entry 1 of PATH)`, `this shell: heavy commands go through the queue`.
+
+### Ready-to-paste `AGENTS.md` block
+
+```markdown
+## Heavy commands (Sluice)
+
+This machine shares its CPU between several agents through Sluice. Builds and
+test runs (`make`, `cargo build`, `cargo test`, `pnpm build`, `docker build`,
+`pytest`, ...) are queued automatically by shims in your PATH; run them the
+normal way and wait for them, even if they take longer to start.
+
+- Do not bypass the queue (no absolute paths like `/usr/bin/make`, no
+  `SLUICE_SHIMS=0`, no `command make`).
+- Queued commands get no stdin and no terminal; pass input as files or flags.
+- For the repository's gates (tests, lint), prefer `sluice run <gate>`: it is
+  cached per tree, so an unchanged tree passes in milliseconds.
+- `sluice status` shows what is running and queued.
+```
+
+### Limits
+
+- Through the queue, stdin is `/dev/null` and there is no terminal (as for
+  `sluice exec`); tools fall back to their non-interactive output.
+- Only commands found through `PATH` are shimmed: `./gradlew`, `./mvnw`,
+  absolute paths and `node_modules/.bin/...` called by path are not
+  intercepted (`npx tsc`, `pnpm exec tsc` and package scripts are).
+- Package scripts that themselves call shimmed commands do not queue twice:
+  the outer job sets `SLUICE_JOB`.

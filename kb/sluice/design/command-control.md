@@ -397,6 +397,34 @@ whether the dir is in `PATH` and before the real binaries, and which real binary
 block. Claude Code users do not need shims (the guard covers them); both together are safe because
 of `SLUICE_JOB` and the resolver skip.
 
+### 5.1 As implemented (H5, 2026-10-23): deviations
+
+- Not found: `shim exec` prints `<name>: command not found` and exits 127, the way a shell
+  reports it (not `sluice: shim: no '<name>' in PATH after <dir>`). A non-executable match exits
+  126 with `<name>: Permission denied`.
+- Label: the first two canonical words joined with a space (`make all`, `run build`, `cargo build`,
+  `gradle build`), the `sluice exec` label convention, instead of all canonical words.
+- Shim names come from the heavy list (`HeavyMatcher::shim_names`): the first word of each entry,
+  `run` expanded to `npm pnpm yarn bun`, `gradle`/`mvn` also as `gradlew`/`mvnw`, plus `npx`;
+  user `[agent] heavy_commands(_extra)` therefore add or remove shims. `gradlew`/`mvnw` are matched
+  as `./gradlew`/`./mvnw` (`shim_canonical_words`).
+- Wrapper fallback (recorded `sluice` gone): drops from `PATH` every directory whose `<name>` is a
+  Sluice shim (line `# sluice-shim v1`), not only the literal `SLUICE_SHIM_DIR`, so a symlinked or
+  duplicated shim dir or a second shim copy cannot loop.
+- `install` also removes Sluice shims of commands no longer in the heavy list. The directory is
+  created 0700; an existing directory keeps its mode. `install`/`uninstall` treat as theirs only
+  regular files (not symlinks) that start exactly with `#!/bin/sh\n# sluice-shim v1\n`; the
+  resolver keeps the looser 64-byte marker check.
+- `status` and `uninstall` accept `--dir` like `install`; without it `SLUICE_SHIM_DIR`, then the
+  default directory, is used. `status --json` (`schema: 1`): `dir`, `exists`, `in_path`,
+  `path_index`, `sluice`, `this_shell {queue, reason}`, `shims [{name, state, real, active}]`
+  (`current | stale | missing | foreign`), `unlisted`.
+- Not done here: the `doctor` check for stale shims (`doctor.rs` belonged to task X1 in the same
+  wave); `sluice shim status` reports `stale` meanwhile. Follow-up.
+- Through the queue stdin is `/dev/null` (as `sluice exec`); only a `-` argument passes through.
+  `shim exec` uses `sluice exec` without `--quiet`, so a command that waited at least 1 s gets the
+  two queue lines on stderr.
+
 ## 6. Security and failure modes
 
 - **Rewrite injection**: prefix-only insertion (4.7); the tokenizer refuses anything it cannot
