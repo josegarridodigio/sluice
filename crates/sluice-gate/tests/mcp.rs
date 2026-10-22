@@ -341,7 +341,7 @@ async fn an_unavailable_daemon_is_an_error_per_gate_not_an_mcp_error() {
     let r = client
         .call_tool(params(
             "verify",
-            &json!({"working_directory": repo_arg(&sb), "gates": ["counted", "after"]}),
+            &json!({"working_directory": repo_arg(&sb), "gates": ["counted", "after"], "fail_fast": false}),
         ))
         .await
         .expect("a Sluice failure is a tool result, not an MCP error");
@@ -379,7 +379,7 @@ async fn parallel_verifies_coalesce_and_a_failure_does_not_stop_the_next_gate() 
     let r = call(
         &client,
         "verify",
-        &json!({"working_directory": dir, "gates": ["bad", "after"]}),
+        &json!({"working_directory": dir, "gates": ["bad", "after"], "fail_fast": false}),
     )
     .await;
     assert_eq!(r.is_error, Some(true), "{}", text(&r));
@@ -635,5 +635,123 @@ async fn status_reports_the_scope_of_scoped_gates() {
     );
     assert!(gate("plain").get("scope").is_none(), "{s}");
     assert!(text(&r).contains("[scoped: 1 of 4 files, "), "{}", text(&r));
+    client.cancel().await.expect("shutdown");
+}
+
+/// `slowpoke` writes its pid and sleeps; `quickfail` fails as soon as the
+/// pid file exists (bounded: it fails anyway after about 15 s), so the
+/// failure always arrives while `slowpoke` runs, whatever the machine load.
+const EARLY: &str = r#"
+[gates.slowpoke]
+cmd = "echo $$ > \"$SLUICE_TEST_COUNTER.slow\"; exec sleep 60"
+
+[gates.quickfail]
+cmd = "i=0; while [ ! -s \"$SLUICE_TEST_COUNTER.slow\" ] && [ $i -lt 300 ]; do sleep 0.05; i=$((i+1)); done; exit 3"
+"#;
+
+fn slow_pid(sb: &Sandbox) -> Option<i32> {
+    fs::read_to_string(format!("{}.slow", sb.counter.display()))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// ADR-0011 M4: the gates of one `verify` run concurrently; the first
+/// failure ends the call and cancels a sibling nobody else waits for (its
+/// process dies and the job records `killed_by = early-verdict`).
+#[tokio::test(flavor = "multi_thread")]
+async fn parallel_verify_early_verdict_cancels_an_orphaned_sibling() {
+    let sb = Sandbox::new(EARLY);
+    let client = connect(&sb, Counter::default()).await;
+    let r = call(
+        &client,
+        "verify",
+        &json!({"working_directory": repo_arg(&sb), "gates": ["quickfail", "slowpoke"]}),
+    )
+    .await;
+    assert_eq!(r.is_error, Some(true), "{}", text(&r));
+    let s = structured(&r);
+    assert_eq!(s["results"][0]["gate"], "quickfail", "{s}");
+    assert_eq!(s["results"][0]["status"], "fail", "{s}");
+    assert_eq!(s["results"][1]["gate"], "slowpoke", "{s}");
+    assert_eq!(s["results"][1]["status"], "cancelled", "{s}");
+    assert_eq!(
+        s["results"][1]["message"], "not finished: quickfail failed first",
+        "{s}"
+    );
+    assert!(
+        s.get("cancelled").is_none(),
+        "the call itself was not cancelled: {s}"
+    );
+    assert!(s["wall_ms"].is_u64(), "{s}");
+    assert!(
+        text(&r).contains("CANCELLED (not finished: quickfail failed first"),
+        "{}",
+        text(&r)
+    );
+    let pid = slow_pid(&sb).expect("slowpoke started before quickfail failed");
+    assert!(
+        wait_for(Duration::from_secs(15), || !alive(pid)),
+        "the orphaned sibling survived the early verdict"
+    );
+    let job = s["results"][1]["job_id"]
+        .as_str()
+        .expect("slowpoke was queued");
+    let mut out = String::new();
+    assert!(
+        wait_for(Duration::from_secs(15), || {
+            let o = sb
+                .sluice()
+                .args(["logs", "--timeline", job])
+                .output()
+                .expect("sluice logs --timeline");
+            out = String::from_utf8_lossy(&o.stdout).into_owned();
+            out.contains("killed by early-verdict")
+        }),
+        "{out}"
+    );
+    assert!(
+        out.contains("slowpoke") && out.contains("queued +0.0"),
+        "{out}"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+/// ADR-0011 M4: a sibling another client also waits for keeps running when
+/// the early verdict detaches this call from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn parallel_verify_keeps_a_sibling_another_client_waits_for() {
+    let sb = Sandbox::new(EARLY);
+    let client = connect(&sb, Counter::default()).await;
+    let dir = repo_arg(&sb);
+    let peer = client.peer().clone();
+    let other_args = json!({"working_directory": dir, "gates": ["slowpoke"]});
+    let other = tokio::spawn(async move { peer.call_tool(params("verify", &other_args)).await });
+    assert!(
+        wait_for(Duration::from_secs(20), || slow_pid(&sb).is_some()),
+        "slowpoke never started"
+    );
+    let pid = slow_pid(&sb).unwrap();
+
+    let r = call(
+        &client,
+        "verify",
+        &json!({"working_directory": dir, "gates": ["quickfail", "slowpoke"]}),
+    )
+    .await;
+    let s = structured(&r);
+    assert_eq!(s["results"][0]["status"], "fail", "{s}");
+    assert_eq!(s["results"][1]["status"], "cancelled", "{s}");
+    // The other call still waits for slowpoke: it keeps running.
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(alive(pid), "a job another client waits for was killed");
+    let status = sb.status_json();
+    assert_eq!(status["running"][0]["gate"], "slowpoke", "{status}");
+    assert_eq!(status["running"][0]["subscribers"], 1, "{status}");
+
+    other.abort();
+    assert!(
+        wait_for(Duration::from_secs(15), || !alive(pid)),
+        "slowpoke outlived its last subscriber"
+    );
     client.cancel().await.expect("shutdown");
 }

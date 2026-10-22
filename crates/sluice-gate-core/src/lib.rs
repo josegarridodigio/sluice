@@ -5,6 +5,7 @@
 //!
 //! Modules:
 //! - [`config`]: `.sluice.toml` (repository gates) and the user config.
+//! - [`cpus`]: CPUs available to the process (affinity mask, cgroup limit).
 //! - [`git`]: the only place that spawns the `git` binary.
 //! - [`tree`]: working-tree snapshot from a private index and object dir.
 //! - [`key`]: cache-key derivation.
@@ -20,6 +21,7 @@
 
 pub mod agent;
 pub mod config;
+pub mod cpus;
 pub mod dirs;
 pub mod error;
 pub mod git;

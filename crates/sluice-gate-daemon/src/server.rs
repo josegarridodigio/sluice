@@ -62,9 +62,11 @@ use crate::executor::{
 use crate::psi::{self, Admission};
 use crate::reaper::Reaper;
 pub use crate::reaper::ReaperCommand;
-use crate::scheduler::{Enqueued, JobSpec, Scheduler};
-use crate::store::{JobRow, JobState, Store};
+use crate::sampler::{self, JobUsage, Utilisation};
+use crate::scheduler::{self as sched, Class, Enqueued, JobSpec, Policy, Pressure, Scheduler};
+use crate::store::{FinishMeta, GateStat, JobRow, JobState, QueuedMeta, RequestRow, Store};
 use crate::{Error, Result};
+use sluice_gate_core::config::{Fairness, QueueOrder};
 
 /// Name of the lease row held by the running daemon.
 pub const LEASE_NAME: &str = "daemon";
@@ -125,6 +127,9 @@ pub struct DaemonConfig {
     /// Directory holding the PSI files `cpu` and `memory` (normally
     /// [`psi::DEFAULT_ROOT`]; tests point it at a temporary directory).
     pub psi_root: PathBuf,
+    /// The proc filesystem read by the samplers (`stat`, `self/status`,
+    /// `<pid>/task/<tid>/schedstat`); normally `/proc`, tests use a fake tree.
+    pub proc_root: PathBuf,
     /// The loaded user config, exposed to extensions through
     /// [`DaemonHandle::config`] (the fields above are derived from it).
     pub user: UserConfig,
@@ -169,7 +174,56 @@ enum JobEvent {
         elapsed_ms: u64,
         log_bytes: u64,
     },
-    Done(Box<Outcome>),
+    /// The outcome and the job's start time (each subscriber derives its
+    /// own `queue_wait_ms` from it).
+    Done(Box<Outcome>, Option<u64>),
+}
+
+/// Key of a gate's learned statistics: repository identity, gate name and
+/// [`cmd_hash`].
+type StatsKey = (PathBuf, String, String);
+
+/// Recent measured runs of each gate (newest last, at most
+/// [`sched::LEARN_WINDOW`]): `(demand_milli, wall_ms)`.
+#[derive(Debug, Default)]
+struct StatsCache(HashMap<StatsKey, std::collections::VecDeque<(u32, u64)>>);
+
+impl StatsCache {
+    fn push(&mut self, key: StatsKey, demand_milli: u32, wall_ms: u64) {
+        let runs = self.0.entry(key).or_default();
+        runs.push_back((demand_milli, wall_ms));
+        while runs.len() > sched::LEARN_WINDOW {
+            runs.pop_front();
+        }
+    }
+
+    /// `(demands, expected_ms)` of a key.
+    fn history(&self, key: &StatsKey) -> (Vec<u32>, Option<u64>) {
+        let Some(runs) = self.0.get(key) else {
+            return (Vec::new(), None);
+        };
+        let demands: Vec<u32> = runs.iter().map(|r| r.0).collect();
+        let walls: Vec<u64> = runs.iter().map(|r| r.1).collect();
+        (demands, sched::expected_ms(&walls))
+    }
+}
+
+/// 16 hex of SHA-256 over the normalised command, NUL, and the extra
+/// arguments joined by NUL (ADR-0011 M2: a new command or filter starts a
+/// new history).
+fn cmd_hash(cmd: &str, extra: &[String]) -> String {
+    let mut h = Sha256::new();
+    h.update(normalize_cmd(cmd).as_bytes());
+    h.update(b"\0");
+    h.update(extra.join("\0").as_bytes());
+    h.finalize()
+        .iter()
+        .take(8)
+        .fold(String::with_capacity(16), |mut s, b| {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// What a job runs: a gate (`run`) or an arbitrary command (`exec`).
@@ -226,6 +280,12 @@ struct JobEntry {
     process: Option<ProcessInfo>,
     /// Exec coalescing identity, removed from [`State::exec_inflight`] on finish.
     exec_identity: Option<String>,
+    /// Learned-statistics key (gates only).
+    stats_key: Option<StatsKey>,
+    /// CPU demand sampled while running (gates only).
+    usage: JobUsage,
+    /// Why the job was killed, when Sluice killed it.
+    killed_by: Option<&'static str>,
 }
 
 /// What [`register`] hands to the connection handler.
@@ -234,6 +294,14 @@ struct Registered {
     coalesced: bool,
     position: usize,
     weight: u32,
+    /// Configured weight after the clamp.
+    weight_cfg: u32,
+    /// Expected run time from history.
+    expected_ms: Option<u64>,
+    /// When this request reached the scheduler.
+    attached_at: u64,
+    /// `job_requests` row of this request.
+    request_row: Option<i64>,
     /// `Some` when the request joined a job that has already started.
     started_at: Option<u64>,
     /// Spool of an exec job that has already started.
@@ -262,6 +330,14 @@ struct Shared {
     state: Mutex<State>,
     store: Mutex<Store>,
     psi: Mutex<Admission>,
+    /// Utilisation sampler (never held together with another mutex).
+    util: Mutex<Utilisation>,
+    /// Learned gate statistics (never held together with another mutex).
+    stats: Mutex<StatsCache>,
+    /// CPUs of the daemon's affinity mask (`None`: every CPU of `/proc/stat`).
+    allowed_cpus: Option<std::collections::BTreeSet<u32>>,
+    /// CPUs available to the daemon, for `status`.
+    cpus: u32,
     wake: Notify,
     idle: Notify,
     stop: watch::Sender<Option<bool>>,
@@ -291,11 +367,32 @@ struct Extensions {
     features: Vec<String>,
 }
 
+/// The admission policy of a daemon: budget and caps from `config`, the
+/// ADR-0011 switches from `[scheduler]` and `[admission]`.
+fn policy(config: &DaemonConfig) -> Policy {
+    let budget = config.budget.max(1);
+    let s = &config.user.scheduler;
+    let a = &config.admission;
+    Policy {
+        budget,
+        cap: Policy::cap_for(budget, a.overcommit),
+        head_reserve_after_ms: duration_ms(config.head_reserve_after),
+        overcommit_interval_ms: duration_ms(a.overcommit_interval),
+        order: match s.order {
+            QueueOrder::Fifo => sched::Order::Fifo,
+            QueueOrder::Sjf => sched::Order::Sjf,
+        },
+        fairness: s.fairness == Fairness::Lane,
+        human_first: s.human_first,
+        learned_weights: s.learned_weights,
+        repo_caps: config.repo_caps.clone(),
+    }
+}
+
 impl State {
     fn new(config: &DaemonConfig) -> Self {
-        let head_ms = u64::try_from(config.head_reserve_after.as_millis()).unwrap_or(u64::MAX);
         Self {
-            sched: Scheduler::new(config.budget, head_ms, config.repo_caps.clone()),
+            sched: Scheduler::with_policy(policy(config)),
             jobs: HashMap::new(),
             exec_inflight: HashMap::new(),
             accepting: true,
@@ -562,8 +659,21 @@ fn rotate_daemon_log(settings: &LogSettings) {
     }
 }
 
+/// Gate statistics of keys unseen this long are deleted by the daily prune.
+const GATE_STATS_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+
+fn prune_gate_stats(shared: &Shared, now: u64) {
+    if let Some(n) = shared.store("pruning gate statistics", |s| {
+        s.prune_gate_stats(now.saturating_sub(GATE_STATS_RETENTION_MS))
+    }) && n > 0
+    {
+        tracing::info!("deleted {n} gate statistics row(s) of commands unseen for 90 days");
+    }
+}
+
 fn prune_logs(shared: &Shared) {
     rotate_daemon_log(&shared.config.log);
+    prune_gate_stats(shared, now_ms());
     let cutoff = now_ms()
         .saturating_sub(u64::try_from(shared.config.log_retention.as_millis()).unwrap_or(u64::MAX));
     if let Some(n) = shared.store("pruning logs", |s| {
@@ -572,6 +682,34 @@ fn prune_logs(shared: &Shared) {
     {
         tracing::info!("deleted {n} old log file(s)");
     }
+}
+
+/// The learned statistics kept in the database (last runs of every key).
+fn load_stats(store: &Store) -> StatsCache {
+    let mut stats = StatsCache::default();
+    match store.gate_stats_recent(sched::LEARN_WINDOW) {
+        Ok(rows) => {
+            for r in rows {
+                stats.push((r.repo, r.gate, r.cmd_hash), r.demand_milli, r.wall_ms);
+            }
+        }
+        Err(e) => tracing::warn!("cannot load the gate statistics: {e}"),
+    }
+    stats
+}
+
+/// The daemon's affinity mask (`<proc>/self/status`) and its CPU count
+/// (the mask, else the affinity and cgroup limits seen by the core).
+fn daemon_cpus(proc_root: &Path) -> (Option<std::collections::BTreeSet<u32>>, u32) {
+    let allowed = std::fs::read_to_string(proc_root.join("self/status"))
+        .ok()
+        .and_then(|s| sluice_gate_core::cpus::allowed_from_status(&s));
+    let cpus = allowed
+        .as_ref()
+        .map_or_else(sluice_gate_core::cpus::available_cpus, |s| {
+            u32::try_from(s.len()).unwrap_or(u32::MAX)
+        });
+    (allowed, cpus)
 }
 
 /// Runs the daemon until `shutdown` resolves or a `stop` request arrives.
@@ -598,6 +736,8 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
     if !take_lease(&store, &owner, &token, started_ms)? {
         return Err(Error::AlreadyRunning(config.lock_path.clone()));
     }
+    let stats = load_stats(&store);
+    let (allowed_cpus, cpus) = daemon_cpus(&config.proc_root);
     let store = Mutex::new(store);
     if let Err(e) = reconcile_orphans(&store, &instance).await {
         tracing::warn!("orphan reconciliation failed: {e}");
@@ -614,6 +754,10 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
         state: Mutex::new(State::new(&config)),
         store,
         psi: Mutex::new(Admission::new(&config.admission)),
+        util: Mutex::new(Utilisation::default()),
+        stats: Mutex::new(stats),
+        allowed_cpus,
+        cpus,
         instance,
         pid,
         started_at: rfc3339(started_ms),
@@ -643,14 +787,13 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
         instance = %shared.instance,
         socket = %shared.config.socket_path.display(),
         budget = shared.config.budget,
+        cpus = shared.cpus,
         "daemon started"
     );
 
     let scheduling = tokio::spawn(scheduling_loop(Arc::clone(&shared)));
     let heartbeat = tokio::spawn(heartbeat_loop(Arc::clone(&shared), token.clone()));
-    let sampler = lock(&shared.psi)
-        .enabled
-        .then(|| tokio::spawn(psi_loop(Arc::clone(&shared))));
+    let sampler = tokio::spawn(sampler_loop(Arc::clone(&shared)));
     let mut runners = JoinSet::new();
     for e in &shared.extensions().active {
         let handle = DaemonHandle {
@@ -677,9 +820,7 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
     runners.abort_all();
     scheduling.abort();
     heartbeat.abort();
-    if let Some(sampler) = sampler {
-        sampler.abort();
-    }
+    sampler.abort();
     release_lease(&shared, &token);
     let _ = timeout(CONNECTION_DRAIN, async {
         while conns.join_next().await.is_some() {}
@@ -766,9 +907,13 @@ async fn drain(shared: &Arc<Shared>, force: bool) {
         let mut queued = Vec::new();
         for id in ids {
             if st.sched.is_queued(&id) {
+                if let Some(entry) = st.jobs.get_mut(&id) {
+                    entry.killed_by = Some("stop");
+                }
                 queued.push(id);
             } else if force && let Some(entry) = st.jobs.get_mut(&id) {
                 entry.cancelled = true;
+                entry.killed_by = Some("stop");
                 if let Some(h) = &entry.handle {
                     h.cancel();
                 }
@@ -838,53 +983,139 @@ async fn heartbeat_loop(shared: Arc<Shared>, token: String) {
 // Scheduling and job execution
 // ---------------------------------------------------------------------------
 
-/// Samples PSI every `psi_poll_interval` and wakes the scheduling loop when
-/// the blocking state changes; exits once PSI turns out to be unavailable.
-async fn psi_loop(shared: Arc<Shared>) {
+/// One tick of the samplers (blocking: reads `/proc`). PSI (while enabled),
+/// CPU utilisation of the daemon's CPUs, and the tasks of every running
+/// gate. Returns whether the PSI blocking state changed.
+fn sample_tick(shared: &Shared) -> bool {
+    let now = now_ms();
+    let changed = {
+        let enabled = lock(&shared.psi).enabled;
+        if enabled {
+            let sample = psi::read_sample(&shared.config.psi_root);
+            let mut adm = lock(&shared.psi);
+            let before = adm.blocking();
+            before != adm.observe(sample, now)
+        } else {
+            false
+        }
+    };
+    let proc_root = &shared.config.proc_root;
+    let times = sampler::read_proc_stat(proc_root, shared.allowed_cpus.as_ref());
+    let (queued, gates): (bool, Vec<(String, i32, u32)>) = {
+        let st = shared.state();
+        let gates = st
+            .jobs
+            .iter()
+            .filter(|(_, e)| e.stats_key.is_some())
+            .filter_map(|(id, e)| e.process.as_ref().map(|p| (id.clone(), p.pgid, p.pid)))
+            .collect();
+        (st.sched.has_queued(), gates)
+    };
+    lock(&shared.util).observe(times, now, queued);
+    if gates.is_empty() {
+        return changed;
+    }
+    let pgids: std::collections::HashSet<i32> = gates.iter().map(|g| g.1).collect();
+    let members = sampler::group_members(proc_root, &pgids);
+    let samples: Vec<(String, Vec<_>, Option<u64>)> = gates
+        .into_iter()
+        .map(|(id, pgid, leader)| {
+            let tasks = members
+                .get(&pgid)
+                .into_iter()
+                .flatten()
+                .flat_map(|&pid| sampler::read_tasks(proc_root, pid))
+                .collect();
+            (id, tasks, sampler::leader_ticks(proc_root, leader))
+        })
+        .collect();
+    let mut st = shared.state();
+    for (id, tasks, leader) in samples {
+        if let Some(entry) = st.jobs.get_mut(&id) {
+            entry.usage.update(&tasks, leader);
+        }
+    }
+    changed
+}
+
+/// Samples PSI, utilisation and job demand every `psi_poll_interval` (1 s
+/// by default, also with PSI off) and wakes the scheduling loop when the
+/// PSI blocking state changes.
+async fn sampler_loop(shared: Arc<Shared>) {
     let period = shared.config.admission.psi_poll_interval;
     let mut tick = tokio::time::interval(period);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        let sample = psi::read_sample(&shared.config.psi_root);
-        let (changed, enabled) = {
-            let mut adm = lock(&shared.psi);
-            let before = adm.blocking();
-            let after = adm.observe(sample, now_ms());
-            (before != after, adm.enabled)
-        };
+        let s = Arc::clone(&shared);
+        let changed = tokio::task::spawn_blocking(move || sample_tick(&s))
+            .await
+            .unwrap_or(false);
         if changed {
             shared.wake.notify_one();
-        }
-        if !enabled {
-            return;
         }
     }
 }
 
-/// One admission pass: the budget scheduler gated by PSI, plus the PSI
-/// starvation guard (admit the queue head alone when it has waited longer
-/// than `psi_max_wait` while PSI blocks).
-fn admit(shared: &Shared, now: u64) -> Vec<String> {
-    let blocking = lock(&shared.psi).blocking();
-    let mut started = shared.state().sched.admit(now, blocking);
-    if !blocking {
-        return started;
-    }
-    let Some(head_queued_at) = shared.state().sched.head_queued_at() else {
-        return started;
+/// CPU `some avg10` below 10 % (the learned-weight fallback needs it at both
+/// ends of a run without `schedstat`).
+fn cpu_calm(shared: &Shared) -> bool {
+    lock(&shared.psi)
+        .info()
+        .cpu_some_avg10
+        .is_some_and(|v| v < 10.0)
+}
+
+/// One admission pass: [`sched::plan`] over the current pressure (PSI
+/// blocking and the starvation guard, the over-admission conditions and the
+/// idle CPUs of the utilisation sampler).
+fn admit(shared: &Shared, now: u64) -> Vec<(String, sched::Admission)> {
+    let a = &shared.config.admission;
+    let (blocking, calm) = {
+        let adm = lock(&shared.psi);
+        (
+            adm.blocking(),
+            adm.calm_for_overcommit(
+                now,
+                a.cpu_some_avg10_low,
+                a.memory_some_avg10_low,
+                duration_ms(a.overcommit_interval),
+            ),
+        )
     };
-    if !lock(&shared.psi).starvation_override(head_queued_at, now) {
-        return started;
-    }
-    if let Some(id) = shared.state().sched.admit_head(now) {
-        lock(&shared.psi).record_override(now);
-        tracing::info!(
-            job = %id,
-            waited_ms = now.saturating_sub(head_queued_at),
-            "PSI starvation guard: starting the queue head despite system pressure"
-        );
-        started.push(id);
+    let head = if blocking {
+        shared.state().sched.head(now)
+    } else {
+        None
+    };
+    let guard_due = head
+        .as_ref()
+        .is_some_and(|(_, queued_at)| lock(&shared.psi).starvation_override(*queued_at, now));
+    let idle_cpus = lock(&shared.util).idle_cpus();
+    let started = shared.state().sched.admit_with(
+        now,
+        Pressure {
+            blocking,
+            guard_due,
+            calm,
+            idle_cpus,
+        },
+    );
+    for (id, admission) in &started {
+        match admission {
+            sched::Admission::Guard => {
+                lock(&shared.psi).record_override(now);
+                tracing::info!(
+                    job = %id,
+                    waited_ms = head.as_ref().map_or(0, |(_, q)| now.saturating_sub(*q)),
+                    "PSI starvation guard: starting the queue head despite system pressure"
+                );
+            }
+            sched::Admission::Over => {
+                tracing::info!(job = %id, ?idle_cpus, "over-admitted: the machine is calm with idle CPUs");
+            }
+            sched::Admission::Nominal => {}
+        }
     }
     started
 }
@@ -895,9 +1126,13 @@ async fn scheduling_loop(shared: Arc<Shared>) {
             () = shared.wake.notified() => {}
             () = sleep(ADMIT_TICK) => {}
         }
-        let started = admit(&shared, now_ms());
-        for id in started {
-            tracing::debug!(job = %id, "admitted");
+        let now = now_ms();
+        let started = admit(&shared, now);
+        for (id, admission) in started {
+            tracing::debug!(job = %id, admission = admission.as_str(), "admitted");
+            shared.store("recording the admission", |s| {
+                s.set_admitted(&id, now, admission.as_str())
+            });
             tokio::spawn(start_job(Arc::clone(&shared), id));
         }
     }
@@ -915,9 +1150,13 @@ fn finish_job(shared: &Shared, id: &str, outcome: Outcome, exit_code: Option<i32
         OutcomeStatus::Error => "error",
         OutcomeStatus::Unknown => "unknown",
     };
-    let events = {
+    let mut outcome = outcome;
+    let calm_end = cpu_calm(shared);
+    let now = now_ms();
+    let (events, started_at, learned) = {
         let mut st = shared.state();
         let max = st.sched.subscribers_max(id).unwrap_or(1);
+        let record = st.sched.record(id, now);
         if st.sched.finish(id).is_none() {
             st.sched.remove_queued(id);
         }
@@ -928,22 +1167,72 @@ fn finish_job(shared: &Shared, id: &str, outcome: Outcome, exit_code: Option<i32
             st.exec_inflight.remove(identity);
         }
         let coalesced = entry.as_ref().map_or(0, |e| e.coalesced);
+        let started_at = entry.as_ref().and_then(|e| e.started_at);
+        if let Some(r) = &record {
+            outcome.wait_reason = r.dominant().map(|c| c.as_str().to_owned());
+            outcome.admission = r.admission.map(|a| a.as_str().to_owned());
+        }
+        let killed_by = entry.as_ref().and_then(|e| e.killed_by);
+        if outcome.status == OutcomeStatus::Killed {
+            outcome.killed_by = killed_by.map(str::to_owned);
+        }
+        let wall_ms = started_at.map(|s| now.saturating_sub(s));
+        let demand = entry
+            .as_ref()
+            .zip(wall_ms)
+            .and_then(|(e, wall)| e.usage.finish(wall, calm_end));
+        let mut learned = None;
+        if let (Some(e), Some(d), Some(wall)) = (&entry, demand, wall_ms)
+            && let Some(key) = &e.stats_key
+            && matches!(outcome.status, OutcomeStatus::Pass | OutcomeStatus::Fail)
+        {
+            learned = Some((
+                key.clone(),
+                GateStat {
+                    repo: key.0.clone(),
+                    gate: key.1.clone(),
+                    cmd_hash: key.2.clone(),
+                    job_id: id.to_owned(),
+                    finished_at: now,
+                    outcome: label.to_owned(),
+                    wall_ms: wall,
+                    cpu_ms: d.cpu_ms,
+                    run_delay_ms: d.run_delay_ms,
+                    demand_milli: d.demand_milli,
+                },
+            ));
+        }
+        let finish = FinishMeta {
+            waits: record.as_ref().map_or([0; 5], |r| r.waits),
+            cpu_ms: demand.map(|d| d.cpu_ms),
+            run_delay_ms: demand.and_then(|d| d.run_delay_ms),
+            demand_milli: demand.map(|d| d.demand_milli),
+            killed_by: outcome.killed_by.clone(),
+        };
         shared.store("recording the outcome", |s| {
             s.set_subscribers(id, u32::try_from(max).unwrap_or(u32::MAX), coalesced)?;
             s.mark_done(
                 id,
                 &shared.instance,
-                now_ms(),
+                now,
                 label,
                 exit_code,
                 outcome.marker_written,
-            )
+            )?;
+            s.set_finish_meta(id, &finish)?;
+            if let Some((_, stat)) = &learned {
+                s.insert_gate_stat(stat)?;
+            }
+            Ok(())
         });
-        entry.map(|e| e.events)
+        (entry.map(|e| e.events), started_at, learned)
     };
+    if let Some((key, stat)) = learned {
+        lock(&shared.stats).push(key, stat.demand_milli, stat.wall_ms);
+    }
     tracing::info!(job = %id, outcome = label, "job done");
     if let Some(events) = events {
-        let _ = events.send(JobEvent::Done(Box::new(outcome)));
+        let _ = events.send(JobEvent::Done(Box::new(outcome), started_at));
     }
     shared.wake.notify_one();
     shared.idle.notify_waiters();
@@ -1049,12 +1338,14 @@ async fn launch(shared: &Shared, id: &str, spec: ExecSpec) -> Option<Finished> {
             &log_path,
         )
     });
+    let calm = cpu_calm(shared);
     let events = {
         let mut st = shared.state();
         let Some(entry) = st.jobs.get_mut(id) else {
             handle.cancel();
             return None;
         };
+        entry.usage.calm_at_start = calm;
         entry.handle = Some(handle.clone());
         if entry.cancelled {
             handle.cancel();
@@ -1576,7 +1867,10 @@ async fn handle_connection(shared: Arc<Shared>, stream: UnixStream) {
         }
     };
     match request {
-        ClientMessage::Run { id, request } => handle_run(&shared, rd, wr, id, request).await,
+        ClientMessage::Run { id, request } => {
+            let via = run_via(&client, &request);
+            handle_run(&shared, rd, wr, id, request, via).await;
+        }
         ClientMessage::Exec { id, request } => handle_exec(&shared, rd, wr, id, request).await,
         ClientMessage::Status { id } => {
             let mut status = status_report(&shared);
@@ -1627,7 +1921,7 @@ async fn handle_connection(shared: Arc<Shared>, stream: UnixStream) {
             remove_socket(&shared.config.socket_path);
             shared.stop.send_replace(Some(force));
         }
-        ClientMessage::Cancel { id } => {
+        ClientMessage::Cancel { id, .. } => {
             send_error(
                 &mut wr,
                 id,
@@ -1651,13 +1945,14 @@ async fn handle_connection(shared: Arc<Shared>, stream: UnixStream) {
     }
 }
 
+#[allow(clippy::too_many_lines, reason = "one report, field by field")]
 fn status_report(shared: &Shared) -> StatusReport {
     let now = now_ms();
     let (psi, psi_blocked_ms_total, psi_blocking) = {
         let adm = lock(&shared.psi);
         (adm.info(), adm.blocked_ms_total(), adm.blocking())
     };
-    let (running, queued, total, used) = {
+    let (running, queued, total, used, cap, over_admissions) = {
         let st = shared.state();
         let (running, queued) = st.sched.snapshot(now, psi_blocking);
         let caller = |id: &str| {
@@ -1674,6 +1969,12 @@ fn status_report(shared: &Shared) -> StatusReport {
             .into_iter()
             .map(|v| {
                 let (kind, label) = kind_label(&v.id);
+                let elapsed_ms = now.saturating_sub(v.started_at);
+                let demand = st
+                    .jobs
+                    .get(&v.id)
+                    .and_then(|e| e.usage.demand_so_far(elapsed_ms))
+                    .map(|d| (d * 10.0).round() / 10.0);
                 RunningJob {
                     caller: caller(&v.id),
                     kind,
@@ -1683,8 +1984,12 @@ fn status_report(shared: &Shared) -> StatusReport {
                     gate: v.gate,
                     weight: v.weight,
                     started_at: rfc3339(v.started_at),
-                    elapsed_ms: now.saturating_sub(v.started_at),
+                    elapsed_ms,
                     subscribers: v.subscribers,
+                    weight_cfg: Some(v.weight_cfg),
+                    waited_ms: Some(v.started_at.saturating_sub(v.queued_at)),
+                    admission: Some(v.admission.as_str().to_owned()),
+                    demand,
                 }
             })
             .collect();
@@ -1703,16 +2008,39 @@ fn status_report(shared: &Shared) -> StatusReport {
                     waiting_ms: now.saturating_sub(v.queued_at),
                     subscribers: v.subscribers,
                     reason: v.reason,
+                    lane: Some(v.lane),
+                    rank: Some(v.rank),
+                    expected_ms: v.expected_ms,
+                    weight_cfg: Some(v.weight_cfg),
+                    wait_detail: v.detail.map(str::to_owned),
                 }
             })
             .collect();
-        (running, queued, st.sched.budget(), st.sched.used())
+        (
+            running,
+            queued,
+            st.sched.budget(),
+            st.sched.used(),
+            st.sched.cap(),
+            st.sched.over_admissions(),
+        )
+    };
+    let (idle_cpus, idle_while_waiting_ms, waiting_wall_ms) = {
+        let u = lock(&shared.util);
+        (
+            u.idle_cpus().map(|v| (v * 10.0).round() / 10.0),
+            u.idle_while_waiting_ms(),
+            u.waiting_wall_ms(),
+        )
     };
     let mut totals = shared
         .store("reading totals", |s| s.totals(None))
         .unwrap_or_default();
     // Kept in memory: covers this daemon instance only.
     totals.psi_blocked_ms_total = psi_blocked_ms_total;
+    totals.idle_while_waiting_ms = Some(idle_while_waiting_ms);
+    totals.waiting_wall_ms = Some(waiting_wall_ms);
+    totals.over_admissions = Some(over_admissions);
     StatusReport {
         schema: STATUS_SCHEMA_VERSION,
         daemon: DaemonInfo {
@@ -1723,7 +2051,14 @@ fn status_report(shared: &Shared) -> StatusReport {
             socket: shared.config.socket_path.clone(),
             log_level: shared.config.log.level.clone(),
         },
-        budget: BudgetInfo { total, used, psi },
+        budget: BudgetInfo {
+            total,
+            used,
+            psi,
+            cap: Some(cap),
+            cpus: Some(shared.cpus),
+            idle_cpus,
+        },
         running,
         queued,
         totals,
@@ -1799,6 +2134,26 @@ fn repo_identity(repo: &proto::RepoInfo) -> PathBuf {
     common.clone()
 }
 
+/// How a `run` request reached the daemon (`job_requests.via`): the MCP
+/// server, a git hook, or the CLI.
+fn run_via(client: &str, request: &RunRequest) -> &'static str {
+    if client.starts_with("sluice-gate-mcp") {
+        "mcp"
+    } else if request.hook.is_some() {
+        "hook"
+    } else {
+        "cli"
+    }
+}
+
+/// Priority class of a caller (ADR-0011 M6).
+fn class_of(caller: Caller) -> Class {
+    match caller {
+        Caller::Human => Class::Human,
+        Caller::Agent | Caller::Unknown => Class::Agent,
+    }
+}
+
 /// A job about to be registered, gate or exec.
 struct NewJob {
     request: JobRequest,
@@ -1808,7 +2163,16 @@ struct NewJob {
     exec_identity: Option<String>,
     /// Repository identity for the per-repository cap and `status`.
     repo: PathBuf,
+    /// Fairness lane (the worktree of the request).
+    lane: PathBuf,
     weight: u32,
+    /// Learned-statistics key (gates only).
+    stats_key: Option<StatsKey>,
+    /// Client send time.
+    requested_at: Option<u64>,
+    /// `job_requests.via`.
+    via: &'static str,
+    client_pid: Option<u32>,
     /// Database columns.
     row_key: Option<String>,
     row_tree: Option<String>,
@@ -1818,14 +2182,29 @@ struct NewJob {
 }
 
 /// Registers a `run` request (new job or coalesced), or returns an error message.
-fn register(shared: &Shared, request: RunRequest) -> std::result::Result<Registered, String> {
+fn register(
+    shared: &Shared,
+    request: RunRequest,
+    via: &'static str,
+) -> std::result::Result<Registered, String> {
+    let repo = repo_identity(&request.repo);
+    let stats_key = (
+        repo.clone(),
+        request.gate.name.clone(),
+        cmd_hash(&request.cmd, &request.extra),
+    );
     register_job(
         shared,
         NewJob {
             key: request.key.clone(),
             exec_identity: None,
-            repo: repo_identity(&request.repo),
+            lane: request.repo.toplevel.clone(),
+            repo,
             weight: request.gate.weight,
+            stats_key: Some(stats_key),
+            requested_at: request.requested_at,
+            via,
+            client_pid: Some(request.client_pid).filter(|p| *p != 0),
             row_key: request.key.as_ref().map(|k| k.as_str().to_owned()),
             row_tree: request.tree.as_ref().map(|t| t.as_str().to_owned()),
             row_repo: request.repo.toplevel.clone(),
@@ -1885,7 +2264,14 @@ fn register_exec(shared: &Shared, request: ExecRequest) -> std::result::Result<R
             key: None,
             exec_identity: exec_identity(&request),
             repo: repo.clone(),
+            lane: request.cwd.clone(),
             weight: request.weight,
+            // `exec` jobs keep their declared weight: their CPU may escape
+            // the process group (ADR-0011 M2).
+            stats_key: None,
+            requested_at: None,
+            via: "exec",
+            client_pid: Some(request.client_pid).filter(|p| *p != 0),
             row_key: None,
             row_tree: None,
             row_repo: repo,
@@ -1896,14 +2282,33 @@ fn register_exec(shared: &Shared, request: ExecRequest) -> std::result::Result<R
     )
 }
 
+/// The `job_requests` row of one request.
+fn request_row(job: &NewJob, job_id: &str, attached_at: u64, coalesced: bool) -> RequestRow {
+    RequestRow {
+        job_id: job_id.to_owned(),
+        caller: caller_str(job.request.caller()).to_owned(),
+        session: job.session.clone(),
+        client_pid: job.client_pid,
+        via: job.via.to_owned(),
+        requested_at: job.requested_at,
+        attached_at,
+        coalesced,
+    }
+}
+
 /// Attaches one more subscriber (already counted by the scheduler) to `job_id`.
 fn coalesce_into(
     shared: &Shared,
     st: &mut State,
+    job: &NewJob,
     job_id: String,
     position: Option<usize>,
 ) -> std::result::Result<Registered, String> {
-    let weight = st.sched.spec(&job_id).map_or(1, |s| s.weight);
+    let now = now_ms();
+    let (weight, weight_cfg, expected_ms) = st
+        .sched
+        .spec(&job_id)
+        .map_or((1, 1, None), |s| (s.weight, s.weight_cfg, s.expected_ms));
     let max = st.sched.subscribers_max(&job_id).unwrap_or(1);
     let Some(entry) = st.jobs.get_mut(&job_id) else {
         st.sched.unsubscribe(&job_id);
@@ -1914,14 +2319,22 @@ fn coalesce_into(
     let started_at = entry.started_at;
     let spool = entry.spool.clone();
     let rx = entry.events.subscribe();
-    shared.store("updating subscribers", |s| {
-        s.set_subscribers(&job_id, u32::try_from(max).unwrap_or(u32::MAX), coalesced)
-    });
+    let row = request_row(job, &job_id, now, true);
+    let request_row = shared
+        .store("updating subscribers", |s| {
+            s.set_subscribers(&job_id, u32::try_from(max).unwrap_or(u32::MAX), coalesced)?;
+            s.insert_request(&row)
+        })
+        .flatten();
     Ok(Registered {
         job_id,
         coalesced: true,
         position: position.unwrap_or(0),
         weight,
+        weight_cfg,
+        expected_ms,
+        attached_at: now,
+        request_row,
         started_at,
         spool,
         events: rx,
@@ -1929,8 +2342,18 @@ fn coalesce_into(
 }
 
 /// Registers a new job or attaches the request to an identical one.
+#[allow(
+    clippy::too_many_lines,
+    reason = "scheduler, database row and job entry of one job"
+)]
 fn register_job(shared: &Shared, job: NewJob) -> std::result::Result<Registered, String> {
     let now = now_ms();
+    // Learned history first: the stats mutex is never held with another.
+    let (demands_milli, expected_ms) = job
+        .stats_key
+        .as_ref()
+        .map(|k| lock(&shared.stats).history(k))
+        .unwrap_or_default();
     let mut st = shared.state();
     if !st.accepting {
         return Err(st.refusal.to_owned());
@@ -1940,30 +2363,38 @@ fn register_job(shared: &Shared, job: NewJob) -> std::result::Result<Registered,
         && st.sched.subscribe(&existing).is_some()
     {
         let position = st.sched.position(&existing);
-        return coalesce_into(shared, &mut st, existing, position);
+        return coalesce_into(shared, &mut st, &job, existing, position);
     }
     let id = new_job_id();
     let spec = JobSpec {
         id: id.clone(),
         key: job.key.clone(),
         repo: job.repo.clone(),
+        lane: job.lane.clone(),
         gate: job.request.name(),
         weight: job.weight,
+        weight_cfg: 0,
+        class: class_of(job.request.caller()),
         queued_at: now,
+        expected_ms,
+        demands_milli,
     };
     match st.sched.enqueue(spec) {
         Enqueued::Created { position } => {
-            let weight = st.sched.spec(&id).map_or(1, |s| s.weight);
+            let (weight, weight_cfg) = st
+                .sched
+                .spec(&id)
+                .map_or((1, 1), |s| (s.weight, s.weight_cfg));
             let row = JobRow {
                 id: id.clone(),
-                key: job.row_key,
-                tree: job.row_tree,
-                repo: job.row_repo,
+                key: job.row_key.clone(),
+                tree: job.row_tree.clone(),
+                repo: job.row_repo.clone(),
                 gate: job.request.name(),
-                cmd: job.cmd,
+                cmd: job.cmd.clone(),
                 weight,
                 caller: caller_str(job.request.caller()).to_owned(),
-                session: job.session,
+                session: job.session.clone(),
                 state: JobState::Queued,
                 outcome: None,
                 exit_code: None,
@@ -1978,7 +2409,21 @@ fn register_job(shared: &Shared, job: NewJob) -> std::result::Result<Registered,
                 coalesced: 0,
                 marker_written: false,
             };
-            shared.store("inserting a job", |s| s.insert_job(&row));
+            let req = request_row(&job, &id, now, false);
+            let request_row = shared
+                .store("inserting a job", |s| {
+                    s.insert_job(&row)?;
+                    s.set_queued_meta(
+                        &id,
+                        QueuedMeta {
+                            requested_at: job.requested_at,
+                            weight_cfg,
+                            expected_ms,
+                        },
+                    )?;
+                    s.insert_request(&req)
+                })
+                .flatten();
             let (events, rx) = broadcast::channel(CHANNEL_CAPACITY);
             if let Some(identity) = &job.exec_identity {
                 st.exec_inflight.insert(identity.clone(), id.clone());
@@ -1996,6 +2441,9 @@ fn register_job(shared: &Shared, job: NewJob) -> std::result::Result<Registered,
                     spool: None,
                     process: None,
                     exec_identity: job.exec_identity,
+                    stats_key: job.stats_key,
+                    usage: JobUsage::default(),
+                    killed_by: None,
                 },
             );
             Ok(Registered {
@@ -2003,25 +2451,49 @@ fn register_job(shared: &Shared, job: NewJob) -> std::result::Result<Registered,
                 coalesced: false,
                 position,
                 weight,
+                weight_cfg,
+                expected_ms,
+                attached_at: now,
+                request_row,
                 started_at: None,
                 spool: None,
                 events: rx,
             })
         }
         Enqueued::Coalesced { job_id, position } => {
-            coalesce_into(shared, &mut st, job_id, position)
+            coalesce_into(shared, &mut st, &job, job_id, position)
         }
+    }
+}
+
+/// Closes the `job_requests` row of a subscriber.
+fn close_request(shared: &Shared, row: Option<i64>, detached: bool) {
+    if let Some(row) = row {
+        shared.store("closing a request", |s| {
+            s.close_request(row, now_ms(), detached)
+        });
     }
 }
 
 /// Removes one subscriber and applies `last_subscriber_gone` when it was the last.
 fn detach(shared: &Shared, job_id: &str) {
+    detach_because(shared, job_id, None);
+}
+
+/// [`detach`] with the client's reason (`cancel.reason`), recorded as the
+/// job's `killed_by` when this subscriber was the last one (default
+/// `last-subscriber`).
+fn detach_because(shared: &Shared, job_id: &str, reason: Option<&str>) {
+    let killed_by = match reason {
+        Some(proto::CANCEL_EARLY_VERDICT) => "early-verdict",
+        _ => "last-subscriber",
+    };
     let drop_queued = {
         let mut st = shared.state();
         let Some(remaining) = st.sched.unsubscribe(job_id) else {
             return;
         };
-        tracing::debug!(job = %job_id, remaining, "subscriber detached");
+        tracing::debug!(job = %job_id, remaining, ?reason, "subscriber detached");
         // `finish` keeps a gate running to cache its result; an exec job
         // has nothing to cache, so losing its last subscriber always kills it.
         let is_exec = st.jobs.get(job_id).is_some_and(|e| e.request.is_exec());
@@ -2030,11 +2502,14 @@ fn detach(shared: &Shared, job_id: &str) {
         {
             return;
         }
+        if let Some(entry) = st.jobs.get_mut(job_id) {
+            entry.killed_by = Some(killed_by);
+        }
         if st.sched.is_queued(job_id) {
             true
         } else {
             if let Some(entry) = st.jobs.get_mut(job_id) {
-                tracing::info!(job = %job_id, "last subscriber gone, cancelling");
+                tracing::info!(job = %job_id, killed_by, "last subscriber gone, cancelling");
                 entry.cancelled = true;
                 if let Some(h) = &entry.handle {
                     h.cancel();
@@ -2045,7 +2520,7 @@ fn detach(shared: &Shared, job_id: &str) {
     };
     if drop_queued {
         let gate = gate_name(shared, job_id);
-        tracing::info!(job = %job_id, "last subscriber gone, dropping the queued job");
+        tracing::info!(job = %job_id, killed_by, "last subscriber gone, dropping the queued job");
         finish_job(shared, job_id, killed_outcome(&gate), None);
     }
 }
@@ -2074,6 +2549,8 @@ struct Subscriber<'a> {
     id: u64,
     job_id: String,
     coalesced: bool,
+    /// When this request reached the scheduler (`queue_wait_ms`).
+    attached_at: u64,
 }
 
 impl Subscriber<'_> {
@@ -2106,11 +2583,12 @@ impl Subscriber<'_> {
                 },
                 false,
             )),
-            Ok(JobEvent::Done(outcome)) => {
+            Ok(JobEvent::Done(outcome, started_at)) => {
                 let mut outcome = *outcome;
                 if self.coalesced {
                     outcome.coalesced_with = Some(job_id.clone());
                 }
+                outcome.queue_wait_ms = started_at.map(|s| s.saturating_sub(self.attached_at));
                 Some((
                     ServerMessage::Done {
                         id,
@@ -2154,22 +2632,28 @@ impl Subscriber<'_> {
     }
 }
 
+#[allow(clippy::too_many_lines, reason = "one connection, in protocol order")]
 async fn handle_run(
     shared: &Arc<Shared>,
     rd: BufReader<OwnedReadHalf>,
     mut wr: OwnedWriteHalf,
     id: u64,
     request: RunRequest,
+    via: &'static str,
 ) {
     let Registered {
         job_id,
         coalesced,
         position,
         weight,
+        weight_cfg,
+        expected_ms,
+        attached_at,
+        request_row,
         started_at,
         mut events,
         ..
-    } = match register(shared, request) {
+    } = match register(shared, request, via) {
         Ok(r) => r,
         Err(message) => {
             send_error(&mut wr, id, ErrorCode::Internal, message).await;
@@ -2185,6 +2669,7 @@ async fn handle_run(
         id,
         job_id,
         coalesced,
+        attached_at,
     };
     let queued = ServerMessage::Queued {
         id,
@@ -2192,9 +2677,12 @@ async fn handle_run(
         position,
         coalesced,
         weight,
+        weight_cfg: Some(weight_cfg),
+        expected_ms,
     };
     if !send(&mut wr, &queued).await {
         detach(shared, &sub.job_id);
+        close_request(shared, request_row, true);
         return;
     }
     // A request that joins a running job never sees the broadcast `started`.
@@ -2207,12 +2695,14 @@ async fn handle_run(
         };
         if !send(&mut wr, &started).await {
             detach(shared, &sub.job_id);
+            close_request(shared, request_row, true);
             return;
         }
     }
 
     let (reader, mut lines) = spawn_reader(rd);
     let mut tick = interval_at(Instant::now() + PROGRESS_EVERY, PROGRESS_EVERY);
+    let mut detached = false;
     loop {
         let (msg, last) = tokio::select! {
             ev = events.recv() => match sub.message(ev) {
@@ -2224,9 +2714,16 @@ async fn handle_run(
                 None => continue,
             },
             line = lines.recv() => match line.flatten().map(|l| proto::decode_client(&l)) {
-                None | Some(Ok(ClientMessage::Cancel { .. })) => {
+                None => {
                     tracing::debug!(job = %sub.job_id, "subscriber left");
                     detach(shared, &sub.job_id);
+                    detached = true;
+                    break;
+                }
+                Some(Ok(ClientMessage::Cancel { reason, .. })) => {
+                    tracing::debug!(job = %sub.job_id, ?reason, "subscriber cancelled");
+                    detach_because(shared, &sub.job_id, reason.as_deref());
+                    detached = true;
                     break;
                 }
                 Some(Ok(_)) => {
@@ -2241,12 +2738,14 @@ async fn handle_run(
         };
         if !send(&mut wr, &msg).await && !last {
             detach(shared, &sub.job_id);
+            detached = true;
             break;
         }
         if last {
             break;
         }
     }
+    close_request(shared, request_row, detached);
     reader.abort();
 }
 
@@ -2318,6 +2817,7 @@ fn forward_signal(shared: &Arc<Shared>, job_id: &str, signal: ExecSignal) -> Sig
     SignalAction::Forwarded
 }
 
+#[allow(clippy::too_many_lines, reason = "one connection, in protocol order")]
 async fn handle_exec(
     shared: &Arc<Shared>,
     rd: BufReader<OwnedReadHalf>,
@@ -2334,9 +2834,13 @@ async fn handle_exec(
         coalesced,
         position,
         weight,
+        weight_cfg,
+        attached_at,
+        request_row,
         started_at,
         spool,
         mut events,
+        ..
     } = match register_exec(shared, request) {
         Ok(r) => r,
         Err(message) => {
@@ -2353,6 +2857,7 @@ async fn handle_exec(
         id,
         job_id,
         coalesced,
+        attached_at,
     };
     let queued = ServerMessage::Queued {
         id,
@@ -2360,9 +2865,12 @@ async fn handle_exec(
         position,
         coalesced,
         weight,
+        weight_cfg: Some(weight_cfg),
+        expected_ms: None,
     };
     if !send(&mut wr, &queued).await {
         detach(shared, &sub.job_id);
+        close_request(shared, request_row, true);
         return;
     }
     if let Some(started_at) = started_at {
@@ -2374,12 +2882,14 @@ async fn handle_exec(
         };
         if !send(&mut wr, &started).await {
             detach(shared, &sub.job_id);
+            close_request(shared, request_row, true);
             return;
         }
     }
 
     let (reader, mut lines) = spawn_reader(rd);
     let mut tick = interval_at(Instant::now() + PROGRESS_EVERY, PROGRESS_EVERY);
+    let mut detached = false;
     loop {
         let (msg, last) = tokio::select! {
             ev = events.recv() => match sub.message(ev) {
@@ -2394,12 +2904,16 @@ async fn handle_exec(
                 None | Some(Ok(ClientMessage::Cancel { .. })) => {
                     tracing::debug!(job = %sub.job_id, "exec subscriber left");
                     detach(shared, &sub.job_id);
+                    detached = true;
                     break;
                 }
                 Some(Ok(ClientMessage::Signal { signal, .. })) => {
                     match forward_signal(shared, &sub.job_id, signal) {
                         SignalAction::Forwarded => continue,
-                        SignalAction::Detached => break,
+                        SignalAction::Detached => {
+                            detached = true;
+                            break;
+                        }
                     }
                 }
                 Some(Ok(_)) => {
@@ -2414,12 +2928,14 @@ async fn handle_exec(
         };
         if !send(&mut wr, &msg).await && !last {
             detach(shared, &sub.job_id);
+            detached = true;
             break;
         }
         if last {
             break;
         }
     }
+    close_request(shared, request_row, detached);
     reader.abort();
 }
 

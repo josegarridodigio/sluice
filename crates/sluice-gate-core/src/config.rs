@@ -653,7 +653,8 @@ impl Default for UserQueueConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DaemonConfig {
-    /// Total budget units; default `max(2, cpu_count - 1)`.
+    /// Total budget units; default `max(2, available CPUs)` (affinity mask
+    /// and cgroup CPU limit, [`crate::cpus::default_budget`]).
     pub budget: u32,
     /// Niceness (0..=19) for gate processes.
     pub nice: u8,
@@ -687,6 +688,19 @@ pub struct AdmissionConfig {
     /// blocked only by PSI, one job is admitted anyway.
     #[serde(with = "humantime_serde")]
     pub psi_max_wait: Duration,
+    /// Over-admission cap as a multiple of the budget (ADR-0011 M3): a job
+    /// that does not fit the budget may still start, up to
+    /// `floor(overcommit * budget)` units, while the machine is calm and
+    /// CPUs are idle. `1.0` disables over-admission.
+    pub overcommit: f64,
+    /// Over-admission needs CPU `some avg10` below this percentage.
+    pub cpu_some_avg10_low: f64,
+    /// Over-admission needs memory `some avg10` below this percentage.
+    pub memory_some_avg10_low: f64,
+    /// At most one over-admission per interval, and none sooner than this
+    /// after PSI admission resumed.
+    #[serde(with = "humantime_serde")]
+    pub overcommit_interval: Duration,
 }
 
 /// The `[cache]` table.
@@ -709,20 +723,54 @@ pub struct AgentDetectionConfig {
     pub env_any_equals: BTreeMap<String, String>,
 }
 
+/// `[scheduler] fairness`: how queued jobs of different worktrees share
+/// the budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Fairness {
+    /// Round-robin between lanes (worktree paths) at equal priority.
+    Lane,
+    /// Arrival order only.
+    Off,
+}
+
+/// `[scheduler] order`: the tie-break among jobs of equal priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum QueueOrder {
+    /// Arrival order.
+    Fifo,
+    /// Shortest expected job first with ageing (highest response ratio next).
+    Sjf,
+}
+
 /// The `[scheduler]` table.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SchedulerConfig {
     /// Once the head of the queue has waited this long, nothing behind it
-    /// starts until it does (head-of-line reservation).
+    /// starts until it does (head-of-line reservation); also the single
+    /// ageing bound of the priority order (ADR-0011).
     #[serde(with = "humantime_serde")]
     pub head_reserve_after: Duration,
+    /// Learn each gate's weight from its measured CPU demand (ADR-0011 M2).
+    pub learned_weights: bool,
+    /// Fairness between worktrees (ADR-0011 M5).
+    pub fairness: Fairness,
+    /// Jobs a human waits for go first (ADR-0011 M6).
+    pub human_first: bool,
+    /// Order among jobs of equal priority (ADR-0011 M7).
+    pub order: QueueOrder,
 }
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             head_reserve_after: Duration::from_secs(30),
+            learned_weights: true,
+            fairness: Fairness::Lane,
+            human_first: true,
+            order: QueueOrder::Fifo,
         }
     }
 }
@@ -735,12 +783,16 @@ pub struct McpConfig {
     /// queued or running (when the client supplied a `progressToken`).
     #[serde(with = "humantime_serde")]
     pub progress_interval: Duration,
+    /// `verify` starts every selected gate at once (ADR-0011 M4); `false`
+    /// runs them one after another as before 0.3.0.
+    pub verify_parallel: bool,
 }
 
 impl Default for McpConfig {
     fn default() -> Self {
         Self {
             progress_interval: Duration::from_secs(15),
+            verify_parallel: true,
         }
     }
 }
@@ -811,9 +863,8 @@ impl Default for UserConfig {
 
 impl Default for DaemonConfig {
     fn default() -> Self {
-        let cpus = std::thread::available_parallelism().map_or(2, std::num::NonZero::get);
         Self {
-            budget: u32::try_from(cpus.saturating_sub(1).max(2)).unwrap_or(u32::MAX),
+            budget: crate::cpus::default_budget(),
             nice: 10,
             ionice_class: IonicClass::BestEffort,
             ionice_level: 7,
@@ -832,6 +883,10 @@ impl Default for AdmissionConfig {
             memory_some_avg10_max: 20.0,
             psi_poll_interval: Duration::from_secs(1),
             psi_max_wait: Duration::from_mins(5),
+            overcommit: 1.5,
+            cpu_some_avg10_low: 25.0,
+            memory_some_avg10_low: 5.0,
+            overcommit_interval: Duration::from_secs(5),
         }
     }
 }
@@ -913,6 +968,19 @@ impl UserConfig {
                 "admission.psi_max_wait must be greater than zero",
             ));
         }
+        let overcommit = cfg.admission.overcommit;
+        if !overcommit.is_finite() || !(1.0..=4.0).contains(&overcommit) {
+            return Err(config_err(
+                path,
+                format!("admission.overcommit must be between 1.0 (off) and 4.0, got {overcommit}"),
+            ));
+        }
+        if cfg.admission.overcommit_interval.is_zero() {
+            return Err(config_err(
+                path,
+                "admission.overcommit_interval must be greater than zero",
+            ));
+        }
         for (name, value) in [
             (
                 "admission.cpu_some_avg10_max",
@@ -921,6 +989,14 @@ impl UserConfig {
             (
                 "admission.memory_some_avg10_max",
                 cfg.admission.memory_some_avg10_max,
+            ),
+            (
+                "admission.cpu_some_avg10_low",
+                cfg.admission.cpu_some_avg10_low,
+            ),
+            (
+                "admission.memory_some_avg10_low",
+                cfg.admission.memory_some_avg10_low,
             ),
         ] {
             if !value.is_finite() || !(0.0..=100.0).contains(&value) {
@@ -1410,8 +1486,8 @@ budget_share_max = 4
     #[test]
     fn user_defaults() {
         let c = UserConfig::default();
-        let cpus = std::thread::available_parallelism().unwrap().get();
-        assert_eq!(c.daemon.budget as usize, cpus.saturating_sub(1).max(2));
+        // ADR-0011 M1: every available CPU (affinity and cgroup), at least 2.
+        assert_eq!(c.daemon.budget, crate::cpus::available_cpus().max(2));
         assert_eq!(c.daemon.nice, 10);
         assert_eq!(c.daemon.ionice_class, IonicClass::BestEffort);
         assert_eq!(c.daemon.ionice_level, 7);
@@ -1486,6 +1562,49 @@ budget_share_max = 4
                 || user_err("version = 1\n[scheduler]\nhead_reserve_after = \"soon\"")
                     .contains("duration")
         );
+    }
+
+    #[test]
+    fn throughput_switches_have_documented_defaults_and_parse() {
+        let c = UserConfig::default();
+        assert!(c.scheduler.learned_weights);
+        assert_eq!(c.scheduler.fairness, Fairness::Lane);
+        assert!(c.scheduler.human_first);
+        assert_eq!(c.scheduler.order, QueueOrder::Fifo);
+        assert!((c.admission.overcommit - 1.5).abs() < f64::EPSILON);
+        assert!((c.admission.cpu_some_avg10_low - 25.0).abs() < f64::EPSILON);
+        assert!((c.admission.memory_some_avg10_low - 5.0).abs() < f64::EPSILON);
+        assert_eq!(c.admission.overcommit_interval, Duration::from_secs(5));
+        assert!(c.mcp.verify_parallel);
+        assert_eq!(c.daemon.budget, crate::cpus::default_budget());
+
+        let c = UserConfig::parse(
+            "version = 1\n[scheduler]\nlearned_weights = false\nfairness = \"off\"\n\
+             human_first = false\norder = \"sjf\"\n[admission]\novercommit = 1.0\n\
+             cpu_some_avg10_low = 35.0\nmemory_some_avg10_low = 2.5\n\
+             overcommit_interval = \"10s\"\n[mcp]\nverify_parallel = false\n",
+            Path::new("/u.toml"),
+        )
+        .unwrap();
+        assert!(!c.scheduler.learned_weights);
+        assert_eq!(c.scheduler.fairness, Fairness::Off);
+        assert!(!c.scheduler.human_first);
+        assert_eq!(c.scheduler.order, QueueOrder::Sjf);
+        assert!((c.admission.overcommit - 1.0).abs() < f64::EPSILON);
+        assert_eq!(c.admission.overcommit_interval, Duration::from_secs(10));
+        assert!(!c.mcp.verify_parallel);
+
+        assert!(user_err("version = 1\n[admission]\novercommit = 0.5").contains("overcommit"));
+        assert!(user_err("version = 1\n[admission]\novercommit = 9.0").contains("overcommit"));
+        assert!(
+            user_err("version = 1\n[admission]\novercommit_interval = \"0s\"")
+                .contains("overcommit_interval")
+        );
+        assert!(
+            user_err("version = 1\n[admission]\ncpu_some_avg10_low = 120.0")
+                .contains("cpu_some_avg10_low")
+        );
+        assert!(user_err("version = 1\n[scheduler]\norder = \"lifo\"").contains("order"));
     }
 
     #[test]

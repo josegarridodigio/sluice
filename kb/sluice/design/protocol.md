@@ -149,6 +149,23 @@ with `elapsed_ms` and `log_bytes`. `gate.timeout_ms = 0` means no timeout.
 A pass whose request had a `key` but no `tree` is reported with
 `not_cached_reason: "the tree is unknown"`.
 
+**Scheduler timeline fields (0.3.0, ADR-0011; all optional and omitted
+when unset, protocol stays 1):**
+
+- `run.requested_at`: client send time (unix ms), the first point of the
+  job timeline. Sent by `sluice run` and `sluice mcp`.
+- `queued.weight_cfg`: the configured weight after the budget and
+  repository-cap clamp (`weight` is then the effective one, possibly a
+  learned weight); `queued.expected_ms`: expected run time from the gate's
+  history.
+- `outcome.queue_wait_ms`: this subscriber's wait (`started_at −
+  attached_at`, 0 when it joined a running job; absent when the job never
+  started); `outcome.wait_reason`: the dominant wait cause (`budget`, `psi`,
+  `repo-cap`, `head-reserved`, `order`); `outcome.admission`: `nominal`,
+  `over` (over-admission) or `guard` (PSI starvation guard);
+  `outcome.killed_by` (only on `killed`): `last-subscriber`,
+  `early-verdict`, `stop` (`superseded` reserved).
+
 ### `status`
 
 `{"type":"status","id":2}` →
@@ -168,6 +185,18 @@ for example `info` or `debug`), omitted when the daemon does not report it,
 so the frozen fixture is unchanged and the protocol stays at version 1; a
 second additive test (`log_level_is_an_additive_optional_field`) pins its
 shape. `sluice status` prints it as `log:      level <level>, <path>/daemon.log`.
+
+Scheduler fields of 0.3.0 (ADR-0011), all optional and omitted when unset
+(`scheduler_fields_are_additive_optional_fields` pins them against the
+unchanged fixture): `budget.cap` (over-admission cap; `used` may exceed
+`total` up to it), `budget.cpus`, `budget.idle_cpus`; `running[]`
+`weight_cfg`, `waited_ms`, `admission`, `demand` (measured CPUs so far);
+`queued[]` `lane` (worktree), `rank` (1-based priority position; the list
+is in rank order), `expected_ms`, `weight_cfg`, `wait_detail` (`outranked`,
+`lane` or `human-first` when the job fitted but higher-ranked jobs took the
+room; `reason` then stays `budget`, its four values are frozen);
+`totals.idle_while_waiting_ms`, `totals.waiting_wall_ms`,
+`totals.over_admissions` (per daemon instance).
 
 Entries of `running` and `queued` have optional `kind` and `label`, omitted
 for gates: an exec job shows `"kind":"exec","label":"cargo build"` and
@@ -233,6 +262,11 @@ with `force` it also kills running jobs (their subscribers get `done` with
 the daemon then closes its side. Equivalent to closing the connection
 (what the CLI does; the MCP server sends `cancel`). Any other message on a
 `run` connection is answered with `error{bad-request}` and ignored.
+Optional `reason` (0.3.0): `"early-verdict"` when an MCP `verify` stops
+waiting because a sibling gate failed first; if this was the job's last
+subscriber the job is killed with `killed_by = early-verdict` (other
+subscribers keep it running). Omitted otherwise (`killed_by =
+last-subscriber`).
 
 ### `exec` (`sluice exec`, from 0.3.0)
 
@@ -393,5 +427,9 @@ panics on malformed input.
   `run.no_marker`, `status` entries' `kind` and `label`) keep `protocol` at
   1 and `status` schema at 1: all optional, omitted when unset; old daemons
   are detected through `welcome.features`.
+- The scheduler additions of 0.3.0 (`run.requested_at`, `cancel.reason`,
+  `queued.weight_cfg`/`expected_ms`, the `outcome` timeline fields and the
+  `status` scheduler fields above) keep `protocol` and `status` schema at 1:
+  optional, omitted when unset, ignored by old peers.
 - `sluice-gate-proto` exposes `PROTOCOL_VERSION` and the typed enums
   `ClientMessage` / `ServerMessage`, each `#[serde(tag = "type", rename_all = "kebab-case")]`.

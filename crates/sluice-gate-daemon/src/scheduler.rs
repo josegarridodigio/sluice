@@ -1,31 +1,155 @@
 //! Pure admission logic: budget, backfill, head-of-line reservation, per-repo
-//! caps and request coalescing (see `kb/sluice/design/scheduler.md` and
-//! ADR-0007).
+//! caps, request coalescing, and the ADR-0011 policies (learned weights,
+//! PSI-driven over-admission, lane fairness, humans first, shortest expected
+//! job first). See `kb/sluice/design/scheduler.md`, ADR-0007 and ADR-0011.
 //!
 //! No I/O, no clocks, no async: callers pass `now` (unix milliseconds) and the
-//! current PSI verdict, so every decision is deterministic and testable.
+//! current pressure, so every decision is deterministic and testable. The
+//! decision itself is [`plan`], a pure function over a [`Snapshot`];
+//! [`Scheduler`] only owns the queue state and applies the plan.
 
-use std::collections::{BTreeMap, VecDeque};
-use std::path::PathBuf;
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use sluice_gate_core::key::CacheKey;
 use sluice_gate_proto::WaitReason;
 
+/// Expected run time of a job without history (HRRN), milliseconds.
+pub const DEFAULT_EXPECTED_MS: u64 = 60_000;
+/// Samples needed before a learned weight is used.
+pub const LEARN_AFTER: usize = 3;
+/// Samples (most recent) a learned weight and an expected time look at.
+pub const LEARN_WINDOW: usize = 10;
+
+/// Priority class of a job (ADR-0011 M6): a human always waits for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Class {
+    /// Requested by a person (`caller = human`); ranks first with `human_first`.
+    Human,
+    /// Requested by an agent (or an unknown caller).
+    #[default]
+    Agent,
+}
+
+/// Tie-break among jobs of equal priority (ADR-0011 M7).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Order {
+    /// Arrival order.
+    #[default]
+    Fifo,
+    /// Highest response ratio next: `(waited + expected) / expected`.
+    Sjf,
+}
+
+/// How a job was admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// Within the budget.
+    Nominal,
+    /// Above the budget, up to the over-admission cap (ADR-0011 M3).
+    Over,
+    /// By the PSI starvation guard, within the budget.
+    Guard,
+}
+
+impl Admission {
+    /// The spelling used in `status`, `done` and the database.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Nominal => "nominal",
+            Self::Over => "over",
+            Self::Guard => "guard",
+        }
+    }
+}
+
+/// Why a queued job did not start in an admission pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitCause {
+    /// Not enough budget units free.
+    Budget,
+    /// PSI blocks admission.
+    Psi,
+    /// The repository cap is reached.
+    RepoCap,
+    /// The head of the queue holds a reservation.
+    Reserved,
+    /// It would have fitted, but higher-ranked jobs took the room first.
+    Order,
+}
+
+impl WaitCause {
+    /// Every cause, in accumulator order.
+    pub const ALL: [Self; 5] = [
+        Self::Budget,
+        Self::Psi,
+        Self::RepoCap,
+        Self::Reserved,
+        Self::Order,
+    ];
+
+    /// Index of the cause's accumulator.
+    pub fn index(self) -> usize {
+        match self {
+            Self::Budget => 0,
+            Self::Psi => 1,
+            Self::RepoCap => 2,
+            Self::Reserved => 3,
+            Self::Order => 4,
+        }
+    }
+
+    /// The frozen wire reason (an outranked job reports `budget`).
+    pub fn reason(self) -> WaitReason {
+        match self {
+            Self::Budget | Self::Order => WaitReason::Budget,
+            Self::Psi => WaitReason::Psi,
+            Self::RepoCap => WaitReason::RepoCap,
+            Self::Reserved => WaitReason::HeadReserved,
+        }
+    }
+
+    /// The spelling used in `done.wait_reason` and the timeline.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Budget => "budget",
+            Self::Psi => "psi",
+            Self::RepoCap => "repo-cap",
+            Self::Reserved => "head-reserved",
+            Self::Order => "order",
+        }
+    }
+}
+
 /// What the scheduler needs to know about one job.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct JobSpec {
     /// Unique job id.
     pub id: String,
     /// Cache key; `None` means the job is never coalesced.
     pub key: Option<CacheKey>,
-    /// Repository toplevel the job runs in (used for the per-repo cap).
+    /// Repository identity the job runs in (used for the per-repo cap).
     pub repo: PathBuf,
+    /// Fairness lane: the worktree path of the request (ADR-0011 M5).
+    pub lane: PathBuf,
     /// Gate name.
     pub gate: String,
-    /// Budget units the job needs (clamped to `1..=budget` at enqueue).
+    /// Budget units the job holds. On input the configured weight; after
+    /// [`Scheduler::enqueue`] the effective one (learned, clamped).
     pub weight: u32,
+    /// Configured weight after the budget and repository-cap clamp (set by
+    /// [`Scheduler::enqueue`]).
+    pub weight_cfg: u32,
+    /// Priority class.
+    pub class: Class,
     /// Time the job was queued, unix milliseconds.
     pub queued_at: u64,
+    /// Expected run time from history ([`expected_ms`]).
+    pub expected_ms: Option<u64>,
+    /// Measured demands of earlier runs (milli-CPUs, oldest first); empty
+    /// for jobs that never learn (`exec`).
+    pub demands_milli: Vec<u32>,
 }
 
 /// Result of [`Scheduler::enqueue`].
@@ -51,16 +175,22 @@ pub enum Enqueued {
 pub struct RunningView {
     /// Job id.
     pub id: String,
-    /// Repository toplevel.
+    /// Repository identity.
     pub repo: PathBuf,
     /// Gate name.
     pub gate: String,
-    /// Budget units held.
+    /// Budget units held (effective weight).
     pub weight: u32,
+    /// Configured weight after the clamp.
+    pub weight_cfg: u32,
     /// Start time, unix milliseconds.
     pub started_at: u64,
+    /// Queue time, unix milliseconds.
+    pub queued_at: u64,
     /// Current subscribers.
     pub subscribers: usize,
+    /// How it was admitted.
+    pub admission: Admission,
 }
 
 /// A queued job as shown by `status`.
@@ -68,19 +198,441 @@ pub struct RunningView {
 pub struct QueuedView {
     /// Job id.
     pub id: String,
-    /// Repository toplevel.
+    /// Repository identity.
     pub repo: PathBuf,
+    /// Fairness lane.
+    pub lane: PathBuf,
     /// Gate name.
     pub gate: String,
-    /// Budget units needed.
+    /// Budget units needed (effective weight).
     pub weight: u32,
+    /// Configured weight after the clamp.
+    pub weight_cfg: u32,
     /// Queue time, unix milliseconds.
     pub queued_at: u64,
     /// Current subscribers.
     pub subscribers: usize,
-    /// Why the job is not running yet.
+    /// Why the job is not running yet (frozen wire values).
     pub reason: WaitReason,
+    /// The detailed cause.
+    pub cause: WaitCause,
+    /// `outranked`, `lane` or `human-first` for [`WaitCause::Order`].
+    pub detail: Option<&'static str>,
+    /// 1-based position in the priority order.
+    pub rank: usize,
+    /// Expected run time from history.
+    pub expected_ms: Option<u64>,
 }
+
+/// Scheduling facts of one job for the timeline (`jobs` columns).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobRecord {
+    /// Configured weight after the clamp.
+    pub weight_cfg: u32,
+    /// Effective weight.
+    pub weight: u32,
+    /// Admission time, when admitted.
+    pub admitted_at: Option<u64>,
+    /// How it was admitted.
+    pub admission: Option<Admission>,
+    /// Wait accumulators, milliseconds, indexed by [`WaitCause::index`].
+    pub waits: [u64; 5],
+    /// Expected run time used for ordering.
+    pub expected_ms: Option<u64>,
+}
+
+impl JobRecord {
+    /// The cause with the largest accumulator; `None` when it never waited.
+    pub fn dominant(&self) -> Option<WaitCause> {
+        WaitCause::ALL
+            .into_iter()
+            .filter(|c| self.waits[c.index()] > 0)
+            .max_by_key(|c| (self.waits[c.index()], std::cmp::Reverse(c.index())))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure decision: snapshot -> plan
+// ---------------------------------------------------------------------------
+
+/// The admission policy (every ADR-0011 switch).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Policy {
+    /// Budget units (at least 1).
+    pub budget: u32,
+    /// Over-admission cap (`>= budget`; equal disables over-admission).
+    pub cap: u32,
+    /// Head reservation and ageing bound, milliseconds.
+    pub head_reserve_after_ms: u64,
+    /// At most one over-admission per this many milliseconds.
+    pub overcommit_interval_ms: u64,
+    /// Tie-break among equal priorities.
+    pub order: Order,
+    /// Interleave lanes (worktrees).
+    pub fairness: bool,
+    /// Humans before agents.
+    pub human_first: bool,
+    /// Use learned weights at enqueue.
+    pub learned_weights: bool,
+    /// Per-repository caps.
+    pub repo_caps: BTreeMap<PathBuf, u32>,
+}
+
+impl Policy {
+    /// ADR-0007 behaviour: FIFO with backfill and reservation, every
+    /// ADR-0011 switch off.
+    pub fn fifo(
+        budget: u32,
+        head_reserve_after_ms: u64,
+        repo_caps: BTreeMap<PathBuf, u32>,
+    ) -> Self {
+        let budget = budget.max(1);
+        Self {
+            budget,
+            cap: budget,
+            head_reserve_after_ms,
+            overcommit_interval_ms: 5_000,
+            order: Order::Fifo,
+            fairness: false,
+            human_first: false,
+            learned_weights: false,
+            repo_caps,
+        }
+    }
+
+    /// `floor(overcommit * budget)`, never below the budget.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "bounded: overcommit is validated to 1.0..=4.0"
+    )]
+    pub fn cap_for(budget: u32, overcommit: f64) -> u32 {
+        let cap = (f64::from(budget) * overcommit.clamp(1.0, 4.0)).floor();
+        (cap as u32).max(budget)
+    }
+}
+
+/// Pressure facts of one admission pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Pressure {
+    /// PSI blocks admission (hysteresis state).
+    pub blocking: bool,
+    /// The PSI starvation guard may start the first ranked job.
+    pub guard_due: bool,
+    /// ADR-0011 section 5 conditions 1–3 hold (PSI available with both
+    /// values, not blocking, calm, not just resumed).
+    pub calm: bool,
+    /// Mean idle CPUs over the last two utilisation samples.
+    pub idle_cpus: Option<f64>,
+}
+
+/// A queued job in a [`Snapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedSnap {
+    /// Job id.
+    pub id: String,
+    /// Repository identity.
+    pub repo: PathBuf,
+    /// Fairness lane.
+    pub lane: PathBuf,
+    /// Effective weight.
+    pub weight: u32,
+    /// Priority class.
+    pub class: Class,
+    /// Queue time.
+    pub queued_at: u64,
+    /// Expected run time.
+    pub expected_ms: Option<u64>,
+}
+
+/// A running job in a [`Snapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningSnap {
+    /// Job id.
+    pub id: String,
+    /// Repository identity.
+    pub repo: PathBuf,
+    /// Fairness lane.
+    pub lane: PathBuf,
+    /// Units held.
+    pub weight: u32,
+}
+
+/// Everything one admission decision depends on.
+#[derive(Debug, Clone, Copy)]
+pub struct Snapshot<'a> {
+    /// Unix milliseconds.
+    pub now: u64,
+    /// The policy.
+    pub policy: &'a Policy,
+    /// Pressure facts.
+    pub pressure: Pressure,
+    /// Time of the last over-admission.
+    pub last_overcommit_at: Option<u64>,
+    /// Running jobs.
+    pub running: &'a [RunningSnap],
+    /// Queued jobs (any order).
+    pub queued: &'a [QueuedSnap],
+}
+
+/// One queued job left waiting by a [`Plan`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wait {
+    /// Job id.
+    pub id: String,
+    /// Why it waits.
+    pub cause: WaitCause,
+    /// Detail of [`WaitCause::Order`].
+    pub detail: Option<&'static str>,
+}
+
+/// The decision of one admission pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Plan {
+    /// Jobs to start, in rank order, with how each is admitted.
+    pub start: Vec<(String, Admission)>,
+    /// The overdue head holding a reservation, if any.
+    pub reserved: Option<String>,
+    /// Jobs left waiting, in rank order.
+    pub waits: Vec<Wait>,
+    /// Every queued job id in rank order (before the starts).
+    pub order: Vec<String>,
+}
+
+fn overdue(s: &Snapshot<'_>, j: &QueuedSnap) -> bool {
+    s.now.saturating_sub(j.queued_at) >= s.policy.head_reserve_after_ms
+}
+
+/// Highest response ratio next: `(waited + expected) / expected`.
+#[allow(clippy::cast_precision_loss, reason = "ratios of millisecond counts")]
+fn hrrn(now: u64, j: &QueuedSnap) -> f64 {
+    let expected = j.expected_ms.unwrap_or(DEFAULT_EXPECTED_MS).max(1) as f64;
+    (now.saturating_sub(j.queued_at) as f64 + expected) / expected
+}
+
+/// Per queued job: running jobs of its lane plus its index among its lane's
+/// queued jobs (arrival order).
+fn lane_ranks(s: &Snapshot<'_>) -> Vec<usize> {
+    s.queued
+        .iter()
+        .map(|j| {
+            let running = s.running.iter().filter(|r| r.lane == j.lane).count();
+            let ahead = s
+                .queued
+                .iter()
+                .filter(|o| {
+                    o.lane == j.lane && (o.queued_at, o.id.as_str()) < (j.queued_at, j.id.as_str())
+                })
+                .count();
+            running + ahead
+        })
+        .collect()
+}
+
+fn compare(s: &Snapshot<'_>, lanes: &[usize], a: usize, b: usize) -> Ordering {
+    let (ja, jb) = (&s.queued[a], &s.queued[b]);
+    let p = s.policy;
+    let (oa, ob) = (overdue(s, ja), overdue(s, jb));
+    let arrival = || (ja.queued_at, ja.id.as_str()).cmp(&(jb.queued_at, jb.id.as_str()));
+    match (oa, ob) {
+        // Overdue jobs outrank everything and are FIFO among themselves.
+        (true, true) => return arrival(),
+        (true, false) => return Ordering::Less,
+        (false, true) => return Ordering::Greater,
+        (false, false) => {}
+    }
+    let mut ord = Ordering::Equal;
+    if p.human_first {
+        ord = ord.then(ja.class.cmp(&jb.class));
+    }
+    if p.fairness {
+        ord = ord.then(lanes[a].cmp(&lanes[b]));
+    }
+    if p.order == Order::Sjf {
+        ord = ord.then_with(|| hrrn(s.now, jb).total_cmp(&hrrn(s.now, ja)));
+    }
+    ord.then_with(arrival)
+}
+
+/// Indices of `s.queued` in priority order (ADR-0011 section 6.1).
+pub fn rank(s: &Snapshot<'_>) -> Vec<usize> {
+    let lanes = lane_ranks(s);
+    let mut idx: Vec<usize> = (0..s.queued.len()).collect();
+    idx.sort_by(|&a, &b| compare(s, &lanes, a, b));
+    idx
+}
+
+/// The admission decision of one pass: (1) PSI blocking → only the guard
+/// may start the first ranked job, within the budget; (2) a nominal pass in
+/// rank order with backfill and head reservation; (3) at most one
+/// over-admission (the reserved head, else the first ranked job under the
+/// cap) when the pressure allows it and nothing started nominally.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the three steps of ADR-0011 section 8, in order"
+)]
+pub fn plan(s: &Snapshot<'_>) -> Plan {
+    let p = s.policy;
+    let lanes = lane_ranks(s);
+    let mut order: Vec<usize> = (0..s.queued.len()).collect();
+    order.sort_by(|&a, &b| compare(s, &lanes, a, b));
+    let mut plan = Plan {
+        order: order.iter().map(|&i| s.queued[i].id.clone()).collect(),
+        ..Plan::default()
+    };
+    let mut held: Vec<(&Path, u32)> = s
+        .running
+        .iter()
+        .map(|r| (r.repo.as_path(), r.weight))
+        .collect();
+    let used_of = |held: &[(&Path, u32)]| held.iter().map(|(_, w)| *w).sum::<u32>();
+    let fits_repo = |held: &[(&Path, u32)], j: &QueuedSnap| {
+        p.repo_caps.get(&j.repo).is_none_or(|&cap| {
+            let repo_used: u32 = held
+                .iter()
+                .filter(|(r, _)| *r == j.repo.as_path())
+                .map(|(_, w)| *w)
+                .sum();
+            repo_used + j.weight <= cap
+        })
+    };
+    let used0 = used_of(&held);
+
+    if s.pressure.blocking {
+        for (pos, &i) in order.iter().enumerate() {
+            let j = &s.queued[i];
+            if pos == 0
+                && s.pressure.guard_due
+                && used0 + j.weight <= p.budget
+                && fits_repo(&held, j)
+            {
+                plan.start.push((j.id.clone(), Admission::Guard));
+                continue;
+            }
+            plan.waits.push(Wait {
+                id: j.id.clone(),
+                cause: WaitCause::Psi,
+                detail: None,
+            });
+        }
+        return plan;
+    }
+
+    let mut reserved: Option<usize> = None;
+    let mut first_waiting = true;
+    let mut started: Vec<usize> = Vec::new();
+    for &i in &order {
+        let j = &s.queued[i];
+        let used = used_of(&held);
+        let fits_budget = used + j.weight <= p.budget;
+        let fits_cap = fits_repo(&held, j);
+        if reserved.is_none() && fits_budget && fits_cap {
+            plan.start.push((j.id.clone(), Admission::Nominal));
+            held.push((j.repo.as_path(), j.weight));
+            started.push(i);
+            continue;
+        }
+        // Only a head blocked by the budget reserves: a head blocked by its
+        // repository cap alone must not stop other repositories.
+        if first_waiting && reserved.is_none() && !fits_budget && overdue(s, j) {
+            reserved = Some(i);
+        }
+        first_waiting = false;
+        let (cause, detail) = if !fits_budget {
+            if !started.is_empty() && used0 + j.weight <= p.budget {
+                (WaitCause::Order, Some(order_detail(s, &lanes, &started, i)))
+            } else {
+                (WaitCause::Budget, None)
+            }
+        } else if !fits_cap {
+            (WaitCause::RepoCap, None)
+        } else {
+            (WaitCause::Reserved, None)
+        };
+        plan.waits.push(Wait {
+            id: j.id.clone(),
+            cause,
+            detail,
+        });
+    }
+    plan.reserved = reserved.map(|i| s.queued[i].id.clone());
+
+    let interval_ok = s
+        .last_overcommit_at
+        .is_none_or(|t| s.now.saturating_sub(t) >= p.overcommit_interval_ms);
+    if p.cap > p.budget && plan.start.is_empty() && s.pressure.calm && interval_ok {
+        let used = used_of(&held);
+        let candidate = match reserved {
+            Some(i) => Some(&s.queued[i]),
+            None => plan
+                .waits
+                .iter()
+                .filter_map(|w| s.queued.iter().find(|q| q.id == w.id))
+                .find(|j| used + j.weight <= p.cap && fits_repo(&held, j)),
+        };
+        if let Some(j) = candidate
+            && used + j.weight <= p.cap
+            && fits_repo(&held, j)
+            && s.pressure
+                .idle_cpus
+                .is_some_and(|idle| idle >= f64::from(j.weight.div_ceil(3).max(1)))
+        {
+            plan.start.push((j.id.clone(), Admission::Over));
+            plan.waits.retain(|w| w.id != j.id);
+        }
+    }
+    plan
+}
+
+/// Why a job that fitted the budget before this pass lost its room.
+fn order_detail(s: &Snapshot<'_>, lanes: &[usize], started: &[usize], i: usize) -> &'static str {
+    let j = &s.queued[i];
+    if s.policy.human_first && started.iter().any(|&k| s.queued[k].class < j.class) {
+        "human-first"
+    } else if s.policy.fairness && started.iter().any(|&k| lanes[k] < lanes[i]) {
+        "lane"
+    } else {
+        "outranked"
+    }
+}
+
+/// Learned weight (ADR-0011 M2): `clamp(round_half_up(P75(demand)),
+/// max(1, ceil(w_cfg / 4)), w_cfg)` over the last [`LEARN_WINDOW`] samples,
+/// once there are [`LEARN_AFTER`]; `w_cfg` otherwise.
+pub fn effective_weight(w_cfg: u32, demands_milli: &[u32]) -> u32 {
+    let w_cfg = w_cfg.max(1);
+    let window = &demands_milli[demands_milli.len().saturating_sub(LEARN_WINDOW)..];
+    if window.len() < LEARN_AFTER {
+        return w_cfg;
+    }
+    let mut v = window.to_vec();
+    v.sort_unstable();
+    // Nearest-rank 75th percentile.
+    let p75 = v[(v.len() * 3).div_ceil(4) - 1];
+    let rounded = p75.saturating_add(500) / 1000;
+    rounded.clamp(w_cfg.div_ceil(4).max(1), w_cfg)
+}
+
+/// Expected run time (ADR-0011 M7): the median wall time of the last
+/// [`LEARN_WINDOW`] runs; `None` without history.
+pub fn expected_ms(walls_ms: &[u64]) -> Option<u64> {
+    let window = &walls_ms[walls_ms.len().saturating_sub(LEARN_WINDOW)..];
+    if window.is_empty() {
+        return None;
+    }
+    let mut v = window.to_vec();
+    v.sort_unstable();
+    let n = v.len();
+    Some(if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        v[n / 2 - 1].midpoint(v[n / 2])
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Stateful scheduler
+// ---------------------------------------------------------------------------
 
 /// One job tracked by the scheduler.
 #[derive(Debug, Clone)]
@@ -89,45 +641,107 @@ struct Job {
     subscribers: usize,
     subscribers_max: usize,
     started_at: u64,
+    admission: Option<Admission>,
+    waits: [u64; 5],
+    cause: WaitCause,
+    detail: Option<&'static str>,
+    accounted_at: u64,
 }
 
 impl Job {
     fn new(spec: JobSpec) -> Self {
+        let accounted_at = spec.queued_at;
         Self {
             spec,
             subscribers: 1,
             subscribers_max: 1,
             started_at: 0,
+            admission: None,
+            waits: [0; 5],
+            cause: WaitCause::Budget,
+            detail: None,
+            accounted_at,
+        }
+    }
+
+    /// Adds the time since the last pass to the current cause ("the state
+    /// before the sample decides").
+    fn account(&mut self, now: u64) {
+        let dt = now.saturating_sub(self.accounted_at);
+        self.waits[self.cause.index()] += dt;
+        self.accounted_at = self.accounted_at.max(now);
+    }
+
+    fn queued_snap(&self) -> QueuedSnap {
+        QueuedSnap {
+            id: self.spec.id.clone(),
+            repo: self.spec.repo.clone(),
+            lane: self.spec.lane.clone(),
+            weight: self.spec.weight,
+            class: self.spec.class,
+            queued_at: self.spec.queued_at,
+            expected_ms: self.spec.expected_ms,
+        }
+    }
+
+    fn running_snap(&self) -> RunningSnap {
+        RunningSnap {
+            id: self.spec.id.clone(),
+            repo: self.spec.repo.clone(),
+            lane: self.spec.lane.clone(),
+            weight: self.spec.weight,
         }
     }
 }
 
-/// Budget scheduler with FIFO + backfill + head-of-line reservation.
+/// Budget scheduler: the state that [`plan`] decides over.
 #[derive(Debug)]
 pub struct Scheduler {
-    budget: u32,
-    head_reserve_after_ms: u64,
-    repo_caps: BTreeMap<PathBuf, u32>,
-    queue: VecDeque<Job>,
+    policy: Policy,
+    /// Queued jobs in arrival order.
+    queue: Vec<Job>,
     running: Vec<Job>,
+    last_overcommit_at: Option<u64>,
+    over_admissions: u64,
+    /// `now` of the last pass (orders `position` between passes).
+    last_now: u64,
 }
 
 impl Scheduler {
-    /// Creates a scheduler with `budget` units (clamped to at least 1), the
-    /// head reservation threshold in milliseconds and the per-repository caps.
+    /// Creates an ADR-0007 scheduler (every ADR-0011 switch off) with
+    /// `budget` units (clamped to at least 1), the head reservation threshold
+    /// in milliseconds and the per-repository caps.
     pub fn new(budget: u32, head_reserve_after_ms: u64, repo_caps: BTreeMap<PathBuf, u32>) -> Self {
+        Self::with_policy(Policy::fifo(budget, head_reserve_after_ms, repo_caps))
+    }
+
+    /// Creates a scheduler with an explicit policy.
+    pub fn with_policy(mut policy: Policy) -> Self {
+        policy.budget = policy.budget.max(1);
+        policy.cap = policy.cap.max(policy.budget);
         Self {
-            budget: budget.max(1),
-            head_reserve_after_ms,
-            repo_caps,
-            queue: VecDeque::new(),
+            policy,
+            queue: Vec::new(),
             running: Vec::new(),
+            last_overcommit_at: None,
+            over_admissions: 0,
+            last_now: 0,
         }
+    }
+
+    /// The policy in force.
+    pub fn policy(&self) -> &Policy {
+        &self.policy
     }
 
     /// Total budget units.
     pub fn budget(&self) -> u32 {
-        self.budget
+        self.policy.budget
+    }
+
+    /// Over-admission cap.
+    pub fn cap(&self) -> u32 {
+        self.policy.cap
     }
 
     /// Units held by running jobs.
@@ -135,12 +749,24 @@ impl Scheduler {
         self.running.iter().map(|j| j.spec.weight).sum()
     }
 
-    /// Adds a request. Weight is clamped to `1..=min(budget, repo cap)` (a
-    /// warning is logged once per clamped job). If `spec.key` is
-    /// `Some` and a queued or running job has the same key, the request is
-    /// attached to it (subscribers += 1) and [`Enqueued::Coalesced`] is
-    /// returned. Otherwise the job goes to the back of the queue with one
-    /// subscriber and [`Enqueued::Created`] is returned.
+    /// Jobs started by over-admission so far.
+    pub fn over_admissions(&self) -> u64 {
+        self.over_admissions
+    }
+
+    /// Whether any job is queued.
+    pub fn has_queued(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
+    /// Adds a request. The configured weight is clamped to
+    /// `1..=min(budget, repo cap)` (a warning is logged once per clamped
+    /// job) and becomes `weight_cfg`; with learned weights the effective
+    /// weight is [`effective_weight`] of it. If `spec.key` is `Some` and a
+    /// queued or running job has the same key, the request is attached to it
+    /// (subscribers += 1) and [`Enqueued::Coalesced`] is returned. Otherwise
+    /// the job is queued with one subscriber and [`Enqueued::Created`] is
+    /// returned.
     pub fn enqueue(&mut self, mut spec: JobSpec) -> Enqueued {
         if let Some(key) = &spec.key
             && let Some(id) = self.find_by_key(key).map(str::to_owned)
@@ -160,70 +786,121 @@ impl Scheduler {
                 repo = %spec.repo.display(),
                 weight = spec.weight,
                 clamped_to = max,
-                budget = self.budget,
+                budget = self.policy.budget,
                 "gate weight exceeds the budget or the repository cap; clamped"
             );
         }
-        spec.weight = spec.weight.clamp(1, max);
-        self.queue.push_back(Job::new(spec));
+        spec.weight_cfg = spec.weight.clamp(1, max);
+        spec.weight = if self.policy.learned_weights {
+            effective_weight(spec.weight_cfg, &spec.demands_milli)
+        } else {
+            spec.weight_cfg
+        };
+        self.queue.push(Job::new(spec));
         Enqueued::Created {
             position: self.queue.len(),
         }
     }
 
-    /// Runs the admission loop (oldest first). A job fits when
-    /// `used + weight <= budget`, its repository cap holds and PSI is not
-    /// blocking. Lighter jobs behind the head backfill while the head has
-    /// waited less than `head_reserve_after`; after that nothing behind the
-    /// head starts until it fits. Returns the ids moved to running, in queue
-    /// order, with `started_at = now`.
+    fn snaps(&self) -> (Vec<RunningSnap>, Vec<QueuedSnap>) {
+        (
+            self.running.iter().map(Job::running_snap).collect(),
+            self.queue.iter().map(Job::queued_snap).collect(),
+        )
+    }
+
+    fn plan_at(&self, now: u64, pressure: Pressure) -> Plan {
+        let (running, queued) = self.snaps();
+        plan(&Snapshot {
+            now,
+            policy: &self.policy,
+            pressure,
+            last_overcommit_at: self.last_overcommit_at,
+            running: &running,
+            queued: &queued,
+        })
+    }
+
+    /// ADR-0007 admission pass: within the budget only, PSI gating as a
+    /// boolean. Returns the ids moved to running, in rank order.
     pub fn admit(&mut self, now: u64, psi_blocking: bool) -> Vec<String> {
-        let mut started = Vec::new();
-        if psi_blocking {
-            return started;
-        }
-        let mut remaining = VecDeque::with_capacity(self.queue.len());
-        let mut reserved = false;
-        while let Some(mut job) = self.queue.pop_front() {
-            let is_head = remaining.is_empty();
-            if reserved {
-                remaining.push_back(job);
-                continue;
-            }
-            if self.fits_budget(&job) && self.fits_repo_cap(&job) {
-                job.started_at = now;
-                started.push(job.spec.id.clone());
-                self.running.push(job);
-                continue;
-            }
-            // Only a head blocked by the budget reserves: a head blocked by its
-            // repository cap alone must not stop other repositories.
-            if is_head && !self.fits_budget(&job) && self.head_waited_too_long(&job, now) {
-                reserved = true;
-            }
-            remaining.push_back(job);
-        }
-        self.queue = remaining;
-        started
+        self.admit_with(
+            now,
+            Pressure {
+                blocking: psi_blocking,
+                ..Pressure::default()
+            },
+        )
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
     }
 
-    /// Queue time of the queue head, if any.
+    /// One admission pass: accounts the elapsed wait of every queued job to
+    /// its previous cause, applies [`plan`] and records the new causes.
+    /// Returns the started ids, in rank order, with how each was admitted
+    /// (`started_at = now`).
+    pub fn admit_with(&mut self, now: u64, pressure: Pressure) -> Vec<(String, Admission)> {
+        self.last_now = now;
+        for job in &mut self.queue {
+            job.account(now);
+        }
+        let plan = self.plan_at(now, pressure);
+        for (id, admission) in &plan.start {
+            let Some(idx) = self.queue.iter().position(|j| &j.spec.id == id) else {
+                continue;
+            };
+            let mut job = self.queue.remove(idx);
+            job.started_at = now;
+            job.admission = Some(*admission);
+            if *admission == Admission::Over {
+                self.last_overcommit_at = Some(now);
+                self.over_admissions += 1;
+            }
+            self.running.push(job);
+        }
+        for wait in &plan.waits {
+            if let Some(job) = self.queue.iter_mut().find(|j| j.spec.id == wait.id) {
+                job.cause = wait.cause;
+                job.detail = wait.detail;
+            }
+        }
+        plan.start
+    }
+
+    /// The first ranked queued job at `now`: `(id, queued_at)`.
+    pub fn head(&self, now: u64) -> Option<(String, u64)> {
+        let (running, queued) = self.snaps();
+        let s = Snapshot {
+            now,
+            policy: &self.policy,
+            pressure: Pressure::default(),
+            last_overcommit_at: self.last_overcommit_at,
+            running: &running,
+            queued: &queued,
+        };
+        rank(&s)
+            .first()
+            .map(|&i| (queued[i].id.clone(), queued[i].queued_at))
+    }
+
+    /// Queue time of the first ranked job (as of the last pass), if any.
     pub fn head_queued_at(&self) -> Option<u64> {
-        self.queue.front().map(|j| j.spec.queued_at)
+        self.head(self.last_now).map(|(_, t)| t)
     }
 
-    /// Starts the queue head alone, ignoring PSI (the starvation guard), when
-    /// it fits the budget and its repository cap; returns its id.
+    /// Starts the first ranked job alone, ignoring PSI (the starvation
+    /// guard), when it fits the budget and its repository cap; returns its id.
     pub fn admit_head(&mut self, now: u64) -> Option<String> {
-        let head = self.queue.front()?;
-        if !(self.fits_budget(head) && self.fits_repo_cap(head)) {
-            return None;
-        }
-        let mut job = self.queue.pop_front()?;
-        job.started_at = now;
-        let id = job.spec.id.clone();
-        self.running.push(job);
-        Some(id)
+        let started = self.admit_with(
+            now,
+            Pressure {
+                blocking: true,
+                guard_due: true,
+                ..Pressure::default()
+            },
+        );
+        started.into_iter().next().map(|(id, _)| id)
     }
 
     /// Removes a running job and returns its spec; `None` if not running.
@@ -235,7 +912,25 @@ impl Scheduler {
     /// Removes a queued job (cancelled before start); `None` if not queued.
     pub fn remove_queued(&mut self, id: &str) -> Option<JobSpec> {
         let idx = self.queue.iter().position(|j| j.spec.id == id)?;
-        self.queue.remove(idx).map(|j| j.spec)
+        Some(self.queue.remove(idx).spec)
+    }
+
+    /// Scheduling facts of a queued or running job; the wait of a queued
+    /// job includes the time since the last pass.
+    pub fn record(&self, id: &str, now: u64) -> Option<JobRecord> {
+        let job = self.job(id)?;
+        let mut job = job.clone();
+        if job.admission.is_none() {
+            job.account(now);
+        }
+        Some(JobRecord {
+            weight_cfg: job.spec.weight_cfg,
+            weight: job.spec.weight,
+            admitted_at: job.admission.map(|_| job.started_at),
+            admission: job.admission,
+            waits: job.waits,
+            expected_ms: job.spec.expected_ms,
+        })
     }
 
     /// Adds a subscriber to a queued or running job; returns the new count.
@@ -264,12 +959,25 @@ impl Scheduler {
         self.job(id).map(|j| j.subscribers_max)
     }
 
-    /// 1-based position in the queue; `None` if running or unknown.
+    /// 1-based position in the priority order (as of the last pass); `None`
+    /// if running or unknown.
     pub fn position(&self, id: &str) -> Option<usize> {
-        self.queue
+        if !self.is_queued(id) {
+            return None;
+        }
+        let (running, queued) = self.snaps();
+        let s = Snapshot {
+            now: self.last_now,
+            policy: &self.policy,
+            pressure: Pressure::default(),
+            last_overcommit_at: self.last_overcommit_at,
+            running: &running,
+            queued: &queued,
+        };
+        rank(&s)
             .iter()
-            .position(|j| j.spec.id == id)
-            .map(|i| i + 1)
+            .position(|&i| queued[i].id == id)
+            .map(|p| p + 1)
     }
 
     /// Whether the job is running.
@@ -292,9 +1000,11 @@ impl Scheduler {
     }
 
     /// Views for `status`: running jobs ordered by `started_at` and queued
-    /// jobs in queue order, each with the reason it is waiting: `Psi` when PSI
-    /// blocks, `RepoCap` when only the repository cap blocks it,
-    /// `HeadReserved` when only the reservation blocks it, `Budget` otherwise.
+    /// jobs in rank order, each with the reason it would wait in a pass at
+    /// `now`: `Psi` when PSI blocks, `RepoCap` when only the repository cap
+    /// blocks it, `HeadReserved` when only the reservation blocks it,
+    /// `Budget` otherwise (including jobs outranked by the jobs ahead, and
+    /// jobs the next pass will start).
     pub fn snapshot(&self, now: u64, psi_blocking: bool) -> (Vec<RunningView>, Vec<QueuedView>) {
         let mut running: Vec<RunningView> = self
             .running
@@ -304,41 +1014,45 @@ impl Scheduler {
                 repo: j.spec.repo.clone(),
                 gate: j.spec.gate.clone(),
                 weight: j.spec.weight,
+                weight_cfg: j.spec.weight_cfg,
                 started_at: j.started_at,
+                queued_at: j.spec.queued_at,
                 subscribers: j.subscribers,
+                admission: j.admission.unwrap_or(Admission::Nominal),
             })
             .collect();
         running.sort_by_key(|v| v.started_at);
 
-        let reserved = self
-            .queue
-            .front()
-            .is_some_and(|head| !self.fits_budget(head) && self.head_waited_too_long(head, now));
-        let queued = self
-            .queue
+        let plan = self.plan_at(
+            now,
+            Pressure {
+                blocking: psi_blocking,
+                ..Pressure::default()
+            },
+        );
+        let queued = plan
+            .order
             .iter()
             .enumerate()
-            .map(|(i, j)| {
-                let reason = if psi_blocking {
-                    WaitReason::Psi
-                } else if !self.fits_budget(j) {
-                    WaitReason::Budget
-                } else if !self.fits_repo_cap(j) {
-                    WaitReason::RepoCap
-                } else if reserved && i > 0 {
-                    WaitReason::HeadReserved
-                } else {
-                    WaitReason::Budget
-                };
-                QueuedView {
+            .filter_map(|(pos, id)| {
+                let j = self.queue.iter().find(|j| &j.spec.id == id)?;
+                let wait = plan.waits.iter().find(|w| &w.id == id);
+                let cause = wait.map_or(WaitCause::Budget, |w| w.cause);
+                Some(QueuedView {
                     id: j.spec.id.clone(),
                     repo: j.spec.repo.clone(),
+                    lane: j.spec.lane.clone(),
                     gate: j.spec.gate.clone(),
                     weight: j.spec.weight,
+                    weight_cfg: j.spec.weight_cfg,
                     queued_at: j.spec.queued_at,
                     subscribers: j.subscribers,
-                    reason,
-                }
+                    reason: cause.reason(),
+                    cause,
+                    detail: wait.and_then(|w| w.detail),
+                    rank: pos + 1,
+                    expected_ms: j.spec.expected_ms,
+                })
             })
             .collect();
         (running, queued)
@@ -365,270 +1079,14 @@ impl Scheduler {
 
     /// Largest weight a job of `repo` can ever hold: the budget, or the
     /// repository cap when lower (at least 1).
-    fn max_weight(&self, repo: &std::path::Path) -> u32 {
-        self.repo_caps
+    fn max_weight(&self, repo: &Path) -> u32 {
+        self.policy
+            .repo_caps
             .get(repo)
-            .map_or(self.budget, |&cap| cap.min(self.budget))
+            .map_or(self.policy.budget, |&cap| cap.min(self.policy.budget))
             .max(1)
-    }
-
-    fn fits_budget(&self, job: &Job) -> bool {
-        self.used() + job.spec.weight <= self.budget
-    }
-
-    fn fits_repo_cap(&self, job: &Job) -> bool {
-        let Some(&cap) = self.repo_caps.get(&job.spec.repo) else {
-            return true;
-        };
-        let repo_used: u32 = self
-            .running
-            .iter()
-            .filter(|j| j.spec.repo == job.spec.repo)
-            .map(|j| j.spec.weight)
-            .sum();
-        repo_used + job.spec.weight <= cap
-    }
-
-    fn head_waited_too_long(&self, head: &Job, now: u64) -> bool {
-        now.saturating_sub(head.spec.queued_at) >= self.head_reserve_after_ms
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const RESERVE: u64 = 30_000;
-
-    fn key(c: char) -> CacheKey {
-        CacheKey::try_from(c.to_string().repeat(64)).unwrap()
-    }
-
-    fn spec(id: &str, key: Option<CacheKey>, repo: &str, weight: u32, queued_at: u64) -> JobSpec {
-        JobSpec {
-            id: id.into(),
-            key,
-            repo: PathBuf::from(repo),
-            gate: "test".into(),
-            weight,
-            queued_at,
-        }
-    }
-
-    fn sched(budget: u32) -> Scheduler {
-        Scheduler::new(budget, RESERVE, BTreeMap::new())
-    }
-
-    #[test]
-    fn same_key_coalesces() {
-        let mut s = sched(8);
-        assert_eq!(
-            s.enqueue(spec("j0", Some(key('a')), "/r", 1, 0)),
-            Enqueued::Created { position: 1 }
-        );
-        for i in 1..6 {
-            assert_eq!(
-                s.enqueue(spec(&format!("j{i}"), Some(key('a')), "/r", 1, 0)),
-                Enqueued::Coalesced {
-                    job_id: "j0".into(),
-                    position: Some(1)
-                }
-            );
-        }
-        assert_eq!(s.subscribers("j0"), Some(6));
-        assert_eq!(s.subscribers_max("j0"), Some(6));
-        assert_eq!(s.find_by_key(&key('a')), Some("j0"));
-        assert!(!s.is_queued("j1"));
-    }
-
-    #[test]
-    fn budget_limits_concurrency() {
-        let mut s = sched(8);
-        for (i, c) in ['a', 'b', 'c', 'd'].into_iter().enumerate() {
-            s.enqueue(spec(&format!("j{i}"), Some(key(c)), "/r", 4, 0));
-        }
-        assert_eq!(s.admit(0, false), vec!["j0", "j1"]);
-        assert_eq!(s.used(), 8);
-        assert_eq!(s.admit(1, false), Vec::<String>::new());
-        assert!(s.finish("j0").is_some());
-        assert_eq!(s.used(), 4);
-        assert_eq!(s.admit(2, false), vec!["j2"]);
-        assert_eq!(s.used(), 8);
-        assert!(s.is_queued("j3"));
-    }
-
-    #[test]
-    fn backfill_then_reservation() {
-        let mut s = sched(8);
-        s.enqueue(spec("r", None, "/r", 4, 0));
-        assert_eq!(s.admit(0, false), vec!["r"]);
-        s.enqueue(spec("head", None, "/r", 6, 0));
-        s.enqueue(spec("l1", None, "/r", 1, 500));
-        s.enqueue(spec("l2", None, "/r", 1, 600));
-        assert_eq!(s.admit(1_000, false), vec!["l1", "l2"]);
-        assert_eq!(s.used(), 6);
-
-        s.enqueue(spec("l3", None, "/r", 1, 31_000));
-        assert_eq!(s.admit(31_000, false), Vec::<String>::new());
-        let (_, queued) = s.snapshot(31_000, false);
-        assert_eq!(queued[0].id, "head");
-        assert_eq!(queued[0].reason, WaitReason::Budget);
-        assert_eq!(queued[1].id, "l3");
-        assert_eq!(queued[1].reason, WaitReason::HeadReserved);
-
-        for id in ["r", "l1", "l2"] {
-            assert!(s.finish(id).is_some());
-        }
-        assert_eq!(s.admit(32_000, false), vec!["head", "l3"]);
-        assert_eq!(s.used(), 7);
-    }
-
-    #[test]
-    fn repo_cap_blocks_only_that_repo() {
-        let caps = BTreeMap::from([(PathBuf::from("/a"), 2)]);
-        let mut s = Scheduler::new(8, RESERVE, caps);
-        s.enqueue(spec("a1", None, "/a", 1, 0));
-        s.enqueue(spec("a2", None, "/a", 1, 0));
-        s.enqueue(spec("a3", None, "/a", 1, 0));
-        s.enqueue(spec("b1", None, "/b", 1, 0));
-        assert_eq!(s.admit(10, false), vec!["a1", "a2", "b1"]);
-        let (_, queued) = s.snapshot(10, false);
-        assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].id, "a3");
-        assert_eq!(queued[0].reason, WaitReason::RepoCap);
-    }
-
-    #[test]
-    fn weight_is_clamped_to_repo_cap() {
-        let caps = BTreeMap::from([(PathBuf::from("/a"), 2)]);
-        let mut s = Scheduler::new(8, RESERVE, caps);
-        s.enqueue(spec("heavy", None, "/a", 5, 0));
-        assert_eq!(s.spec("heavy").unwrap().weight, 2);
-        assert_eq!(s.admit(0, false), vec!["heavy"]);
-        assert_eq!(s.used(), 2);
-    }
-
-    #[test]
-    fn cap_blocked_head_does_not_reserve() {
-        let caps = BTreeMap::from([(PathBuf::from("/a"), 2)]);
-        let mut s = Scheduler::new(8, RESERVE, caps);
-        s.enqueue(spec("a1", None, "/a", 2, 0));
-        assert_eq!(s.admit(0, false), vec!["a1"]);
-        s.enqueue(spec("a2", None, "/a", 2, 0));
-        s.enqueue(spec("b1", None, "/b", 1, 40_000));
-        // The head (a2) has waited past head_reserve_after but is blocked only
-        // by its repository cap: b1 still starts.
-        assert_eq!(s.admit(40_000, false), vec!["b1"]);
-        let (_, queued) = s.snapshot(40_000, false);
-        assert_eq!(queued[0].id, "a2");
-        assert_eq!(queued[0].reason, WaitReason::RepoCap);
-        s.enqueue(spec("b2", None, "/b", 1, 40_001));
-        let (_, queued) = s.snapshot(40_001, false);
-        assert_eq!(queued[1].reason, WaitReason::Budget);
-    }
-
-    #[test]
-    fn psi_blocks_everything() {
-        let mut s = sched(8);
-        s.enqueue(spec("j0", None, "/r", 1, 0));
-        s.enqueue(spec("j1", None, "/r", 1, 0));
-        assert_eq!(s.admit(0, true), Vec::<String>::new());
-        let (running, queued) = s.snapshot(0, true);
-        assert_eq!(running, Vec::new());
-        assert!(queued.iter().all(|q| q.reason == WaitReason::Psi));
-        assert_eq!(s.admit(1, false), vec!["j0", "j1"]);
-    }
-
-    #[test]
-    fn admit_head_only_when_it_fits() {
-        let mut s = sched(4);
-        assert_eq!(s.head_queued_at(), None);
-        assert_eq!(s.admit_head(0), None);
-        s.enqueue(spec("big", None, "/r", 3, 5));
-        s.enqueue(spec("small", None, "/r", 1, 6));
-        s.enqueue(spec("next", None, "/r", 3, 7));
-        assert_eq!(s.head_queued_at(), Some(5));
-        assert_eq!(s.admit_head(10).as_deref(), Some("big"));
-        assert!(s.is_running("big") && s.is_queued("small"));
-        assert_eq!(s.admit_head(11).as_deref(), Some("small"));
-        assert_eq!(s.admit_head(12), None, "next does not fit the budget");
-        assert_eq!(s.head_queued_at(), Some(7));
-    }
-
-    #[test]
-    fn weight_is_clamped() {
-        let mut s = sched(8);
-        s.enqueue(spec("big", None, "/r", 50, 0));
-        s.enqueue(spec("small", None, "/r", 1, 0));
-        s.enqueue(spec("zero", None, "/r", 0, 0));
-        assert_eq!(s.spec("big").unwrap().weight, 8);
-        assert_eq!(s.spec("zero").unwrap().weight, 1);
-        assert_eq!(s.admit(0, false), vec!["big"]);
-        assert_eq!(s.used(), 8);
-        assert_eq!(Scheduler::new(0, RESERVE, BTreeMap::new()).budget(), 1);
-    }
-
-    #[test]
-    fn unknown_ids_and_unsubscribe() {
-        let mut s = sched(8);
-        assert!(s.remove_queued("nope").is_none());
-        assert!(s.finish("nope").is_none());
-        assert!(s.subscribe("nope").is_none());
-        assert!(s.unsubscribe("nope").is_none());
-        s.enqueue(spec("j0", None, "/r", 1, 0));
-        assert!(s.finish("j0").is_none(), "queued, not running");
-        assert_eq!(s.subscribe("j0"), Some(2));
-        assert_eq!(s.unsubscribe("j0"), Some(1));
-        assert_eq!(s.unsubscribe("j0"), Some(0));
-        assert_eq!(s.subscribers_max("j0"), Some(2));
-        assert_eq!(s.remove_queued("j0").map(|j| j.id), Some("j0".into()));
-        assert!(!s.is_queued("j0"));
-    }
-
-    #[test]
-    fn coalesce_onto_running_and_null_key() {
-        let mut s = sched(8);
-        s.enqueue(spec("j0", Some(key('a')), "/r", 1, 0));
-        s.admit(5, false);
-        assert!(s.is_running("j0"));
-        assert_eq!(
-            s.enqueue(spec("j1", Some(key('a')), "/other", 1, 6)),
-            Enqueued::Coalesced {
-                job_id: "j0".into(),
-                position: None
-            }
-        );
-        assert_eq!(s.subscribers("j0"), Some(2));
-        assert_eq!(
-            s.enqueue(spec("n1", None, "/r", 8, 0)),
-            Enqueued::Created { position: 1 }
-        );
-        assert_eq!(
-            s.enqueue(spec("n2", None, "/r", 8, 0)),
-            Enqueued::Created { position: 2 }
-        );
-        assert!(s.finish("j0").is_some());
-        assert!(s.find_by_key(&key('a')).is_none());
-    }
-
-    #[test]
-    fn snapshot_order_and_positions() {
-        let mut s = sched(2);
-        for (i, id) in ["x", "y", "z", "w"].into_iter().enumerate() {
-            s.enqueue(spec(id, None, "/r", 1, i as u64));
-        }
-        assert_eq!(s.admit(10, false), vec!["x", "y"]);
-        let (running, queued) = s.snapshot(10, false);
-        assert_eq!(
-            running.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
-            ["x", "y"]
-        );
-        assert!(running.iter().all(|r| r.started_at == 10));
-        let ids: Vec<&str> = queued.iter().map(|q| q.id.as_str()).collect();
-        assert_eq!(ids, ["z", "w"]);
-        assert_eq!(s.position("z"), Some(1));
-        assert_eq!(s.position("w"), Some(2));
-        assert_eq!(s.position("x"), None);
-        assert!(queued.iter().all(|q| q.reason == WaitReason::Budget));
-    }
-}
+mod tests;

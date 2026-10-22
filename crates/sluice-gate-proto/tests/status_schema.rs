@@ -33,6 +33,7 @@ fn report() -> StatusReport {
                 memory_some_avg10: Some(0.5),
                 blocking: false,
             },
+            ..BudgetInfo::default()
         },
         running: vec![RunningJob {
             job_id: "j-run".into(),
@@ -45,6 +46,7 @@ fn report() -> StatusReport {
             caller: Caller::Agent,
             kind: None,
             label: None,
+            ..RunningJob::default()
         }],
         queued: vec![QueuedJob {
             job_id: "j-queued".into(),
@@ -57,6 +59,7 @@ fn report() -> StatusReport {
             reason: WaitReason::Psi,
             kind: None,
             label: None,
+            ..QueuedJob::default()
         }],
         totals: Totals {
             since: "2026-10-01T00:00:00Z".into(),
@@ -70,6 +73,7 @@ fn report() -> StatusReport {
             run_ms_total: 900_000,
             time_saved_ms: 3_600_000,
             psi_blocked_ms_total: 42_000,
+            ..Totals::default()
         },
         queue: None,
     }
@@ -156,4 +160,61 @@ fn log_level_is_an_additive_optional_field() {
     let back: StatusReport =
         serde_json::from_value(serde_json::to_value(&with_level).unwrap()).unwrap();
     assert_eq!(back, with_level);
+}
+
+/// ADR-0011 (B1, L1): every scheduler field is optional and additive.
+#[test]
+fn scheduler_fields_are_additive_optional_fields() {
+    let mut with = report();
+    with.budget.cap = Some(12);
+    with.budget.cpus = Some(8);
+    with.budget.idle_cpus = Some(2.5);
+    with.running[0].weight_cfg = Some(8);
+    with.running[0].waited_ms = Some(31_000);
+    with.running[0].admission = Some("over".into());
+    with.running[0].demand = Some(6.1);
+    with.queued[0].lane = Some("/abs/wt".into());
+    with.queued[0].rank = Some(1);
+    with.queued[0].expected_ms = Some(12_000);
+    with.queued[0].weight_cfg = Some(1);
+    with.queued[0].wait_detail = Some("outranked".into());
+    with.totals.idle_while_waiting_ms = Some(900);
+    with.totals.waiting_wall_ms = Some(10_000);
+    with.totals.over_admissions = Some(3);
+    let mut actual = serde_json::to_value(&with).unwrap();
+    for (obj, keys) in [
+        ("budget", &["cap", "cpus", "idle_cpus"][..]),
+        (
+            "totals",
+            &[
+                "idle_while_waiting_ms",
+                "waiting_wall_ms",
+                "over_admissions",
+            ][..],
+        ),
+    ] {
+        let o = actual[obj].as_object_mut().unwrap();
+        for k in keys {
+            assert!(o.remove(*k).is_some(), "{obj}.{k}");
+        }
+    }
+    for (list, keys) in [
+        (
+            "running",
+            &["weight_cfg", "waited_ms", "admission", "demand"][..],
+        ),
+        (
+            "queued",
+            &["lane", "rank", "expected_ms", "weight_cfg", "wait_detail"][..],
+        ),
+    ] {
+        let o = actual[list][0].as_object_mut().unwrap();
+        for k in keys {
+            assert!(o.remove(*k).is_some(), "{list}.{k}");
+        }
+    }
+    let expected: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+    assert_eq!(actual, expected);
+    let back: StatusReport = serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
+    assert_eq!(back, with);
 }

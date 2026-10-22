@@ -481,7 +481,7 @@ Options:
 
 ### `sluice logs`
 
-Show the log of a job.
+Show the log of a job, or with `--timeline` the scheduler timeline of recent jobs.
 
 <details>
 <summary>Full help</summary>
@@ -495,8 +495,10 @@ Arguments:
   [JOB_ID]  Job id; defaults to the most recent job
 
 Options:
-  -n, --lines <LINES>  Only print the last N lines
-  -h, --help           Print help
+  -n, --lines <LINES>     Only print the last N lines
+      --timeline          Print the scheduler timeline instead of the log: one line per job (requested, queued, admitted, started, finished, wait reasons, demand, requesters)
+      --since <DURATION>  With --timeline and no job id: the jobs queued within this period [default: 10m]
+  -h, --help              Print help
 ```
 
 </details>

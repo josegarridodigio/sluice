@@ -1,9 +1,11 @@
 //! The Sluice daemon: one per user, listening on a Unix socket.
 //!
 //! Modules:
-//! - [`store`]: SQLite persistence (jobs, lease, events, totals).
+//! - [`store`]: SQLite persistence (jobs, lease, events, totals, timeline).
+//! - [`migrate`]: numbered, transactional, additive database migrations.
 //! - [`scheduler`]: pure admission logic (budget, backfill, reservation, coalescing).
 //! - [`psi`]: pressure stall information sampling and the PSI admission gate.
+//! - [`sampler`]: CPU utilisation (`/proc/stat`) and per-job demand (`schedstat`).
 //! - [`executor`]: runs one gate in a process group with log capture and timeout.
 //! - [`reaper`]: companion process that kills the gate groups when the daemon dies.
 //! - [`server`]: socket listener, protocol handling, subscribers, lifecycle.
@@ -13,8 +15,10 @@
 
 pub mod executor;
 mod meta;
+pub mod migrate;
 pub mod psi;
 pub mod reaper;
+pub mod sampler;
 pub mod scheduler;
 pub mod server;
 pub mod store;
@@ -46,6 +50,24 @@ pub enum Error {
         /// Version found.
         found: u32,
         /// Version required.
+        expected: u32,
+    },
+    /// A versioned group of additive tables (`sched_schema`) is newer than
+    /// this build.
+    #[error(
+        "database {path}: {table} {found} is newer than this build (expects {expected}, \
+         written by {writer}); update sluice or restore the `.bak-*` copy next to the database"
+    )]
+    NewerSchema {
+        /// Version table (`sched_schema`).
+        table: &'static str,
+        /// Release that last opened the database.
+        writer: String,
+        /// Database file.
+        path: std::path::PathBuf,
+        /// Version found.
+        found: u32,
+        /// Highest version this build knows.
         expected: u32,
     },
     /// Another daemon holds the lock.

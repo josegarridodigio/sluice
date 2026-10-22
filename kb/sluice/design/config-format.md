@@ -129,7 +129,7 @@ Rules:
 version = 1
 
 [daemon]
-budget = 8                 # default: max(2, cpu_count - 1)
+budget = 8                 # default: max(2, available CPUs: affinity mask and cgroup limit); 0.2.0: max(2, cpus - 1)
 nice = 10                  # 0..19; applied to gate processes
 ionice_class = "best-effort"   # none | best-effort | idle
 ionice_level = 7
@@ -149,9 +149,14 @@ cpu_some_avg10_max = 60.0  # percent; do not admit new jobs above this
 memory_some_avg10_max = 20.0
 psi_poll_interval = "1s"
 psi_max_wait = "5m"        # while PSI blocks, admit the queue head once it has waited this long (must be > 0)
+overcommit = 1.5           # 0.3.0, ADR-0011 M3: over-admission cap = floor(overcommit * budget); 1.0 disables; 1.0..=4.0
+cpu_some_avg10_low = 25.0  # over-admit only below this CPU some avg10 (percent)
+memory_some_avg10_low = 5.0  # ... and below this memory some avg10 (percent)
+overcommit_interval = "5s" # at most one over-admission per interval, none sooner after a PSI resume (must be > 0)
 
 [mcp]
 progress_interval = "15s"  # progress notifications while verify runs (floored at 1s, re-read per call)
+verify_parallel = true     # 0.3.0, ADR-0011 M4: verify runs its gates concurrently (false: sequential, 0.2.0 behaviour)
 
 [debug]
 level = "info"             # log filter (RUST_LOG syntax) of the daemon, `sluice mcp` and `sluice run`; SLUICE_LOG wins
@@ -162,7 +167,11 @@ ttl_days = 30
 tail_lines = 40
 
 [scheduler]
-head_reserve_after = "30s" # backfill behind the queue head only this long (ADR-0007)
+head_reserve_after = "30s" # backfill behind the queue head only this long (ADR-0007); also the ageing bound (ADR-0011)
+learned_weights = true     # 0.3.0, ADR-0011 M2: gates hold P75 of their measured demand after 3 runs, in [ceil(w/4), w]
+fairness = "lane"          # 0.3.0, ADR-0011 M5: lane (worktrees take turns) | off
+human_first = true         # 0.3.0, ADR-0011 M6: human-waited jobs before agent jobs
+order = "fifo"             # 0.3.0, ADR-0011 M7: fifo | sjf (shortest expected job first with ageing)
 
 [agent_detection]
 env_any_set = ["CLAUDECODE"]      # any of these set and non-empty => agent (SLUICE_AGENT is the override, see below)
@@ -202,8 +211,11 @@ through to the `CI` rule.
 User config notes: every section and field is optional (a missing file
 means defaults); unknown fields are errors; validation: `daemon.budget >= 1`,
 `daemon.nice <= 19`, `daemon.ionice_level <= 7`, `admission.psi_poll_interval > 0`,
-`admission.psi_max_wait > 0`, `admission.cpu_some_avg10_max` and
-`memory_some_avg10_max` in `[0, 100]`, `budget_share_max >= 1`, `debug.level` a valid
+`admission.psi_max_wait > 0`, `admission.cpu_some_avg10_max`,
+`memory_some_avg10_max`, `cpu_some_avg10_low` and `memory_some_avg10_low` in
+`[0, 100]`, `admission.overcommit` in `[1.0, 4.0]`,
+`admission.overcommit_interval > 0`, `scheduler.fairness` one of `lane`/`off`,
+`scheduler.order` one of `fifo`/`sjf`, `budget_share_max >= 1`, `debug.level` a valid
 `EnvFilter` directive (`info`, `debug`, `sluice_gate_daemon=debug,info`; the error names the
 file and the value). `sluice daemon restart [--debug]` applies a changed `[debug]` section;
 `--debug` forces `debug` for that daemon instance only. `daemon.idle_exit` (always "never" in v1) is parsed but has
@@ -228,7 +240,15 @@ changes); the client and the MCP server re-read the file per call (so
 daemon's own start-time check, and the CLI and MCP take `queue.tick` live to
 bound their wait for a landing). Everything else is live
 (`log_retention_days` prunes job logs daily from the daemon;
-`mcp.progress_interval` paces `verify`'s progress notifications).
+`mcp.progress_interval` paces `verify`'s progress notifications and
+`mcp.verify_parallel` is read per `verify` call). The ADR-0011 switches
+(`scheduler.learned_weights`, `fairness`, `human_first`, `order`,
+`admission.overcommit` and its three companions, `mcp.verify_parallel`)
+each turn one mechanism on or off so the tuning loop (L3) can measure them
+one at a time on the same binary; the v0.2.0 policy is `budget = cpus - 1`,
+`learned_weights = false`, `overcommit = 1.0`, `verify_parallel = false`,
+`fairness = "off"`, `human_first = false`, `order = "fifo"`. Releases up to
+0.2.0 reject these keys (unknown fields).
 
 ## Path scoping (`paths`, `paths_ignore`)
 

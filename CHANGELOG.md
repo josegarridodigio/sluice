@@ -59,6 +59,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Scheduler throughput (ADR-0011): the default budget is the number of
+  available CPUs (affinity and cgroup limits honoured); gates learn their
+  real CPU demand and are admitted with it; PSI-driven over-admission up to
+  1.5x the budget when the machine has idle CPUs; MCP `verify` runs its
+  gates concurrently and stops at the first failure (`fail_fast`); jobs are
+  shared fairly between worktrees, humans first, with optional
+  shortest-job-first. Every mechanism has a config switch.
+- A per-job scheduler timeline and `idle_while_waiting_ms` in
+  `status --json`, `verify` results and `sluice logs --timeline`.
+- The daemon database gains additive, transactional migrations with a
+  backup copy before migrating; 0.2.0 binaries still open the migrated
+  file.
 - The README is short and current (no development phases, no pinned
   release numbers); the details moved to `docs/how-it-works.md`,
   `docs/cli.md` (generated from `--help`) and `docs/configuration.md`.

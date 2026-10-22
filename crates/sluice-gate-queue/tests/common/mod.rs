@@ -288,6 +288,7 @@ pub fn daemon_config_with(
             ..AdmissionConfig::default()
         },
         psi_root: state.join("pressure"),
+        proc_root: std::path::PathBuf::from("/proc"),
         user,
         log: sluice_gate_daemon::server::LogSettings::default(),
         extensions: vec![Arc::new(QueueExtension::new(QueueOptions {

@@ -110,6 +110,7 @@ fn config(dir: &Path, budget: u32, policy: LastSubscriberGone) -> DaemonConfig {
             ..AdmissionConfig::default()
         },
         psi_root: dir.join("pressure"),
+        proc_root: std::path::PathBuf::from("/proc"),
         user: server::UserConfig::default(),
         log: sluice_gate_daemon::server::LogSettings::default(),
         extensions: Vec::new(),
@@ -208,6 +209,7 @@ fn run_msg(
             client_pid: std::process::id(),
             hook: None,
             no_marker: false,
+            requested_at: None,
         },
     }
 }
@@ -425,7 +427,13 @@ async fn exec_runs_an_argv_into_a_spool_with_sluice_job_set() {
     let Some(ServerMessage::Log { lines, .. }) = next(&mut r).await else {
         panic!("no log");
     };
-    assert_eq!(lines.concat(), format!("out{job_id}"));
+    // stdout and stderr are separate streams: their relative arrival order
+    // is not defined, only the content of each one.
+    let joined = lines.concat();
+    assert!(
+        joined == format!("out{job_id}") || joined == format!("{job_id}out"),
+        "{joined:?}"
+    );
     // A signal outside an exec connection is refused.
     let (_w, mut r) = d
         .request(&ClientMessage::Signal {
@@ -1378,5 +1386,219 @@ async fn psi_unavailable_falls_back_to_the_budget() {
         .request(&run_msg(&repo, "free", "true", None, None, 0))
         .await;
     assert_eq!(done_status(&until_done(&mut r).await), OutcomeStatus::Pass);
+    d.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0011: timeline, utilisation sampler, early verdict
+// ---------------------------------------------------------------------------
+
+fn with_requested_at(mut msg: ClientMessage) -> ClientMessage {
+    if let ClientMessage::Run { request, .. } = &mut msg {
+        request.requested_at = Some(dirs::now_ms());
+    }
+    msg
+}
+
+fn done_outcome(msgs: &[ServerMessage]) -> (String, sluice_gate_proto::Outcome) {
+    match msgs.last() {
+        Some(ServerMessage::Done {
+            job_id, outcome, ..
+        }) => (job_id.clone(), outcome.clone()),
+        other => panic!("no done: {other:?}"),
+    }
+}
+
+/// L1: every job records its timeline; the points are present and ordered,
+/// and a job that waited reports how long and why.
+#[tokio::test(flavor = "multi_thread")]
+async fn timeline_fields_are_present_and_monotonic() {
+    let repo = make_repo();
+    let d = start(1, LastSubscriberGone::Cancel).await;
+
+    let (_wa, mut ra) = d
+        .request(&with_requested_at(run_msg(
+            &repo, "first", "sleep 1", None, None, 0,
+        )))
+        .await;
+    let first = until_started(&mut ra).await;
+    let (_wb, mut rb) = d
+        .request(&with_requested_at(run_msg(
+            &repo, "second", "true", None, None, 0,
+        )))
+        .await;
+    let msgs_b = until_done(&mut rb).await;
+    let msgs_a = until_done(&mut ra).await;
+    assert!(
+        matches!(
+            &msgs_b[0],
+            ServerMessage::Queued {
+                weight: 1,
+                weight_cfg: Some(1),
+                ..
+            }
+        ),
+        "{msgs_b:?}"
+    );
+    let (_, a) = done_outcome(&msgs_a);
+    assert_eq!(a.admission.as_deref(), Some("nominal"));
+    assert_eq!(a.killed_by, None);
+    let (second, b) = done_outcome(&msgs_b);
+    assert_eq!(b.status, OutcomeStatus::Pass);
+    assert_eq!(b.wait_reason.as_deref(), Some("budget"), "{b:?}");
+    assert!(b.queue_wait_ms.is_some_and(|w| w > 0), "{b:?}");
+
+    let store = Store::open_read_only(&d.path("sluice.db")).unwrap();
+    assert_eq!(store.sched_version(), 1);
+    for id in [&first, &second] {
+        let t = store.timeline(id).unwrap().expect("the job row");
+        let requested = t.requested_at.expect("requested_at");
+        let admitted = t.admitted_at.expect("admitted_at");
+        let started = t.job.started_at.expect("started_at");
+        let finished = t.job.finished_at.expect("finished_at");
+        assert!(
+            requested <= t.job.queued_at
+                && t.job.queued_at <= admitted
+                && admitted <= started
+                && started <= finished,
+            "{t:?}"
+        );
+        assert_eq!(t.weight_cfg, Some(1));
+        assert_eq!(t.admission.as_deref(), Some("nominal"));
+        assert_eq!(t.requests, 1);
+    }
+    let t = store.timeline(&second).unwrap().unwrap();
+    assert!(t.waits[0].is_some_and(|w| w > 0), "budget wait: {t:?}");
+    d.shutdown().await;
+}
+
+/// Writes a fake `/proc/stat` with two CPUs.
+fn write_stat(proc_root: &Path, idle: u64, busy: u64) {
+    let tmp = proc_root.join("stat.tmp");
+    std::fs::write(
+        &tmp,
+        format!(
+            "cpu  {b2} 0 0 {i2} 0 0 0 0 0 0\ncpu0 {busy} 0 0 {idle} 0 0 0 0 0 0\n\
+             cpu1 {busy} 0 0 {idle} 0 0 0 0 0 0\n",
+            b2 = busy * 2,
+            i2 = idle * 2
+        ),
+    )
+    .unwrap();
+    std::fs::rename(&tmp, proc_root.join("stat")).unwrap();
+}
+
+/// L1: while a job is queued and the (fake) CPUs are idle, the daemon's
+/// utilisation sampler integrates the idle fraction into
+/// `idle_while_waiting_ms`.
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_while_waiting_grows_when_the_budget_leaves_cpus_idle() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let repo = make_repo();
+    let dir = tempfile::tempdir().unwrap();
+    let proc_root = dir.path().join("proc");
+    std::fs::create_dir_all(&proc_root).unwrap();
+    write_stat(&proc_root, 0, 0);
+    let mut cfg = config(dir.path(), 1, LastSubscriberGone::Cancel);
+    cfg.proc_root.clone_from(&proc_root);
+    cfg.admission.psi_poll_interval = Duration::from_millis(50);
+    let d = start_in(dir, cfg).await;
+
+    // Both fake CPUs stay fully idle: the idle counters grow, busy ones not.
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let stop = Arc::clone(&stop);
+        let proc_root = proc_root.clone();
+        std::thread::spawn(move || {
+            let mut idle = 0;
+            while !stop.load(Ordering::SeqCst) {
+                idle += 5;
+                write_stat(&proc_root, idle, 0);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+    };
+
+    let (wa, mut ra) = d
+        .request(&run_msg(&repo, "holder", "sleep 30", None, None, 0))
+        .await;
+    until_started(&mut ra).await;
+    let (wb, mut rb) = d
+        .request(&run_msg(&repo, "waiter", "true", None, None, 0))
+        .await;
+    assert!(matches!(
+        next(&mut rb).await,
+        Some(ServerMessage::Queued { .. })
+    ));
+    let s = status_until(&d, "idle time while waiting", |s| {
+        s.totals.idle_while_waiting_ms.is_some_and(|v| v >= 100)
+    })
+    .await;
+    let idle = s.totals.idle_while_waiting_ms.unwrap();
+    let wall = s.totals.waiting_wall_ms.unwrap();
+    assert!(idle <= wall, "idle fraction <= 1: {:?}", s.totals);
+    assert!(
+        s.budget.idle_cpus.is_some_and(|c| c > 1.5 && c <= 2.0),
+        "{:?}",
+        s.budget
+    );
+    assert_eq!(s.queued.len(), 1);
+    assert!(s.queued[0].rank == Some(1) && s.queued[0].weight_cfg == Some(1));
+    stop.store(true, Ordering::SeqCst);
+    writer.join().unwrap();
+    drop((wa, wb));
+    d.shutdown().await;
+}
+
+/// M4, daemon side: a `cancel` with reason `early-verdict` detaches one
+/// subscriber; the job keeps running while another one waits and is killed
+/// (recorded as `killed_by = early-verdict`) when the last one leaves so.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_early_verdict_cancel_kills_only_a_job_nobody_else_waits_for() {
+    let repo = make_repo();
+    let d = start(2, LastSubscriberGone::Cancel).await;
+    let msg = run_msg(&repo, "slow", "sleep 30", Some(key(9)), None, 0);
+    let (mut wa, mut ra) = d.request(&msg).await;
+    let job = until_started(&mut ra).await;
+    let (mut wb, mut rb) = d.request(&msg).await;
+    assert!(matches!(
+        next(&mut rb).await,
+        Some(ServerMessage::Queued {
+            coalesced: true,
+            ..
+        })
+    ));
+    let early = |id| {
+        encode(&ClientMessage::Cancel {
+            id,
+            reason: Some(sluice_gate_proto::CANCEL_EARLY_VERDICT.into()),
+        })
+        .unwrap()
+    };
+    wa.write_all(early(7).as_bytes()).await.unwrap();
+    // The other subscriber still waits: the job keeps running.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let s = status(&d).await;
+    assert_eq!(s.running.len(), 1, "{s:?}");
+    assert_eq!(s.running[0].subscribers, 1);
+    wb.write_all(early(7).as_bytes()).await.unwrap();
+    let db = d.path("sluice.db");
+    let mut killed_by = None;
+    wait_for(
+        "the job to be killed",
+        || {
+            killed_by = Store::open_read_only(&db)
+                .ok()
+                .and_then(|s| s.timeline(&job).ok().flatten())
+                .filter(|t| t.job.state == JobState::Done)
+                .and_then(|t| t.killed_by);
+            killed_by.is_some()
+        },
+        WAIT,
+    )
+    .await;
+    assert_eq!(killed_by.as_deref(), Some("early-verdict"));
     d.shutdown().await;
 }

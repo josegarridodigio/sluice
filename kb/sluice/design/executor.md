@@ -258,10 +258,44 @@ CREATE TABLE events (                 -- client-side hits
   at INTEGER NOT NULL, repo TEXT NOT NULL, gate TEXT NOT NULL, saved_ms INTEGER NOT NULL);
 ```
 
+**Migrations (0.3.0, ADR-0013 G9, ADR-0011 section 7.4).** `schema.version`
+stays 1 so 0.1.0/0.2.0 binaries keep opening the file. Additions are
+versioned by their own one-row table and applied on open by
+`sluice_gate_daemon::migrate`: numbered additive migrations (new tables,
+nullable columns) in one `IMMEDIATE` transaction with the version update;
+before migrating an existing file a consistent copy is written next to it as
+`sluice.db.bak-<version before>` (`VACUUM INTO`; an existing backup is
+kept); a newer version refuses a read-write open (`NewerSchema`) while a
+read-only open still reads the known columns. `sched_schema` 1 adds:
+
+```sql
+CREATE TABLE sched_schema (version INTEGER NOT NULL);       -- 1
+-- jobs, all nullable: requested_at, admitted_at, weight_cfg, expected_ms,
+--   wait_budget_ms, wait_psi_ms, wait_repo_cap_ms, wait_reserved_ms,
+--   wait_order_ms, cpu_ms, run_delay_ms, demand_milli (INTEGER);
+--   admission, killed_by (TEXT). `weight` is the effective weight.
+CREATE TABLE job_requests (
+  id INTEGER PRIMARY KEY, job_id TEXT NOT NULL, caller TEXT NOT NULL,
+  session TEXT, client_pid INTEGER, via TEXT,       -- mcp | cli | hook | exec | queue
+  requested_at INTEGER, attached_at INTEGER NOT NULL, finished_at INTEGER,
+  coalesced INTEGER NOT NULL, detached INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX job_requests_job ON job_requests(job_id);
+CREATE TABLE gate_stats (                              -- newest 20 per key
+  repo TEXT NOT NULL, gate TEXT NOT NULL, cmd_hash TEXT NOT NULL,
+  job_id TEXT NOT NULL, finished_at INTEGER NOT NULL, outcome TEXT NOT NULL,
+  wall_ms INTEGER NOT NULL, cpu_ms INTEGER NOT NULL, run_delay_ms INTEGER,
+  demand_milli INTEGER NOT NULL);
+CREATE INDEX gate_stats_key ON gate_stats(repo, gate, cmd_hash, finished_at);
+```
+
+Rows written by a downgraded 0.2.0 daemon (its `INSERT` names its columns)
+have NULL timeline fields, read as unknown (`sluice logs --timeline`).
+Keys of `gate_stats` unseen for 90 days are pruned with the daily log prune.
+
 Timestamps are unix milliseconds (integers), never strings. Busy timeouts
 map to a typed retryable error, never to a gate failure. The database is
-never deleted automatically; a schema mismatch is a hard error with a
-message naming the file. `totals(since)` filters jobs by `queued_at` and events by `at`;
+never deleted automatically; a `schema.version` mismatch is a hard error
+with a message naming the file. `totals(since)` filters jobs by `queued_at` and events by `at`;
 `prune_logs` refuses job ids containing path separators or `..`.
 
 ## Client side (`sluice run` on a miss)

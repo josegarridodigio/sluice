@@ -7,7 +7,9 @@ tags: [sluice, design, scheduler, latency, alpha]
 
 Status: design for alpha tasks B1, L1, L2 and L3 of
 [[sluice/plan/alpha-plan.md]]; sections 2–7 are the source of the ADR-0011
-draft. Extends [[sluice/design/scheduler.md]],
+draft. B1 and L1 (with M4–M7 of L2) are implemented; section 12 lists
+where the code differs from this text, and
+[[sluice/design/scheduler.md]] describes the current behaviour. Extends [[sluice/design/scheduler.md]],
 [[sluice/design/psi-admission.md]] and
 [[sluice/design/adr/0007-scheduler-fairness.md]]. Evidence:
 [[sluice/changes/alpha-readiness.md]] (`s2_problem` overload run).
@@ -487,3 +489,49 @@ is exactly the plan's overload risk.
 5. Learned weights for `exec` jobs? No (their CPU escapes the group).
 6. ADR-0011: extracted by the lead from sections 2–7; ADR-0007 becomes
    "amended" and [[sluice/design/scheduler.md]] is updated when B1 lands.
+
+## 12. Implementation notes and deviations (B1 + L1)
+
+Change note: [[sluice/changes/scheduler-throughput.md]]. Config names and
+defaults are exactly those of section 2. Where the code differs:
+
+1. **Over-admission waits for a quiet pass.** `plan` over-admits only when
+   nothing started nominally in the same pass: the idle-CPU reading predates
+   those starts. The next pass (≤ 1 s) may over-admit.
+2. **Unsampled runs teach nothing.** A gate run that ended before the
+   sampler saw it (shorter than one tick) records no `gate_stats` row; with
+   section 4's formula it would record a demand near 0 and pull the weight
+   to its floor. Learning therefore needs runs of about a second or more.
+3. **Lane of `exec` jobs** is the request's `cwd` (the exec request carries
+   no worktree toplevel); gates use `repo.toplevel`.
+4. **`job_requests.via`**: `mcp` when the client's `hello` name starts with
+   `sluice-gate-mcp`, `hook` when the run request names a hook, `queue` for
+   merge-queue runs, `exec` for exec, else `cli`. `requested_at` is sent by
+   `sluice run` and the MCP server; the queue runner and `exec` leave it
+   unset.
+5. **Status order.** `status.queued` is listed in rank order (with every
+   switch off this is arrival order, as before) and gains `rank`.
+   `wait_detail` is set only for the `order` cause. `idle_cpus` and
+   `demand` are rounded to 0.1. `budget.cpus` is the daemon's affinity mask
+   size (falling back to the affinity/cgroup count of the core).
+6. **Sequential `verify`** (`[mcp] verify_parallel = false`, or a single
+   gate) is exactly the pre-0.3.0 loop: every gate runs, `fail_fast` is
+   ignored. The early-verdict failure set is fail, timeout, error and
+   killed. In parallel mode each pending gate sends its own progress
+   notification per interval. `(queued 31.0s: budget)` is appended to the
+   `verify` text line; `sluice run -v` does not print it yet.
+7. **Migration framework.** `crate::migrate` (numbered `Migration`s per
+   version table, one `IMMEDIATE` transaction, `VACUUM INTO
+   <db>.bak-<version>` before migrating an existing file, an existing
+   backup is kept). A newer `sched_schema` refuses a read-write open
+   (`Error::NewerSchema`) but a read-only open reads it (only known columns
+   are selected). The merge queue keeps its own `queue_schema` code.
+8. **`killed_by = superseded`** is reserved (M8 deferred) and never set.
+9. **Downgrade check** is a test of the v0.2.0 statements on a migrated
+   file (version check, named `INSERT`, start/finish updates) plus a daemon
+   started with the v0.2.0 user-config fixture; the real-binary check stays
+   with `s6_upgrade`.
+10. **CPU budget source.** `sluice_gate_core::cpus` reads
+    `Cpus_allowed_list` and the cgroup v2/v1 limits itself (injectable root,
+    unit-tested) and falls back to `available_parallelism`; the daemon's
+    utilisation sampler uses the mask from `<proc_root>/self/status`.

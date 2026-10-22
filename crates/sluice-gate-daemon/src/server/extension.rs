@@ -26,8 +26,8 @@ use tokio::sync::{broadcast, watch};
 use tokio::time::{Instant, Interval, interval_at};
 
 use super::{
-    DaemonConfig, JobEvent, LEASE_NAME, PROGRESS_EVERY, Registered, Shared, Subscriber, detach,
-    lock, register, rfc3339,
+    DaemonConfig, JobEvent, LEASE_NAME, PROGRESS_EVERY, Registered, Shared, Subscriber,
+    close_request, detach, lock, register, rfc3339,
 };
 
 /// A boxed, `Send` future: the return type of the [`Extension`] methods,
@@ -181,12 +181,16 @@ impl DaemonHandle {
     /// subscription yields one `error{internal}` and ends.
     pub fn submit_run(&self, request: RunRequest) -> RunSubscription {
         let shared = Arc::clone(&self.shared);
-        match register(&shared, request) {
+        match register(&shared, request, "queue") {
             Ok(Registered {
                 job_id,
                 coalesced,
                 position,
                 weight,
+                weight_cfg,
+                expected_ms,
+                attached_at,
+                request_row,
                 started_at,
                 events,
                 ..
@@ -201,6 +205,8 @@ impl DaemonHandle {
                     position,
                     coalesced,
                     weight,
+                    weight_cfg: Some(weight_cfg),
+                    expected_ms,
                 }]);
                 if let Some(started_at) = started_at {
                     pending.push_back(ServerMessage::Started {
@@ -214,6 +220,8 @@ impl DaemonHandle {
                     shared,
                     job_id,
                     coalesced,
+                    attached_at,
+                    request_row,
                     pending,
                     events: Some(events),
                     tick: interval_at(Instant::now() + PROGRESS_EVERY, PROGRESS_EVERY),
@@ -224,6 +232,8 @@ impl DaemonHandle {
                 shared,
                 job_id: String::new(),
                 coalesced: false,
+                attached_at: 0,
+                request_row: None,
                 pending: VecDeque::from([ServerMessage::Error {
                     id: 0,
                     code: ErrorCode::Internal,
@@ -351,6 +361,8 @@ pub struct RunSubscription {
     shared: Arc<Shared>,
     job_id: String,
     coalesced: bool,
+    attached_at: u64,
+    request_row: Option<i64>,
     pending: VecDeque<ServerMessage>,
     events: Option<broadcast::Receiver<JobEvent>>,
     tick: Interval,
@@ -393,12 +405,16 @@ impl RunSubscription {
             id: 0,
             job_id: self.job_id.clone(),
             coalesced: self.coalesced,
+            attached_at: self.attached_at,
         };
         loop {
             tokio::select! {
                 ev = events.recv() => {
                     if let Some((msg, last)) = sub.message(ev) {
                         self.finished = last;
+                        if last {
+                            close_request(&self.shared, self.request_row.take(), false);
+                        }
                         return Some(msg);
                     }
                 }
@@ -417,6 +433,7 @@ impl Drop for RunSubscription {
         if !self.finished {
             tracing::debug!(job = %self.job_id, "extension subscription dropped");
             detach(&self.shared, &self.job_id);
+            close_request(&self.shared, self.request_row.take(), true);
         }
     }
 }

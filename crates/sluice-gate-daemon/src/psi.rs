@@ -80,6 +80,8 @@ struct AdmissionState {
     last_observed_ms: Option<u64>,
     blocked_ms_total: u64,
     last_override_ms: Option<u64>,
+    /// When admission last resumed after blocking.
+    last_resume_ms: Option<u64>,
 }
 
 /// PSI admission state machine.
@@ -157,6 +159,7 @@ impl Admission {
             if self.state.calm_samples >= RESUME_SAMPLES {
                 self.state.blocking = false;
                 self.state.calm_samples = 0;
+                self.state.last_resume_ms = Some(now_ms);
                 tracing::info!(
                     cpu = ?sample.cpu_some_avg10,
                     memory = ?sample.memory_some_avg10,
@@ -209,6 +212,34 @@ impl Admission {
     /// Records that the starvation guard admitted a job at `now_ms`.
     pub fn record_override(&mut self, now_ms: u64) {
         self.state.last_override_ms = Some(now_ms);
+    }
+
+    /// Conditions 1–3 of PSI-driven over-admission (ADR-0011 section 5):
+    /// PSI is enabled and the last sample has both values, admission is not
+    /// blocking and resumed at least `interval_ms` ago, CPU `some avg10` is
+    /// below `cpu_low` and memory `some avg10` below `memory_low`.
+    pub fn calm_for_overcommit(
+        &self,
+        now_ms: u64,
+        cpu_low: f64,
+        memory_low: f64,
+        interval_ms: u64,
+    ) -> bool {
+        let (Some(cpu), Some(memory)) = (
+            self.state.last.cpu_some_avg10,
+            self.state.last.memory_some_avg10,
+        ) else {
+            return false;
+        };
+        self.enabled
+            && self.state.last_observed_ms.is_some()
+            && !self.state.blocking
+            && self
+                .state
+                .last_resume_ms
+                .is_none_or(|t| now_ms.saturating_sub(t) >= interval_ms)
+            && cpu < cpu_low
+            && memory < memory_low
     }
 }
 
@@ -337,6 +368,44 @@ mod tests {
         });
         assert!(!off.observe(s(99.0, 99.0), 0));
         assert!(!off.info().enabled);
+    }
+
+    #[test]
+    fn calm_for_overcommit_conditions_and_cooldown() {
+        let calm = |a: &Admission, now| a.calm_for_overcommit(now, 25.0, 5.0, 5_000);
+        let mut a = adm();
+        assert!(!calm(&a, 0), "no sample yet");
+        a.observe(s(10.0, 1.0), 0);
+        assert!(calm(&a, 0));
+        a.observe(s(25.0, 1.0), 1_000);
+        assert!(!calm(&a, 1_000), "cpu at the low mark");
+        a.observe(s(10.0, 5.0), 2_000);
+        assert!(!calm(&a, 2_000), "memory at the low mark");
+        // Missing memory value: PSI must report both.
+        a.observe(
+            Some(PsiSample {
+                cpu_some_avg10: Some(1.0),
+                memory_some_avg10: None,
+            }),
+            3_000,
+        );
+        assert!(!calm(&a, 3_000));
+        // Blocking, then the cooldown after the resume.
+        a.observe(s(70.0, 0.0), 4_000);
+        assert!(!calm(&a, 4_000));
+        a.observe(s(1.0, 0.0), 5_000);
+        assert!(!a.observe(s(1.0, 0.0), 6_000), "resumed at 6 s");
+        assert!(!calm(&a, 10_999), "less than 5 s since the resume");
+        assert!(calm(&a, 11_000));
+        // PSI unavailable or off: never calm.
+        a.observe(None, 12_000);
+        assert!(!calm(&a, 20_000));
+        let mut off = Admission::new(&AdmissionConfig {
+            psi_enabled: false,
+            ..AdmissionConfig::default()
+        });
+        off.observe(s(0.0, 0.0), 0);
+        assert!(!calm(&off, 0));
     }
 
     #[test]

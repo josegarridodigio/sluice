@@ -5,7 +5,7 @@ tags: [sluice, adr, scheduler]
 
 # ADR-0007: FIFO with backfill and head-of-line reservation
 
-Status: accepted (2026-10-22), designed for Phase 2.
+Status: accepted (2026-10-22), designed for Phase 2; amended by [[sluice/design/adr/0011-scheduler-throughput.md]] (default budget, learned weights, over-admission, lane fairness and humans first; the no-starvation guarantee through `head_reserve_after` is kept).
 
 ## Context
 

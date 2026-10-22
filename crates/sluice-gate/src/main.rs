@@ -223,6 +223,19 @@ enum Command {
         /// Only print the last N lines.
         #[arg(short = 'n', long)]
         lines: Option<usize>,
+        /// Print the scheduler timeline instead of the log: one line per job
+        /// (requested, queued, admitted, started, finished, wait reasons,
+        /// demand, requesters).
+        #[arg(long)]
+        timeline: bool,
+        /// With --timeline and no job id: the jobs queued within this period.
+        #[arg(
+            long,
+            value_name = "DURATION",
+            default_value = "10m",
+            requires = "timeline"
+        )]
+        since: String,
     },
     /// Local merge queue: enqueue committed branches, approve trains, land them.
     ///
@@ -470,7 +483,13 @@ fn main() -> ExitCode {
         Command::Hook {
             command: HookCommand::Print { manager },
         } => hook_print(manager),
-        Command::Logs { job_id, lines } => logs::show(job_id.as_deref(), lines),
+        Command::Logs {
+            job_id,
+            timeline: true,
+            since,
+            ..
+        } => logs::timeline(job_id.as_deref(), &since),
+        Command::Logs { job_id, lines, .. } => logs::show(job_id.as_deref(), lines),
         Command::Guard { hook: _ } => guard::run_hook(),
         Command::Shim { command } => match command {
             ShimCommand::Install { dir, force } => shim::install(dir.as_deref(), force),

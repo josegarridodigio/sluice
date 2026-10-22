@@ -131,7 +131,7 @@ Every section and field is optional.
 version = 1
 
 [daemon]
-budget = 8                     # default: max(2, cpu_count - 1)
+budget = 8                     # default: max(2, available CPUs)
 nice = 10
 ionice_class = "best-effort"   # none | best-effort | idle
 ionice_level = 7
@@ -145,9 +145,17 @@ cpu_some_avg10_max = 60.0
 memory_some_avg10_max = 20.0
 psi_poll_interval = "1s"
 psi_max_wait = "5m"
+overcommit = 1.5               # 1.0 disables over-admission
+cpu_some_avg10_low = 25.0
+memory_some_avg10_low = 5.0
+overcommit_interval = "5s"
 
 [scheduler]
 head_reserve_after = "30s"
+learned_weights = true
+fairness = "lane"              # lane | off
+human_first = true
+order = "fifo"                 # fifo | sjf
 
 [cache]
 ttl_days = 30
@@ -155,6 +163,7 @@ tail_lines = 40
 
 [mcp]
 progress_interval = "15s"
+verify_parallel = true
 
 [queue]
 enabled = true
@@ -176,7 +185,7 @@ budget_share_max = 4
 
 | Field | Default | Notes |
 |---|---|---|
-| `daemon.budget` | `max(2, cpus - 1)` | Total weight of gates running at once. Must be >= 1. |
+| `daemon.budget` | `max(2, cpus)` | Total weight of gates running at once; `cpus` honours the daemon's CPU affinity (`taskset`) and cgroup CPU limit. Must be >= 1. (0.2.0 and older: `max(2, cpus - 1)`.) |
 | `daemon.nice` | `10` | 0 to 19; applied to gate processes. |
 | `daemon.ionice_class` | `best-effort` | `none`, `best-effort` or `idle`. |
 | `daemon.ionice_level` | `7` | 0 to 7. |
@@ -188,10 +197,19 @@ budget_share_max = 4
 | `admission.memory_some_avg10_max` | `20.0` | Percent, 0 to 100. |
 | `admission.psi_poll_interval` | `1s` | Must be > 0. |
 | `admission.psi_max_wait` | `5m` | While PSI blocks, admit the queue head once it has waited this long. Must be > 0. |
-| `scheduler.head_reserve_after` | `30s` | Backfill behind the queue head only this long. |
+| `admission.overcommit` | `1.5` | Over-admission: a job that does not fit the budget may start, up to `floor(overcommit × budget)` units, while the machine is calm (both PSI values below the `*_low` marks, not right after a block) and at least `ceil(weight / 3)` CPUs are idle; at most one such start per `overcommit_interval`. `1.0` turns it off. 1.0 to 4.0. Needs PSI. |
+| `admission.cpu_some_avg10_low` | `25.0` | Percent: over-admission only below this CPU pressure. |
+| `admission.memory_some_avg10_low` | `5.0` | Percent: over-admission only below this memory pressure. |
+| `admission.overcommit_interval` | `5s` | At most one over-admission per interval, and none sooner than this after PSI stopped blocking. Must be > 0. |
+| `scheduler.head_reserve_after` | `30s` | Backfill behind the queue head only this long; also the ageing bound: a job waiting longer goes ahead of everything else, in arrival order. |
+| `scheduler.learned_weights` | `true` | After 3 runs, a gate holds the 75th percentile of its measured CPU demand (CPU plus run-queue wait over wall time, last 10 runs), never more than its `weight` and never less than a quarter of it. `sluice exec` jobs keep their weight. |
+| `scheduler.fairness` | `"lane"` | `lane`: at equal priority, worktrees take turns (a worktree with jobs running or several queued goes behind the others). `off`: arrival order. |
+| `scheduler.human_first` | `true` | Jobs a person waits for (`sluice run` from a terminal, human hooks) go before agent jobs. |
+| `scheduler.order` | `"fifo"` | `fifo` or `sjf` (shortest expected job first with ageing: highest `(waited + expected) / expected` next, expected = median of the gate's last runs, 60 s when unknown). |
 | `cache.ttl_days` | `30` | Age after which a marker is ignored. |
 | `cache.tail_lines` | `40` | Log lines shown on failure (`defaults.tail_lines` overrides it per repository). |
 | `mcp.progress_interval` | `15s` | Progress notifications while `verify` runs (floored at 1s). |
+| `mcp.verify_parallel` | `true` | `verify` starts all its gates at once and, with its `fail_fast` parameter (default true), returns at the first failure, cancelling the gates nobody else waits for. `false`: one gate after another, every gate runs (0.2.0 behaviour). |
 | `queue.enabled` | `true` | Kill switch for the merge queue runner. |
 | `queue.allow_agent_approval` | `false` | Let the MCP `queue_approve` tool approve trains. |
 | `queue.tick` | `5s` | Runner housekeeping period (floored at 50 ms). |

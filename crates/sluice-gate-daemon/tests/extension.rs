@@ -128,6 +128,7 @@ fn config(dir: &Path, extensions: Vec<Arc<dyn Extension>>) -> DaemonConfig {
             ..AdmissionConfig::default()
         },
         psi_root: dir.join("pressure"),
+        proc_root: std::path::PathBuf::from("/proc"),
         user: UserConfig::default(),
         log: sluice_gate_daemon::server::LogSettings::default(),
         extensions,
@@ -238,6 +239,7 @@ fn run_request(dir: &Path, cmd: &str) -> RunRequest {
         client_pid: std::process::id(),
         hook: None,
         no_marker: false,
+        requested_at: None,
     }
 }
 

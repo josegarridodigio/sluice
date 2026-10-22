@@ -1,8 +1,12 @@
-//! SQLite persistence: jobs, lease (fencing), client hit events and totals.
+//! SQLite persistence: jobs, lease (fencing), client hit events, totals and
+//! the scheduler timeline (job requests, gate statistics).
 //!
 //! The schema is documented in `kb/sluice/design/executor.md`. The store is
 //! synchronous; callers use it from a blocking context. The database file is
-//! never deleted or migrated: a version mismatch is a hard error.
+//! never deleted. `schema.version` stays 1 (a mismatch is a hard error);
+//! additions are versioned by their own tables and applied on open by the
+//! [`crate::migrate`] framework (`sched_schema`, ADR-0011 section 7.4),
+//! after a `.bak-<version>` copy of the file.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
@@ -125,7 +129,116 @@ pub struct JobRow {
 pub struct Store {
     conn: Connection,
     path: PathBuf,
+    /// `sched_schema` version of the file (0: no timeline columns).
+    sched: u32,
 }
+
+/// Scheduling facts written when a job is queued (`sched_schema` 1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueuedMeta {
+    /// Client send time.
+    pub requested_at: Option<u64>,
+    /// Configured weight after the clamp.
+    pub weight_cfg: u32,
+    /// Expected run time from history.
+    pub expected_ms: Option<u64>,
+}
+
+/// Scheduling and measurement facts written when a job ends.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FinishMeta {
+    /// Wait accumulators: budget, psi, repo cap, reserved, order (ms).
+    pub waits: [u64; 5],
+    /// Measured CPU time.
+    pub cpu_ms: Option<u64>,
+    /// Measured run-queue wait.
+    pub run_delay_ms: Option<u64>,
+    /// Measured demand, milli-CPUs.
+    pub demand_milli: Option<u32>,
+    /// `last-subscriber`, `early-verdict`, `stop` or `superseded`.
+    pub killed_by: Option<String>,
+}
+
+/// One request (subscriber) of a job (`job_requests`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestRow {
+    /// Job the request joined.
+    pub job_id: String,
+    /// `agent`, `human` or `unknown`.
+    pub caller: String,
+    /// Agent session, if any.
+    pub session: Option<String>,
+    /// Client process id.
+    pub client_pid: Option<u32>,
+    /// `mcp`, `cli`, `hook`, `exec` or `queue`.
+    pub via: String,
+    /// Client send time.
+    pub requested_at: Option<u64>,
+    /// When the request reached the scheduler.
+    pub attached_at: u64,
+    /// Whether it joined an existing job.
+    pub coalesced: bool,
+}
+
+/// One measured run of a gate (`gate_stats`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateStat {
+    /// Repository identity.
+    pub repo: PathBuf,
+    /// Gate name.
+    pub gate: String,
+    /// 16 hex of the command hash.
+    pub cmd_hash: String,
+    /// Job id.
+    pub job_id: String,
+    /// End time.
+    pub finished_at: u64,
+    /// `pass` or `fail`.
+    pub outcome: String,
+    /// Wall time.
+    pub wall_ms: u64,
+    /// CPU time.
+    pub cpu_ms: u64,
+    /// Run-queue wait (`None` without `schedstat`).
+    pub run_delay_ms: Option<u64>,
+    /// Demand, milli-CPUs.
+    pub demand_milli: u32,
+}
+
+/// A job with its timeline (`sluice logs --timeline`). The timeline fields
+/// are `None` on rows written by releases without them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Timeline {
+    /// The base row.
+    pub job: JobRow,
+    /// Client send time.
+    pub requested_at: Option<u64>,
+    /// Admission decision time.
+    pub admitted_at: Option<u64>,
+    /// Configured weight after the clamp.
+    pub weight_cfg: Option<u32>,
+    /// Expected run time.
+    pub expected_ms: Option<u64>,
+    /// Wait accumulators: budget, psi, repo cap, reserved, order (ms).
+    pub waits: [Option<u64>; 5],
+    /// `nominal`, `over` or `guard`.
+    pub admission: Option<String>,
+    /// Who killed it.
+    pub killed_by: Option<String>,
+    /// Measured CPU time.
+    pub cpu_ms: Option<u64>,
+    /// Measured run-queue wait.
+    pub run_delay_ms: Option<u64>,
+    /// Measured demand, milli-CPUs.
+    pub demand_milli: Option<u32>,
+    /// Requests that joined the job.
+    pub requests: u32,
+    /// Requests that left before the end.
+    pub detached: u32,
+}
+
+/// Rows kept per `gate_stats` key.
+const GATE_STATS_KEEP: i64 = 20;
 
 impl std::fmt::Debug for Store {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -209,11 +322,20 @@ impl Store {
     /// Opens (creating if needed) the database in WAL mode.
     ///
     /// An empty database gets the schema; an existing one with another
-    /// version fails with [`Error::Schema`]. Nothing is ever migrated or deleted.
+    /// `schema.version` fails with [`Error::Schema`]. Pending additive
+    /// migrations ([`crate::migrate::SCHED_MIGRATIONS`]) are then applied,
+    /// after a `.bak-<version>` copy of an existing file; a newer
+    /// `sched_schema` fails with [`Error::NewerSchema`]. Nothing is deleted.
     ///
     /// # Errors
     /// I/O, SQLite, busy or schema mismatch errors.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, crate::migrate::SCHED_MIGRATIONS)
+    }
+
+    /// [`Store::open`] with an explicit migration list (tests inject a
+    /// failing migration to prove the rollback).
+    pub(crate) fn open_with(path: &Path, migrations: &[crate::migrate::Migration]) -> Result<Self> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             sluice_gate_core::dirs::create_private_dir(parent)
                 .map_err(|e| io(format!("creating {}", parent.display()), e))?;
@@ -226,13 +348,49 @@ impl Store {
             .map_err(db)?;
         conn.pragma_update(None, "foreign_keys", false)
             .map_err(db)?;
-        let store = Self {
+        let mut store = Self {
             conn,
             path: path.to_path_buf(),
+            sched: 0,
         };
-        store.init_schema()?;
+        let fresh = store.init_schema()?;
+        store.migrate(fresh, migrations)?;
         crate::meta::record_writer(&store.conn).map_err(db)?;
         Ok(store)
+    }
+
+    /// Applies the pending `sched_schema` migrations (backup first unless
+    /// the database was just created).
+    fn migrate(&mut self, fresh: bool, migrations: &[crate::migrate::Migration]) -> Result<()> {
+        use crate::migrate::{self, SCHED_TABLE};
+        let target = migrations.iter().map(|m| m.version).max().unwrap_or(0);
+        let found = migrate::version(&self.conn, SCHED_TABLE).map_err(db)?;
+        if found > target {
+            return Err(Error::NewerSchema {
+                table: SCHED_TABLE,
+                writer: crate::meta::describe_writer(&self.conn),
+                path: self.path.clone(),
+                found,
+                expected: target,
+            });
+        }
+        if found < target {
+            if !fresh {
+                let bak = migrate::backup(&self.conn, &self.path, found).map_err(db)?;
+                tracing::info!(backup = %bak.display(), "database copied before migrating");
+            }
+            self.sched = migrate::apply(&self.conn, SCHED_TABLE, migrations, target).map_err(db)?;
+        } else {
+            self.sched = found;
+        }
+        Ok(())
+    }
+
+    /// `sched_schema` version of the open file (0: written by a release
+    /// without the scheduler timeline and opened read-only).
+    #[must_use]
+    pub fn sched_version(&self) -> u32 {
+        self.sched
     }
 
     /// Opens the database read-only (for client diagnostics) and checks the schema version.
@@ -246,11 +404,17 @@ impl Store {
         )
         .map_err(db)?;
         conn.busy_timeout(Duration::from_millis(2000)).map_err(db)?;
-        let store = Self {
+        let mut store = Self {
             conn,
             path: path.to_path_buf(),
+            sched: 0,
         };
         store.check_version()?;
+        // Only the columns this build knows are ever selected, so a newer
+        // (additive) `sched_schema` reads fine.
+        store.sched = crate::migrate::version(&store.conn, crate::migrate::SCHED_TABLE)
+            .map_err(db)?
+            .min(crate::migrate::SCHED_SCHEMA_VERSION);
         Ok(store)
     }
 
@@ -278,17 +442,20 @@ impl Store {
         .map_err(db)
     }
 
-    fn init_schema(&self) -> Result<()> {
+    /// Creates the base schema in an empty database (returns `true`), else
+    /// checks `schema.version`.
+    fn init_schema(&self) -> Result<bool> {
         let tx = self.tx()?;
         if Self::table_count(&tx)? == 0 {
             tx.execute_batch(SCHEMA_SQL).map_err(db)?;
             tx.execute("INSERT INTO schema (version) VALUES (?1)", [SCHEMA_VERSION])
                 .map_err(db)?;
             tx.commit().map_err(db)?;
-            return Ok(());
+            return Ok(true);
         }
         tx.commit().map_err(db)?;
-        self.check_version()
+        self.check_version()?;
+        Ok(false)
     }
 
     fn check_version(&self) -> Result<()> {
@@ -625,6 +792,311 @@ impl Store {
         Ok((killed, orphaned))
     }
 
+    // ---- Timeline (sched_schema 1) ----
+    //
+    // Every write below is a no-op on a file without the timeline columns
+    // (never the case for a read-write store, which migrates on open).
+
+    /// Records the queue-time facts of a job.
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn set_queued_meta(&self, id: &str, meta: QueuedMeta) -> Result<()> {
+        if self.sched < 1 {
+            return Ok(());
+        }
+        self.conn
+            .execute(
+                "UPDATE jobs SET requested_at = ?2, weight_cfg = ?3, expected_ms = ?4 WHERE id = ?1",
+                params![
+                    id,
+                    meta.requested_at.map(i),
+                    meta.weight_cfg,
+                    meta.expected_ms.map(i)
+                ],
+            )
+            .map_err(db)?;
+        Ok(())
+    }
+
+    /// Records the admission decision of a job.
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn set_admitted(&self, id: &str, admitted_at: u64, admission: &str) -> Result<()> {
+        if self.sched < 1 {
+            return Ok(());
+        }
+        self.conn
+            .execute(
+                "UPDATE jobs SET admitted_at = ?2, admission = ?3 WHERE id = ?1",
+                params![id, i(admitted_at), admission],
+            )
+            .map_err(db)?;
+        Ok(())
+    }
+
+    /// Records the end-of-job facts (waits, measured demand, killer).
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn set_finish_meta(&self, id: &str, meta: &FinishMeta) -> Result<()> {
+        if self.sched < 1 {
+            return Ok(());
+        }
+        let w = meta.waits;
+        self.conn
+            .execute(
+                "UPDATE jobs SET wait_budget_ms = ?2, wait_psi_ms = ?3, wait_repo_cap_ms = ?4, \
+                 wait_reserved_ms = ?5, wait_order_ms = ?6, cpu_ms = ?7, run_delay_ms = ?8, \
+                 demand_milli = ?9, killed_by = ?10 WHERE id = ?1",
+                params![
+                    id,
+                    i(w[0]),
+                    i(w[1]),
+                    i(w[2]),
+                    i(w[3]),
+                    i(w[4]),
+                    meta.cpu_ms.map(i),
+                    meta.run_delay_ms.map(i),
+                    meta.demand_milli,
+                    meta.killed_by,
+                ],
+            )
+            .map_err(db)?;
+        Ok(())
+    }
+
+    /// Inserts a request row; returns its id (`None` without the table).
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn insert_request(&self, row: &RequestRow) -> Result<Option<i64>> {
+        if self.sched < 1 {
+            return Ok(None);
+        }
+        self.conn
+            .execute(
+                "INSERT INTO job_requests (job_id, caller, session, client_pid, via, \
+                 requested_at, attached_at, coalesced) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    row.job_id,
+                    row.caller,
+                    row.session,
+                    row.client_pid,
+                    row.via,
+                    row.requested_at.map(i),
+                    i(row.attached_at),
+                    i64::from(row.coalesced),
+                ],
+            )
+            .map_err(db)?;
+        Ok(Some(self.conn.last_insert_rowid()))
+    }
+
+    /// Closes a request row: when its subscriber got `done` or left.
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn close_request(&self, id: i64, finished_at: u64, detached: bool) -> Result<()> {
+        if self.sched < 1 {
+            return Ok(());
+        }
+        self.conn
+            .execute(
+                "UPDATE job_requests SET finished_at = ?2, detached = ?3 \
+                 WHERE id = ?1 AND finished_at IS NULL",
+                params![id, i(finished_at), i64::from(detached)],
+            )
+            .map_err(db)?;
+        Ok(())
+    }
+
+    /// Inserts one measured run and keeps the newest 20 of its key.
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn insert_gate_stat(&self, s: &GateStat) -> Result<()> {
+        if self.sched < 1 {
+            return Ok(());
+        }
+        let tx = self.tx()?;
+        let repo = path_str(&s.repo);
+        tx.execute(
+            "INSERT INTO gate_stats (repo, gate, cmd_hash, job_id, finished_at, outcome, \
+             wall_ms, cpu_ms, run_delay_ms, demand_milli) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                repo,
+                s.gate,
+                s.cmd_hash,
+                s.job_id,
+                i(s.finished_at),
+                s.outcome,
+                i(s.wall_ms),
+                i(s.cpu_ms),
+                s.run_delay_ms.map(i),
+                s.demand_milli,
+            ],
+        )
+        .map_err(db)?;
+        tx.execute(
+            "DELETE FROM gate_stats WHERE repo = ?1 AND gate = ?2 AND cmd_hash = ?3 \
+             AND rowid NOT IN (SELECT rowid FROM gate_stats WHERE repo = ?1 AND gate = ?2 \
+             AND cmd_hash = ?3 ORDER BY finished_at DESC, rowid DESC LIMIT ?4)",
+            params![repo, s.gate, s.cmd_hash, GATE_STATS_KEEP],
+        )
+        .map_err(db)?;
+        tx.commit().map_err(db)?;
+        Ok(())
+    }
+
+    /// The newest `per_key` runs of every key, oldest first within a key.
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn gate_stats_recent(&self, per_key: usize) -> Result<Vec<GateStat>> {
+        if self.sched < 1 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT repo, gate, cmd_hash, job_id, finished_at, outcome, wall_ms, cpu_ms, \
+                 run_delay_ms, demand_milli FROM gate_stats \
+                 ORDER BY repo, gate, cmd_hash, finished_at DESC, rowid DESC",
+            )
+            .map_err(db)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(GateStat {
+                    repo: PathBuf::from(r.get::<_, String>(0)?),
+                    gate: r.get(1)?,
+                    cmd_hash: r.get(2)?,
+                    job_id: r.get(3)?,
+                    finished_at: u(r.get(4)?),
+                    outcome: r.get(5)?,
+                    wall_ms: u(r.get(6)?),
+                    cpu_ms: u(r.get(7)?),
+                    run_delay_ms: r.get::<_, Option<i64>>(8)?.map(u),
+                    demand_milli: r.get(9)?,
+                })
+            })
+            .map_err(db)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db)?;
+        let mut out: Vec<GateStat> = Vec::with_capacity(rows.len());
+        let mut group: Vec<GateStat> = Vec::new();
+        for row in rows {
+            let same = group.last().is_some_and(|g| {
+                g.repo == row.repo && g.gate == row.gate && g.cmd_hash == row.cmd_hash
+            });
+            if !same {
+                out.extend(group.drain(..).rev());
+            }
+            if group.len() < per_key {
+                group.push(row);
+            }
+        }
+        out.extend(group.drain(..).rev());
+        Ok(out)
+    }
+
+    /// Deletes the statistics of keys with no run since `unseen_since_ms`;
+    /// returns the rows deleted.
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn prune_gate_stats(&self, unseen_since_ms: u64) -> Result<usize> {
+        if self.sched < 1 {
+            return Ok(0);
+        }
+        self.conn
+            .execute(
+                "DELETE FROM gate_stats WHERE (repo, gate, cmd_hash) IN \
+                 (SELECT repo, gate, cmd_hash FROM gate_stats GROUP BY repo, gate, cmd_hash \
+                  HAVING max(finished_at) < ?1)",
+                [i(unseen_since_ms)],
+            )
+            .map_err(db)
+    }
+
+    fn timeline_of(&self, job: JobRow) -> Result<Timeline> {
+        let mut t = Timeline {
+            job,
+            requested_at: None,
+            admitted_at: None,
+            weight_cfg: None,
+            expected_ms: None,
+            waits: [None; 5],
+            admission: None,
+            killed_by: None,
+            cpu_ms: None,
+            run_delay_ms: None,
+            demand_milli: None,
+            requests: 0,
+            detached: 0,
+        };
+        if self.sched < 1 {
+            return Ok(t);
+        }
+        let opt = |r: &Row<'_>, n: usize| r.get::<_, Option<i64>>(n).map(|v| v.map(u));
+        self.conn
+            .query_row(
+                "SELECT requested_at, admitted_at, weight_cfg, expected_ms, wait_budget_ms, \
+                 wait_psi_ms, wait_repo_cap_ms, wait_reserved_ms, wait_order_ms, admission, \
+                 killed_by, cpu_ms, run_delay_ms, demand_milli, \
+                 (SELECT count(*) FROM job_requests q WHERE q.job_id = jobs.id), \
+                 (SELECT count(*) FROM job_requests q WHERE q.job_id = jobs.id AND q.detached) \
+                 FROM jobs WHERE id = ?1",
+                [&t.job.id],
+                |r| {
+                    t.requested_at = opt(r, 0)?;
+                    t.admitted_at = opt(r, 1)?;
+                    t.weight_cfg = r.get(2)?;
+                    t.expected_ms = opt(r, 3)?;
+                    for k in 0..5 {
+                        t.waits[k] = opt(r, 4 + k)?;
+                    }
+                    t.admission = r.get(9)?;
+                    t.killed_by = r.get(10)?;
+                    t.cpu_ms = opt(r, 11)?;
+                    t.run_delay_ms = opt(r, 12)?;
+                    t.demand_milli = r.get(13)?;
+                    t.requests = r.get(14)?;
+                    t.detached = r.get(15)?;
+                    Ok(())
+                },
+            )
+            .map_err(db)?;
+        Ok(t)
+    }
+
+    /// One job with its timeline.
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn timeline(&self, id: &str) -> Result<Option<Timeline>> {
+        match self.job(id)? {
+            Some(job) => self.timeline_of(job).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Jobs queued since `since_ms`, oldest first, with their timelines.
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn timelines_since(&self, since_ms: u64) -> Result<Vec<Timeline>> {
+        let jobs = self.query_jobs(
+            &format!(
+                "SELECT {JOB_COLUMNS} FROM jobs WHERE queued_at >= ?1 ORDER BY queued_at ASC, id ASC"
+            ),
+            &[&i(since_ms)],
+        )?;
+        jobs.into_iter().map(|j| self.timeline_of(j)).collect()
+    }
+
     // ---- Events and totals ----
 
     /// Records a client-side cache hit.
@@ -723,6 +1195,8 @@ impl Store {
             time_saved_ms: u(saved_events).saturating_add(u(saved_jobs)),
             // Not persisted: the server fills it from its in-memory PSI state.
             psi_blocked_ms_total: 0,
+            // Per daemon instance, filled by the server from its sampler.
+            ..sluice_gate_proto::Totals::default()
         })
     }
 
@@ -870,6 +1344,251 @@ mod tests {
         let s = Store::open(&p).unwrap();
         assert_eq!(s.job("j1").unwrap().unwrap(), job("j1", "A", 1));
         assert!(s.job("nope").unwrap().is_none());
+    }
+
+    fn columns(s: &Store, table: &str) -> Vec<String> {
+        let mut stmt = s
+            .conn
+            .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap()
+    }
+
+    /// A database as 0.2.0 leaves it: base schema, `schema.version` 1, no
+    /// `sched_schema`.
+    fn v020_db(p: &Path) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let conn = Connection::open(p).unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        conn.execute("INSERT INTO schema (version) VALUES (1)", [])
+            .unwrap();
+    }
+
+    #[test]
+    fn a_fresh_database_is_migrated_without_a_backup() {
+        let (_d, p) = tmp();
+        let s = Store::open(&p).unwrap();
+        assert_eq!(s.sched_version(), crate::migrate::SCHED_SCHEMA_VERSION);
+        assert!(columns(&s, "jobs").contains(&"killed_by".to_owned()));
+        assert!(columns(&s, "job_requests").contains(&"via".to_owned()));
+        assert!(columns(&s, "gate_stats").contains(&"demand_milli".to_owned()));
+        assert!(!crate::migrate::backup_path(&p, 0).exists());
+        let version: u32 = s
+            .conn
+            .query_row("SELECT version FROM schema", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 1, "schema.version stays 1");
+    }
+
+    #[test]
+    fn migration_backs_up_and_is_idempotent() {
+        let (_d, p) = tmp();
+        v020_db(&p);
+        {
+            let conn = Connection::open(&p).unwrap();
+            conn.execute(
+                "INSERT INTO jobs (id, repo, gate, cmd, weight, caller, state, queued_at, \
+                 daemon_instance) VALUES ('old', '/r', 'test', 'true', 1, 'human', 'done', 5, 'x')",
+                [],
+            )
+            .unwrap();
+        }
+        let s = Store::open(&p).unwrap();
+        let bak = crate::migrate::backup_path(&p, 0);
+        assert!(bak.exists(), "backup written before migrating");
+        assert_eq!(s.sched_version(), 1);
+        assert!(s.job("old").unwrap().is_some());
+        let old = s.timeline("old").unwrap().unwrap();
+        assert_eq!(old.admitted_at, None, "old rows read as unknown");
+        // The backup is the pre-migration file.
+        let backup = Connection::open(&bak).unwrap();
+        assert_eq!(crate::migrate::version(&backup, "sched_schema").unwrap(), 0);
+        let jobs: i64 = backup
+            .query_row("SELECT count(*) FROM jobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(jobs, 1);
+        drop((s, backup));
+        // Second open: nothing to do, the backup is untouched.
+        let before = std::fs::metadata(&bak).unwrap().modified().unwrap();
+        let s = Store::open(&p).unwrap();
+        assert_eq!(s.sched_version(), 1);
+        assert_eq!(std::fs::metadata(&bak).unwrap().modified().unwrap(), before);
+        let rows: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM sched_schema", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn a_failing_migration_rolls_back_everything() {
+        let (_d, p) = tmp();
+        v020_db(&p);
+        let broken = [
+            crate::migrate::SCHED_MIGRATIONS[0],
+            crate::migrate::Migration {
+                version: 2,
+                name: "broken",
+                sql: "ALTER TABLE jobs ADD COLUMN extra INTEGER; SELECT * FROM no_such_table;",
+            },
+        ];
+        assert!(Store::open_with(&p, &broken).is_err());
+        let conn = Connection::open(&p).unwrap();
+        assert_eq!(crate::migrate::version(&conn, "sched_schema").unwrap(), 0);
+        drop(conn);
+        let ro = Store::open_read_only(&p).unwrap();
+        assert_eq!(ro.sched_version(), 0);
+        assert!(!columns(&ro, "jobs").contains(&"killed_by".to_owned()));
+        assert!(!columns(&ro, "jobs").contains(&"extra".to_owned()));
+        drop(ro);
+        // The real list then applies cleanly.
+        assert_eq!(Store::open(&p).unwrap().sched_version(), 1);
+    }
+
+    #[test]
+    fn a_newer_sched_schema_is_refused_read_write_but_read_only_works() {
+        let (_d, p) = tmp();
+        drop(Store::open(&p).unwrap());
+        let conn = Connection::open(&p).unwrap();
+        conn.execute("UPDATE sched_schema SET version = 7", [])
+            .unwrap();
+        drop(conn);
+        match Store::open(&p) {
+            Err(Error::NewerSchema {
+                found, expected, ..
+            }) => assert_eq!((found, expected), (7, 1)),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(Store::open_read_only(&p).unwrap().sched_version(), 1);
+    }
+
+    #[test]
+    fn timeline_requests_and_gate_stats() {
+        let (_d, p) = tmp();
+        let s = Store::open(&p).unwrap();
+        s.insert_job(&job("j1", "A", 100)).unwrap();
+        s.set_queued_meta(
+            "j1",
+            QueuedMeta {
+                requested_at: Some(90),
+                weight_cfg: 8,
+                expected_ms: Some(12_000),
+            },
+        )
+        .unwrap();
+        let r1 = s
+            .insert_request(&RequestRow {
+                job_id: "j1".into(),
+                caller: "agent".into(),
+                session: None,
+                client_pid: Some(7),
+                via: "mcp".into(),
+                requested_at: Some(90),
+                attached_at: 100,
+                coalesced: false,
+            })
+            .unwrap()
+            .unwrap();
+        let r2 = s
+            .insert_request(&RequestRow {
+                job_id: "j1".into(),
+                caller: "human".into(),
+                session: None,
+                client_pid: None,
+                via: "cli".into(),
+                requested_at: None,
+                attached_at: 150,
+                coalesced: true,
+            })
+            .unwrap()
+            .unwrap();
+        s.set_admitted("j1", 200, "over").unwrap();
+        assert!(
+            s.mark_started("j1", "A", 210, None, None, Path::new("/l"))
+                .unwrap()
+        );
+        s.close_request(r2, 250, true).unwrap();
+        assert!(s.mark_done("j1", "A", 900, "killed", None, false).unwrap());
+        s.close_request(r1, 900, false).unwrap();
+        s.set_finish_meta(
+            "j1",
+            &FinishMeta {
+                waits: [60, 0, 0, 0, 40],
+                cpu_ms: Some(3_000),
+                run_delay_ms: Some(500),
+                demand_milli: Some(5_000),
+                killed_by: Some("early-verdict".into()),
+            },
+        )
+        .unwrap();
+        let t = s.timeline("j1").unwrap().unwrap();
+        assert_eq!(
+            (
+                t.requested_at,
+                t.job.queued_at,
+                t.admitted_at,
+                t.job.started_at
+            ),
+            (Some(90), 100, Some(200), Some(210))
+        );
+        assert_eq!(t.job.finished_at, Some(900));
+        assert_eq!(t.weight_cfg, Some(8));
+        assert_eq!(t.expected_ms, Some(12_000));
+        assert_eq!(t.waits, [Some(60), Some(0), Some(0), Some(0), Some(40)]);
+        assert_eq!(t.admission.as_deref(), Some("over"));
+        assert_eq!(t.killed_by.as_deref(), Some("early-verdict"));
+        assert_eq!(
+            (t.cpu_ms, t.run_delay_ms, t.demand_milli),
+            (Some(3_000), Some(500), Some(5_000))
+        );
+        assert_eq!((t.requests, t.detached), (2, 1));
+        assert_eq!(s.timelines_since(0).unwrap().len(), 1);
+        assert_eq!(s.timelines_since(101).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn gate_stats_keep_twenty_per_key_and_prune_unseen_keys() {
+        let (_d, p) = tmp();
+        let s = Store::open(&p).unwrap();
+        let stat = |n: u64, key: &str| GateStat {
+            repo: PathBuf::from("/r"),
+            gate: "test".into(),
+            cmd_hash: key.into(),
+            job_id: format!("j{n}"),
+            finished_at: n,
+            outcome: "pass".into(),
+            wall_ms: 1_000 + n,
+            cpu_ms: 500,
+            run_delay_ms: None,
+            demand_milli: u32::try_from(n).unwrap(),
+        };
+        for n in 0..25 {
+            s.insert_gate_stat(&stat(n, "aaaa")).unwrap();
+        }
+        s.insert_gate_stat(&stat(3, "bbbb")).unwrap();
+        let all = s.gate_stats_recent(100).unwrap();
+        assert_eq!(
+            all.iter().filter(|g| g.cmd_hash == "aaaa").count(),
+            20,
+            "pruned to 20"
+        );
+        let recent = s.gate_stats_recent(10).unwrap();
+        let a: Vec<u64> = recent
+            .iter()
+            .filter(|g| g.cmd_hash == "aaaa")
+            .map(|g| g.finished_at)
+            .collect();
+        assert_eq!(a, (15..25).collect::<Vec<_>>(), "newest ten, oldest first");
+        assert_eq!(s.prune_gate_stats(10).unwrap(), 1, "bbbb unseen since 3");
+        assert!(
+            s.gate_stats_recent(10)
+                .unwrap()
+                .iter()
+                .all(|g| g.cmd_hash == "aaaa")
+        );
     }
 
     #[test]

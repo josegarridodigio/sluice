@@ -118,9 +118,25 @@ fn render(r: &StatusReport, log_path: &Path, socket_fallback: Option<&str>) -> S
     if let Some(level) = &r.daemon.log_level {
         let _ = writeln!(out, "log:      level {level}, {}", log_path.display());
     }
+    let mut extra = Vec::new();
+    if let Some(cap) = r.budget.cap.filter(|c| *c > r.budget.total) {
+        extra.push(format!("cap {cap}"));
+    }
+    if let Some(idle) = r.budget.idle_cpus {
+        let cpus = r
+            .budget
+            .cpus
+            .map_or_else(String::new, |c| format!(" of {c}"));
+        extra.push(format!("{idle:.1}{cpus} cpus idle"));
+    }
+    let extra = if extra.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", extra.join(", "))
+    };
     let _ = writeln!(
         out,
-        "budget:   {} of {} units busy",
+        "budget:   {} of {} units busy{extra}",
         r.budget.used, r.budget.total
     );
     let _ = writeln!(out, "pressure: {}", pressure(&r.budget.psi));
@@ -139,10 +155,17 @@ fn render(r: &StatusReport, log_path: &Path, socket_fallback: Option<&str>) -> S
     }
     let _ = writeln!(out, "queued:   {}", r.queued.len());
     for (i, j) in r.queued.iter().enumerate() {
+        let detail = j
+            .wait_detail
+            .as_deref()
+            .map_or_else(String::new, |d| format!(": {d}"));
+        let expected = j
+            .expected_ms
+            .map_or_else(String::new, |ms| format!("  expected {}", dur(ms)));
         let _ = writeln!(
             out,
-            "  #{:<3} {:<16} {:<20} weight {:<2} waiting {:>8}  ({})",
-            i + 1,
+            "  #{:<3} {:<16} {:<20} weight {:<2} waiting {:>8}  ({}{detail}){expected}",
+            j.rank.unwrap_or(i + 1),
             j.gate,
             basename(&j.repo),
             j.weight,
@@ -162,6 +185,19 @@ fn render(r: &StatusReport, log_path: &Path, socket_fallback: Option<&str>) -> S
         t.coalesced,
         dur(t.time_saved_ms)
     );
+    if let (Some(idle), Some(wall)) = (t.idle_while_waiting_ms, t.waiting_wall_ms)
+        && wall > 0
+    {
+        let _ = writeln!(
+            out,
+            "waiting:  {} with jobs queued, {} of it CPU-idle{}",
+            dur(wall),
+            dur(idle),
+            t.over_admissions
+                .filter(|n| *n > 0)
+                .map_or_else(String::new, |n| format!(", {n} over-admitted"))
+        );
+    }
     out
 }
 
@@ -218,6 +254,37 @@ mod tests {
         );
         assert!(
             text.contains("pressure: cpu n/a mem n/a (unavailable)"),
+            "{text}"
+        );
+        assert!(!text.contains("waiting:"), "{text}");
+    }
+
+    #[test]
+    fn render_shows_the_scheduler_fields_when_present() {
+        let mut r = StatusReport::default();
+        r.budget.total = 20;
+        r.budget.used = 24;
+        r.budget.cap = Some(30);
+        r.budget.cpus = Some(20);
+        r.budget.idle_cpus = Some(3.0);
+        r.queued.push(QueuedJob {
+            gate: "test".into(),
+            rank: Some(1),
+            wait_detail: Some("lane".into()),
+            expected_ms: Some(12_000),
+            ..QueuedJob::default()
+        });
+        r.totals.waiting_wall_ms = Some(60_000);
+        r.totals.idle_while_waiting_ms = Some(6_000);
+        r.totals.over_admissions = Some(2);
+        let text = render(&r, Path::new("/l"), None);
+        assert!(
+            text.contains("24 of 20 units busy (cap 30, 3.0 of 20 cpus idle)"),
+            "{text}"
+        );
+        assert!(text.contains("(budget: lane)  expected 12.0s"), "{text}");
+        assert!(
+            text.contains("waiting:  1m00s with jobs queued, 6.0s of it CPU-idle, 2 over-admitted"),
             "{text}"
         );
     }

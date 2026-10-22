@@ -23,6 +23,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How a `run` request ended.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant, reason = "one short-lived value per gate")]
 pub(crate) enum RunEnd {
     /// The daemon sent `done`.
     Done {
@@ -36,6 +37,13 @@ pub(crate) enum RunEnd {
     /// The MCP request was cancelled; the subscription was dropped.
     Cancelled {
         /// Job id, when `queued` arrived before the cancellation.
+        job_id: Option<String>,
+    },
+    /// A sibling gate of the same `verify` failed first (early verdict,
+    /// ADR-0011 M4); the subscription was dropped with reason
+    /// `early-verdict`.
+    EarlyVerdict {
+        /// Job id, when `queued` arrived before the verdict.
         job_id: Option<String>,
     },
 }
@@ -66,13 +74,16 @@ async fn send(writer: &mut OwnedWriteHalf, msg: &ClientMessage) -> Result<(), St
         .map_err(|e| e.to_string())
 }
 
-/// Sends `request` and follows its events until `done` or cancellation.
+/// Sends `request` and follows its events until `done`, cancellation of the
+/// MCP request (`ct`) or an early verdict of the `verify` call (`early`).
 ///
 /// `on_event` sees every server message (`queued`, `started`, `progress`).
+#[allow(clippy::too_many_lines, reason = "the run exchange, in protocol order")]
 pub(crate) async fn run(
     socket: &Path,
     request: RunRequest,
     ct: &CancellationToken,
+    early: &CancellationToken,
     mut on_event: impl FnMut(&ServerMessage) + Send,
 ) -> Result<RunEnd, RunError> {
     let handshake = async {
@@ -111,6 +122,7 @@ pub(crate) async fn run(
     };
     let (mut lines, mut writer) = tokio::select! {
         () = ct.cancelled() => return Ok(RunEnd::Cancelled { job_id: None }),
+        () = early.cancelled() => return Ok(RunEnd::EarlyVerdict { job_id: None }),
         r = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake) => match r {
             Ok(Ok(v)) => v,
             Ok(Err(why)) => return Err(RunError::NotQueued(why)),
@@ -127,9 +139,20 @@ pub(crate) async fn run(
         let line = tokio::select! {
             () = ct.cancelled() => {
                 // Detach explicitly, then close; either alone is enough for the daemon.
-                let _ = send(&mut writer, &ClientMessage::Cancel { id: 1 }).await;
+                let _ = send(&mut writer, &ClientMessage::Cancel { id: 1, reason: None }).await;
                 let _ = writer.shutdown().await;
                 return Ok(RunEnd::Cancelled { job_id: job });
+            }
+            () = early.cancelled() => {
+                // The daemon records `killed_by = early-verdict` when this was
+                // the job's last subscriber; other subscribers keep it running.
+                let cancel = ClientMessage::Cancel {
+                    id: 1,
+                    reason: Some(proto::CANCEL_EARLY_VERDICT.to_owned()),
+                };
+                let _ = send(&mut writer, &cancel).await;
+                let _ = writer.shutdown().await;
+                return Ok(RunEnd::EarlyVerdict { job_id: job });
             }
             line = lines.next_line() => line,
         };

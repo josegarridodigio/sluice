@@ -61,11 +61,25 @@ Parameters:
 | `gates` | string[] | no | Gate names, run in this order (a repeated name runs twice, the second normally a hit). Default (or `[]`): gates whose `hooks` contain `pre-commit`, alphabetically; if none is tagged, every gate. |
 | `timeout_seconds` | integer | no | Execution time limit per gate, overrides the gate's `timeout`; `0` means no timeout. Queue wait does not count. |
 | `extra_args` | string[] | no | Appended to every selected gate's command and folded into the cache key (see [[sluice/design/cache-key.md]]), so a pass with arguments never answers a call without them. |
+| `fail_fast` | boolean | no | Default `true`: the call returns at the first gate that fails, times out, errors or is killed, and cancels the gates still pending. `false` waits for every gate. |
 
-Behaviour: gates run sequentially in the given order (a `depends_on` is
-not honoured in v1) and **all selected gates run even after one fails**.
-For each gate: hit → `PASS (cached, passed <age> ago)`; miss → daemon
-`run` (coalescing applies); the tool blocks until every gate finished.
+Behaviour (0.3.0, ADR-0011 M4): the selected gates run **concurrently**
+(one daemon connection per gate, submitted together; a `depends_on` is not
+honoured in v1). With `fail_fast` (default) the first failing gate ends
+the call: every pending gate's subscription is dropped with `cancel`
+reason `early-verdict`, so the daemon kills (or drops from the queue) a job
+nobody else waits for (`killed_by = early-verdict`), while a job another
+client coalesced into keeps running (under `last_subscriber_gone = finish`
+it completes and caches). Those gates report `cancelled` with message
+`not finished: <gate> failed first` and the text line `CANCELLED (not
+finished: <gate> failed first; job <id>)`; the call itself is not
+`cancelled`. `fail_fast: false` waits for every gate and reports every
+failure. `[mcp] verify_parallel = false` (or a single gate) restores the
+pre-0.3.0 sequential loop: gates in the given order, **all of them run
+even after one fails**, `fail_fast` ignored. Results are always listed in
+the requested order. For each gate: hit → `PASS (cached, passed <age>
+ago)`; miss → daemon `run` (coalescing applies). A gate that waited in the
+queue gets ` (queued <time>: <reason>)` appended to its line.
 Progress notifications every `[mcp] progress_interval` (default 15 s)
 carrying the gate, queue position or elapsed time and the job id, when
 the client sent a `progressToken`. Cancellation (`CancellationToken`,
@@ -120,7 +134,11 @@ gates) appear when relevant; the text tail is `--- last <n> lines of
 `cache.tail_lines`); the report carries `cancelled: true` after a
 cancellation. A Sluice error on one gate (daemon unavailable, refused
 before `queued`, connection lost) is recorded as that gate's `error`
-result and the remaining gates still run; the call returns `is_error`.
+result (with `fail_fast` it is the early verdict; otherwise the remaining
+gates still run); the call returns `is_error`. Optional 0.3.0 fields:
+`GateResult.queue_wait_ms` (this call's queue wait), `GateResult.wait_reason`
+(dominant cause: `budget`, `psi`, `repo-cap`, `head-reserved`, `order`) and
+`VerifyReport.wall_ms` (the whole call).
 
 A failing gate is a normal result with `is_error = true` (the model must
 read it); only protocol-level problems (bad or relative

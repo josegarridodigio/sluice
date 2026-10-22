@@ -77,6 +77,7 @@ fn daemon_config(env: &EnvMap, user: &UserConfig, detached: bool) -> Result<Daem
         version: env!("CARGO_PKG_VERSION").to_owned(),
         admission: user.admission.clone(),
         psi_root: PathBuf::from(sluice_gate_daemon::psi::DEFAULT_ROOT),
+        proc_root: PathBuf::from("/proc"),
         user: user.clone(),
         log: LogSettings {
             level: Some(log_level(env, user)),

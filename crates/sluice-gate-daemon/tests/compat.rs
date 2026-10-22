@@ -156,6 +156,7 @@ fn config(dir: &Path) -> DaemonConfig {
             ..AdmissionConfig::default()
         },
         psi_root: dir.join("pressure"),
+        proc_root: std::path::PathBuf::from("/proc"),
         user: server::UserConfig::default(),
         log: server::LogSettings::default(),
         extensions: Vec::new(),
@@ -456,6 +457,161 @@ async fn a_daemon_runs_on_an_old_database() {
         );
         d.shutdown().await;
     }
+}
+
+fn raw_count(conn: &rusqlite::Connection, sql: &str) -> i64 {
+    conn.query_row(sql, [], |r| r.get(0)).unwrap()
+}
+
+/// ADR-0011 section 7.4 / ADR-0013 G9: the database written by the v0.2.0
+/// release migrates to `sched_schema` 1 without losing history, after a
+/// `.bak-0` copy, and a second open is a no-op.
+#[test]
+fn the_v020_database_migrates_without_losing_history() {
+    use sluice_gate_daemon::migrate;
+    let (_dir, db) = copy_db("v0.2.0");
+    let raw = rusqlite::Connection::open(&db).unwrap();
+    let jobs_before = raw_count(&raw, "SELECT count(*) FROM jobs");
+    let events_before = raw_count(&raw, "SELECT count(*) FROM events");
+    assert!(jobs_before >= 7);
+    assert_eq!(migrate::version(&raw, migrate::SCHED_TABLE).unwrap(), 0);
+    drop(raw);
+
+    let store = Store::open(&db).unwrap();
+    assert_eq!(store.sched_version(), migrate::SCHED_SCHEMA_VERSION);
+    let bak = migrate::backup_path(&db, 0);
+    assert!(bak.exists(), "backup before migrating");
+    let newest = store.newest_job().unwrap().expect("history survives");
+    let t = store.timeline(&newest.id).unwrap().expect("old row");
+    assert_eq!(t.job, newest);
+    assert_eq!((t.admitted_at, t.weight_cfg, t.requests), (None, None, 0));
+    assert_eq!(
+        store.timelines_since(0).unwrap().len(),
+        usize::try_from(jobs_before).unwrap()
+    );
+    drop(store);
+
+    let raw = rusqlite::Connection::open(&db).unwrap();
+    assert_eq!(raw_count(&raw, "SELECT count(*) FROM jobs"), jobs_before);
+    assert_eq!(
+        raw_count(&raw, "SELECT count(*) FROM events"),
+        events_before
+    );
+    assert_eq!(
+        raw_count(&raw, "SELECT version FROM schema"),
+        1,
+        "schema.version stays 1"
+    );
+    for table in ["job_requests", "gate_stats", "sched_schema"] {
+        let n = raw_count(
+            &raw,
+            &format!(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = '{table}'"
+            ),
+        );
+        assert_eq!(n, 1, "{table}");
+    }
+    drop(raw);
+    // The backup is the untouched v0.2.0 file.
+    let backup = rusqlite::Connection::open(&bak).unwrap();
+    assert_eq!(migrate::version(&backup, migrate::SCHED_TABLE).unwrap(), 0);
+    assert_eq!(raw_count(&backup, "SELECT count(*) FROM jobs"), jobs_before);
+    drop(backup);
+
+    // Idempotent: nothing to apply, the backup is not rewritten.
+    let modified = fs::metadata(&bak).unwrap().modified().unwrap();
+    let again = Store::open(&db).unwrap();
+    assert_eq!(again.sched_version(), migrate::SCHED_SCHEMA_VERSION);
+    assert_eq!(fs::metadata(&bak).unwrap().modified().unwrap(), modified);
+    drop(again);
+    let raw = rusqlite::Connection::open(&db).unwrap();
+    assert_eq!(raw_count(&raw, "SELECT count(*) FROM sched_schema"), 1);
+}
+
+/// The v0.2.0 store's own statements (its version check, `INSERT` with its
+/// named columns, start/finish updates and totals) still work on a migrated
+/// file: `schema.version` stayed 1 and every new column is nullable, so a
+/// downgraded 0.2.0 daemon keeps opening and writing it.
+#[test]
+fn a_v020_daemon_still_opens_and_writes_the_migrated_file() {
+    let (_dir, db) = copy_db("v0.2.0");
+    drop(Store::open(&db).unwrap());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let version: i64 = conn
+        .query_row("SELECT version FROM schema LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 1, "the check of v0.2.0 passes");
+    conn.execute(
+        "INSERT INTO jobs (id, key, tree, repo, gate, cmd, weight, caller, session, state, \
+         outcome, exit_code, queued_at, started_at, finished_at, log_path, pgid, \
+         proc_start_ticks, daemon_instance, subscribers_max, coalesced, marker_written) \
+         VALUES ('v020-job', NULL, NULL, '/r', 'test', 'true', 1, 'human', NULL, 'queued', \
+         NULL, NULL, 1, NULL, NULL, NULL, NULL, NULL, 'old-1', 1, 0, 0)",
+        [],
+    )
+    .expect("v0.2.0 insert");
+    conn.execute(
+        "UPDATE jobs SET state = 'running', started_at = 2, pgid = 1, proc_start_ticks = 1, \
+         log_path = '/l' WHERE id = 'v020-job' AND daemon_instance = 'old-1' AND state = 'queued'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE jobs SET state = 'done', outcome = 'pass', exit_code = 0, finished_at = 3, \
+         marker_written = 1 WHERE id = 'v020-job' AND daemon_instance = 'old-1' \
+         AND state IN ('queued', 'running')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    // The current release reads the downgraded row: timeline unknown.
+    let store = Store::open(&db).unwrap();
+    let t = store.timeline("v020-job").unwrap().unwrap();
+    assert_eq!(t.job.outcome.as_deref(), Some("pass"));
+    assert_eq!(
+        (t.requested_at, t.admitted_at, t.admission),
+        (None, None, None)
+    );
+}
+
+/// A daemon started with the v0.2.0 user config fixture runs a job on the
+/// migrated v0.2.0 database and records the new timeline.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_with_the_v020_user_config_runs_on_the_migrated_database() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../sluice-gate-core/tests/fixtures/compat/v0.2.0/user-config/full.toml");
+    let user = server::UserConfig::parse(&fs::read_to_string(&path).unwrap(), &path).unwrap();
+    let (dir, db) = copy_db("v0.2.0");
+    let mut cfg = config(dir.path());
+    cfg.user = user;
+    let socket = cfg.socket_path.clone();
+    let (tx, rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(server::run(cfg, async move {
+        let _ = rx.await;
+    }));
+    let d = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !socket.exists() {
+            assert!(tokio::time::Instant::now() < deadline, "no socket");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Daemon {
+            dir,
+            socket,
+            stop: Some(tx),
+            task,
+        }
+    };
+    let repo = make_repo("v0.2.0");
+    let lines = transcript("v0.2.0", "run-fail");
+    let replies = replay(&d, &lines, &repo).await;
+    assert_matches_recording("v0.2.0", "run-fail", &lines, &replies);
+    let store = Store::open_read_only(&db).unwrap();
+    let newest = store.newest_job().unwrap().unwrap();
+    let t = store.timeline(&newest.id).unwrap().unwrap();
+    assert!(t.admitted_at.is_some() && t.admission.is_some(), "{t:?}");
+    drop(store);
+    d.shutdown().await;
 }
 
 #[test]

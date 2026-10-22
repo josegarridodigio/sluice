@@ -412,6 +412,7 @@ fn to_request(m: RunMaterial, caller: proto::Caller) -> RunRequest {
         client_pid: std::process::id(),
         hook: m.hook,
         no_marker: false,
+        requested_at: Some(sluice_gate_core::dirs::now_ms()),
     }
 }
 

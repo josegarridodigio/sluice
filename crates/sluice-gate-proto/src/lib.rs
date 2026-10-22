@@ -59,6 +59,11 @@ pub const FEATURE_QUEUE_ONLY: &str = "queue-only";
 /// Value of [`RunningJob::kind`] / [`QueuedJob::kind`] for `sluice exec` jobs.
 pub const JOB_KIND_EXEC: &str = "exec";
 
+/// [`ClientMessage::Cancel::reason`] of an MCP `verify` that ended early
+/// because a sibling gate failed (ADR-0011 M4); also the `killed_by` value
+/// of a job cancelled that way.
+pub const CANCEL_EARLY_VERDICT: &str = "early-verdict";
+
 /// Maximum accepted length of one protocol line, in bytes (1 MiB).
 pub const MAX_LINE_BYTES: usize = 1 << 20;
 
@@ -123,6 +128,11 @@ pub enum ClientMessage {
     Cancel {
         /// Id of the `run` request to detach from.
         id: u64,
+        /// Why the client detaches, recorded as the job's `killed_by` when
+        /// this was its last subscriber (for example
+        /// [`CANCEL_EARLY_VERDICT`]); omitted from the wire when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// Run an arbitrary command under the budget, without cache (`sluice
     /// exec`). Only sent to a daemon announcing [`FEATURE_EXEC`].
@@ -294,6 +304,10 @@ pub struct RunRequest {
     /// [`FEATURE_QUEUE_ONLY`]; omitted from the wire when false.
     #[serde(default, skip_serializing_if = "is_false")]
     pub no_marker: bool,
+    /// When the client sent the request (unix milliseconds), the first
+    /// point of the job timeline; omitted from the wire when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_at: Option<u64>,
 }
 
 #[allow(
@@ -460,9 +474,17 @@ pub enum ServerMessage {
         /// True when attached to an existing job.
         #[serde(default)]
         coalesced: bool,
-        /// Weight of the job.
+        /// Weight of the job (effective: learned or configured).
         #[serde(default)]
         weight: u32,
+        /// Configured weight after the budget and repository-cap clamp;
+        /// omitted when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        weight_cfg: Option<u32>,
+        /// Expected run time from the gate's history, in milliseconds;
+        /// omitted when unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_ms: Option<u64>,
     },
     /// The gate process started.
     Started {
@@ -607,6 +629,23 @@ pub struct Outcome {
     /// for `tail` only); omitted when the log was written.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_error: Option<String>,
+    /// Time this subscriber waited for the job to start, in milliseconds
+    /// (`started_at - attached_at`, 0 when it joined a running job); omitted
+    /// when the job never started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_wait_ms: Option<u64>,
+    /// Dominant reason the job waited (`budget`, `psi`, `repo-cap`,
+    /// `head-reserved` or `order`); omitted when it did not wait.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_reason: Option<String>,
+    /// How the job was admitted: `nominal`, `over` (over-admission) or
+    /// `guard` (PSI starvation guard); omitted when it never started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission: Option<String>,
+    /// Who killed the job: `last-subscriber`, `early-verdict`, `stop` or
+    /// `superseded`; omitted unless it was killed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub killed_by: Option<String>,
 }
 
 /// Category of an [`Outcome`].
@@ -722,6 +761,16 @@ pub struct BudgetInfo {
     pub used: u32,
     /// Pressure stall information.
     pub psi: PsiInfo,
+    /// Over-admission cap (`floor(overcommit * total)`); `used` may exceed
+    /// `total` up to it. Omitted when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cap: Option<u32>,
+    /// CPUs available to the daemon (affinity mask and cgroup limit).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<u32>,
+    /// Mean idle CPUs over the last two utilisation samples.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_cpus: Option<f64>,
 }
 
 /// Linux pressure stall information.
@@ -764,6 +813,19 @@ pub struct RunningJob {
     /// Label of an `exec` job (its `gate` is `exec:<label>`); omitted for gates.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Configured weight (after the clamp); `weight` is the effective one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight_cfg: Option<u32>,
+    /// Milliseconds the job waited in the queue before it started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waited_ms: Option<u64>,
+    /// `nominal`, `over` (over-admission) or `guard` (PSI starvation guard).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission: Option<String>,
+    /// Measured demand so far (CPU time plus run-queue wait over wall time,
+    /// in CPUs); gates only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub demand: Option<f64>,
 }
 
 /// A queued job in a status report.
@@ -792,6 +854,22 @@ pub struct QueuedJob {
     /// Label of an `exec` job (its `gate` is `exec:<label>`); omitted for gates.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Fairness lane (the worktree path the request came from).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane: Option<PathBuf>,
+    /// 1-based position in the priority order (the next admission pass).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rank: Option<usize>,
+    /// Expected run time from the gate's history, in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_ms: Option<u64>,
+    /// Configured weight (after the clamp); `weight` is the effective one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight_cfg: Option<u32>,
+    /// Detail of `reason` when the job would fit but higher-ranked jobs
+    /// took the room: `outranked`, `lane` or `human-first`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_detail: Option<String>,
 }
 
 /// Why a queued job is not running yet.
@@ -840,6 +918,17 @@ pub struct Totals {
     /// daemon instance only, accumulated per sample; keeps what accrued if PSI
     /// later becomes unavailable).
     pub psi_blocked_ms_total: u64,
+    /// Integral of the idle fraction of the daemon's CPUs while at least one
+    /// job was queued, in milliseconds (current daemon instance only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_while_waiting_ms: Option<u64>,
+    /// Wall time with at least one job queued, in milliseconds (current
+    /// daemon instance only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_wall_ms: Option<u64>,
+    /// Jobs started by over-admission (current daemon instance only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub over_admissions: Option<u64>,
 }
 
 /// Payload of the `queue-status` reply (also `sluice queue status --json`).
@@ -1179,6 +1268,7 @@ mod tests {
             client_pid: 4242,
             hook: Some("pre-commit".into()),
             no_marker: false,
+            requested_at: None,
         }
     }
 
@@ -1195,6 +1285,7 @@ mod tests {
             message: "ok".into(),
             signal: None,
             log_error: None,
+            ..Outcome::default()
         }
     }
 
@@ -1218,6 +1309,7 @@ mod tests {
                     memory_some_avg10: None,
                     blocking: false,
                 },
+                ..BudgetInfo::default()
             },
             running: vec![RunningJob {
                 job_id: "j".into(),
@@ -1230,6 +1322,7 @@ mod tests {
                 caller: Caller::Human,
                 kind: None,
                 label: None,
+                ..RunningJob::default()
             }],
             queued: vec![
                 QueuedJob {
@@ -1243,6 +1336,7 @@ mod tests {
                     reason: WaitReason::HeadReserved,
                     kind: None,
                     label: None,
+                    ..QueuedJob::default()
                 },
                 QueuedJob {
                     job_id: "x".into(),
@@ -1349,7 +1443,10 @@ mod tests {
                 },
             },
             ClientMessage::Stop { id: 4, force: true },
-            ClientMessage::Cancel { id: 1 },
+            ClientMessage::Cancel {
+                id: 1,
+                reason: None,
+            },
             ClientMessage::QueueEnqueue {
                 id: 5,
                 request: EnqueueRequest {
@@ -1424,6 +1521,8 @@ mod tests {
                 position: 0,
                 coalesced: true,
                 weight: 4,
+                weight_cfg: None,
+                expected_ms: None,
             },
             ServerMessage::Started {
                 id: 1,
@@ -1567,7 +1666,9 @@ mod tests {
                 job_id: "j".into(),
                 position: 0,
                 coalesced: false,
-                weight: 4
+                weight: 4,
+                weight_cfg: None,
+                expected_ms: None
             }
         );
         let d = decode_server(
@@ -1730,6 +1831,82 @@ mod tests {
             !queued.contains("kind") && !queued.contains("label"),
             "{queued}"
         );
+    }
+
+    /// ADR-0011: `requested_at`, the cancel reason, the `queued` scheduler
+    /// fields and the outcome timeline fields stay off the wire when unset,
+    /// and old lines still decode.
+    #[test]
+    fn scheduler_wire_fields_are_additive() {
+        let run = encode(&ClientMessage::Run {
+            id: 1,
+            request: run_request(),
+        })
+        .unwrap();
+        assert!(!run.contains("requested_at"), "{run}");
+        let mut req = run_request();
+        req.requested_at = Some(1_700_000_000_000);
+        let line = encode(&ClientMessage::Run {
+            id: 1,
+            request: req.clone(),
+        })
+        .unwrap();
+        assert!(line.contains(r#""requested_at":1700000000000"#), "{line}");
+        assert_eq!(
+            decode_client(&line).unwrap(),
+            ClientMessage::Run {
+                id: 1,
+                request: req
+            }
+        );
+
+        let cancel = encode(&ClientMessage::Cancel {
+            id: 1,
+            reason: None,
+        })
+        .unwrap();
+        assert_eq!(cancel, "{\"type\":\"cancel\",\"id\":1}\n");
+        let early = encode(&ClientMessage::Cancel {
+            id: 1,
+            reason: Some(CANCEL_EARLY_VERDICT.into()),
+        })
+        .unwrap();
+        assert!(early.contains(r#""reason":"early-verdict""#), "{early}");
+        assert_eq!(
+            decode_client(r#"{"type":"cancel","id":1}"#).unwrap(),
+            ClientMessage::Cancel {
+                id: 1,
+                reason: None
+            }
+        );
+
+        let queued = ServerMessage::Queued {
+            id: 1,
+            job_id: "j".into(),
+            position: 1,
+            coalesced: false,
+            weight: 6,
+            weight_cfg: None,
+            expected_ms: None,
+        };
+        assert_eq!(
+            encode(&queued).unwrap(),
+            "{\"type\":\"queued\",\"id\":1,\"job_id\":\"j\",\"position\":1,\"coalesced\":false,\"weight\":6}\n"
+        );
+
+        let done = encode(&outcome()).unwrap();
+        for k in ["queue_wait_ms", "wait_reason", "admission", "killed_by"] {
+            assert!(!done.contains(k), "{done}");
+        }
+        let full = Outcome {
+            queue_wait_ms: Some(31_000),
+            wait_reason: Some("budget".into()),
+            admission: Some("over".into()),
+            killed_by: Some(CANCEL_EARLY_VERDICT.into()),
+            ..outcome()
+        };
+        let back: Outcome = serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        assert_eq!(back, full);
     }
 
     #[test]

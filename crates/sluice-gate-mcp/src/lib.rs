@@ -154,6 +154,12 @@ struct VerifyParams {
     /// Arguments appended to every selected gate's command.
     #[serde(default)]
     extra_args: Option<Vec<String>>,
+    /// Stop at the first failing gate (default true): the call returns as
+    /// soon as one gate fails, times out or errors, and the gates still
+    /// pending are cancelled (a job another client also waits for keeps
+    /// running). `false` waits for every gate and reports every failure.
+    #[serde(default)]
+    fail_fast: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -265,6 +271,14 @@ struct GateResult {
     /// Last lines of the log of a failing gate (absent when empty).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tail: Vec<String>,
+    /// Time this call waited in the queue before the gate started, in
+    /// milliseconds (absent for cached passes and gates that never started).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queue_wait_ms: Option<u64>,
+    /// Dominant reason the job waited: `budget`, `psi`, `repo-cap`,
+    /// `head-reserved` or `order` (absent when it did not wait).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wait_reason: Option<String>,
 }
 
 impl GateResult {
@@ -281,6 +295,8 @@ impl GateResult {
             not_cached_reason: None,
             message: None,
             tail: Vec::new(),
+            queue_wait_ms: None,
+            wait_reason: None,
         }
     }
 }
@@ -289,13 +305,16 @@ impl GateResult {
 struct VerifyReport {
     /// Repository root.
     repository: PathBuf,
-    /// One entry per gate, in run order.
+    /// One entry per gate, in the requested order.
     results: Vec<GateResult>,
     /// True when every gate passed.
     all_passed: bool,
     /// True when the call was cancelled before every gate finished.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     cancelled: bool,
+    /// Wall time of the whole call, in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wall_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -439,6 +458,7 @@ fn to_request(m: RunMaterial) -> RunRequest {
         client_pid: std::process::id(),
         hook: m.hook,
         no_marker: false,
+        requested_at: Some(sluice_gate_core::dirs::now_ms()),
     }
 }
 
@@ -599,6 +619,8 @@ impl Progress {
 struct GateLine {
     result: GateResult,
     line: String,
+    /// Cancelled because a sibling gate failed first (early verdict).
+    early: bool,
 }
 
 fn cancelled_line(gate: &str, job_id: Option<String>) -> GateLine {
@@ -609,7 +631,32 @@ fn cancelled_line(gate: &str, job_id: Option<String>) -> GateLine {
     let mut result = GateResult::new(gate, GateStatus::Cancelled);
     result.job_id = job_id;
     result.message = Some("the verification was cancelled".to_owned());
-    GateLine { result, line }
+    GateLine {
+        result,
+        line,
+        early: false,
+    }
+}
+
+/// A gate left unfinished because a sibling gate failed first; the message
+/// names that gate once the call knows it ([`name_early_verdicts`]).
+fn early_line(gate: &str, job_id: Option<String>) -> GateLine {
+    let mut line = cancelled_line(gate, job_id);
+    line.early = true;
+    line
+}
+
+/// Words the lines of gates cancelled by the early verdict:
+/// `not finished: <gate> failed first`.
+fn name_early_verdicts(lines: &mut [GateLine], failed: &str) {
+    for g in lines.iter_mut().filter(|g| g.early) {
+        let why = format!("not finished: {failed} failed first");
+        g.line = match &g.result.job_id {
+            Some(j) => format!("CANCELLED ({why}; job {j})"),
+            None => format!("CANCELLED ({why})"),
+        };
+        g.result.message = Some(why);
+    }
 }
 
 /// A Sluice-side failure of one gate (daemon unavailable, request refused,
@@ -620,6 +667,7 @@ fn error_line(gate: &str, why: &str) -> GateLine {
     GateLine {
         result,
         line: format!("ERROR ({why})"),
+        early: false,
     }
 }
 
@@ -688,6 +736,13 @@ fn outcome_line(
             format!("ERROR unknown outcome status from the daemon (job {job_id}); update sluice")
         }
     };
+    // `(queued 31.0s: budget)` when the job waited for a reason.
+    let line = match (&outcome.wait_reason, outcome.queue_wait_ms) {
+        (Some(reason), Some(ms)) if ms > 0 && outcome.status != OutcomeStatus::Cached => {
+            format!("{line} (queued {}: {reason})", dur(ms))
+        }
+        _ => line,
+    };
     let failed_with_log = matches!(
         status,
         GateStatus::Fail | GateStatus::Timeout | GateStatus::Killed
@@ -709,8 +764,14 @@ fn outcome_line(
         not_cached_reason: not_cached,
         message: (status == GateStatus::Error).then(|| outcome.message.clone()),
         tail,
+        queue_wait_ms: outcome.queue_wait_ms,
+        wait_reason: outcome.wait_reason.clone(),
     };
-    GateLine { result, line }
+    GateLine {
+        result,
+        line,
+        early: false,
+    }
 }
 
 /// Text of a `verify` result: one line per gate, then the tail of the
@@ -796,10 +857,13 @@ impl Server {
         GateLine {
             result,
             line: format!("PASS (cached, passed {} ago)", age(&marker.passed_at)),
+            early: false,
         }
     }
 
-    /// Runs one gate: cache hit, or a daemon job followed to the end.
+    /// Runs one gate: cache hit, or a daemon job followed to the end. `early`
+    /// is cancelled when a sibling gate of the same call failed first.
+    #[allow(clippy::too_many_arguments, reason = "one gate of one verify call")]
     async fn verify_gate(
         &self,
         repo: &RepoContext,
@@ -808,6 +872,7 @@ impl Server {
         ctx: &RequestContext<RoleServer>,
         progress: Option<&Progress>,
         position: (usize, usize),
+        early: &CancellationToken,
     ) -> Result<GateLine, McpError> {
         let ct = &ctx.ct;
         let res = repo.select(gate).map_err(|e| invalid(e.to_string()))?;
@@ -831,6 +896,9 @@ impl Server {
                 off_reason,
             } => (request, res, off_reason),
         };
+        if early.is_cancelled() {
+            return Ok(early_line(gate, None));
+        }
         let timeout = params
             .timeout_seconds
             .map_or(res.gate.timeout, Duration::from_secs);
@@ -852,7 +920,7 @@ impl Server {
 
         tracing::info!(gate, "running through the daemon");
         let state = Mutex::new(JobState::default());
-        let run = daemon::run(&socket, request, ct, |msg| {
+        let run = daemon::run(&socket, request, ct, early, |msg| {
             if let Ok(mut s) = state.lock() {
                 s.update(msg);
             }
@@ -887,27 +955,90 @@ impl Server {
                 (job_id, outcome, coalesced),
             )),
             Ok(RunEnd::Cancelled { job_id }) => Ok(cancelled_line(gate, job_id)),
+            Ok(RunEnd::EarlyVerdict { job_id }) => Ok(early_line(gate, job_id)),
             Err(e @ (RunError::NotQueued(_) | RunError::Lost(_))) => {
                 Ok(error_line(gate, &e.to_string()))
             }
         }
     }
 
+    /// Every gate at once (ADR-0011 M4). With `fail_fast`, the first gate
+    /// that fails, times out or errors cancels the pending ones (their
+    /// daemon subscriptions are dropped with reason `early-verdict`).
+    /// Returns the lines in `gates` order.
+    async fn verify_parallel(
+        &self,
+        repo: &RepoContext,
+        gates: &[String],
+        params: &VerifyParams,
+        ctx: &RequestContext<RoleServer>,
+        progress: Option<&Progress>,
+        fail_fast: bool,
+    ) -> Result<Vec<GateLine>, McpError> {
+        type GateFuture<'a> = std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<GateLine, McpError>> + Send + 'a>,
+        >;
+        let early = CancellationToken::new();
+        let n = gates.len();
+        let mut futures: Vec<GateFuture<'_>> = gates
+            .iter()
+            .enumerate()
+            .map(|(i, gate)| {
+                Box::pin(self.verify_gate(repo, gate, params, ctx, progress, (i + 1, n), &early))
+                    as GateFuture<'_>
+            })
+            .collect();
+        let mut lines: Vec<Option<GateLine>> = (0..n).map(|_| None).collect();
+        let mut pending: Vec<usize> = (0..n).collect();
+        let mut failed: Option<String> = None;
+        while !pending.is_empty() {
+            let (k, out) = std::future::poll_fn(|cx| {
+                for (k, &i) in pending.iter().enumerate() {
+                    if let std::task::Poll::Ready(out) = futures[i].as_mut().poll(cx) {
+                        return std::task::Poll::Ready((k, out));
+                    }
+                }
+                std::task::Poll::Pending
+            })
+            .await;
+            let i = pending.remove(k);
+            let line = out?;
+            let failure = matches!(
+                line.result.status,
+                GateStatus::Fail | GateStatus::Timeout | GateStatus::Error | GateStatus::Killed
+            );
+            if fail_fast && failure && failed.is_none() {
+                tracing::info!(gate = %line.result.gate, "early verdict: cancelling the pending gates");
+                failed = Some(line.result.gate.clone());
+                early.cancel();
+            }
+            lines[i] = Some(line);
+        }
+        drop(futures);
+        let mut lines: Vec<GateLine> = lines.into_iter().flatten().collect();
+        if let Some(failed) = failed {
+            name_early_verdicts(&mut lines, &failed);
+        }
+        Ok(lines)
+    }
+
     /// Verify the working tree: run the selected gates (cache hit in milliseconds,
-    /// otherwise queued in the shared Sluice daemon) and block until every gate
-    /// finished. Gates run sequentially. Call this before committing instead of
-    /// running test, lint or type-check commands yourself. Sends a progress
-    /// notification every 15 s (configurable) when the request carries a
-    /// progressToken; without one, the client's idle timeout (30 minutes in
-    /// Claude Code) is the effective limit. The result lists one line per gate
-    /// and, on failure, the tail of the first failing log; `is_error` is set
-    /// when any gate did not pass.
+    /// otherwise queued in the shared Sluice daemon) and block until they
+    /// finished. The gates run concurrently; by default (`fail_fast`) the call
+    /// returns at the first gate that fails and cancels the others. Call this
+    /// before committing instead of running test, lint or type-check commands
+    /// yourself. Sends a progress notification every 15 s (configurable) when
+    /// the request carries a progressToken; without one, the client's idle
+    /// timeout (30 minutes in Claude Code) is the effective limit. The result
+    /// lists one line per gate and, on failure, the tail of the first failing
+    /// log; `is_error` is set when any gate did not pass.
     #[tool(output_schema = schema_for_output::<VerifyReport>())]
     async fn verify(
         &self,
         Parameters(params): Parameters<VerifyParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
         let dir = workdir(&params.working_directory)?;
         let env = Arc::clone(&self.env);
         let mode = cache_mode(&env);
@@ -919,12 +1050,15 @@ impl Server {
                 results: Vec::new(),
                 all_passed: false,
                 cancelled: true,
+                wall_ms: None,
             };
             return result(verify_text(&[], true), &report, true);
         };
         let repo = repo.map_err(|e| invalid(e.to_string()))?;
         let gates = select_gates(&repo.config, params.gates.clone())?;
-        tracing::info!(repo = %repo.paths.toplevel.display(), ?gates, "verify");
+        let parallel = repo.user.mcp.verify_parallel;
+        let fail_fast = params.fail_fast.unwrap_or(true);
+        tracing::info!(repo = %repo.paths.toplevel.display(), ?gates, parallel, fail_fast, "verify");
 
         let progress = ctx.meta.get_progress_token().map(|token| Progress {
             peer: ctx.peer.clone(),
@@ -932,25 +1066,37 @@ impl Server {
             interval: repo.user.mcp.progress_interval.max(Duration::from_secs(1)),
             started: Instant::now(),
         });
-        let mut lines: Vec<GateLine> = Vec::with_capacity(gates.len());
-        let mut cancelled = false;
-        for (i, gate) in gates.iter().enumerate() {
-            let line = self
-                .verify_gate(
-                    &repo,
-                    gate,
-                    &params,
-                    &ctx,
-                    progress.as_ref(),
-                    (i + 1, gates.len()),
-                )
-                .await?;
-            cancelled = line.result.status == GateStatus::Cancelled;
-            lines.push(line);
-            if cancelled {
-                break;
+        let lines = if parallel && gates.len() > 1 {
+            self.verify_parallel(&repo, &gates, &params, &ctx, progress.as_ref(), fail_fast)
+                .await?
+        } else {
+            // Sequential (`[mcp] verify_parallel = false`): the pre-0.3.0
+            // behaviour, every gate in order, stopping only on cancellation.
+            let never = CancellationToken::new();
+            let mut lines: Vec<GateLine> = Vec::with_capacity(gates.len());
+            for (i, gate) in gates.iter().enumerate() {
+                let line = self
+                    .verify_gate(
+                        &repo,
+                        gate,
+                        &params,
+                        &ctx,
+                        progress.as_ref(),
+                        (i + 1, gates.len()),
+                        &never,
+                    )
+                    .await?;
+                let stop = line.result.status == GateStatus::Cancelled;
+                lines.push(line);
+                if stop {
+                    break;
+                }
             }
-        }
+            lines
+        };
+        let cancelled = lines
+            .iter()
+            .any(|g| g.result.status == GateStatus::Cancelled && !g.early);
         let all_passed = !cancelled && lines.iter().all(|g| g.result.status == GateStatus::Pass);
         let text = verify_text(&lines, cancelled);
         let report = VerifyReport {
@@ -958,6 +1104,7 @@ impl Server {
             results: lines.into_iter().map(|g| g.result).collect(),
             all_passed,
             cancelled,
+            wall_ms: Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
         };
         result(text, &report, !all_passed)
     }
@@ -1556,10 +1703,12 @@ mod tests {
         let lines = vec![
             GateLine {
                 result: GateResult::new("test", GateStatus::Pass),
+                early: false,
                 line: "PASS 1.0s (job j)".into(),
             },
             GateLine {
                 result: fail,
+                early: false,
                 line: "FAIL exit=1 0.1s (job j) log=/l/j.log".into(),
             },
         ];
