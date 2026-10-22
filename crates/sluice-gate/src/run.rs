@@ -245,6 +245,14 @@ fn run_traced(args: &RunArgs, trace: &mut Trace) -> ExitCode {
         Ok(r) => r,
         Err(e) => return fail(&e),
     };
+    // A socket path that can never work (an over-long `SLUICE_SOCKET`, an
+    // unsafe fallback directory) is a configuration error to fix, not a
+    // reason to lose the queue silently with an in-process run.
+    if let Err(e @ sluice_gate_core::Error::SocketPath { .. }) =
+        sluice_gate_core::dirs::socket_path(&env)
+    {
+        return fail(&e.to_string());
+    }
     match via_daemon(&ctx, args, request, &state, trace) {
         Ok(code) => return code,
         Err(why) => eprintln!("sluice: daemon unavailable ({why}); running in-process"),

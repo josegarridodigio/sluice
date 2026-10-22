@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The daemon and its clients fall back to `/tmp/sluice-<uid>/daemon.sock`
+  (created 0700; refused when it is a symlink, owned by another user or
+  group/world writable) when the runtime-dir socket path exceeds the Unix
+  limit, instead of silently running gates in-process; an over-long
+  `SLUICE_SOCKET` is a clear error; `sluice doctor` gains a `socket-path`
+  check.
+
 ## [0.2.0] - 2026-10-22
 
 ### Added

@@ -18,6 +18,30 @@ section 5, [[sluice/design/scheduler.md]], [[sluice/design/executor.md]].
   directory mode `0700`, socket `0600`. `SLUICE_SOCKET` overrides the
   socket path only; `daemon.lock` and `start.lock` stay in the runtime
   directory, so one daemon per user regardless of the socket path.
+- Length limit and short fallback (`sluice_gate_core::dirs::choose_socket`):
+  a socket path must fit in `sockaddr_un.sun_path`, computed as
+  `SUN_PATH_LEN` = 108 bytes on Linux including the NUL, so at most 107
+  bytes (`SOCKET_PATH_MAX`). Selection, the same pure function of the
+  environment and the uid in the daemon and every client:
+  1. `SLUICE_SOCKET` when set. An over-long value is an error
+     (`unusable daemon socket path …: SLUICE_SOCKET is N bytes, longer
+     than the 107-byte Unix socket limit`); `sluice run` exits 1 instead of
+     running in-process, so the queue is never lost silently.
+  2. `<runtime-dir>/daemon.sock` when it fits.
+  3. Otherwise `/tmp/sluice-<uid>/daemon.sock`. Its directory is created
+     `0700` (last component only) and refused, with an error naming the
+     directory and the problem, when it is a symlink, not a directory, not
+     owned by the uid, or group/world writable; Sluice never chmods or
+     reuses such a directory. The locks stay in the (long) runtime
+     directory, which `flock` does not limit.
+  No abstract sockets: they bypass file permissions. The daemon logs
+  `socket path fallback in use: <preferred> is N bytes, …` at start;
+  `sluice status` prints `socket:   fallback in use (…)`; `sluice doctor`
+  has a `socket-path` check (ok / fallback in use with the reason / fail
+  when too long or the fallback directory is unsafe).
+  `SLUICE_TEST_SOCKET_FALLBACK_DIR` replaces the `/tmp` base of the
+  fallback; it is test-only (the suite uses it so it never touches the
+  user's real `/tmp/sluice-<uid>`), not a supported setting.
 - Newline-delimited JSON: one JSON object per line, UTF-8, no pretty
   printing. Lines longer than 1 MiB are rejected.
 - The first line in each direction is the handshake. One connection serves

@@ -29,7 +29,14 @@ pub fn show(json: bool) -> ExitCode {
                     }
                 }
             } else {
-                print!("{}", render(&report, &dirs::daemon_log_path(&env)));
+                let fallback = dirs::plan_socket(&env)
+                    .ok()
+                    .filter(|l| l.path == report.daemon.socket)
+                    .and_then(|l| l.fallback_reason());
+                print!(
+                    "{}",
+                    render(&report, &dirs::daemon_log_path(&env), fallback.as_deref())
+                );
             }
             ExitCode::SUCCESS
         }
@@ -91,8 +98,9 @@ fn pressure(psi: &PsiInfo) -> String {
     )
 }
 
-/// Renders the text form of a status report.
-fn render(r: &StatusReport, log_path: &Path) -> String {
+/// Renders the text form of a status report; `socket_fallback` is the
+/// reason the short socket fallback is in use, if it is.
+fn render(r: &StatusReport, log_path: &Path, socket_fallback: Option<&str>) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let _ = writeln!(
@@ -103,6 +111,9 @@ fn render(r: &StatusReport, log_path: &Path) -> String {
         age(&r.daemon.started_at),
         r.daemon.socket.display()
     );
+    if let Some(reason) = socket_fallback {
+        let _ = writeln!(out, "socket:   fallback in use ({reason})");
+    }
     if let Some(level) = &r.daemon.log_level {
         let _ = writeln!(out, "log:      level {level}, {}", log_path.display());
     }
@@ -186,7 +197,13 @@ mod tests {
         r.totals.runs = 3;
         r.totals.time_saved_ms = 90_000;
         r.daemon.log_level = Some("debug".into());
-        let text = render(&r, Path::new("/s/daemon.log"));
+        let text = render(&r, Path::new("/s/daemon.log"), None);
+        assert!(!text.contains("fallback"), "{text}");
+        let with = render(&r, Path::new("/s/daemon.log"), Some("/long is 130 bytes"));
+        assert!(
+            with.contains("socket:   fallback in use (/long is 130 bytes)"),
+            "{with}"
+        );
         assert!(
             text.contains("log:      level debug, /s/daemon.log"),
             "{text}"

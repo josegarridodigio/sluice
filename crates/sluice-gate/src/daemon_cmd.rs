@@ -202,6 +202,15 @@ pub fn start(foreground: bool) -> ExitCode {
         return ExitCode::from(EXIT_ERROR);
     }
     init_tracing(config.log.level.as_deref().unwrap_or("info"));
+    if let Some(reason) = dirs::plan_socket(&env)
+        .ok()
+        .and_then(|l| l.fallback_reason())
+    {
+        tracing::info!(
+            socket = %config.socket_path.display(),
+            "socket path fallback in use: {reason}"
+        );
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

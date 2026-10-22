@@ -57,7 +57,9 @@ sluice doctor [--json] [--bundle [PATH]]
 
 Checks, each `ok`, `warn` or `fail` with a one-line detail: git is found and
 at least 2.31; the PSI files are readable; the state and runtime directories
-exist (the runtime directory must be mode 0700); the daemon socket answers
+exist (the runtime directory must be mode 0700); `socket-path`: the socket
+path fits the 107-byte Unix socket limit, or the short fallback is in use
+(see below), or it is too long; the daemon socket answers
 and the daemon runs the installed version (otherwise: `run 'sluice daemon
 restart'`); the lease row matches the live daemon pid; the user config
 parses; inside a repository, `.sluice.toml` parses, a hook in the hooks
@@ -65,6 +67,28 @@ directory (`core.hooksPath` or `.git/hooks`) calls sluice, and the marker
 directory size; the `sluice` found in `PATH` is the binary you are running.
 It exits 1 when any check fails and never uses the network (it does not look
 for new releases; `sluice update --check` does).
+
+## Socket path too long
+
+A Unix socket path can be at most 107 bytes on Linux (108 with the
+terminating NUL). When `$XDG_RUNTIME_DIR/sluice/daemon.sock` is longer (a
+deeply nested `XDG_RUNTIME_DIR`, common in containers and test harnesses),
+the daemon and every client use `/tmp/sluice-<uid>/daemon.sock` instead;
+nothing to configure. You can see it in three places:
+
+- `daemon.log`: `socket path fallback in use: <preferred> is N bytes, ...`;
+- `sluice status`: `socket:   fallback in use (...)` under the `daemon:` line;
+- `sluice doctor`: `[ok  ] socket-path    fallback in use: ...`.
+
+Sluice creates `/tmp/sluice-<uid>` with mode 0700. It refuses to use it,
+with an error naming the directory and the problem, when it is a symlink, is
+not a directory, is owned by another user, or is group or world writable
+(someone else may be able to replace the socket). Fix it with
+`chmod 700 /tmp/sluice-<uid>`, or remove it if it is not yours, and retry.
+
+`SLUICE_SOCKET` always wins. When it is longer than the limit, `sluice run`
+exits 1 with `SLUICE_SOCKET is N bytes, longer than the 107-byte Unix socket
+limit` instead of silently running the gate in-process; set a shorter path.
 
 ## `--bundle`
 

@@ -159,6 +159,7 @@ fn collect(env: &EnvMap, cwd: &Path) -> Vec<Check> {
     let mut out = vec![check_git(), check_psi()];
     out.push(check_state_dir(env));
     out.push(check_runtime_dir(env));
+    out.push(check_socket_path(env));
     out.extend(check_daemon(env));
     out.push(check_user_config(env));
     match git::discover(cwd, env) {
@@ -284,6 +285,52 @@ fn check_runtime_dir(env: &EnvMap) -> Check {
                 dir.display()
             ),
         ),
+    }
+}
+
+/// `socket-path`: the socket path fits in `sun_path` (ok), the short
+/// fallback is in use (ok, with the reason; fail when its directory is
+/// unsafe), or the path is too long (fail).
+fn check_socket_path(env: &EnvMap) -> Check {
+    const NAME: &str = "socket-path";
+    let location = match dirs::plan_socket(env) {
+        Ok(l) => l,
+        Err(e) => return check(NAME, Status::Fail, e.to_string()),
+    };
+    let len = location.path.as_os_str().len();
+    let path = location.path.display();
+    let max = dirs::SOCKET_PATH_MAX;
+    match location.source {
+        dirs::SocketSource::Explicit => check(
+            NAME,
+            Status::Ok,
+            format!("{path} from SLUICE_SOCKET ({len} of {max} bytes)"),
+        ),
+        dirs::SocketSource::Default => {
+            check(NAME, Status::Ok, format!("{path} ({len} of {max} bytes)"))
+        }
+        dirs::SocketSource::Fallback { .. } => {
+            let reason = location.fallback_reason().unwrap_or_default();
+            let dir = location.path.parent().unwrap_or(Path::new("/"));
+            let problem = dirs::current_uid()
+                .filter(|_| fs::symlink_metadata(dir).is_ok())
+                .and_then(|uid| dirs::unsafe_socket_dir(dir, uid));
+            match problem {
+                Some(problem) => check(
+                    NAME,
+                    Status::Fail,
+                    format!(
+                        "fallback {path} refused: {} {problem} ({reason})",
+                        dir.display()
+                    ),
+                ),
+                None => check(
+                    NAME,
+                    Status::Ok,
+                    format!("fallback in use: {path} because {reason}"),
+                ),
+            }
+        }
     }
 }
 

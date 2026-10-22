@@ -289,6 +289,7 @@ fn doctor_on_a_healthy_sandbox_exits_zero_with_the_documented_shape() {
         "psi",
         "state-dir",
         "runtime-dir",
+        "socket-path",
         "daemon",
         "daemon-version",
         "lease",
@@ -305,6 +306,7 @@ fn doctor_on_a_healthy_sandbox_exits_zero_with_the_documented_shape() {
     assert_eq!(check(&report, "lease")["status"], "ok");
     assert_eq!(check(&report, "hooks")["status"], "ok");
     assert_eq!(check(&report, "runtime-dir")["status"], "ok");
+    assert_eq!(check(&report, "socket-path")["status"], "ok");
 
     sb.sluice()
         .arg("doctor")

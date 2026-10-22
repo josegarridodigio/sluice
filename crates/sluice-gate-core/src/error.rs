@@ -95,6 +95,16 @@ pub enum Error {
         reason: String,
     },
 
+    /// The daemon socket path cannot be used: too long for `sun_path`, or
+    /// its directory is unsafe (see [`crate::dirs::socket_location`]).
+    #[error("unusable daemon socket path {path}: {problem}")]
+    SocketPath {
+        /// The socket path (or its directory) that was refused.
+        path: PathBuf,
+        /// What is wrong with it and how to fix it.
+        problem: String,
+    },
+
     /// The semaphore could not be acquired within the allowed time.
     #[error("could not acquire a concurrency slot within {0:?}")]
     SemaphoreTimeout(std::time::Duration),
