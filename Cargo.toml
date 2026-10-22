@@ -14,8 +14,8 @@ edition = "2024"
 rust-version = "1.99"
 license = "MIT"
 authors = ["Jose Antonio Garrido <josegarrido@digio.es>"]
-repository = "https://github.com/josegarrido/sluice"
-homepage = "https://github.com/josegarrido/sluice"
+repository = "https://github.com/josegarridodigio/sluice"
+homepage = "https://github.com/josegarridodigio/sluice"
 keywords = ["git", "hooks", "cache", "agents", "mcp"]
 categories = ["development-tools", "command-line-utilities"]
 

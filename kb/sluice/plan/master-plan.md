@@ -66,7 +66,7 @@ Tasks:
   `home_jose_Escritorio_Proyectos_sluice`.
 - [x] Scaffold the Cargo workspace, CI (fmt, clippy, test), license, README skeleton, `.gitignore` ([[sluice/changes/phase-0-scaffold.md]]).
 - [x] `git init` and first commit.
-- [ ] User creates the GitHub remote; fix `repository` in `Cargo.toml`.
+- [x] GitHub remote: https://github.com/josegarridodigio/sluice (origin), first push 2026-10-22.
 
 Exit criteria met: plan, config format and crate names approved on 2026-10-22.
 

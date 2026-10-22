@@ -52,8 +52,7 @@ cargo test --workspace                                    # 5 passed (4 CLI smok
 ## Follow-ups
 
 - `repository` / `homepage` in `Cargo.toml` point to
-  `https://github.com/josegarrido/sluice`, a guess; fix when the user
-  creates the remote.
+  `https://github.com/josegarridodigio/sluice` (remote created by the user on 2026-10-22).
 - External dependency versions are re-checked when each crate first uses
   them (Phase 1: `serde`, `toml`, `sha2`, `humantime`, `directories`,
   `tempfile`).

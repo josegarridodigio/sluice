@@ -11,7 +11,7 @@ Questions asked to the user, with answers once received. Newest at the end.
 
 | # | Question | Proposal | Answer |
 |---|---|---|---|
-| Q1 | Repository location and remote URL | Local: `/home/jose/Escritorio/Proyectos/sluice` (current dir). Remote: to be created by the user (GitHub?). | Answered 2026-10-22: this directory; remote on GitHub, created by the user (URL pending). |
+| Q1 | Repository location and remote URL | Local: `/home/jose/Escritorio/Proyectos/sluice` (current dir). Remote: to be created by the user (GitHub?). | Answered 2026-10-22: this directory; remote on GitHub: https://github.com/josegarridodigio/sluice (given 2026-10-22). |
 | Q2 | crates.io crate names | `sluicegate` (CLI, binary `sluice`), `sluicegate-core`, `sluicegate-proto`, `sluicegate-daemon`, `sluicegate-mcp`. All verified free on crates.io on 2026-10-22 via the crates.io API (HTTP 404). `sluice`, `sluice-rs`, `sluice-cli` are taken (HTTP 200). | Answered 2026-10-22: **`sluice-gate-*`** (hyphenated): `sluice-gate` (CLI, binary `sluice`), `sluice-gate-core`, `sluice-gate-proto`, `sluice-gate-daemon`, `sluice-gate-mcp`. Re-verified free on crates.io the same day. |
 | Q3 | License | MIT OR Apache-2.0 dual license (Rust ecosystem convention, compatible with gate-cache MIT and agent-task-queue Apache-2.0). | Answered 2026-10-22: **MIT** only. |
 | Q4 | Target platforms v1 | Linux first; keep macOS compiling (no PSI, no ionice) but untested until Phase 5. | Answered 2026-10-22: **Linux only** for v1. macOS is not a target; no effort spent keeping it compiling. |
