@@ -2,6 +2,7 @@
 # End-to-end run of the MCP server with real Claude Code sessions.
 #
 # Usage: scripts/phase3-e2e.sh [gate_seconds] [progress_interval]   (defaults 90 and 15s)
+# SLUICE_E2E_MODEL picks the model of the agent sessions (default haiku).
 #
 # With progress_interval set above the idle window (for example 10m) the run
 # shows what happens when no progress notification reaches Claude Code.
@@ -20,6 +21,8 @@ set -eu
 
 GATE="${1:-90}"
 PROGRESS="${2:-15s}"
+# The sessions only call one tool and echo its result: the cheapest model is enough.
+MODEL="${SLUICE_E2E_MODEL:-haiku}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build -q --release -p sluice-gate --manifest-path "$ROOT/Cargo.toml"
@@ -73,7 +76,7 @@ agent() { # agent <cwd> <label>
     start=$(date +%s)
     ( cd "$dir" && env -u CLAUDECODE -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ID \
         CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=60000 \
-        claude -p "$prompt" --model sonnet --max-turns 3 --output-format json \
+        claude -p "$prompt" --model "$MODEL" --max-turns 3 --output-format json \
           --mcp-config "$TMP/mcp.json" --strict-mcp-config \
           --allowedTools mcp__sluice__verify --permission-mode default \
           > "$TMP/$label.json" 2> "$TMP/$label.err" ) || true

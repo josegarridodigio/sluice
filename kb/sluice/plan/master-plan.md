@@ -184,6 +184,14 @@ referenced here.
 - [ ] Acceptance tests 1–8 of the design (local bare remote, kill during push).
 - [ ] Docs (`docs/agents.md`, README), change note, acceptance note, reconciliation report.
 
+## Agent integration package (after Phase 6, before the final report)
+
+- [ ] Claude Code plugin in this repository, the repository doubling as its marketplace: registers the `sluice mcp` server, ships a `sluice` skill (verify → commit → `queue_enqueue` → stop; exit code 3; reading `status`/`logs`; queue conflicts), and an optional `PreToolUse` hook that redirects raw test commands run through Bash to `verify` and denies `sluice queue approve` to agents.
+- [ ] `docs/agents.md` points to the plugin; the per-repository `CLAUDE.md` block shrinks to one line or disappears.
+- [ ] Proven with real non-interactive sessions on the cheapest model (`haiku`): the skill loads, the hook redirects, the agent verifies and enqueues.
+
+Why: one install per user instead of a block pasted into every repository's `CLAUDE.md`; the skill only enters the context when relevant; the hook is the only piece that enforces the queue.
+
 ## Working agreements
 
 - Everything in English (code, docs, commits, KB).
