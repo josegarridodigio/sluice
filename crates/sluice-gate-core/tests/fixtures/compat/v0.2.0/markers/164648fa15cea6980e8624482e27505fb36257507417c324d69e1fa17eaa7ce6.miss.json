@@ -1,0 +1,10 @@
+{
+  "format": 1,
+  "key": "164648fa15cea6980e8624482e27505fb36257507417c324d69e1fa17eaa7ce6",
+  "gate": "fail",
+  "exit_code": 1,
+  "reason": "gate failed",
+  "job_id": "1792706636550-2573520-d0a9d7",
+  "log_path": "/tmp/sa-compat.0mulba/v0.2.0/home/.state/sluice/logs/1792706636550-2573520-d0a9d7.log",
+  "recorded_at": "2026-10-22T22:03:56Z"
+}

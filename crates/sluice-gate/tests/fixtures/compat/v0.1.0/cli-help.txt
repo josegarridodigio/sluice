@@ -1,0 +1,178 @@
+===== sluice =====
+Sluice runs named gates (tests, linters, type checks) under a global concurrency budget and caches results per git tree so each tree is verified once. Git hooks call `sluice run`; coding agents call the MCP server started by `sluice mcp` (tools verify, status, gate_list, logs).
+
+On a cache miss `sluice run` hands the gate to the per-user daemon (`sluice daemon`), starting it on demand; when the daemon cannot be reached or started the gate runs in-process. `sluice status` shows the queue.
+
+Exit codes of `sluice run`: 0 pass or cache hit; the gate's own code on failure; 3 refused by agent_hook_policy = "fail-fast"; 124 gate timeout; 143 gate killed (signal or `sluice daemon stop --force`); 1 Sluice error; 2 usage error.
+
+Environment: SLUICE_DISABLE=1 runs the gate directly (no cache, no queue); SLUICE_CACHE=0|1 forces the cache off or on (on overrides CI); CI disables the cache; SLUICE_AGENT=1|0 forces agent or human detection; SLUICE_CONFIG points at the user config; SLUICE_SOCKET overrides the daemon socket path; SLUICE_LOG sets the log filter of the daemon and of `sluice mcp` (default info).
+
+Usage: sluice <COMMAND>
+
+Commands:
+  run     Run a gate: cache hit in milliseconds, otherwise queue it in the daemon under the budget
+  mcp     Start the MCP stdio server (spawned by the coding agent)
+  daemon  Start the per-user daemon (detached unless --foreground), or stop it
+  status  Show the daemon, budget, system pressure (PSI), running and queued jobs, and totals
+  cache   Inspect or clear cache markers for the current repository
+  init    Write a starter `.sluice.toml` and print hook snippets
+  hook    Print hook integration snippets
+  logs    Show the log of a job
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+===== sluice run =====
+Run a gate: cache hit in milliseconds, otherwise queue it in the daemon under the budget
+
+Usage: sluice run [OPTIONS] <GATE> [-- <EXTRA>...]
+
+Arguments:
+  <GATE>      Gate name as defined in `.sluice.toml`
+  [EXTRA]...  Extra arguments appended to the gate command
+
+Options:
+      --hook <HOOK>  Name of the git hook invoking Sluice (pre-commit, pre-push, ...). Enables the hook policy on a cache miss and, for pre-commit, records the committed tree
+  -v, --verbose      Stream the gate output to stderr while it runs (it is always written to the log)
+      --explain      Explain what Sluice would do (caller detection, policy, tree, key, cache lookup) and exit
+  -h, --help         Print help
+
+===== sluice mcp =====
+Start the MCP stdio server (spawned by the coding agent).
+
+Tools: `verify` (run gates through the cache and the daemon, blocking with progress notifications), `status`, `gate_list`, `logs`. Logs go to stderr only. Register `sluice mcp` as a stdio MCP server in the agent's config.
+
+Usage: sluice mcp
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+===== sluice daemon =====
+Start the per-user daemon (detached unless --foreground), or stop it.
+
+Exits 75 when another daemon still holds the daemon lock.
+
+Usage: sluice daemon [OPTIONS] [COMMAND]
+
+Commands:
+  stop  Ask the running daemon to stop (queued jobs are dropped, running jobs finish)
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+      --foreground
+          Stay attached to the terminal instead of detaching
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+===== sluice daemon stop =====
+Ask the running daemon to stop (queued jobs are dropped, running jobs finish).
+
+Without --force, waits (up to 60 s) until the running jobs finished and the daemon released its lock, so the next command starts a fresh daemon.
+
+Usage: sluice daemon stop [OPTIONS]
+
+Options:
+      --force
+          Kill running jobs instead of letting them finish
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+===== sluice status =====
+Show the daemon, budget, system pressure (PSI), running and queued jobs, and totals
+
+Usage: sluice status [OPTIONS]
+
+Options:
+      --json  Print machine-readable JSON instead of text
+  -h, --help  Print help
+
+===== sluice cache =====
+Inspect or clear cache markers for the current repository
+
+Usage: sluice cache <COMMAND>
+
+Commands:
+  status  Show, per gate, whether the current tree has a cached pass
+  clear   Remove markers and miss records for the current repository
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+===== sluice cache status =====
+Show, per gate, whether the current tree has a cached pass
+
+Usage: sluice cache status [OPTIONS]
+
+Options:
+      --all   Also list every marker stored for the repository
+  -h, --help  Print help
+
+===== sluice cache clear =====
+Remove markers and miss records for the current repository
+
+Usage: sluice cache clear [OPTIONS]
+
+Options:
+      --gate <GATE>  Only clear entries of this gate
+  -h, --help         Print help
+
+===== sluice init =====
+Write a starter `.sluice.toml` and print hook snippets
+
+Usage: sluice init [OPTIONS]
+
+Options:
+      --force  Overwrite an existing `.sluice.toml`
+  -h, --help   Print help
+
+===== sluice hook =====
+Print hook integration snippets
+
+Usage: sluice hook <COMMAND>
+
+Commands:
+  print  Print the snippet for a hook manager
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+===== sluice hook print =====
+Print the snippet for a hook manager
+
+Usage: sluice hook print <MANAGER>
+
+Arguments:
+  <MANAGER>
+          Hook manager to print the snippet for
+
+          Possible values:
+          - husky:      Husky: scripts in `.husky/`
+          - lefthook:   Lefthook: a `lefthook.yml` fragment
+          - pre-commit: The pre-commit / prek framework: `.pre-commit-config.yaml`
+          - plain:      Plain POSIX scripts in `.githooks/`
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+===== sluice logs =====
+Show the log of a job
+
+Usage: sluice logs [OPTIONS] [JOB_ID]
+
+Arguments:
+  [JOB_ID]  Job id; defaults to the most recent job
+
+Options:
+  -n, --lines <LINES>  Only print the last N lines
+  -h, --help           Print help

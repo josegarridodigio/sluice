@@ -1,0 +1,34 @@
+version = 1
+
+[daemon]
+budget = 8                 # default: max(2, cpu_count - 1)
+nice = 10                  # 0..19; applied to gate processes
+ionice_class = "best-effort"   # none | best-effort | idle
+ionice_level = 7
+log_retention_days = 7
+idle_exit = "0s"           # 0 = never exit when idle
+last_subscriber_gone = "cancel"   # cancel | finish
+
+[admission]
+psi_enabled = true
+cpu_some_avg10_max = 60.0  # percent; do not admit new jobs above this
+memory_some_avg10_max = 20.0
+psi_poll_interval = "1s"
+psi_max_wait = "5m"        # while PSI blocks, admit the queue head once it has waited this long (must be > 0)
+
+[mcp]
+progress_interval = "15s"  # progress notifications while verify runs (floored at 1s, re-read per call)
+
+[cache]
+ttl_days = 30
+tail_lines = 40
+
+[scheduler]
+head_reserve_after = "30s" # backfill behind the queue head only this long (ADR-0007)
+
+[agent_detection]
+env_any_set = ["CLAUDECODE"]      # any of these set and non-empty => agent (SLUICE_AGENT is the override, see below)
+env_any_equals = {}               # e.g. { CLAUDE_CODE_ENTRYPOINT = "cli" }
+
+[repos."/home/jose/Escritorio/Proyectos/foo"]
+budget_share_max = 4       # optional per-repo cap

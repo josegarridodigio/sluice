@@ -1,0 +1,13 @@
+{
+  "format": 1,
+  "key": "65b7e8e5ff35b99357a43c43831d66b52ed466bbad6b427633b400ee086cc444",
+  "tree": "1e67c0033bbf0b817b030c3633465f4d0a8226c6",
+  "gate": "slow",
+  "cmd": "sleep 6",
+  "passed_at": "2026-10-22T22:03:50Z",
+  "duration_ms": 6003,
+  "exit_code": 0,
+  "job_id": "1792706624887-2564611-e84235",
+  "sluice_version": "0.1.0",
+  "committed_tree": null
+}

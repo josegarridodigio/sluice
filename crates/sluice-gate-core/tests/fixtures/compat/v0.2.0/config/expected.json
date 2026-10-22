@@ -1,0 +1,245 @@
+{
+  "full.toml": {
+    "defaults": {
+      "agent_hook_policy": "fail-fast",
+      "human_hook_policy": "wait",
+      "tail_lines": 40
+    },
+    "gates": {
+      "lint": {
+        "cache": true,
+        "cmd": "npm run lint",
+        "depends_on": [],
+        "env": {},
+        "hooks": [
+          "pre-commit"
+        ],
+        "key_files": [],
+        "key_inputs": [],
+        "timeout_secs": 300.0,
+        "weight": 1
+      },
+      "test": {
+        "cache": true,
+        "cmd": "npm test -- --maxWorkers=2",
+        "depends_on": [
+          "lint"
+        ],
+        "env": {
+          "NODE_ENV": "test"
+        },
+        "hooks": [
+          "pre-commit",
+          "pre-push"
+        ],
+        "key_files": [
+          ".env.test"
+        ],
+        "key_inputs": [
+          "node --version"
+        ],
+        "timeout_secs": 1200.0,
+        "weight": 4
+      }
+    },
+    "version": 1
+  },
+  "init.toml": {
+    "defaults": {
+      "agent_hook_policy": "fail-fast",
+      "human_hook_policy": "wait",
+      "tail_lines": 40
+    },
+    "gates": {
+      "lint": {
+        "cache": true,
+        "cmd": "npm run lint",
+        "depends_on": [],
+        "env": {},
+        "hooks": [
+          "pre-commit"
+        ],
+        "key_files": [],
+        "key_inputs": [],
+        "timeout_secs": 1800.0,
+        "weight": 1
+      },
+      "test": {
+        "cache": true,
+        "cmd": "npm test",
+        "depends_on": [],
+        "env": {},
+        "hooks": [
+          "pre-commit",
+          "pre-push"
+        ],
+        "key_files": [],
+        "key_inputs": [],
+        "timeout_secs": 1200.0,
+        "weight": 4
+      }
+    },
+    "version": 1
+  },
+  "minimal.toml": {
+    "defaults": {
+      "agent_hook_policy": "fail-fast",
+      "human_hook_policy": "wait",
+      "tail_lines": null
+    },
+    "gates": {
+      "test": {
+        "cache": true,
+        "cmd": "true",
+        "depends_on": [],
+        "env": {},
+        "hooks": [],
+        "key_files": [],
+        "key_inputs": [],
+        "timeout_secs": 1800.0,
+        "weight": 1
+      }
+    },
+    "version": 1
+  },
+  "queue.toml": {
+    "defaults": {
+      "agent_hook_policy": "fail-fast",
+      "human_hook_policy": "wait",
+      "tail_lines": 40
+    },
+    "gates": {
+      "lint": {
+        "cache": true,
+        "cmd": "npm run lint",
+        "depends_on": [],
+        "env": {},
+        "hooks": [
+          "pre-commit"
+        ],
+        "key_files": [],
+        "key_inputs": [],
+        "timeout_secs": 300.0,
+        "weight": 1
+      },
+      "test": {
+        "cache": true,
+        "cmd": "npm test -- --maxWorkers=2",
+        "depends_on": [
+          "lint"
+        ],
+        "env": {
+          "NODE_ENV": "test"
+        },
+        "hooks": [
+          "pre-commit",
+          "pre-push"
+        ],
+        "key_files": [
+          ".env.test"
+        ],
+        "key_inputs": [
+          "node --version"
+        ],
+        "timeout_secs": 1200.0,
+        "weight": 4
+      }
+    },
+    "queue": {
+      "audit_ref": true,
+      "gates": null,
+      "max_train": 4,
+      "network_timeout_secs": 60.0,
+      "push_timeout_secs": 600.0,
+      "remote": "origin",
+      "target": null
+    },
+    "version": 1
+  },
+  "recorded.toml": {
+    "defaults": {
+      "agent_hook_policy": "fail-fast",
+      "human_hook_policy": "wait",
+      "tail_lines": 20
+    },
+    "gates": {
+      "fail": {
+        "cache": true,
+        "cmd": "false",
+        "depends_on": [],
+        "env": {},
+        "hooks": [],
+        "key_files": [],
+        "key_inputs": [],
+        "timeout_secs": 1800.0,
+        "weight": 1
+      },
+      "keyed": {
+        "cache": true,
+        "cmd": "true    # key   material",
+        "depends_on": [],
+        "env": {
+          "A": "1",
+          "B": "2"
+        },
+        "hooks": [],
+        "key_files": [
+          "a.txt",
+          "missing.txt"
+        ],
+        "key_inputs": [
+          "echo hi"
+        ],
+        "timeout_secs": 1800.0,
+        "weight": 1
+      },
+      "modify": {
+        "cache": true,
+        "cmd": "echo x >> a.txt",
+        "depends_on": [],
+        "env": {},
+        "hooks": [],
+        "key_files": [],
+        "key_inputs": [],
+        "timeout_secs": 1800.0,
+        "weight": 1
+      },
+      "slow": {
+        "cache": true,
+        "cmd": "sleep 6",
+        "depends_on": [],
+        "env": {},
+        "hooks": [],
+        "key_files": [],
+        "key_inputs": [],
+        "timeout_secs": 1800.0,
+        "weight": 1
+      },
+      "test": {
+        "cache": true,
+        "cmd": "true",
+        "depends_on": [],
+        "env": {},
+        "hooks": [
+          "pre-commit"
+        ],
+        "key_files": [],
+        "key_inputs": [],
+        "timeout_secs": 60.0,
+        "weight": 1
+      },
+      "timeout": {
+        "cache": true,
+        "cmd": "sleep 5",
+        "depends_on": [],
+        "env": {},
+        "hooks": [],
+        "key_files": [],
+        "key_inputs": [],
+        "timeout_secs": 1.0,
+        "weight": 1
+      }
+    },
+    "version": 1
+  }
+}

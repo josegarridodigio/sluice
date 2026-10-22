@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "daemon": {
+    "instance": "2564611-1792706620155",
+    "pid": 2564611,
+    "started_at": "2026-10-22T22:03:40Z",
+    "version": "0.1.0",
+    "socket": "/tmp/sa-compat.0mulba/v0.1.0/run/real.sock"
+  },
+  "budget": {
+    "total": 19,
+    "used": 1,
+    "psi": {
+      "enabled": true,
+      "cpu_some_avg10": 2.09,
+      "memory_some_avg10": 0.0,
+      "blocking": false
+    }
+  },
+  "running": [
+    {
+      "job_id": "1792706624887-2564611-e84235",
+      "repo": "/tmp/sa-compat.0mulba/v0.1.0/repo",
+      "gate": "slow",
+      "weight": 1,
+      "started_at": "2026-10-22T22:03:44Z",
+      "elapsed_ms": 1491,
+      "subscribers": 1,
+      "caller": "human"
+    }
+  ],
+  "queued": [],
+  "totals": {
+    "since": "2026-10-22T22:03:41Z",
+    "runs": 5,
+    "passes": 3,
+    "failures": 1,
+    "timeouts": 1,
+    "hits": 1,
+    "coalesced": 0,
+    "wait_ms_total": 6,
+    "run_ms_total": 1056,
+    "time_saved_ms": 1,
+    "psi_blocked_ms_total": 0
+  }
+}

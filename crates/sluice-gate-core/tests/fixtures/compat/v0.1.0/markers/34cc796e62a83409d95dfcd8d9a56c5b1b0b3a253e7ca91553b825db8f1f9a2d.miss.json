@@ -1,0 +1,10 @@
+{
+  "format": 1,
+  "key": "34cc796e62a83409d95dfcd8d9a56c5b1b0b3a253e7ca91553b825db8f1f9a2d",
+  "gate": "modify",
+  "exit_code": 0,
+  "reason": "the gate modified the tree",
+  "job_id": "1792706623997-2564611-7395e1",
+  "log_path": "/tmp/sa-compat.0mulba/v0.1.0/home/.state/sluice/logs/1792706623997-2564611-7395e1.log",
+  "recorded_at": "2026-10-22T22:03:44Z"
+}

@@ -1,0 +1,31 @@
+version = 1
+
+[defaults]
+agent_hook_policy = "fail-fast"
+human_hook_policy = "wait"
+tail_lines = 20
+
+[gates.test]
+cmd = "true"
+weight = 1
+timeout = "1m"
+hooks = ["pre-commit"]
+
+[gates.fail]
+cmd = "false"
+
+[gates.timeout]
+cmd = "sleep 5"
+timeout = "1s"
+
+[gates.modify]
+cmd = "echo x >> a.txt"
+
+[gates.slow]
+cmd = "sleep 6"
+
+[gates.keyed]
+cmd = "true    # key   material"
+key_inputs = ["echo hi"]
+key_files = ["a.txt", "missing.txt"]
+env = { B = "2", A = "1" }

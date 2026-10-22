@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `docs/compatibility.md`: what stays compatible from 0.3.0 and how
+  changes are made; golden files recorded from the 0.1.0 and 0.2.0 release
+  binaries (configs, markers, status and queue JSON, protocol transcripts,
+  databases, CLI surface, MCP tools) with tests that read them.
 - Path-scoped gates: optional `paths` / `paths_ignore` (git glob pathspecs,
   root-relative; `.sluice.toml` always counts). The key hashes only the
   selected files, so changes outside the scope keep the cached pass, with

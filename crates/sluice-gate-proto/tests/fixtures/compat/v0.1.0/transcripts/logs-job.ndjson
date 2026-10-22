@@ -1,0 +1,4 @@
+{"conn":1,"dir":"c2s","msg":{"type":"hello","protocol":1,"client":"sluice-gate 0.1.0","pid":2573073}}
+{"conn":1,"dir":"s2c","msg":{"type":"welcome","protocol":1,"daemon":"sluice-gate 0.1.0","instance":"2564611-1792706620155","pid":2564611,"started_at":"2026-10-22T22:03:40Z"}}
+{"conn":1,"dir":"c2s","msg":{"type":"logs","id":1,"job_id":"1792706621234-2564611-fbad8c","tail":3}}
+{"conn":1,"dir":"s2c","msg":{"type":"log","id":1,"job_id":"1792706621234-2564611-fbad8c","path":"{{HOME}}/.state/sluice/logs/1792706621234-2564611-fbad8c.log","lines":["","","# exit: 0 after 0.0s"]}}

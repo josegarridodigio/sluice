@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "trains": [
+    {
+      "train_id": "t-1792706647252-2c6c4d",
+      "repo": "/tmp/sa-compat.0mulba/v0.2.0/queue-clone/.git",
+      "remote": "origin",
+      "target": "main",
+      "base_sha": "510e98c58c0299a5212ab46d2805661236f03081",
+      "state": "ready",
+      "members": [
+        "1792706647212-2573520-a79ffd"
+      ],
+      "merge_sha": "d9ad182062514336866def3032ba1f7dc290cef8",
+      "gates": [
+        {
+          "gate": "test",
+          "key": "e44a930cfd3ae1bbc69d805ea9fc285097fb78fe0578d740b9a66379bcbcc692",
+          "job_id": "1792706647296-2573520-b18c59",
+          "status": "pass",
+          "duration_ms": 2
+        }
+      ],
+      "train_hash": "0a5071d5411bc46250859ef1e7138944b2e38ca01eac496016d360fef3ea31eb",
+      "created_at": "2026-10-22T22:04:07Z",
+      "updated_at": "2026-10-22T22:04:07Z",
+      "push_timeout_ms": 600000,
+      "network_timeout_ms": 60000
+    }
+  ],
+  "jobs": [
+    {
+      "job_id": "1792706647212-2573520-a79ffd",
+      "repo": "/tmp/sa-compat.0mulba/v0.2.0/queue-clone/.git",
+      "worktree": "/tmp/sa-compat.0mulba/v0.2.0/queue-clone",
+      "branch": "feature",
+      "head_sha": "d9ad182062514336866def3032ba1f7dc290cef8",
+      "remote": "origin",
+      "target": "main",
+      "state": "ready",
+      "train_id": "t-1792706647252-2c6c4d",
+      "caller": "human",
+      "cancel_requested": false,
+      "attempts": 1,
+      "enqueued_at": "2026-10-22T22:04:07Z",
+      "updated_at": "2026-10-22T22:04:07Z"
+    }
+  ]
+}

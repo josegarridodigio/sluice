@@ -1,0 +1,14 @@
+{
+  "format-2": {
+    "body": "format-2.json",
+    "file_key": "327cec8351e86dd071118eec00ffc190dd1b2810065304f375266859b7dad976"
+  },
+  "unknown-field": {
+    "body": "unknown-field.json",
+    "file_key": "327cec8351e86dd071118eec00ffc190dd1b2810065304f375266859b7dad976"
+  },
+  "wrong-key": {
+    "body": "wrong-key.json",
+    "file_key": "0000000000000000000000000000000000000000000000000000000000000001"
+  }
+}

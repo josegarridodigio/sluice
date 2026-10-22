@@ -1,0 +1,13 @@
+{
+  "format": 2,
+  "key": "327cec8351e86dd071118eec00ffc190dd1b2810065304f375266859b7dad976",
+  "tree": "1e67c0033bbf0b817b030c3633465f4d0a8226c6",
+  "gate": "test",
+  "cmd": "true",
+  "passed_at": "2026-10-22T22:03:41Z",
+  "duration_ms": 1,
+  "exit_code": 0,
+  "job_id": "1792706621234-2564611-fbad8c",
+  "sluice_version": "0.1.0",
+  "committed_tree": null
+}

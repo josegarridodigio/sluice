@@ -1,0 +1,10 @@
+{
+  "format": 1,
+  "key": "2cfefd3a87eab347057f5676912a5ffcfb374e47b5fb2fe93623f58315a74819",
+  "gate": "timeout",
+  "exit_code": null,
+  "reason": "timed out",
+  "job_id": "1792706636985-2573520-c447b4",
+  "log_path": "/tmp/sa-compat.0mulba/v0.2.0/home/.state/sluice/logs/1792706636985-2573520-c447b4.log",
+  "recorded_at": "2026-10-22T22:03:58Z"
+}

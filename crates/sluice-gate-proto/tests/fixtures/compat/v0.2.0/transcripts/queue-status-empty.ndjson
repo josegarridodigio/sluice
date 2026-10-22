@@ -1,0 +1,4 @@
+{"conn":2,"dir":"c2s","msg":{"type":"hello","protocol":1,"client":"sluice-gate 0.2.0","pid":2577316}}
+{"conn":2,"dir":"s2c","msg":{"type":"welcome","protocol":1,"daemon":"sluice-gate 0.2.0","instance":"2573520-1792706634586","pid":2573520,"started_at":"2026-10-22T22:03:54Z","features":["queue"]}}
+{"conn":2,"dir":"c2s","msg":{"type":"queue-status","id":1,"repo":"{{QUEUE_CLONE}}/.git"}}
+{"conn":2,"dir":"s2c","msg":{"type":"queue-status","id":1,"schema":1,"trains":[],"jobs":[]}}

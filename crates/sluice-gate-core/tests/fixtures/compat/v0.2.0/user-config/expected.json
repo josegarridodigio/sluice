@@ -1,0 +1,33 @@
+{
+  "empty.toml": {},
+  "full.toml": {
+    "admission.cpu_some_avg10_max": 60.0,
+    "admission.memory_some_avg10_max": 20.0,
+    "admission.psi_enabled": true,
+    "admission.psi_max_wait_secs": 300.0,
+    "admission.psi_poll_interval_secs": 1.0,
+    "agent_detection.env_any_equals": {},
+    "agent_detection.env_any_set": [
+      "CLAUDECODE"
+    ],
+    "cache.tail_lines": 40,
+    "cache.ttl_days": 30,
+    "daemon.budget": 8,
+    "daemon.idle_exit_secs": 0.0,
+    "daemon.ionice_class": "best-effort",
+    "daemon.ionice_level": 7,
+    "daemon.last_subscriber_gone": "cancel",
+    "daemon.log_retention_days": 7,
+    "daemon.nice": 10,
+    "debug.daemon_log_max_mib": 20,
+    "debug.level": "info",
+    "mcp.progress_interval_secs": 15.0,
+    "queue.allow_agent_approval": false,
+    "queue.enabled": true,
+    "queue.retention_secs": 2592000.0,
+    "queue.tick_secs": 5.0,
+    "repos|/home/jose/Escritorio/Proyectos/foo|budget_share_max": 4,
+    "scheduler.head_reserve_after_secs": 30.0,
+    "version": 1
+  }
+}

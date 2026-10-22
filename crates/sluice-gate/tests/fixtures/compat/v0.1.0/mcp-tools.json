@@ -1,0 +1,362 @@
+{
+  "tools": [
+    {
+      "description": "List the gates of the repository's .sluice.toml: name, command, weight,\ntimeout, hooks and cache flag.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "working_directory": {
+            "description": "Absolute path inside the repository (worktree).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "working_directory"
+        ],
+        "type": "object"
+      },
+      "name": "gate_list",
+      "outputSchema": {
+        "$defs": {
+          "GateInfo": {
+            "properties": {
+              "cache": {
+                "description": "Whether passes are cached.",
+                "type": "boolean"
+              },
+              "cmd": {
+                "description": "Command, as configured.",
+                "type": "string"
+              },
+              "hooks": {
+                "description": "Git hooks the gate belongs to.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "name": {
+                "description": "Gate name.",
+                "type": "string"
+              },
+              "timeout_seconds": {
+                "description": "Execution timeout in seconds (0 = none).",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "weight": {
+                "description": "Budget units the gate occupies while running.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "name",
+              "cmd",
+              "weight",
+              "timeout_seconds",
+              "hooks",
+              "cache"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "gates": {
+            "description": "Gates of `.sluice.toml`, by name.",
+            "items": {
+              "$ref": "#/$defs/GateInfo"
+            },
+            "type": "array"
+          },
+          "repository": {
+            "description": "Repository root.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "gates"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Show the last lines of a job log (default: the newest job). Output is\ncapped at 64 KiB; the full log stays on disk at the returned path.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "job_id": {
+            "default": null,
+            "description": "Job id (as printed by `verify` or `status`). Default: the newest job.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tail": {
+            "default": null,
+            "description": "Number of trailing lines (default 100, max 2000).",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "logs",
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "job_id": {
+            "description": "Job id.",
+            "type": "string"
+          },
+          "lines": {
+            "description": "Trailing lines, oldest first.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "omitted_bytes": {
+            "description": "Bytes dropped from the front to keep the output under 64 KiB.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "path": {
+            "description": "Log file (the full output stays there).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "path",
+          "lines",
+          "omitted_bytes"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Show the Sluice daemon: budget, running and queued jobs, totals (same\nschema as `sluice status --json`; `daemon` is null when none runs). With\n`working_directory`, also the cache state of that tree per gate.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "working_directory": {
+            "default": null,
+            "description": "Absolute path inside a repository: adds the cache state of its\ncurrent tree per gate and marks that repository's jobs.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "status"
+    },
+    {
+      "description": "Verify the working tree: run the selected gates (cache hit in milliseconds,\notherwise queued in the shared Sluice daemon) and block until every gate\nfinished. Gates run sequentially. Call this before committing instead of\nrunning test, lint or type-check commands yourself. Sends a progress\nnotification every 15 s (configurable) when the request carries a\nprogressToken; without one, the client's idle timeout (30 minutes in\nClaude Code) is the effective limit. The result lists one line per gate\nand, on failure, the tail of the first failing log; `is_error` is set\nwhen any gate did not pass.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "extra_args": {
+            "default": null,
+            "description": "Arguments appended to every selected gate's command.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "gates": {
+            "default": null,
+            "description": "Gate names, run in this order. Default: the gates whose `hooks`\ncontain `pre-commit`; when none is tagged, every gate.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "timeout_seconds": {
+            "default": null,
+            "description": "Execution time limit per gate in seconds, overriding the gate's\n`timeout`. Time spent waiting in the queue does not count.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "working_directory": {
+            "description": "Absolute path inside the repository (worktree) to verify.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "working_directory"
+        ],
+        "type": "object"
+      },
+      "name": "verify",
+      "outputSchema": {
+        "$defs": {
+          "GateResult": {
+            "properties": {
+              "cached": {
+                "description": "True when answered from the cache (nothing ran for this call).",
+                "type": "boolean"
+              },
+              "coalesced": {
+                "description": "True when this call joined a job another client had already queued.",
+                "type": "boolean"
+              },
+              "duration_ms": {
+                "description": "Wall-clock run time in milliseconds (absent for cached passes).",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "exit_code": {
+                "description": "Exit code, when the process exited normally.",
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "gate": {
+                "description": "Gate name.",
+                "type": "string"
+              },
+              "job_id": {
+                "description": "Job id (for a cached pass, the job that produced the marker).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "log_path": {
+                "description": "Path of the job log.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "message": {
+                "description": "Human-readable detail (errors, cancellation).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "not_cached_reason": {
+                "description": "Why a pass was not cached, if it was not.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "$ref": "#/$defs/GateStatus",
+                "description": "Outcome category."
+              },
+              "tail": {
+                "description": "Last lines of the log of a failing gate (absent when empty).",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "gate",
+              "status",
+              "cached",
+              "coalesced"
+            ],
+            "type": "object"
+          },
+          "GateStatus": {
+            "description": "Final state of one gate in a `verify` call.",
+            "oneOf": [
+              {
+                "const": "pass",
+                "description": "Passed (or a cached pass).",
+                "type": "string"
+              },
+              {
+                "const": "fail",
+                "description": "Non-zero exit or killed by a foreign signal.",
+                "type": "string"
+              },
+              {
+                "const": "timeout",
+                "description": "Exceeded its execution timeout.",
+                "type": "string"
+              },
+              {
+                "const": "killed",
+                "description": "Killed by Sluice (daemon stop, last subscriber gone).",
+                "type": "string"
+              },
+              {
+                "const": "error",
+                "description": "Sluice itself failed to run the gate.",
+                "type": "string"
+              },
+              {
+                "const": "cancelled",
+                "description": "The `verify` call was cancelled while this gate was pending.",
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "all_passed": {
+            "description": "True when every gate passed.",
+            "type": "boolean"
+          },
+          "cancelled": {
+            "description": "True when the call was cancelled before every gate finished.",
+            "type": "boolean"
+          },
+          "repository": {
+            "description": "Repository root.",
+            "type": "string"
+          },
+          "results": {
+            "description": "One entry per gate, in run order.",
+            "items": {
+              "$ref": "#/$defs/GateResult"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "repository",
+          "results",
+          "all_passed"
+        ],
+        "type": "object"
+      }
+    }
+  ]
+}
