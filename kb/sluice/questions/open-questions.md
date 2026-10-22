@@ -24,6 +24,8 @@ Questions asked to the user, with answers once received. Newest at the end.
 | Q11 | Environment for gate processes | The daemon runs gates; which environment do they get? Proposal: the client's full environment snapshot minus `GIT_*` hook vars, plus the gate's `env`. Alternative: daemon env + allow-list. | Answered 2026-10-22: the client's full environment, sanitised (`GIT_*` hook vars and `CLAUDE*` removed), plus the gate's `env`. |
 | Q12 | Pre-commit key content | Hash the working tree (what tests see) or the index being committed (what gets committed)? Proposal, aligned with gate-cache: copy the hook's index and `add -A` on top, i.e. working tree content; record the committed tree in the marker so a later `pre-push` on a clean checkout hits. | Answered 2026-10-22: working-tree content, with the committed tree recorded in the marker. |
 | Q13 | MCP `verify` shape | (a) blocking call with progress notifications and cancellation (simplest for the model, one turn), or (b) bounded wait ≤ 30 s returning a job handle plus a `verify_status` poll tool (agent-task-queue's proven pattern). Facts found: Claude Code's MCP idle window is 30 min and progress notifications reset it; calls over 2 min are backgrounded, not killed. Proposal: (a), recorded in [[sluice/design/adr/0005-mcp-verify-blocking-or-handle.md]]. | Answered 2026-10-22: blocking `verify` with progress notifications and cancellation (ADR-0005 accepted). |
+| Q14 | Config hooks declaration | Asked 2026-10-22 together with the above. Per-gate `hooks = [...]` list vs a separate `[hooks]` table. | Answered 2026-10-22: per-gate `hooks = [...]` list. |
+
 ## Decisions taken without asking (reversible, reported)
 
 - Cloned reference repos into `refs/` (first in a sibling dir, moved inside on user request).
@@ -34,4 +36,16 @@ Questions asked to the user, with answers once received. Newest at the end.
 
 Related: [[sluice/plan/master-plan.md]].
 
-| Q14 | Config hooks declaration | Asked 2026-10-22 together with the above. Per-gate `hooks = [...]` list vs a separate `[hooks]` table. | Answered 2026-10-22: per-gate `hooks = [...]` list. |
+## Phase 6, local merge queue (answered 2026-10-22)
+
+The nine design questions were put to the user before implementation; the
+answers are recorded in section 14 of [[sluice/design/merge-queue.md]] and in
+ADR-0009 ([[sluice/design/adr/0009-merge-queue.md]]): best-effort batch
+landing, any branch ref as the base (`<remote>/<branch>` or a local branch),
+`--no-ff` merge commits, batching with `max_train = 4` and split-to-singles on
+failure, gates and `[queue]` read from the base commit, reconcile row 8 back
+to `ready` with approval voided, audit ref pushed by default, reconcile only
+on command, and the repository's `pre-push` hook runs at push time.
+
+Open questions: none. Deferred items are listed in
+[[sluice/changes/final-reconciliation.md]].

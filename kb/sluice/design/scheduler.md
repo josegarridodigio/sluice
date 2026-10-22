@@ -110,6 +110,14 @@ count, caller, session. Derived for `status`: hits (from client `event`s),
 coalesced, time saved = Σ run time of the job for each coalesced
 subscriber of a passed job + Σ marker.duration_ms for each reported hit.
 
+## Merge queue jobs
+
+The merge queue ([[sluice/design/merge-queue.md]]) submits its gate runs
+through `DaemonHandle::submit_run`, the same registration path as a client
+`run` (session `queue:<train-id>`), so they obey the budget, weights, repo
+cap, PSI admission and coalescing described here; the scheduler has no queue
+specific code.
+
 ## Properties to test (Phase 2 acceptance)
 
 - Six concurrent requests for the same key → one process run (counter file = 1), six `done{pass}`.

@@ -13,12 +13,14 @@
   <img alt="Status: pre-alpha" src="https://img.shields.io/badge/status-pre--alpha-red.svg">
 </p>
 
-> **Status: pre-alpha, Phases 1–4 done.** `sluice run` caches gate results
+> **Status: pre-alpha, Phases 0–6 done.** `sluice run` caches gate results
 > per git tree, a per-user daemon queues misses under a weighted budget,
 > coalesces identical requests and holds new work while the machine is
-> under pressure (Linux PSI), and `sluice mcp` gives coding agents a
-> `verify` tool that blocks safely. A first release and real-world numbers
-> come next; see the [roadmap](#roadmap).
+> under pressure (Linux PSI), `sluice mcp` gives coding agents a `verify`
+> tool that blocks safely, and a local merge queue lands agents' committed
+> branches only after a human approves. Release `v0.1.0` is published; the
+> debugging tools and the Claude Code plugin came after Phase 6, see the
+> [roadmap](#roadmap).
 
 ![Six requests, one run](docs/assets/demo.gif)
 
@@ -150,6 +152,7 @@ sluice status [--json]                                   # queue, in-flight, tot
 sluice mcp                                               # MCP stdio server for agents  (Phase 3)
 sluice queue enqueue|status|approve|retry|cancel|reconcile   # local merge queue    (Phase 6)
 sluice doctor [--json] [--bundle [PATH]]                 # health checks, redacted bug-report bundle
+sluice update [--check] [--version <vX.Y.Z>] [--yes] [--no-restart]   # self-update from the release assets
 ```
 
 ### Use with coding agents
@@ -166,9 +169,6 @@ that redirects raw test commands to `verify`. With `sluice` in your `PATH`:
 No `CLAUDE.md` block is needed. Details in [plugin/README.md](plugin/README.md).
 Other agents: register `sluice mcp` as an MCP server and paste the
 `AGENTS.md` block from [docs/agents.md](docs/agents.md).
-
-```
-```
 
 Exit codes of `sluice run`: 0 pass or cache hit; the gate's own code on
 failure; 3 refused by `agent_hook_policy = "fail-fast"`; 124 timeout; 143
@@ -189,8 +189,10 @@ disables the cache; `SLUICE_AGENT=1|0` forces agent or human detection;
 `SLUICE_CONFIG` points at the user config
 (`~/.config/sluice/config.toml`); `SLUICE_SOCKET` moves the daemon socket;
 `SLUICE_LOG` sets the log filter of `sluice daemon` (written to
-`~/.local/state/sluice/daemon.log`) and `sluice mcp` (stderr), `info` by
-default.
+`~/.local/state/sluice/daemon.log`), `sluice mcp` (stderr and a log file) and
+`sluice run`, then `[debug] level` of the user config, then `info`;
+`SLUICE_UPDATE_BASE_URL` points `sluice update` at a directory or `file://`
+URL holding the release archives, `SHA256SUMS` and a `LATEST` file.
 
 `sluice status` prints the daemon (pid, version, uptime, socket), budget
 use, system pressure (`pressure: cpu 12.3% mem 0.4% (ok|blocking admission|unavailable)`),
@@ -202,7 +204,10 @@ daemon to exit; `--force` kills them. `sluice daemon` exits 75 when a
 daemon is already running.
 
 MCP tools for agents: `verify` (blocks until the gates finish, with
-progress notifications and cancellation), `status`, `gate_list`, `logs`.
+progress notifications and cancellation), `status`, `gate_list`, `logs`, and
+for the merge queue `queue_enqueue`, `queue_status`, `queue_approve` (refused
+unless the user config sets `[queue] allow_agent_approval = true`),
+`queue_retry` and `queue_cancel`.
 
 ## Debugging
 
@@ -234,7 +239,10 @@ lands the train atomically. Agents enqueue, humans approve; add
 | 2 | Daemon: budget scheduler, coalescing, process groups, timeouts, SQLite metrics, `sluice status` | done |
 | 3 | MCP server (`verify`, `status`, `gate_list`, `logs`), `docs/agents.md` | done |
 | 4 | PSI-based admission, stable `--json` schema (`sluice status --json` is the metrics export) | done |
-| 5 | Release builds, install script, real-world numbers | done |
+| 5 | Release builds, install script, real-world numbers (`v0.1.0` published) | done |
+| 6 | Local merge queue: `sluice queue ...`, MCP queue tools, atomic push with write-ahead marker and `reconcile` ([docs/merge-queue.md](docs/merge-queue.md)) | done |
+| after 6 | Debugging and observability: persistent logs, `[debug] level`, `sluice daemon restart --debug`, `sluice doctor [--bundle]` ([docs/debugging.md](docs/debugging.md)); `sluice update` | done |
+| after 6 | Claude Code plugin: MCP server, `sluice` skill and guard hook ([plugin/README.md](plugin/README.md)) | done |
 
 Design history lives in [`kb/`](kb/sluice/plan/master-plan.md): the plan,
 the architecture, one ADR per decision, and research notes on the projects

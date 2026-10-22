@@ -74,6 +74,9 @@ pub struct MarkerSummary {
     pub tree: TreeHash,
     /// RFC 3339 timestamp of the pass.
     pub passed_at: String,
+    /// Tree of the index when the pass was recorded inside `pre-commit`
+    /// with unstaged changes present (see [`Marker::committed_tree`]).
+    pub committed_tree: Option<TreeHash>,
     /// Time since the pass.
     pub age: Duration,
 }
@@ -277,6 +280,7 @@ impl MarkerStore {
                 gate: m.gate,
                 tree: m.tree,
                 passed_at: m.passed_at,
+                committed_tree: m.committed_tree,
                 age,
             });
         }

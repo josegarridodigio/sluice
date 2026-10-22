@@ -24,7 +24,10 @@ Related: [[sluice/research/problem-statement.md]],
 | 3 | MCP front-end and agent policy | **done** (2026-10-22) | [[sluice/changes/phase-3-mcp.md]], [[sluice/changes/phase-3-acceptance.md]] (end to end with real sessions via `scripts/phase3-e2e.sh`). |
 | 4 | Load-aware admission and observability | **done** (2026-10-22) | [[sluice/changes/phase-4-psi.md]], [[sluice/changes/phase-4-acceptance.md]]; design [[sluice/design/psi-admission.md]]. |
 | 5 | Packaging and real-world validation | **done** (2026-10-22) | [[sluice/changes/packaging.md]] (release `v0.1.0` published, installer verified against it), [[sluice/changes/phase-5-validation.md]] (benchmark on this repository), README demo. |
-| 6 | Local merge queue (mergetrain-inspired) | **in progress** (design approved 2026-10-22) | [[sluice/design/merge-queue.md]], ADR-0009 accepted; user answers in section 14 of the design. |
+| 6 | Local merge queue (mergetrain-inspired) | **done** (2026-10-22) | [[sluice/design/merge-queue.md]], ADR-0009; [[sluice/changes/phase-6-daemon-extension-point.md]], [[sluice/changes/phase-6-merge-queue.md]], [[sluice/changes/phase-6-cli.md]], [[sluice/changes/phase-6-mcp.md]], [[sluice/changes/phase-6-acceptance.md]], [[sluice/changes/phase-6-reconciliation.md]]; user guide `docs/merge-queue.md`. |
+| 6a | Debugging and observability (after Phase 6) | **done** (2026-10-22) | [[sluice/changes/debugging.md]]; `docs/debugging.md`. `sluice update` landed in the same stretch: [[sluice/changes/self-update.md]]. |
+| 6b | Agent integration package (after Phase 6) | **done** (2026-10-22) | [[sluice/changes/agent-plugin.md]]; `plugin/`, `docs/agents.md`. |
+| final | Final reconciliation of KB, docs and CLI | **done** (2026-10-22) | [[sluice/changes/final-reconciliation.md]]. |
 
 ## Phase 0 — Setup and research
 
@@ -178,11 +181,11 @@ referenced here.
 ## Phase 6 — Local merge queue
 
 - [x] Design and ADR-0009 ([[sluice/design/merge-queue.md]]); user answers recorded 2026-10-22.
-- [ ] Daemon extension API (`Extension`, `DaemonHandle`), `welcome.features`, queue messages in `sluice-gate-proto`.
-- [ ] Crate `sluice-gate-queue`: store, runner, push protocol, reconcile.
-- [ ] CLI `sluice queue enqueue|status|approve|retry|cancel|reconcile` and MCP `queue_enqueue|queue_status|queue_approve`.
+- [x] Daemon extension API (`Extension`, `DaemonHandle`), `welcome.features`, queue messages in `sluice-gate-proto` ([[sluice/changes/phase-6-daemon-extension-point.md]]).
+- [x] Crate `sluice-gate-queue`: store, runner, push protocol, reconcile ([[sluice/changes/phase-6-merge-queue.md]]).
+- [x] CLI `sluice queue enqueue|status|approve|retry|cancel|reconcile` and MCP `queue_enqueue|queue_status|queue_approve|queue_retry|queue_cancel` ([[sluice/changes/phase-6-cli.md]], [[sluice/changes/phase-6-mcp.md]]).
 - [x] Acceptance tests 1–8 of the design (local bare remote, kill during push): [[sluice/changes/phase-6-acceptance.md]] (2026-10-22).
-- [ ] Docs (`docs/agents.md`, README), change note, acceptance note, reconciliation report.
+- [x] Docs (`docs/merge-queue.md`, `docs/agents.md`, README), change notes, acceptance note, reconciliation report ([[sluice/changes/phase-6-reconciliation.md]]).
 
 ## Debugging and observability (after Phase 6, before the final report)
 
@@ -213,8 +216,11 @@ Why: one install per user instead of a block pasted into every repository's `CLA
 
 ## Next steps
 
-1. Phase 6 implementation per the checklist above.
-2. Final reconciliation over the whole KB and the final report.
+All phases and both post-phase blocks are done and reconciled
+([[sluice/changes/final-reconciliation.md]]). What remains is outside the
+plan: deferred items are listed in that note (for example the unimplemented
+`committed_tree` evidence in `sluice cache status`), and the next release
+tag needs the user's approval.
 
 Earlier plan for Phase 3: `sluice-gate-mcp` with rmcp per [[sluice/design/mcp-tools.md]]
    (`verify`, `status`, `gate_list`, `logs`), fail-fast message pointing to

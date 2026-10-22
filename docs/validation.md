@@ -18,7 +18,8 @@ git config core.hooksPath .githooks         # per clone; worktrees share it
 
 Without `sluice` in `PATH` the hooks run the cargo commands directly, so
 the repository stays protected. For coding agents working on this repo,
-register the MCP server and paste the rules of [agents.md](agents.md):
+install the Claude Code plugin (see [agents.md](agents.md), section 2) or
+register the MCP server by hand and paste the rules of section 3:
 
 ```sh
 claude mcp add sluice -- sluice mcp

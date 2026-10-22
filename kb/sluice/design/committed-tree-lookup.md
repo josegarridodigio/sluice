@@ -23,8 +23,12 @@ evidence and does **not** reuse the pass automatically.
 ## Decision for Phase 2
 
 - Keep recording `committed_tree` in markers written from `--hook pre-commit`.
-- `sluice cache status` shows, for the current tree, markers whose
-  `committed_tree` equals it with the note `passed with unstaged changes
-  present` so a human can decide.
+- `sluice cache status` reads it back: for a gate that misses on the
+  current tree, it appends `; passed with unstaged changes present <age> ago
+  (tree <12 hex>)` when a fresh marker of that gate has `committed_tree`
+  equal to the current tree and a different `tree`
+  (`crates/sluice-gate/src/cache.rs` `status`, `MarkerSummary.committed_tree`;
+  test `cache_status_notes_a_pass_recorded_with_unstaged_changes`). It is a
+  note only: the gate still runs.
 - No automatic hit on `committed_tree`. Revisit only if real usage shows
   many push-time misses caused by this case (measure in Phase 5).

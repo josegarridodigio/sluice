@@ -38,8 +38,9 @@ recoverable (write-ahead marker, pin ref, atomic push, endpoint-bound reconcile)
   (members' SHAs, base, landing SHA and tree, gate keys, endpoint); any drift voids it.
 - Push protocol: pin ref `refs/sluice/pending/<train>`, then a fsynced write-ahead marker in
   the same transaction that moves the train to `pushing`, then
-  `git push --atomic --force-with-lease=<target>:<base>` together with the audit ref
-  `refs/sluice/landed/<sha>`. The repository's `pre-push` hook runs (the user chose not to
+  `git push --atomic --force-with-lease=refs/heads/<target>:<base>` together with the audit
+  ref `refs/sluice/landed/<sha>` (pushed with an expect-absent lease; `audit_ref = false`
+  drops it). A local target lands by an `update-ref` compare-and-swap instead. The repository's `pre-push` hook runs (the user chose not to
   bypass it; a Sluice hook answers from the markers the train produced, and a declining hook
   fails the train). Ambiguous outcomes park the train as `needs_reconcile`;
   `sluice queue reconcile` decides from the remote with a fixed table, refusing when the
@@ -56,8 +57,10 @@ recoverable (write-ahead marker, pin ref, atomic push, endpoint-bound reconcile)
 ## Consequences
 
 - No new process to supervise; the queue inherits the daemon's single-instance guarantee,
-  orphan handling and logs. A daemon restart dissolves unfinished trains and parks pushes
-  for reconcile; it never silently re-pushes.
+  orphan handling and logs. A daemon restart dissolves `building` and `verifying` trains
+  (their jobs are re-queued), parks `pushing` trains for reconcile and keeps `ready` and
+  `approved` trains (re-stamped with the new lease); it never silently re-pushes an
+  interrupted push.
 - Queue verification competes with agents' gates for the same budget, and benefits from
   their markers: a branch an agent already verified on the same tree costs nothing.
 - The daemon now runs `git fetch`/`git push` with the user's credentials, taken from the

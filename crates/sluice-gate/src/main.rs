@@ -34,7 +34,8 @@ use snippets::{HookManager, snippet};
     long_about = "Sluice runs named gates (tests, linters, type checks) under a global \
                   concurrency budget and caches results per git tree so each tree is verified \
                   once. Git hooks call `sluice run`; coding agents call the MCP server started by \
-                  `sluice mcp` (tools verify, status, gate_list, logs).\n\n\
+                  `sluice mcp` (tools verify, status, gate_list, logs and the merge-queue tools \
+                  queue_enqueue, queue_status, queue_approve, queue_retry, queue_cancel).\n\n\
                   On a cache miss `sluice run` hands the gate to the per-user daemon \
                   (`sluice daemon`), starting it on demand; when the daemon cannot be reached \
                   or started the gate runs in-process. `sluice status` shows the queue.\n\n\
@@ -77,8 +78,9 @@ enum Command {
     /// Start the MCP stdio server (spawned by the coding agent).
     ///
     /// Tools: `verify` (run gates through the cache and the daemon, blocking with
-    /// progress notifications), `status`, `gate_list`, `logs`. Logs go to stderr
-    /// only. Register `sluice mcp` as a stdio MCP server in the agent's config.
+    /// progress notifications), `status`, `gate_list`, `logs`, and the merge-queue
+    /// tools `queue_enqueue`, `queue_status`, `queue_approve`, `queue_retry`,
+    /// `queue_cancel`. Logs go to stderr only. Register `sluice mcp` as a stdio MCP server in the agent's config.
     Mcp,
     /// Start the per-user daemon (detached unless --foreground), or stop it.
     ///

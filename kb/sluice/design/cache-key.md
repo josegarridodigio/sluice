@@ -78,7 +78,7 @@ Git exports variables to hook processes; Sluice reads them explicitly:
 
 | Hook | Relevant env | Content to hash |
 |---|---|---|
-| `pre-commit` | `GIT_INDEX_FILE` points at the index being committed (or a temp index for `git commit -a` / partial commits) | Same procedure as outside hooks: copy the index git gave us, then `add -A` on top. The result is the **working tree** content, which is what the gate command actually sees. Hook managers that stash unstaged changes (pre-commit/prek, lefthook with `stage_fixed`) make it equal to the committed tree; Husky and plain hooks do not. The marker additionally records `committed_tree` (`write-tree` from the copied hook index without `add -A`, one extra spawn only inside `pre-commit`). In Phase 1 it is recorded but not used for lookups; a secondary lookup by committed tree (so that a `pre-push` after a commit made with unstaged changes can hit) is planned for Phase 2 and tracked in [[sluice/design/committed-tree-lookup.md]]. When the working tree was clean apart from the staged changes, the working-tree hash equals the committed tree and the normal lookup already hits at push time. Confirmed as the draft answer to Q12 in [[sluice/questions/open-questions.md]]. |
+| `pre-commit` | `GIT_INDEX_FILE` points at the index being committed (or a temp index for `git commit -a` / partial commits) | Same procedure as outside hooks: copy the index git gave us, then `add -A` on top. The result is the **working tree** content, which is what the gate command actually sees. Hook managers that stash unstaged changes (pre-commit/prek, lefthook with `stage_fixed`) make it equal to the committed tree; Husky and plain hooks do not. The marker additionally records `committed_tree` (`write-tree` from the copied hook index without `add -A`, one extra spawn only inside `pre-commit`). It is recorded but never used for an automatic hit: the decision in [[sluice/design/committed-tree-lookup.md]] is to keep it as evidence only (it is stored in the marker; nothing reads it back). When the working tree was clean apart from the staged changes, the working-tree hash equals the committed tree and the normal lookup already hits at push time. Confirmed as the draft answer to Q12 in [[sluice/questions/open-questions.md]]. |
 | `pre-push` | `GIT_DIR` (stdin lists the pushed refs; Sluice does not read it) | Working-tree hash, like everywhere else. On a clean checkout that equals the pushed commit's tree, so a pass recorded at commit time hits. |
 | other hooks | whatever git exports | Same working-tree hash; the hook policy applies to any `--hook` value (or whenever `GIT_DIR`/`GIT_INDEX_FILE` is present). Only `pre-commit` triggers the `committed_tree` record. |
 
@@ -204,5 +204,7 @@ Rules:
   must be declared via `key_inputs` / `key_files`, otherwise stale passes are
   possible.
 - A cache hit is a local optimisation. CI stays authoritative.
+
+The merge queue derives the keys of its gates with this same code from the tree `T` of the combined commit, so a pass on that exact tree hit or written by any client counts ([[sluice/design/merge-queue.md]] section 5).
 
 Related: [[sluice/design/architecture.md]], [[sluice/design/config-format.md]].

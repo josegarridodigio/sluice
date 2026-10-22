@@ -6,9 +6,10 @@ tags: [sluice, design, config]
 # Configuration format (v1)
 
 Status: approved 2026-10-22 (Phase-0 answers Q10, Q11, Q14). `version = 1`
-is frozen once Phase 1 ships; until then field additions are allowed,
-renames are not. Any incompatible change later bumps the version with a
-migration note.
+is frozen: only additive, optional fields are allowed (the merge-queue
+`[queue]` tables, the user `[mcp]` and `[debug]` tables and `gates.<name>.cache`
+were added this way). Renames and incompatible changes bump the version
+with a migration note.
 
 ## Repository config: `.sluice.toml`
 
@@ -41,7 +42,16 @@ hooks = ["pre-commit", "pre-push"]
 key_inputs = ["node --version"]     # stdout of each command is folded into the cache key
 key_files  = [".env.test"]          # ignored/untracked files whose content must invalidate the cache
 env        = { NODE_ENV = "test" }
-depends_on = ["lint"]               # optional: run only after these gates passed (same tree)
+depends_on = ["lint"]               # optional: reserved, validated but not scheduled in v1
+
+[queue]                             # merge queue defaults, all optional (read from the base commit)
+remote = "origin"
+# target = "main"                   # default: the remote's HEAD branch
+# gates = ["lint", "test"]          # default: gates with a pre-push hook, else all
+max_train = 4
+audit_ref = true
+push_timeout = "10m"
+network_timeout = "60s"
 ```
 
 Field reference:
@@ -58,6 +68,9 @@ Field reference:
 | `gates.<name>.hooks` | list | `[]` | Hook names this gate is meant for. Free-form, but `pre-commit` and `pre-push` are recognised by `sluice hook print`. |
 | `gates.<name>.key_inputs` | list of commands | `[]` | Each command's stdout (via `sh -c` in the worktree root, stderr discarded) is part of the key. Keep them fast; they run on every invocation that consults the cache, including hits. A failing command makes the run uncached (notice on stderr), never a gate failure. |
 | `gates.<name>.key_files` | list of paths | `[]` | Relative to repo root. Content hash is part of the key. For files git ignores. Missing file hashes as "absent". |
+| `gates.<name>.env` | table | `{}` | Added to the gate's environment and to the key. |
+| `gates.<name>.depends_on` | list | `[]` | Gate names; validated (must exist, no self-reference) but not scheduled in v1. |
+| `gates.<name>.cache` | bool | `true` | `false` makes the gate always run (still queued). |
 | `queue.remote` | string | `origin` | Remote of the default merge-queue target (Phase 6, [[sluice/design/merge-queue.md]]). Must not be empty, start with `-` or contain whitespace/control characters (it reaches git as an argument); at enqueue it must also be a configured remote of the repository (`invalid_remote`). |
 | `queue.target` | string | the remote's HEAD branch | Default target branch for `sluice queue enqueue`. |
 | `queue.gates` | list | gates with a `pre-push` hook, else every gate | Gates a train must pass; each must exist. |
@@ -65,10 +78,6 @@ Field reference:
 | `queue.audit_ref` | bool | `true` | Push `refs/sluice/landed/<sha>` atomically with the target. |
 | `queue.push_timeout` | duration | `10m` | Limit for the push, including the repository's `pre-push` hook. |
 | `queue.network_timeout` | duration > 0 | `60s` | Limit of every other network call of the queue (`fetch` of the base, `ls-remote` checks at enqueue, in the ready watch, before the push, in reconcile); on expiry git's process group is killed and the call fails. For the base fetch it is read from Sluice's last fetched base (else the remote-tracking branch) of the target, never from a member. |
-
-| `gates.<name>.env` | table | `{}` | Added to the gate's environment and to the key. |
-| `gates.<name>.depends_on` | list | `[]` | Gate names; validated (must exist, no self-reference) but not scheduled in v1. |
-| `gates.<name>.cache` | bool | `true` | `false` makes the gate always run (still queued). |
 
 Rules:
 
@@ -81,6 +90,16 @@ Rules:
   than the gate itself; `human_hook_policy` may not be `fail-fast`.
   `[defaults]` and `[gates]` are optional; a file with only `version = 1`
   is valid (and every `sluice run` then fails with `unknown gate`).
+- `[queue]` (merge queue) is valid only in `.sluice.toml`; the daemon reads
+  it with `git show <base commit>:.sluice.toml`, never from a queued branch
+  or the working tree. A missing or invalid file at the base yields the
+  built-in `[queue]` defaults. Validation errors (at parse): `queue.max_train must be
+  >= 1`, `queue.remote <must not be empty | must not start with '-' | must
+  not contain whitespace or control characters>`, `queue.network_timeout
+  must be > 0`, `queue.gates names an unknown gate "<name>"`. The per-user
+  queue keys below (`enabled`, `allow_agent_approval`, `tick`, `retention`)
+  are rejected here as unknown fields, and `queue.remote` and the other
+  repo keys are rejected in the user file.
 - `cmd` is normalised for the key by trimming and collapsing whitespace
   runs; nothing else.
 - The file is read from the current worktree's root (`git rev-parse
@@ -143,7 +162,7 @@ Environment variables (highest precedence):
 
 | Variable | Effect |
 |---|---|
-| `SLUICE_DISABLE=1` | `sluice run`: run the gate directly (needs the repo and `.sluice.toml`), no cache, no queue, no user config. Through `sluice mcp`: cache off, the gate still queues. |
+| `SLUICE_DISABLE` (truthy) | `sluice run`: run the gate directly (needs the repo and `.sluice.toml`), no cache, no queue, no user config. Through `sluice mcp`: cache off, the gate still queues. |
 | `SLUICE_CACHE=0` / `1` | Force cache off / on (on overrides the `CI` rule). |
 | `CI` | Cache off unless `SLUICE_CACHE` is truthy. A falsy `CI` (`0`, `false`, `no`, `off`) does not count as set. |
 | `SLUICE_AGENT=1` / `0` | Force agent / human detection (truthy / falsy words as below; any other value is ignored). |
@@ -151,6 +170,8 @@ Environment variables (highest precedence):
 | `SLUICE_LOG` | Log filter of the daemon (`sluice daemon`), MCP (`sluice mcp`) and CLI (`sluice run`) processes, e.g. `debug`. Precedence: `SLUICE_LOG` (when valid), then `[debug] level`, then `info`. Written to stderr (the daemon's goes to `daemon.log`, the MCP server's also to `logs/mcp-<pid>.log`). |
 | `SLUICE_TEST_CLIENT_LOG_CAP` | Test-only: byte cap that triggers the `client.log` rotation instead of 5 MiB. Not a user setting. |
 | `SLUICE_CONFIG` | Override the user config path (ignored when empty). |
+| `SLUICE_VERSION`, `SLUICE_INSTALL_DIR` | `scripts/install.sh` only: release tag to install (default latest) and target directory (default `$HOME/.local/bin`). |
+| `SLUICE_UPDATE_BASE_URL` | `sluice update`: directory or `file://` URL with the archives, `SHA256SUMS` and `LATEST`, instead of GitHub releases. |
 
 Truthy words: `1`, `true`, `yes`, `on`; falsy: `0`, `false`, `no`, `off`
 (case-insensitive, trimmed). An unrecognised `SLUICE_CACHE` value falls
@@ -163,11 +184,16 @@ means defaults); unknown fields are errors; validation: `daemon.budget >= 1`,
 `memory_some_avg10_max` in `[0, 100]`, `budget_share_max >= 1`, `debug.level` a valid
 `EnvFilter` directive (`info`, `debug`, `sluice_gate_daemon=debug,info`; the error names the
 file and the value). `sluice daemon restart [--debug]` applies a changed `[debug]` section;
-`--debug` forces `debug` for that daemon instance only. `daemon.idle_exit` (always "never" in v1) is parsed and validated but has
-no effect. The daemon reads `[daemon]`, `[scheduler]`, `[admission]`,
-`[repos]` and `cache.*` once at start (`sluice daemon stop` to apply
-changes); the client and the MCP server re-read the file per call.
-Everything else is live
+`--debug` forces `debug` for that daemon instance only. `daemon.idle_exit` (always "never" in v1) is parsed but has
+no effect and is not range-checked. The `[queue]` keys have no validation
+beyond their types; the runner floors `tick` at 50 ms, and `retention = "0s"`
+prunes every finished row at the next pass. The daemon reads `[daemon]`, `[scheduler]`, `[admission]`,
+`[repos]`, `[queue]` (`enabled`, `allow_agent_approval`, `tick`, `retention`),
+`[debug]` and `cache.*` once at start (`sluice daemon restart` to apply
+changes); the client and the MCP server re-read the file per call (so
+`sluice mcp` checks `queue.allow_agent_approval` live, on top of the
+daemon's own start-time check, and the CLI and MCP take `queue.tick` live to
+bound their wait for a landing). Everything else is live
 (`log_retention_days` prunes job logs daily from the daemon;
 `mcp.progress_interval` paces `verify`'s progress notifications).
 

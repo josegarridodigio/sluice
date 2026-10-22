@@ -21,9 +21,11 @@ sluice cache status [--all] | clear [--gate <gate>]                  # markers o
 sluice init [--force]                                                # starter .sluice.toml + plain hook snippet (Phase 1)
 sluice hook print husky|lefthook|pre-commit|plain                    # integration snippets (Phase 1)
 sluice logs [<job-id>] [-n <lines>]                                  # job logs (Phase 1)
-sluice daemon [--foreground] | stop [--force]                        # the brain: one per user, Unix socket (Phase 2)
+sluice daemon [--foreground] | stop [--force] | restart [--debug] [--force]   # the brain: one per user, Unix socket (Phase 2)
 sluice status [--json]                                               # queue, in-flight, cache stats, time saved (Phase 2)
 sluice mcp                                                           # MCP stdio server spawned by the agent (Phase 3)
+sluice queue enqueue [<branch>] [--base <base>] | status [--json] | approve <train> [--yes] | retry <job> | cancel <job> | reconcile   # local merge queue (Phase 6)
+sluice doctor [--json] [--bundle [<path>]]                           # installation checks, redacted bug-report bundle
 sluice update [--check] [--version <vX.Y.Z>] [--yes] [--no-restart]  # self-update from the release assets (curl + tar + SHA256SUMS, no HTTP crate)
 ```
 
@@ -73,7 +75,9 @@ with weight, timeout, extra key inputs, env. Details and the frozen format
 live in [[sluice/design/config-format.md]].
 
 User-level `~/.config/sluice/config.toml`: global budget, PSI thresholds, log
-retention, nice/ionice, per-repo overrides, agent detection.
+retention, nice/ionice, per-repo overrides, agent detection, `[mcp]`, `[queue]`
+(merge queue, also readable from the repository file for the keys the format
+allows there) and `[debug]` (log level, `daemon.log` rotation).
 
 ## 4. Cache key and markers
 
@@ -98,7 +102,7 @@ Summarised here; authoritative in [[sluice/design/cache-key.md]].
 |---|---|---|
 | Markers and miss records | `<git-common-dir>/sluice/markers/` | shared by all worktrees of a repo |
 | Scratch snapshots, daemon socket, locks, semaphore slots | `$XDG_RUNTIME_DIR/sluice/` (fallback `/tmp/sluice-<uid>/`) | mode `0700`; stale `snap-*` swept after 1 h |
-| Job logs, SQLite database | `$XDG_STATE_HOME/sluice/` (fallback `~/.local/state/sluice/`) | `logs/<job-id>.log`, `sluice.db` (Phase 2) |
+| Job logs, SQLite database | `$XDG_STATE_HOME/sluice/` (fallback `~/.local/state/sluice/`) | `logs/<job-id>.log`, `sluice.db` (Phase 2; it also holds the `queue_*` tables), `daemon.log` (+ `.1` to `.3`), `logs/mcp-<pid>.log`, `logs/client.log` (+ `.1`), `merge/<train-id>/` (merge-queue worktrees) |
 | User config | `$SLUICE_CONFIG` or `$XDG_CONFIG_HOME/sluice/config.toml` (fallback `~/.config/sluice/config.toml`) | optional |
 
 Job ids are `<unix-ms>-<pid>-<6 hex digits of the sub-second nanoseconds>`;
@@ -117,7 +121,11 @@ is ignored when empty; with no `HOME` the state dir falls back to
   executable as `sluice daemon` (which detaches itself with
   `nix::unistd::daemon` before creating its tokio runtime and sends stdout
   and stderr to `<state>/daemon.log`; `SLUICE_LOG` sets its log filter),
-  polls the socket every 20 ms for up to 5 s, releases the lock. The
+  polls the socket every 20 ms for up to 5 s, releases the lock. The log
+  filter is `SLUICE_LOG`, then `[debug] level`, then `info`; `daemon.log`
+  rotates by size ([[sluice/design/executor.md]]) and
+  `sluice daemon restart [--debug]` starts a fresh instance (debug level for
+  that instance only). The
   spawned daemon's environment has every `GIT_*` variable removed so a
   hook's variables never stick to it. Double start is impossible because
   the daemon holds `<runtime-dir>/daemon.lock` for its whole life and a
@@ -225,6 +233,30 @@ run as child tasks so approvals and the watch of ready trains never wait for
 a gate. With `[queue] enabled = false` the runner idles and every `queue-*`
 request gets `error{not-supported}`.
 
+### 5.7 Logs, diagnostics and self-update
+
+Persistent traces ([[sluice/changes/debugging.md]], `docs/debugging.md`):
+`<state>/daemon.log` (rotated above `[debug] daemon_log_max_mib`, three
+generations), `<state>/logs/mcp-<pid>.log` per `sluice mcp` process,
+`<state>/logs/client.log` (one line per `sluice run`, rotated above 5 MiB to
+`client.log.1`) and one log per job. The daemon's daily pruning deletes job
+logs and `mcp-*.log` files older than `[daemon] log_retention_days`;
+`client.log` is only rotated. `sluice doctor [--json]` runs read-only checks
+(git version, PSI files, state and runtime directories, daemon socket and
+version, lease row, user config, repository config, hooks, marker size, the
+`sluice` first in `PATH`), exits 1 when one fails and never uses the network;
+`--bundle [path]` adds a redacted `.tar.gz` (versions, configs, `status
+--json`, `queue status --json`, recent daemon, client and MCP logs, logs of
+the last failed jobs).
+
+`sluice update [--check] [--version <vX.Y.Z>] [--yes] [--no-restart]` resolves
+the release from the `releases/latest` redirect (or `--version`), downloads
+the archive and `SHA256SUMS` with `curl` (or `wget`), verifies the checksum,
+extracts with `tar`, runs the new binary to confirm its version and replaces
+the executable atomically; unless `--no-restart` it then stops an idle daemon
+(a busy one keeps the old version). `SLUICE_UPDATE_BASE_URL` redirects the
+download to a directory or `file://` URL ([[sluice/changes/self-update.md]]).
+
 ## 6. IPC protocol
 
 Newline-delimited JSON over the Unix socket, with a `protocol` field in
@@ -247,7 +279,11 @@ blocking as long as needed with progress notifications every
 timeout applies to MCP tool calls, only the client's idle window; see
 [[sluice/research/claude-code-facts.md]]). Tools: `verify`, `status`,
 `gate_list`, `logs`. Details and the decision on the MCP Tasks extension
-in [[sluice/design/mcp-tools.md]] and ADR-0005.
+in [[sluice/design/mcp-tools.md]] and ADR-0005. The merge queue adds
+`queue_enqueue`, `queue_status`, `queue_approve`, `queue_retry` and
+`queue_cancel` (nine tools in all; `queue_approve` is refused unless the user
+config sets `[queue] allow_agent_approval = true`). The process also writes
+`<state>/logs/mcp-<pid>.log`.
 
 ## 8. Hook integration and agent policy
 

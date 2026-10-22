@@ -47,6 +47,12 @@ Status: implemented in Phase 2 (`sluice-gate-daemon`, CLI `daemon_cmd`, proto `c
   printing `waiting for N running jobs to finish`, then a note and exit 0
   if it gives up; `--force` polls the pid for up to 10 s) so the next
   client gets a fresh daemon.
+- **Restart:** `sluice daemon restart [--debug] [--force]` (`daemon_cmd::restart`)
+  refuses with exit 1 while gates are running unless `--force`, stops the
+  daemon as `stop` does, then autostarts a detached one; with `--debug` the
+  new instance gets `SLUICE_LOG=debug` (that instance only). It prints
+  `no daemon running; starting one` when there was none and
+  `daemon started` (`(log level debug)` with `--debug`) on success.
 - **Idle:** never exits on its own in v1 (`daemon.idle_exit = 0s`, Q10).
 - **Restart reconciliation:** on start, rows in `jobs` with
   `state = 'running'` from another `daemon_instance` are orphans (queued
@@ -118,8 +124,11 @@ Status: implemented in Phase 2 (`sluice-gate-daemon`, CLI `daemon_cmd`, proto `c
 
 ## Persistence (SQLite, `rusqlite` bundled, WAL)
 
-File `<state>/sluice.db`. `Store::open_read_only` exists for diagnostics
-tooling (no CLI command uses it yet); all writes go through the daemon.
+File `<state>/sluice.db`. `Store::open_read_only` serves diagnostics
+(`sluice doctor` reads the lease row and the failed jobs through it); all
+writes go through the daemon. The merge queue keeps its own `queue_*` tables
+in the same file ([[sluice/design/merge-queue.md]] section 4) and the daemon's
+`schema.version` stays 1.
 The state dir, the logs dir and the socket directory are created `0700`
 (`dirs::create_private_dir`, which also applies to missing parents such as
 `~/.local/state`); files inside follow the process umask.

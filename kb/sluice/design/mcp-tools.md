@@ -178,12 +178,15 @@ Common rules:
   touches the index or the working tree.
 - The daemon is autostarted (`ensure_daemon`) and spoken to with the blocking
   client's `Client::request` on a blocking thread; the reply is returned as is,
-  so an `error` message keeps its code. The server identifies itself as
-  `sluice-gate-mcp <version>`.
+  so an `error` message keeps its code. The queue tools go through the shared
+  proto client, whose `hello` says `sluice-gate <version>` (only `verify`,
+  `status` and `logs` use the `sluice-gate-mcp <version>` client of
+  `daemon.rs`); the MCP server info is `sluice <version>`.
 - Failures are **tool error results** (`is_error = true`, no structured
   content) whose text starts with the code and a colon: the daemon's own
   codes `conflict-state`, `not-allowed`, `stale-plan`, `duplicate-branch`,
-  `not-supported`, `not-found`, `internal`, plus codes minted by the server
+  `not-supported` (also when `[queue] enabled = false`), `not-found`,
+  `bad-request`, `internal`, plus codes minted by the server
   before or around the daemon call: `dirty-worktree`, `detached-head`,
   `unknown-branch`, `not-a-repository`, `git`, `unavailable` (daemon cannot be
   reached). Only a bad or relative `working_directory` or an unsafe
@@ -234,7 +237,9 @@ and commit on '<branch>', run `verify`, then call queue_retry with job_id
 <id>`), its gates (`test PASS 12.4s`, `lint CACHED`), and a
 state line: `ready; a human approves with `sluice queue approve <id>``,
 `approved; the daemon is pushing`, `landed <sha7>`, `push outcome unknown; a
-human runs `sluice queue reconcile``; jobs outside any train follow. Conflict
+human runs `sluice queue reconcile``; jobs outside any train follow under
+`jobs outside a train:`. With no trains and no jobs the text is `the merge
+queue is empty for this repository`. Conflict
 paths are read from `detail.paths` (or a bare array). `structured_content` =
 the `queue-status` payload, `schema: 1`, same as `sluice queue status --json`.
 
@@ -255,14 +260,16 @@ Inputs: `working_directory`, `train_id`.
 3. **Daemon-side gate**: the daemon repeats the check for `via: mcp` and
    answers `not-allowed` if the flag is off (the daemon's copy of the user
    config); a changed train gives `stale-plan`.
-4. On `queue-approved` with the train `approved`/`pushing`, it polls
+4. On `queue-approved`, while the train is `ready`/`approved`/`pushing`, it polls
    `queue-status` every second, up to the train's `push_timeout_ms` plus
    its `network_timeout_ms` (pre-push checks), two user-config `[queue]
    tick`s and 30 s (defaults 10 min and 60 s when the daemon does not report
    them; `approve_wait`), until the train is `landed`, `needs_reconcile`
    or disappears/`dissolved`; it sends a progress notification every
    `[mcp] progress_interval` when the request has a progress token.
-   Cancelling the call stops the wait, never the push.
+   Cancelling the call stops the wait, never the push (error result
+   `cancelled: stopped waiting; train <id> stays <state> and the daemon
+   continues`).
 
 Text: `landed <sha7> on <remote>/<target> (train <id>)`, or
 `needs_reconcile: …`, `failed: train … was dissolved …`, `timeout: train …

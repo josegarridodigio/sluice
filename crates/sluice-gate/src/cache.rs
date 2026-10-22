@@ -36,6 +36,15 @@ pub fn status(all: bool) -> ExitCode {
     match tree::snapshot(&repo.paths, &repo.probe_env, &repo.scratch) {
         Ok(Snapshot::Known(tree)) => {
             println!("tree:    {tree}");
+            // Passes recorded in `pre-commit` on a superset of this tree
+            // (unstaged changes present): shown as evidence, never a hit.
+            let supersets: Vec<_> = store
+                .list()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|m| m.committed_tree.as_ref() == Some(&tree) && m.tree != tree)
+                .filter(|m| m.age <= repo.ttl)
+                .collect();
             for (name, gate) in &repo.config.gates {
                 if !gate.cache {
                     println!("{name:<16} always runs (cache = false)");
@@ -60,7 +69,21 @@ pub fn status(all: bool) -> ExitCode {
                     },
                     Err(e) => format!("ERROR ({e})"),
                 };
-                println!("{name:<16} {line}");
+                let note = if line.starts_with("MISS") {
+                    supersets
+                        .iter()
+                        .find(|m| &m.gate == name)
+                        .map_or_else(String::new, |m| {
+                            format!(
+                                "; passed with unstaged changes present {} ago (tree {})",
+                                age(&m.passed_at),
+                                &m.tree.as_str()[..12]
+                            )
+                        })
+                } else {
+                    String::new()
+                };
+                println!("{name:<16} {line}{note}");
             }
         }
         Ok(Snapshot::Unknown { reason }) => {

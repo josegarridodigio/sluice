@@ -71,7 +71,8 @@ One block per train with its members, the gates and, for conflicts, the paths
 and the retry hint. A dissolved train is hidden once a newer train exists for the
 same target (its members show up in the newer train or on their own; `--json`
 keeps every train). Jobs that are not in a train are listed as `queued` with their
-position. When no train can be built because the target cannot be fetched or the
+position; other jobs outside a train (for example `CONFLICT` or `FAILED`) are listed
+under `jobs needing attention:`. An empty queue prints `sluice: the merge queue is empty`. When no train can be built because the target cannot be fetched or the
 base commit's `.sluice.toml` is invalid, the queued line says why
 (`waiting: base_unavailable <git error>` or `waiting: base_config_invalid <error>`);
 the queue tries again once per `[queue] tick` and, after 3 failed attempts in a
@@ -92,7 +93,7 @@ sends the train hash it displayed, so if the train changed in between (the targe
 moved, a member was cancelled or retried) the daemon refuses with `stale-plan`:
 look at `status` again and approve the new plan. On success it prints
 `sluice: landed <sha> on <target> (train <id>)`. If the push is still running it
-prints `approved; pushing...` and waits until the train lands or fails, at most the
+prints `sluice: approved; pushing…` and waits until the train lands or fails, at most the
 base's `push_timeout` plus its `network_timeout`, two ticks and 30 s; then it prints
 the train's current state and exits 1 (the daemon carries on; check
 `sluice queue status`).
@@ -112,7 +113,8 @@ the train's current state and exits 1 (the daemon carries on; check
   with the decision `landed`, `ready` (approval voided, approve again), `queued`
   (the target moved, the train will be rebuilt), `cancelled` or `refused` (for example
   `push_in_progress`, `endpoint_changed`, `remote_unreachable`; nothing changed).
-  It only runs when you ask for it. If the decision cannot be recorded, the train
+  With nothing to reconcile it prints `sluice: no train needs reconciling`.
+It only runs when you ask for it. If the decision cannot be recorded, the train
   stays `needs_reconcile` with its pin ref and worktree, so `reconcile` can run again.
 
 ## Exit codes
@@ -120,9 +122,9 @@ the train's current state and exits 1 (the daemon carries on; check
 | Code | Meaning |
 |---|---|
 | 0 | ok |
-| 1 | error (including a daemon without the queue: it prints the daemon's message) |
+| 1 | error: not a repository, detached HEAD, dirty worktree, unknown train or job, a base the queue cannot use (tag, raw SHA, invalid remote), `not-supported` (the queue is disabled with `[queue] enabled = false`), an `approve` declined at the prompt or that stopped waiting, and a daemon without the queue (the client says it does not support the merge queue) |
 | 2 | usage error, or `approve` without a terminal and without `--yes` |
-| 4 | refused by the state of the queue (`conflict-state`, `not-allowed`, `stale-plan`, `duplicate-branch`) |
+| 4 | refused by the state of the queue (`conflict-state`, `not-allowed`, `stale-plan`, `duplicate-branch`), for example `approve` of a train that is not `ready`, or an `enqueue` of the target itself or of a branch that already has an active job |
 
 Messages start with `sluice: `. If the running daemon predates the queue, run
 `sluice daemon stop`; the next command starts a matching one.

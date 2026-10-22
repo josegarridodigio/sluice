@@ -53,15 +53,19 @@ from bypassing the queue (documented, enforced by the forge, not by Sluice).
   branch name, local or remote), and a local branch checked out in any worktree
   (`target_checked_out`: updating it would desync that worktree, which product code never
   touches). The refusal message starts with a token: `head`, `tag`, `sha`, `unknown_base`,
-  `invalid_remote`, `no_default_target` (error code `bad-request`), `own_branch`,
+  `invalid_remote`, `no_default_target`, `invalid_base` (the worktrees cannot be listed) (error code `bad-request`), `own_branch`,
   `target_checked_out` (`not-allowed`). The columns `remote`/`target` store `""`/`<branch>` for local targets.
 - **Train**: the unit the runner builds, verifies, gets approved and pushes: an ordered list of
   jobs merged onto one `base_sha`. It yields a commit `S` (the landing SHA) and its tree `T`.
 - **Train hash**: `sha256(repo, remote, endpoint_hash, target, base_sha, [(job_id, head_sha)…],
-  S, T, sorted gate keys)`. Shown at approval and stored with it; re-checked before push.
+  S, T, sorted gate keys)`. Shown at approval and stored with it; re-checked before push. Encoding (`model::train_hash`): the
+  prefix `sluice-train-v1`, then each field NUL-terminated, a `|` field after the members, and the
+  gate keys as `gate=key` (`gate=-` for an uncached gate), sorted.
 - **Lease**: the daemon's existing lease row (`lease.name = 'daemon'`, random token). The runner
-  only works while the heartbeat succeeds; every queue write is a compare-and-swap on
-  `claim_token = <lease token>` and the expected `state`.
+  only works while the heartbeat succeeds; every queue write first checks that the lease row still
+  carries its token (`Writer::new`, else the write is refused as lease lost); train updates are a
+  compare-and-swap on `claim_token = <lease token>` and the expected `state`, job updates on the
+  expected `state`.
 - **Pin ref**: local ref `refs/sluice/pending/<train-id>` → `S`, created before the marker so
   the commit survives `git gc` and the merge worktree's removal until reconcile.
 - **Write-ahead marker**: row in `queue_push_markers` written in the same transaction that
@@ -71,12 +75,14 @@ from bypassing the queue (documented, enforced by the forge, not by Sluice).
 - **Endpoint binding**: `endpoint_hash = sha256(git remote get-url --push <remote>)` with
   userinfo stripped: the URL `git push <remote>` uses (`pushurl`, else `url`, with
   `insteadOf`/`pushInsteadOf` applied; `target::endpoint`). A remote with several push
-  URLs is refused (a train lands on exactly one endpoint). Recorded in the train hash and
+  URLs is refused (a train lands on exactly one endpoint). A local target has no URL: its
+  `endpoint_hash` is `sha256("local:" + git common dir)`. Recorded in the train hash and
   the marker; push and reconcile refuse when the remote now resolves to another URL
   (`endpoint_changed`). Every network query of a train (base fetch, ready watch,
   pre-push target check, reconcile) goes to that push URL, never to the fetch URL, so a
   triangular setup (fetch from A, push to B) builds on B's branch and lands on B.
-- **Audit ref**: remote ref `refs/sluice/landed/<S>` pushed atomically with the target, so
+- **Audit ref**: remote ref `refs/sluice/landed/<S>` pushed atomically with the target (while
+  `[queue] audit_ref` is true, the default), so
   reconcile can tell "landed and later rewritten" from "never landed".
 
 ## 3. Job state machine
@@ -90,18 +96,18 @@ Side exits: `conflict`, `failed`, `cancelled`, `needs_reconcile`. Exact transiti
 | queued | merging | claim into a train (one `BEGIN IMMEDIATE` with job selection) | runner |
 | queued | failed | 3 consecutive failures to prepare the base (`base_unavailable`, `base_config_invalid`) | runner |
 | merging | verifying | its merge applied cleanly | runner |
-| merging | conflict | `git merge` conflicted (with base or earlier members); the job leaves the train (`train_id` cleared) | runner |
-| merging | failed | internal error while building the train (reason `internal`) | runner |
+| merging | conflict | `git merge` conflicted (with base or earlier members; reason `conflict`, `merge_failed` or `dirty_merge`); the job leaves the train (`train_id` cleared) | runner |
+| merging | failed | internal error while building the train (reason `internal`; a `verifying` job fails the same way) | runner |
 | verifying | ready | every gate passed or hit | runner |
-| verifying | failed | a gate failed / timed out / was killed (single-member train), or `tree_mismatch` | runner |
+| verifying | failed | a gate failed / timed out / was killed / errored and the train has a single surviving member (reason `gate_failed`), or `tree_mismatch` (checked before any gate runs) | runner |
 | verifying | queued | multi-member train failed: members split (section 5, step 7) | runner |
 | ready | approved | `queue approve <train>` with matching train hash | human (CLI) or MCP if allowed |
-| ready, approved | queued | base moved, member cancelled or retried, config drift; approval voided | runner |
+| ready, approved | queued | base moved, member cancelled, `stale_plan` (train hash changed or a cancel pending), `endpoint_changed`, merge worktree changed; approval voided | runner |
 | approved | pushing | marker + pin ref written, lease re-checked | runner |
 | approved | failed | local target checked out at landing time (reason `target_checked_out`) | runner |
 | pushing | landed | push exit 0 | runner |
-| pushing | queued | definitive rejection, lease mismatch on target (remote moved) | runner |
-| pushing | failed | definitive rejection for permission/policy | runner |
+| pushing | queued | definitive rejection, lease mismatch on target (remote moved), or a failed local compare-and-swap | runner |
+| pushing | failed | definitive rejection for permission/policy or a refused refspec (reason `push_rejected`), or a declining `pre-push` hook (reason `pre_push_hook`) | runner |
 | pushing | needs_reconcile | ambiguous push failure, or daemon start finds the train `pushing` | runner / daemon start |
 | pushing | cancelled | definitive rejection (nothing landed) while `cancel_requested` | runner |
 | needs_reconcile | landed / ready / queued / cancelled | decision table, section 6 | `queue reconcile` |
@@ -181,7 +187,8 @@ finished trains changed within the last hour (their worktrees).
 
 One tokio task per daemon, woken by every `queue-*` request and by the user config's
 `[queue] tick` (default 5 s); it does nothing while the lease is lost, the daemon is stopping
-or `[queue] enabled = false`. Per (repo, remote, target) at most one train is active.
+or `[queue] enabled = false` (every `queue-*` request is then refused with error code
+`not-supported`). Per (repo, remote, target) at most one train is active.
 Preparing a group's base and claiming it (steps 1–2), building a train (steps 3–7), the
 ready watch of a train (step 8, at most once per tick) and pushing it (step 9) run as
 child tasks of the runner, and every network call has a deadline (`[queue]
@@ -195,11 +202,11 @@ dissolves an unfinished build and parks an unfinished push).
    oldest first, the runner spawns one task (busy key per group) that runs step 2 for it
    (fetch, config), then in one
    `BEGIN IMMEDIATE`: verifies the lease token, re-reads the queued jobs of that target and
-   takes up to `max_train` of them by `queue_order` (a `solo` job only alone, and the batch
+   takes up to `[queue] max_train` (default 4) of them by `queue_order` (a `solo` job only alone, and the batch
    stops before a `solo` job), creates the train row, moves them to `merging` with
    `claim_token`. No train is built while an older train of the same target is
    `building`/`verifying`/`ready`/`approved`/`pushing`/`needs_reconcile`.
-2. **Trusted config.** Remote target: `git fetch --no-tags --no-write-fetch-head -- <push
+2. **Trusted config.** Remote target: `git fetch --no-tags --quiet --no-write-fetch-head -- <push
    URL> +refs/heads/<target>:refs/sluice/base/<remote>/<target>` (env: sanitised daemon env
    plus the enqueuer's allowlist; the repository's `FETCH_HEAD` is never written), `base_sha`
    = that ref. Its deadline is the `[queue] network_timeout` of a trusted commit of the
@@ -223,7 +230,8 @@ dissolves an unfinished build and parks an unfinished push).
    no committer identity). On conflict: record the conflicting paths, `git merge --abort`,
    mark the job `conflict` (reason `conflict`, detail `{"paths": [...]}`; `merge_failed` when
    git failed without conflicting paths), continue. A merge that leaves the tree dirty is
-   reset and the job gets reason `dirty_merge`. No member left → the train is `dissolved`.
+   reset (`git reset --hard`, `git clean -fd`) and the job becomes `conflict` with reason
+   `dirty_merge` and the dirty paths in `detail`. No member left → the train is `dissolved`.
    Survivors → `verifying`. The train keeps every claimed member in `members`; the hash uses
    the survivors.
 5. **Key.** `T = git rev-parse S^{tree}`. Take `tree::snapshot` of the clean worktree (the same
@@ -236,7 +244,8 @@ dissolves an unfinished build and parks an unfinished push).
    the hash as `<gate>=-`). Markers live in the repo's common dir, so keys computed by agents' `verify` calls
    on the same tree hit: a fast-forwarded single-member train that the agent already
    verified needs no run at all.
-6. **Run through Sluice.** `MarkerStore::lookup` per key; all hits → `ready` immediately.
+6. **Run through Sluice.** `MarkerStore::lookup` per key; all hits (or no gate at all, e.g. a base without `.sluice.toml`) →
+   `ready` immediately.
    Otherwise submit one `RunRequest` per missing gate through `DaemonHandle::submit_run`
    (section 10): `repo.common_dir` = the real common dir, `toplevel`/`cwd` = merge worktree,
    `key`/`tree` = derived, `committed_tree = T`, `caller = human`, `session =
@@ -248,8 +257,8 @@ dissolves an unfinished build and parks an unfinished push).
 7. **Outcome.** Decided in one write transaction (`runner::finish_train`), which re-reads
    the members: a member that left `verifying` meanwhile (cancelled) dissolves the train
    and re-queues the others (never an `internal` failure). All pass/cached → train `ready`,
-   `train_hash` computed, `queue status` shows the plan. A failure in a single-member train → job `failed`, reason `gate_failed` (detail:
-   `gate`, `job_id`, `status`, `exit_code`, `log_path`, `message`). A failure in a multi-member train → v1 splits: every member returns to `queued`
+   `train_hash` computed, `queue status` shows the plan. A failure in a train with a single surviving member → job `failed`, reason `gate_failed` (detail:
+   `gate`, `job_id`, `status`, `exit_code`, `log_path`, `message`). A failure with several surviving members → v1 splits: every member returns to `queued`
    with the flag `solo`, so the next trains contain one job each (linear isolation). Stretch
    (optional, not v1): bisection of the failing train and re-run of the survivors as a fresh
    train, plus detection of a semantic-conflict pair, as in mergetrain.
@@ -278,7 +287,8 @@ of the current push URL unchanged (else dissolved with note `endpoint_changed`, 
 train is rebuilt against the new URL), for a local target that it is not checked out
 (else jobs `failed`, reason `target_checked_out`), `ls-remote` of the push URL (train's
 `network_timeout`) target == `base_sha` (else dissolved, `target moved`). A remote that
-cannot be reached leaves the train `approved` and the check is retried at the next tick.
+cannot be reached (or whose push URL cannot be resolved) leaves the train `approved` and the check is
+retried at the next tick.
 Then:
 
 1. `git update-ref refs/sluice/pending/<train-id> S` (pin ref).
@@ -288,12 +298,14 @@ Then:
 3. Spawn, in its own process group, with the approver's env allowlist:
    `git push --atomic --porcelain --no-follow-tags --recurse-submodules=no
    --force-with-lease=refs/heads/<target>:<base_sha> --force-with-lease=refs/sluice/landed/<S>:
-   -- <remote> <S>:refs/heads/<target> <S>:refs/sluice/landed/<S>`; record `push_pid` and
+   -- <remote> <S>:refs/heads/<target> <S>:refs/sluice/landed/<S>` (the audit-ref lease option and refspec
+   are present only with `[queue] audit_ref = true`, the default; `push::push_args`); record `push_pid` and
    `push_start_ticks` (`executor::proc_start_ticks`) in the marker right after spawn. A
    push that cannot be spawned after the marker was written is an ambiguous end
    (`needs_reconcile`, note `push_spawn_failed: …`), never a train left `pushing`. The
    push env is the daemon's env without `GIT_*`, plus `LC_ALL=C` (stderr is parsed) and
-   `GIT_TERMINAL_PROMPT=0`, plus the approver's allowlist.
+   `GIT_TERMINAL_PROMPT=0`, plus the approver's allowlist (`SSH_AUTH_SOCK`, `SSH_AGENT_PID`,
+   `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `SSH_ASKPASS`, `HOME`, `PATH`, `TERM`; `git::ENV_ALLOWLIST`).
    The repository's `pre-push` hook **runs** (user decision, section 14): the push is a
    regular push from the merge worktree with the repository's `core.hooksPath`, so a
    Sluice-based hook answers from the markers the train just produced (the daemon's env
@@ -312,7 +324,7 @@ Then:
    `pre-push` for a ref update); a failed compare-and-swap is a definitive rejection
    (train dissolved, jobs `queued`). A local ref update cannot end ambiguously, so
    `needs_reconcile` only arises for it when the daemon dies between the marker and the
-   update; reconcile then applies rows 4 to 9 against the local refs.
+   update (or `git` cannot be spawned for it); reconcile then applies rows 4 to 9 against the local refs.
 4. Exit 0 → `landed`, marker kept as history (`outcome: landed` in `queue_events`), pin ref
    deleted, worktree removed. Classification (`push::classify`, on the line of
    `refs/heads/<target>`): `[rejected]` (`stale info`, `non-fast-forward`, `fetch first`) →
@@ -322,7 +334,7 @@ Then:
    `error: dst refspec`, `error: unable to push to unqualified destination`) → jobs
    `failed`, reason `push_rejected`; the `pre-push` hook declined → jobs `failed`,
    reason `pre_push_hook`, detail `{"output": ...}`. A job with a pending cancel ends
-   `cancelled` instead of `failed`/`queued`. Anything else (signal, timeout, network error,
+   `cancelled` instead of `failed`/`queued`. Anything else (signal, timeout, exit 0 with a rejected ref line, network error,
    truncated or unparsable output, or only the audit ref reported stale, which hints that `S`
    already landed) → `needs_reconcile`.
 
@@ -351,9 +363,9 @@ Every decision deletes the marker except refusals; the pin ref goes with it, and
 worktree too except for row 8 (the train must be pushable again). Pin ref and worktree are
 removed only after the decision's transaction committed: when that write is refused (the
 state or the token changed meanwhile, lease lost) the result is `refused` with the store's
-reason and both stay for the next reconcile. Row 7 dissolves the train:
-members with a pending cancel → `cancelled`, the others → `queued`. Row 9 dissolves it with
-every member `queued`. Reconcile only reads the remote (`ls-remote` of the push URL, and a `fetch` of it into
+reason and both stay for the next reconcile. Rows 7 and 9 dissolve the train
+(`Writer::dissolve`): members with a pending cancel → `cancelled`, the others → `queued` with
+`attempts + 1`. Reconcile only reads the remote (`ls-remote` of the push URL, and a `fetch` of it into
 `refs/sluice/base/<remote>/<target>` when the target's commit is missing for the ancestry
 check, both with the train's `network_timeout`; a timeout is row 3 or 10); it never
 pushes. A deleted target branch counts as "moved" (row 9). With the push
@@ -377,9 +389,13 @@ over `ReconcileInput`; `reconcile::gather` collects the facts.
   them with the reason cleared.
 - **Merge conflict**: job `conflict` with paths; the agent rebases its branch and calls
   `queue retry <job>`, which re-reads `refs/heads/<branch>` and re-queues (new `queue_order`).
-- **Runner death mid-train**: daemon start dissolves `merging`/`verifying` trains (jobs
-  `queued`, `attempts + 1`); gate jobs are already handled as orphans by the executor.
-- **Runner death mid-push**: marker present → `needs_reconcile` (section 6); pin ref keeps `S`.
+- **Runner death mid-train**: daemon start dissolves `building`/`verifying` trains (jobs
+  `queued`, `attempts + 1`) and re-queues any job stranded in `merging`/`verifying` without a
+  live train; `ready`/`approved` trains survive the restart (they are re-stamped with the new
+  lease token and go on); gate jobs are already handled as orphans by the executor.
+- **Runner death mid-push**: daemon start parks every `pushing` train as `needs_reconcile`
+  (section 6), whether the marker is present, absent or the push process is still alive (a
+  live push is logged, never killed); pin ref keeps `S`.
 - **Lease lost**: the runner stops claiming and never starts a push; a running push finishes
   and its result is written only if the fence still matches, otherwise the next daemon parks
   it as `needs_reconcile`.
@@ -388,18 +404,23 @@ over `ReconcileInput`; `reconcile::gather` collects the facts.
   the same through the `update-ref` compare-and-swap.
 - **`pre-push` hook declined or hung**: declined → jobs `failed` (`pre_push_hook`); hung →
   `push_timeout`, group killed, `needs_reconcile`.
+- **Push rejected by policy** (`[remote rejected]`, permission denied, a refspec git refuses):
+  nothing landed, jobs `failed` with reason `push_rejected`. **Local target checked out** in a
+  worktree at landing time: jobs `failed` with reason `target_checked_out`.
 - **Stalled remote**: every `fetch`/`ls-remote` has the `network_timeout` deadline and runs
   in a child task; a stall during step 2 records `base_unavailable` (`git … timed out after
   …`) like any fetch failure, during the watch or the pre-push check it is an unreachable
   remote (nothing changes, retried next tick), during reconcile row 3/10.
-- **SQLite busy**: typed retryable error, never a job state change.
+- **SQLite busy**: `StoreError::Busy` (retryable, nothing written); a request gets error code
+  `internal` with the message `database busy, retry later`, the runner retries at the next tick;
+  never a job state change.
 
 ## 8. Protocol additions
 
 Protocol stays **1**. All additions follow the versioning rules (new message types and optional
 fields); old clients never send them. To avoid relying on `bad-request` from an old daemon,
 `welcome` gains an optional `features: ["queue"]`; a client that does not see it prints
-`the running daemon does not support the merge queue; run 'sluice daemon stop'`. A bump would
+`the running daemon does not support the merge queue; run 'sluice daemon stop' and retry`. A bump would
 force every hook client to restart the daemon for a feature most repositories do not use.
 
 Client: `queue-enqueue {repo, worktree, branch, head_sha, base?, caller, session, env, via?}`
@@ -409,8 +430,10 @@ The optional `via` (`cli`|`mcp`, absent = `cli`) is the `queue_events.actor` of 
 request. Train views carry the base's `push_timeout_ms` and `network_timeout_ms`.
 Server: `queue-job {job}`, `queue-status {schema: 1, trains, jobs}`, `queue-approved {train}`,
 `queue-reconcile {results: [{train_id, decision, reason}]}`; errors reuse `error` with new
-codes `conflict-state`, `not-allowed`, `stale-plan`, `duplicate-branch`. `status` gains an
-optional `queue: {active, ready, needs_reconcile}` summary. The client resolves the branch,
+codes `conflict-state`, `not-allowed`, `stale-plan`, `duplicate-branch` and `not-supported`
+(no extension serves the request, or the queue is disabled, section 15). `status` gains an
+optional `queue: {active, ready, needs_reconcile}` summary (`active` = jobs not `landed`,
+`cancelled`, `conflict` or `failed`; `ready` and `needs_reconcile` count trains). The client resolves the branch,
 SHA and cleanliness itself (git in the caller's worktree) and sends facts, like `run` does.
 
 ## 9. CLI and MCP surfaces
@@ -424,26 +447,36 @@ train t-1761…-9f2e01  origin/main  base 4e1c9a0  READY (awaiting approval)
   feat/login  job …a1b2c3  merged   gates: test PASS (cached)  lint PASS 12.4s
   feat/ui     job …77d0e4  CONFLICT src/app.ts  → rebase, then 'sluice queue retry …77d0e4'
   approve with: sluice queue approve t-1761…-9f2e01
-$ sluice queue approve t-1761…-9f2e01      # prints the plan, asks 'yes' on a TTY
+$ sluice queue approve t-1761…-9f2e01      # prints the plan, asks 'Land this train? [y/N]' on a TTY
 sluice: landed 3b7d2f1 on origin/main (train t-1761…-9f2e01)
 $ sluice queue retry …77d0e4 | cancel <job> | reconcile | status --json
 ```
 
-`enqueue` refuses a dirty worktree, a detached HEAD, a branch already active, a branch
-equal to the target, and a base that is not a branch (section 2). `approve` without a TTY requires `--yes`; it always sends the train hash
+`enqueue` refuses a worktree with staged or unstaged changes to tracked files (untracked files
+are ignored), a detached HEAD and a branch that does not exist locally (all in the client);
+the daemon refuses a branch already active (`duplicate-branch`), a branch equal to the target
+or a checked-out local target (`not-allowed`), and a base that is not a branch (`bad-request`,
+section 2). `status` and `reconcile` are scoped to the repository of the current directory
+when run inside one (everything otherwise); `retry` must run inside the repository of the
+job. `approve` without a TTY requires `--yes` (usage error, exit 2); it always sends the train hash
 it displayed (`stale-plan` if the train changed), then waits for the landing at most the
 train's `push_timeout` + `network_timeout` + two ticks + 30 s; on expiry it prints the
 train's state and exits 1 with the hint `sluice queue status`. The human `status` view
 hides a dissolved train once a newer train exists for the same (repo, remote, target);
 `--json` keeps every train. Exit codes: 0 ok, 1 error, 2 usage, 4
-refused by state (`conflict-state`, `not-allowed`, `stale-plan`).
+refused by state (`conflict-state`, `not-allowed`, `stale-plan`, `duplicate-branch`).
 
 MCP (thin clients of the same messages, `working_directory` required, every request
-`via: mcp`): `queue_enqueue {branch?, base?}`, `queue_status {}` (text +
-`structured_content` = `status --json`), `queue_approve {train_id}`: returns `not-allowed`
+`via: mcp`, errors are tool errors whose text starts with the error code; the client's own
+refusals use `dirty-worktree`, `detached-head`, `unknown-branch`, `not-a-repository`):
+`queue_enqueue {branch?, base?}`, `queue_status {}` (text +
+`structured_content` = `status --json`, scoped to the repository of `working_directory`),
+`queue_approve {train_id}` (sends progress notifications while it waits when the request
+carries a `progressToken`): returns `not-allowed`
 unless the user config has `[queue] allow_agent_approval = true` (checked by the MCP server
 and again by the daemon; its wait has the same bound as the CLI's), `queue_retry
-{job_id}` (re-reads the branch head like the CLI) and `queue_cancel {job_id}`. The server
+{job_id}` (re-reads the branch head like the CLI) and `queue_cancel {job_id}` (both answer
+`not-found` for a job of another repository). The server
 instructions say: enqueue after `verify` passes, then stop; after a conflict or failure fix
 the branch and call `queue_retry` (a new `queue_enqueue` would be `duplicate-branch`);
 never approve.
@@ -453,14 +486,19 @@ never approve.
 New crate `sluice-gate-queue` (async, tokio; keeps `sluice-gate-core` sync-only). Depends on
 `sluice-gate-core` (config, git, tree, key, marker), `sluice-gate-proto` (message types) and
 `sluice-gate-daemon` only through these small public items, added for it:
-- `server::Extension` trait (`fn features() -> &[&str]`, `async fn handle(msg, ctx) ->
-  ServerMessage`, `async fn run(handle)`), passed in `DaemonConfig.extensions`; the binary
-  `sluice-gate` wires `QueueExtension` in, so the daemon crate never depends on the queue.
+- `server::Extension` trait (object-safe, methods return `BoxFuture`: `fn features() ->
+  &[&'static str]`, `on_start(&DaemonHandle) -> Result<()>` (after the lease and the orphan
+  sweep, before the socket accepts; an error disables the extension for the daemon's life:
+  its features are not announced and its messages get `error{internal}`), `run(Arc<Self>,
+  handle)`, `handle(msg, ctx) -> Option<ServerMessage>` (`None` = not mine, the next
+  extension is tried), `status_summary() -> Option<QueueSummary>`), passed in
+  `DaemonConfig.extensions`; the binary `sluice-gate` wires `QueueExtension` in, so the daemon
+  crate never depends on the queue.
 - `DaemonHandle`: `submit_run(RunRequest) -> RunSubscription` (stream of server events; drop
   = unsubscribe), `fence() -> LeaseFence {instance, token}`, `lease_held() -> bool`,
   `shutdown()` (watch), `store_tx(|tx| …)` (`BEGIN IMMEDIATE`, busy → retryable),
   `store_tx_durable(|tx| …)` (the same with `synchronous = FULL`, for the push marker),
-  `sanitised_env()`, `state_dir()`, `config()`, `daemon_config()`.
+  `sanitised_env()`, `state_dir()`, `log_dir()`, `config()`, `daemon_config()`.
 - `sluice_gate_core::git::command` (builds the push's `git` command, spawned by the queue in
   its own process group), `git::run_output` (raw output for status-interpreting calls),
   `git::run_output_deadline` (network calls: own process group, killed on expiry,
@@ -486,6 +524,10 @@ push_timeout = "10m"       # covers the pre-push hook and the transfer
 network_timeout = "60s"    # fetch / ls-remote deadline (process group killed)
 ```
 
+Validation of `[queue]` (the file is rejected otherwise): `max_train >= 1`, `network_timeout
+> 0`, `remote` non-empty, without whitespace or control characters and not starting with `-`,
+every name in `gates` defined in the same file; unknown keys are rejected.
+
 User config `[queue]`: `allow_agent_approval = false`, `enabled = true` (a user-level kill
 switch), `tick = "5s"`, `retention = "30d"` (section 4). `allow_agent_approval` is only a user-config key: in `.sluice.toml`
 it is an unknown field and the strict parser rejects the file, so repository content (which
@@ -502,10 +544,13 @@ agents can write) can never grant approval rights.
   enforcement.
 - Pushes use the user's own credentials, taken from the approving client's env allowlist
   (`SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `SSH_ASKPASS`, `HOME`,
-  `PATH`, `TERM`; `git::ENV_ALLOWLIST`), stored with the train (`push_env`) until it lands, is
+  `PATH`, `TERM`; `sluice_gate_queue::git::ENV_ALLOWLIST`, mirrored by the CLI and MCP clients
+before sending), stored with the train (`push_env`) until it lands, is
   dissolved or the approval is voided. Fetches and `ls-remote` use the enqueuing client's
-  allowlist (`queue_jobs.env`, cleared once the job is `landed` or `cancelled`). Endpoint
-  URLs are stored without userinfo. Gates and `[queue]` come from the base. A `[queue]
+  allowlist (`queue_jobs.env`, cleared once the job is `landed` or `cancelled`); git runs with
+  `GIT_TERMINAL_PROMPT=0` and no stdin, so interactive auth fails instead of hanging. Push
+  URLs are never stored: only `endpoint_hash`, the hash of the push URL with its userinfo
+  stripped, is. Gates and `[queue]` come from the base. A `[queue]
   remote` is a configured remote name that never starts with `-` (section 2), and
   user-derived positional arguments follow `--`.
 - Hooks are disabled in the merge worktree for merge and ref operations. The push runs the
@@ -525,8 +570,25 @@ agents can write) can never grant approval rights.
 4. Two identical gates requested by a train and an agent `verify` coalesce into one run.
 5. Base moved while `ready` → dissolved, rebuilt, old approval rejected (`stale-plan`).
 6. `queue_approve` over MCP refused by default; allowed with `allow_agent_approval = true`.
-7. `endpoint_changed` refusal after `git remote set-url`; lost lease → no push.
+7. After `git remote set-url` the approved train is dissolved with `endpoint_changed` and
+   rebuilt, nothing is pushed to either URL without a new approval (`reconcile` also refuses
+   a changed endpoint, covered inside test 1); lost lease → no push.
 8. Multi-member train with one failing member → split, other members land after approval.
+
+Implemented in `crates/sluice-gate/tests/queue_e2e.rs` (real binary), as
+`acceptance_1_conflict_ready_no_push_before_approval_then_landing`,
+`acceptance_2a_sigkill_during_push_then_hook_released_reconciles_to_landed`,
+`acceptance_2b_sigkill_during_push_then_hook_aborted_reconciles_to_ready`,
+`acceptance_3_marked_tree_is_ready_without_running_a_gate`,
+`acceptance_4_train_gate_and_agent_run_coalesce`,
+`acceptance_5_base_moved_dissolves_old_plan_is_stale_new_one_lands`,
+`acceptance_6_mcp_approval_refused_by_default_then_allowed`,
+`acceptance_7a_endpoint_changed_never_pushes`, `acceptance_7b_lost_lease_never_pushes` and
+`acceptance_8_failing_member_splits_and_the_others_land`; the "marker but no push spawned" case of
+test 2 is `marker_without_push_is_parked_at_start_then_ready` in
+`crates/sluice-gate-queue/tests/queue.rs`. Extra e2e tests: local branch target and checked-out
+refusal, declining `pre-push` hook, `base_unavailable` and `base_config_invalid` failing after
+three attempts, MCP retry/cancel after a conflict.
 
 ## 14. Decisions (user answers, 2026-10-22)
 
@@ -547,7 +609,9 @@ Answers 2 and 9 changed the draft; the rest confirmed it.
 ## 15. Request handling (as implemented)
 
 - `queue-enqueue`: `repo` must be a git common dir and `head_sha` a commit of it; the branch
-  must be non-empty and not `HEAD`; the base is resolved (section 2). Duplicate active branch
+  must be non-empty and not `HEAD` (`bad-request`); the base is resolved (section 2; a branch
+  equal to the target or a checked-out local target → `not-allowed`, any other unusable base
+  → `bad-request`). Duplicate active branch
   → `duplicate-branch`. The stored `env` is the allowlist only. Paths are canonicalised.
   The audit actor is `via` (`mcp` from the MCP tools, `cli` otherwise); the same holds for
   `queue-retry` and `queue-cancel`.
@@ -556,12 +620,16 @@ Answers 2 and 9 changed the draft; the rest confirmed it.
   `not-found`; a `dissolved` train → `stale-plan` (it was rebuilt; the old plan is void);
   another non-`ready` state → `conflict-state`; a hash that differs from the stored one or
   from the hash recomputed from the rows → `stale-plan`.
-- `queue-retry`: only `conflict`/`failed` jobs (`conflict-state` otherwise); re-queued at the
-  back with the new head, `attempts + 1`, `solo` cleared.
+- `queue-retry`: unknown job → `not-found`; a `head_sha` that is not a commit → `bad-request`;
+  only `conflict`/`failed` jobs (`conflict-state` otherwise); re-queued at the back with the
+  new head, `attempts + 1`, `solo`, `reason` and `detail` cleared.
 - `queue-cancel`: see section 3; `landed`/`cancelled` → `conflict-state`.
 - `queue-reconcile`: one result per `needs_reconcile` train; a refusal reports
   `decision: refused` and its reason.
 - Lease lost or a write refused by the fence → `error{internal}`; SQLite busy →
   `error{internal}` ("database busy, retry later"), nothing changed.
 - With `[queue] enabled = false` every request gets `error{not-supported}` naming the
-  setting; `welcome.features` still lists `queue`.
+  setting (the runner does not step; start-up recovery still runs); `welcome.features` still
+  lists `queue`. If the extension's `on_start` failed, it is disabled for the daemon's life:
+  no feature is announced and queue requests get `error{internal}`.
+- `queue-status`: `repo` limits trains and jobs to one repository (canonicalised).

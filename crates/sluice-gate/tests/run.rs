@@ -380,6 +380,40 @@ cmd = "echo run >> \"$SLUICE_TEST_COUNTER\"; echo fixed >> a.txt"
 }
 
 #[test]
+fn cache_status_notes_a_pass_recorded_with_unstaged_changes() {
+    let sb = Sandbox::standard();
+    // Stage one change, keep another unstaged, pass `test` inside pre-commit.
+    fs::write(sb.repo.join("a.txt"), "staged\n").unwrap();
+    sb.git(&["add", "a.txt"]);
+    fs::write(sb.repo.join("b.txt"), "unstaged\n").unwrap();
+    sb.git(&["add", "-N", "b.txt"]);
+    sb.sluice()
+        .env("SLUICE_AGENT", "0")
+        .args(["run", "--hook", "pre-commit", "test"])
+        .assert()
+        .success();
+    sb.git(&["commit", "-q", "-m", "staged only"]);
+    // Drop the unstaged change: the tree is now the committed one.
+    sb.git(&["rm", "-q", "--cached", "b.txt"]);
+    fs::remove_file(sb.repo.join("b.txt")).unwrap();
+    sb.sluice()
+        .args(["cache", "status"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::is_match(
+                r"test\s+MISS; passed with unstaged changes present .* ago \(tree [0-9a-f]{12}\)",
+            )
+            .unwrap()
+            .and(predicate::str::is_match(r"lint\s+MISS\n").unwrap()),
+        );
+    // Evidence only: the gate still runs on this tree.
+    let before = sb.runs();
+    sb.sluice().args(["run", "test"]).assert().success();
+    assert_eq!(sb.runs(), before + 1);
+}
+
+#[test]
 fn failure_returns_the_gate_exit_code_with_log_tail_and_records_a_miss() {
     let sb = Sandbox::standard();
     sb.sluice().args(["run", "fail"]).assert().code(7).stderr(

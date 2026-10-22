@@ -233,8 +233,11 @@ Server replies:
 
 A daemon without an extension that handles the request answers
 `{"type":"error","id":N,"code":"not-supported","message":"the running daemon does not support the merge queue; run 'sluice daemon stop' and retry"}`.
-When the extension is configured but its start-up failed, the answer is
-`error{internal}` with `the merge queue failed to start: <cause>`. The
+When the user config sets `[queue] enabled = false` the extension answers
+`error{not-supported}` with `the merge queue is disabled in the user config
+([queue] enabled = false)`. When the extension is configured but its
+start-up failed, the answer is `error{internal}` with `the merge queue
+failed to start: <cause>`. The
 blocking client's `Client::request(&msg)` returns the single reply as is,
 an `error` included, so the caller can map its code.
 
@@ -250,12 +253,19 @@ completion and write the marker so the next request hits).
 `{"type":"error","id":N,"code":"protocol|bad-request|not-found|internal|conflict-state|not-allowed|stale-plan|duplicate-branch|not-supported","message":"..."}`.
 The last five are only sent for `queue-*` requests: `conflict-state` (the
 job or train is not in a state that allows the request), `not-allowed`
-(refused by policy, e.g. agent approval), `stale-plan` (the train hash no
-longer matches), `duplicate-branch` (the branch already has an active
-job), `not-supported` (no extension serves the request).
+(refused by policy: an MCP approval while `[queue] allow_agent_approval` is
+off, or an enqueue whose target the policy forbids), `stale-plan` (the
+train hash no longer matches), `duplicate-branch` (the branch already has
+an active job), `not-supported` (no extension serves the request, or the
+queue is disabled by `[queue] enabled = false`). `queue-*` requests also
+use `bad-request` (not a git common dir, no branch, not a commit, invalid
+base or remote), `not-found` (unknown job or train) and `internal` (lease
+lost, store failure, queue failed to start).
 Unknown `type`, malformed JSON, a line over 1 MiB or invalid UTF-8 →
-`bad-request` (`id` 0 when unknown); a first line that is not `hello` →
-`protocol` (`expected hello`), a second `hello` → `duplicate hello`; a
+`bad-request` (`id` 0 when unknown); a `cancel` outside a `run` connection
+→ `bad-request` (`cancel outside a run connection`); a first line that is not `hello` →
+`protocol` (`expected hello`), a malformed first line → `bad-request`
+(`malformed hello: ...`), a second `hello` → `protocol` (`duplicate hello`); a
 `hello` with another protocol → `protocol`; a `run` while the daemon is
 stopping or has lost its lease → `internal`; `logs` for an unknown job or a
 job without a log yet → `not-found`. Both the `hello` and the request line

@@ -177,17 +177,14 @@ invoked the hook and on `defaults.agent_hook_policy` in `.sluice.toml`:
 
 Humans use `human_hook_policy` (`wait` by default, or `run-unqueued`).
 
-The `fail-fast` message is three lines on stderr (shown here as the Phase 1
-wording; `<rule>` is the detection rule that fired):
+The `fail-fast` message is three lines on stderr (`<rule>` is the detection
+rule that fired, `<why>` the cache state; the exit code is 3):
 
 ```
 sluice: '<gate>' has not passed on this tree (<why>).
 sluice: <hook> was invoked by a coding agent (<rule>) and agent_hook_policy is "fail-fast".
 sluice: call the 'verify' MCP tool (or run 'sluice run <gate>') first, then retry the git command.
 ```
-
-'verify' MCP tool (or run 'sluice run <gate>') first"). The exit code is 3
-in both versions.
 
 With the cache off (for example `CI` is set, or `SLUICE_CACHE=0`), the gate
 can never be cached, so refusing would block the caller forever: the gate
