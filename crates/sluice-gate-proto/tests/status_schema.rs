@@ -7,8 +7,8 @@
 //! meaning bumps [`STATUS_SCHEMA_VERSION`] and gets a new fixture).
 
 use sluice_gate_proto::{
-    BudgetInfo, Caller, DaemonInfo, PsiInfo, QueuedJob, RunningJob, STATUS_SCHEMA_VERSION,
-    StatusReport, Totals, WaitReason,
+    BudgetInfo, Caller, DaemonInfo, PsiInfo, QueueSummary, QueuedJob, RunningJob,
+    STATUS_SCHEMA_VERSION, StatusReport, Totals, WaitReason,
 };
 
 const FIXTURE: &str = include_str!("fixtures/status-schema-1.json");
@@ -66,6 +66,7 @@ fn report() -> StatusReport {
             time_saved_ms: 3_600_000,
             psi_blocked_ms_total: 42_000,
         },
+        queue: None,
     }
 }
 
@@ -91,4 +92,25 @@ fn status_report_matches_fixture() {
 fn fixture_round_trips() {
     let parsed: StatusReport = serde_json::from_str(FIXTURE).unwrap();
     assert_eq!(parsed, report());
+}
+
+#[test]
+fn queue_summary_is_an_additive_optional_field() {
+    let mut with_queue = report();
+    with_queue.queue = Some(QueueSummary {
+        active: 4,
+        ready: 1,
+        needs_reconcile: 2,
+    });
+    let mut actual = serde_json::to_value(&with_queue).unwrap();
+    let queue = actual.as_object_mut().unwrap().remove("queue").unwrap();
+    assert_eq!(
+        queue,
+        serde_json::json!({"active": 4, "ready": 1, "needs_reconcile": 2})
+    );
+    let expected: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+    assert_eq!(actual, expected);
+    let back: StatusReport =
+        serde_json::from_value(serde_json::to_value(&with_queue).unwrap()).unwrap();
+    assert_eq!(back, with_queue);
 }

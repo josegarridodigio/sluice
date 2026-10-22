@@ -109,6 +109,8 @@ fn config(dir: &Path, budget: u32, policy: LastSubscriberGone) -> DaemonConfig {
             ..AdmissionConfig::default()
         },
         psi_root: dir.join("pressure"),
+        user: server::UserConfig::default(),
+        extensions: Vec::new(),
     }
 }
 

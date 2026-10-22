@@ -73,6 +73,43 @@ pub struct RepoConfig {
     /// Gates by name.
     #[serde(default)]
     pub gates: BTreeMap<String, Gate>,
+    /// Merge queue settings (`[queue]`).
+    #[serde(default)]
+    pub queue: QueueConfig,
+}
+
+/// The `[queue]` table of `.sluice.toml` (merge queue, read from the base
+/// commit by the daemon, never from a queued branch).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct QueueConfig {
+    /// Remote the default target lives on.
+    pub remote: String,
+    /// Default target branch; `None` = the remote's HEAD branch.
+    pub target: Option<String>,
+    /// Gates a train must pass; `None` = gates with a `pre-push` hook, else
+    /// every gate.
+    pub gates: Option<Vec<String>>,
+    /// Maximum jobs combined into one train (1 disables batching).
+    pub max_train: u32,
+    /// Push `refs/sluice/landed/<sha>` atomically with the target.
+    pub audit_ref: bool,
+    /// Time limit for the push, including the repository's `pre-push` hook.
+    #[serde(with = "humantime_serde")]
+    pub push_timeout: Duration,
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        Self {
+            remote: "origin".to_owned(),
+            target: None,
+            gates: None,
+            max_train: 4,
+            audit_ref: true,
+            push_timeout: Duration::from_secs(600),
+        }
+    }
 }
 
 /// The `[defaults]` table.
@@ -213,6 +250,22 @@ impl RepoConfig {
                 "defaults.human_hook_policy cannot be \"fail-fast\" (use \"wait\" or \"run-unqueued\")",
             ));
         }
+        if self.queue.max_train < 1 {
+            return Err(config_err(path, "queue.max_train must be >= 1"));
+        }
+        if self.queue.remote.trim().is_empty() {
+            return Err(config_err(path, "queue.remote must not be empty"));
+        }
+        if let Some(gates) = &self.queue.gates {
+            for gate in gates {
+                if !self.gates.contains_key(gate) {
+                    return Err(config_err(
+                        path,
+                        format!("queue.gates names an unknown gate \"{gate}\""),
+                    ));
+                }
+            }
+        }
         for (name, gate) in &self.gates {
             if !valid_gate_name(name) {
                 return Err(config_err(
@@ -349,8 +402,34 @@ pub struct UserConfig {
     pub scheduler: SchedulerConfig,
     /// MCP server settings.
     pub mcp: McpConfig,
+    /// Merge queue settings.
+    pub queue: UserQueueConfig,
     /// Per-repository overrides keyed by repository path.
     pub repos: BTreeMap<PathBuf, RepoOverride>,
+}
+
+/// The `[queue]` table of the user config.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct UserQueueConfig {
+    /// User-level kill switch for the merge queue runner.
+    pub enabled: bool,
+    /// Let the MCP `queue_approve` tool approve trains (off: humans only,
+    /// through the CLI).
+    pub allow_agent_approval: bool,
+    /// Period of the runner's housekeeping tick.
+    #[serde(with = "humantime_serde")]
+    pub tick: Duration,
+}
+
+impl Default for UserQueueConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow_agent_approval: false,
+            tick: Duration::from_secs(5),
+        }
+    }
 }
 
 /// The `[daemon]` table.
@@ -468,6 +547,7 @@ impl Default for UserConfig {
             agent_detection: AgentDetectionConfig::default(),
             scheduler: SchedulerConfig::default(),
             mcp: McpConfig::default(),
+            queue: UserQueueConfig::default(),
             repos: BTreeMap::new(),
         }
     }
@@ -763,6 +843,43 @@ depends_on = ["lint"]
         assert!(m.contains("depends_on") && m.contains("itself"));
         let m = msg(&gate_with("cmd = \"x\"\ndepends_on = [\"zzz\"]"));
         assert!(m.contains("depends_on") && m.contains("zzz"));
+    }
+
+    #[test]
+    fn queue_section_defaults_and_validation() {
+        let c = parse("version = 1").unwrap();
+        assert_eq!(c.queue.remote, "origin");
+        assert_eq!(c.queue.max_train, 4);
+        assert!(c.queue.audit_ref);
+        assert_eq!(c.queue.push_timeout, Duration::from_secs(600));
+        assert!(c.queue.target.is_none() && c.queue.gates.is_none());
+        let text = format!(
+            "{}\n[queue]\nremote = \"up\"\ntarget = \"dev\"\ngates = [\"g\"]\nmax_train = 1\n\
+             audit_ref = false\npush_timeout = \"2m\"",
+            gate_with("cmd = \"x\"")
+        );
+        let c = parse(&text).unwrap();
+        assert_eq!(c.queue.target.as_deref(), Some("dev"));
+        assert_eq!(c.queue.gates.as_deref(), Some(&["g".to_owned()][..]));
+        assert_eq!(c.queue.push_timeout, Duration::from_secs(120));
+        assert!(msg("version = 1\n[queue]\nmax_train = 0").contains("max_train"));
+        assert!(msg("version = 1\n[queue]\nremote = \" \"").contains("remote"));
+        assert!(msg("version = 1\n[queue]\ngates = [\"nope\"]").contains("nope"));
+        assert!(msg("version = 1\n[queue]\nbogus = 1").contains("bogus"));
+    }
+
+    #[test]
+    fn user_queue_section() {
+        let c = UserConfig::parse("version = 1", Path::new("u.toml")).unwrap();
+        assert!(c.queue.enabled && !c.queue.allow_agent_approval);
+        assert_eq!(c.queue.tick, Duration::from_secs(5));
+        let c = UserConfig::parse(
+            "version = 1\n[queue]\nenabled = false\nallow_agent_approval = true\ntick = \"1s\"",
+            Path::new("u.toml"),
+        )
+        .unwrap();
+        assert!(!c.queue.enabled && c.queue.allow_agent_approval);
+        assert_eq!(c.queue.tick, Duration::from_secs(1));
     }
 
     #[test]

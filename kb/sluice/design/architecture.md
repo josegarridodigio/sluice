@@ -170,12 +170,44 @@ subscribers of passed jobs).
 
 Markers stay as files inside `.git`: the hit path must not depend on the DB.
 
+### 5.5 Extension point
+
+`sluice_gate_daemon::server` defines an object-safe `Extension` trait
+(`Send + Sync + Debug`; methods return `BoxFuture`, a pinned boxed `Send`
+future) and `DaemonConfig.extensions: Vec<Arc<dyn Extension>>` (empty by
+default; the merge queue, [[sluice/design/merge-queue.md]], is the intended
+user, so the daemon crate never depends on it). At start, after the lease is
+acquired and orphans are reconciled and before the socket is bound, the
+daemon awaits each extension's `on_start(&DaemonHandle)`; one that fails is
+logged and disabled. Each active extension's `run(Arc<Self>, DaemonHandle)`
+is spawned as one task; on stop the daemon sets the `shutdown()` watch to
+`true`, drains its jobs, waits up to 10 s for these tasks, aborts them and
+then releases the lease. `welcome.features` is the concatenation of the
+active extensions' `features()`. Every `queue-*` request is offered to the
+active extensions in order (`handle(msg, &ExtensionCtx)`, `None` = not
+mine) and the first reply is sent; if none answers the daemon replies
+`error{not-supported}`, or `error{internal}` when an extension failed to
+start. `status` takes `queue` from the first `status_summary()` that
+returns one. `DaemonHandle` (cloneable) offers `submit_run(RunRequest) ->
+RunSubscription` (the same `register` path as a client `run`; dropping the
+subscription before `done` detaches like a client disconnect), `fence() ->
+LeaseFence {instance, token}` with `LeaseFence::check(&Transaction)`,
+`lease_held()`, `shutdown()`, `store_tx(f)` (one `BEGIN IMMEDIATE` on the
+daemon's connection under the store mutex; busy is the retryable
+`StoreError::Busy`), `state_dir()`, `log_dir()`, `config()` (the
+`UserConfig` passed in `DaemonConfig.user`), `daemon_config()` and
+`sanitised_env()` (the daemon's environment through
+`sluice_gate_core::git::child_env`, computed once at start).
+
 ## 6. IPC protocol
 
 Newline-delimited JSON over the Unix socket, with a `protocol` field in
 the hello/welcome handshake. Client messages: `hello`, `run`, `status`,
-`logs`, `event`, `stop`, `cancel`; server messages: `welcome`, `queued`,
-`started`, `progress`, `done`, `status`, `log`, `stopping`, `error`.
+`logs`, `event`, `stop`, `cancel`, and the merge-queue requests
+`queue-enqueue`, `queue-status`, `queue-approve`, `queue-retry`,
+`queue-cancel`, `queue-reconcile`; server messages: `welcome`, `queued`,
+`started`, `progress`, `done`, `status`, `log`, `stopping`, `error`, and
+`queue-job`, `queue-status`, `queue-approved`, `queue-reconcile`.
 Authoritative in [[sluice/design/protocol.md]]; types in
 `sluice-gate-proto`.
 

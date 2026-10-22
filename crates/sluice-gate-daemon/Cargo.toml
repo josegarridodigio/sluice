@@ -15,6 +15,7 @@ categories.workspace = true
 sluice-gate-core.workspace = true
 sluice-gate-proto.workspace = true
 thiserror.workspace = true
+anyhow.workspace = true
 humantime = "2.4.0"
 nix = { version = "0.31.3", features = ["process", "signal", "resource", "fs"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }

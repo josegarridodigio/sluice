@@ -14,6 +14,15 @@
 //! never held together with another one).
 //! Each job has a `broadcast` channel of [`JobEvent`]s; every subscriber
 //! rewrites them into [`ServerMessage`]s carrying its own request id.
+//!
+//! Extensions ([`Extension`], e.g. the merge queue) get one long-lived task
+//! each and a [`DaemonHandle`]; `queue-*` requests are routed to them.
+
+mod extension;
+
+pub use extension::{
+    BoxFuture, DaemonHandle, Extension, ExtensionCtx, LeaseFence, RunSubscription, StoreError,
+};
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{DirBuilder, File, OpenOptions};
@@ -21,14 +30,15 @@ use std::future::Future;
 use std::hash::BuildHasher;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
-pub use sluice_gate_core::config::{AdmissionConfig, LastSubscriberGone};
+pub use sluice_gate_core::config::{AdmissionConfig, LastSubscriberGone, UserConfig};
 use sluice_gate_core::dirs::{job_id as new_job_id, now_ms};
-use sluice_gate_core::git::RepoPaths;
+use sluice_gate_core::git::{self, RepoPaths};
 use sluice_gate_core::key::{CacheKey, command_with_args, normalize_cmd};
 use sluice_gate_core::marker::{Lookup, Marker, MarkerStore, MissRecord};
 use sluice_gate_core::{CACHE_FORMAT_VERSION, tree};
@@ -68,6 +78,8 @@ const ADMIT_TICK: Duration = Duration::from_secs(1);
 const PRUNE_EVERY_MS: u64 = 24 * 60 * 60 * 1000;
 /// Time given to open connections to flush their last message on exit.
 const CONNECTION_DRAIN: Duration = Duration::from_secs(2);
+/// How long the daemon waits for extension tasks to return once stopping.
+const EXTENSION_GRACE: Duration = Duration::from_secs(10);
 /// Timeout used when a gate has `timeout_ms = 0` (no timeout): ten years.
 const NO_TIMEOUT: Duration = Duration::from_hours(10 * 365 * 24);
 
@@ -107,6 +119,12 @@ pub struct DaemonConfig {
     /// Directory holding the PSI files `cpu` and `memory` (normally
     /// [`psi::DEFAULT_ROOT`]; tests point it at a temporary directory).
     pub psi_root: PathBuf,
+    /// The loaded user config, exposed to extensions through
+    /// [`DaemonHandle::config`] (the fields above are derived from it).
+    pub user: UserConfig,
+    /// Extensions plugged into the daemon (the merge queue); empty for a
+    /// plain daemon.
+    pub extensions: Vec<Arc<dyn Extension>>,
 }
 
 /// Event of one job, broadcast to all its subscribers.
@@ -164,6 +182,28 @@ struct Shared {
     wake: Notify,
     idle: Notify,
     stop: watch::Sender<Option<bool>>,
+    /// Lease token (fencing value of [`LeaseFence`]).
+    token: String,
+    /// Cleared when a heartbeat finds the lease lost.
+    lease_held: AtomicBool,
+    /// Turns `true` when the daemon starts stopping.
+    shutting_down: watch::Sender<bool>,
+    /// The daemon's environment sanitised for gate processes.
+    sanitised_env: BTreeMap<String, String>,
+    /// Extensions whose `on_start` succeeded; set before the socket is bound.
+    extensions: OnceLock<Extensions>,
+    /// Connection id counter.
+    next_conn: AtomicU64,
+}
+
+/// Extensions after start-up.
+#[derive(Debug, Default)]
+struct Extensions {
+    active: Vec<Arc<dyn Extension>>,
+    /// `on_start` errors of disabled extensions.
+    failures: Vec<String>,
+    /// Concatenated features of the active extensions.
+    features: Vec<String>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -185,6 +225,50 @@ impl Shared {
     fn state(&self) -> MutexGuard<'_, State> {
         lock(&self.state)
     }
+
+    fn extensions(&self) -> &Extensions {
+        static EMPTY: Extensions = Extensions {
+            active: Vec::new(),
+            failures: Vec::new(),
+            features: Vec::new(),
+        };
+        self.extensions.get().unwrap_or(&EMPTY)
+    }
+}
+
+/// The daemon's own environment sanitised like a client's `child_env`;
+/// falls back to dropping `GIT_*` and `CLAUDE*` when git cannot list its
+/// local variables.
+fn sanitised_env() -> BTreeMap<String, String> {
+    let env: BTreeMap<String, String> = std::env::vars().collect();
+    git::child_env(&env).unwrap_or_else(|e| {
+        tracing::warn!("cannot sanitise the environment through git: {e}");
+        env.into_iter()
+            .filter(|(k, _)| !k.starts_with("GIT_") && !k.starts_with("CLAUDE"))
+            .collect()
+    })
+}
+
+/// Runs every extension's `on_start`; failed ones are disabled.
+async fn start_extensions(shared: &Arc<Shared>) {
+    let handle = DaemonHandle {
+        shared: Arc::clone(shared),
+    };
+    let mut ext = Extensions::default();
+    for e in &shared.config.extensions {
+        match e.on_start(&handle).await {
+            Ok(()) => {
+                ext.features
+                    .extend(e.features().iter().map(|f| (*f).to_owned()));
+                ext.active.push(Arc::clone(e));
+            }
+            Err(err) => {
+                tracing::error!(extension = ?e, "extension failed to start: {err:#}");
+                ext.failures.push(format!("{err:#}"));
+            }
+        }
+    }
+    let _ = shared.extensions.set(ext);
 }
 
 fn rfc3339(ms: u64) -> String {
@@ -305,6 +389,10 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
     }
 
     let (stop, _) = watch::channel(None);
+    let (shutting_down, _) = watch::channel(false);
+    let sanitised_env = tokio::task::spawn_blocking(sanitised_env)
+        .await
+        .unwrap_or_default();
     let head_ms = u64::try_from(config.head_reserve_after.as_millis()).unwrap_or(u64::MAX);
     let shared = Arc::new(Shared {
         state: Mutex::new(State {
@@ -321,9 +409,16 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
         wake: Notify::new(),
         idle: Notify::new(),
         stop,
+        token: token.clone(),
+        lease_held: AtomicBool::new(true),
+        shutting_down,
+        sanitised_env,
+        extensions: OnceLock::new(),
+        next_conn: AtomicU64::new(1),
         config,
     });
     prune_logs(&shared);
+    start_extensions(&shared).await;
 
     let listener = match bind(&shared.config.socket_path) {
         Ok(l) => l,
@@ -344,13 +439,30 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
     let sampler = lock(&shared.psi)
         .enabled
         .then(|| tokio::spawn(psi_loop(Arc::clone(&shared))));
+    let mut runners = JoinSet::new();
+    for e in &shared.extensions().active {
+        let handle = DaemonHandle {
+            shared: Arc::clone(&shared),
+        };
+        runners.spawn(Arc::clone(e).run(handle));
+    }
 
     let mut conns = JoinSet::new();
     let force = accept_loop(&shared, &listener, &mut conns, shutdown).await;
+    shared.shutting_down.send_replace(true);
     drop(listener);
     remove_socket(&shared.config.socket_path);
 
     drain(&shared, force).await;
+    if timeout(EXTENSION_GRACE, async {
+        while runners.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        tracing::warn!("extension tasks did not stop in time; aborting them");
+    }
+    runners.abort_all();
     scheduling.abort();
     heartbeat.abort();
     if let Some(sampler) = sampler {
@@ -496,6 +608,7 @@ async fn heartbeat_loop(shared: Arc<Shared>, token: String) {
         });
         if held == Some(false) {
             tracing::error!("the daemon lease was lost; no new work is accepted");
+            shared.lease_held.store(false, Ordering::SeqCst);
             let mut st = shared.state();
             st.accepting = false;
             st.refusal = "the daemon lost its lease; run `sluice daemon stop`";
@@ -1013,29 +1126,31 @@ async fn read_message(
     }
 }
 
-/// Reads `hello` and answers `welcome`; false when the connection must close.
+/// Reads `hello` and answers `welcome`; returns the client name, `None`
+/// when the connection must close.
 async fn handshake(
     shared: &Shared,
     rd: &mut BufReader<OwnedReadHalf>,
     wr: &mut OwnedWriteHalf,
-) -> bool {
-    match read_message(rd, wr).await {
-        None => return false,
+) -> Option<String> {
+    let client = match read_message(rd, wr).await {
+        None => return None,
         Some(Ok(ClientMessage::Hello {
             protocol, client, ..
         })) if protocol == PROTOCOL_VERSION => {
             tracing::debug!(client = %client, "hello");
+            client
         }
         Some(Ok(ClientMessage::Hello { protocol, .. })) => {
             let msg = format!(
                 "this daemon speaks protocol {PROTOCOL_VERSION}, the client speaks {protocol}; run `sluice daemon stop`"
             );
             send_error(wr, 0, ErrorCode::Protocol, msg).await;
-            return false;
+            return None;
         }
         Some(Ok(_)) => {
             send_error(wr, 0, ErrorCode::Protocol, "expected hello").await;
-            return false;
+            return None;
         }
         Some(Err(e)) => {
             send_error(
@@ -1045,26 +1160,56 @@ async fn handshake(
                 format!("malformed hello: {e}"),
             )
             .await;
-            return false;
+            return None;
         }
-    }
+    };
     let welcome = ServerMessage::Welcome {
         protocol: PROTOCOL_VERSION,
         daemon: format!("sluice-gate {}", shared.config.version),
         instance: shared.instance.clone(),
         pid: shared.pid,
         started_at: shared.started_at.clone(),
+        features: shared.extensions().features.clone(),
     };
-    send(wr, &welcome).await
+    send(wr, &welcome).await.then_some(client)
+}
+
+/// Message of the `not-supported` error for `queue-*` requests.
+const QUEUE_NOT_SUPPORTED: &str =
+    "the running daemon does not support the merge queue; run 'sluice daemon stop' and retry";
+
+/// Routes a `queue-*` request to the first extension that answers.
+async fn dispatch_extension(
+    shared: &Shared,
+    wr: &mut OwnedWriteHalf,
+    id: u64,
+    msg: ClientMessage,
+    ctx: ExtensionCtx,
+) {
+    let ext = shared.extensions();
+    for e in &ext.active {
+        if let Some(reply) = e.handle(msg.clone(), &ctx).await {
+            let _ = send(wr, &reply).await;
+            return;
+        }
+    }
+    if let Some(failure) = ext.failures.first() {
+        let message = format!("the merge queue failed to start: {failure}");
+        send_error(wr, id, ErrorCode::Internal, message).await;
+    } else {
+        send_error(wr, id, ErrorCode::NotSupported, QUEUE_NOT_SUPPORTED).await;
+    }
 }
 
 async fn handle_connection(shared: Arc<Shared>, stream: UnixStream) {
+    let conn_id = shared.next_conn.fetch_add(1, Ordering::Relaxed);
+    let peer_pid = stream.peer_cred().ok().and_then(|c| c.pid());
     let (rd, mut wr) = stream.into_split();
     let mut rd = BufReader::new(rd);
 
-    if !handshake(&shared, &mut rd, &mut wr).await {
+    let Some(client) = handshake(&shared, &mut rd, &mut wr).await else {
         return;
-    }
+    };
 
     let request = match read_message(&mut rd, &mut wr).await {
         None => return,
@@ -1083,8 +1228,27 @@ async fn handle_connection(shared: Arc<Shared>, stream: UnixStream) {
     match request {
         ClientMessage::Run { id, request } => handle_run(&shared, rd, wr, id, request).await,
         ClientMessage::Status { id } => {
-            let status = status_report(&shared);
+            let mut status = status_report(&shared);
+            for e in &shared.extensions().active {
+                if let Some(summary) = e.status_summary().await {
+                    status.queue = Some(summary);
+                    break;
+                }
+            }
             let _ = send(&mut wr, &ServerMessage::Status { id, status }).await;
+        }
+        msg @ (ClientMessage::QueueEnqueue { id, .. }
+        | ClientMessage::QueueStatus { id, .. }
+        | ClientMessage::QueueApprove { id, .. }
+        | ClientMessage::QueueRetry { id, .. }
+        | ClientMessage::QueueCancel { id, .. }
+        | ClientMessage::QueueReconcile { id, .. }) => {
+            let ctx = ExtensionCtx {
+                conn_id,
+                client,
+                peer_pid,
+            };
+            dispatch_extension(&shared, &mut wr, id, msg, ctx).await;
         }
         ClientMessage::Logs { id, job_id, tail } => {
             handle_logs(&shared, &mut wr, id, job_id, tail).await;
@@ -1187,6 +1351,7 @@ fn status_report(shared: &Shared) -> StatusReport {
         running,
         queued,
         totals,
+        queue: None,
     }
 }
 

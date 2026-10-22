@@ -58,6 +58,13 @@ Field reference:
 | `gates.<name>.hooks` | list | `[]` | Hook names this gate is meant for. Free-form, but `pre-commit` and `pre-push` are recognised by `sluice hook print`. |
 | `gates.<name>.key_inputs` | list of commands | `[]` | Each command's stdout (via `sh -c` in the worktree root, stderr discarded) is part of the key. Keep them fast; they run on every invocation that consults the cache, including hits. A failing command makes the run uncached (notice on stderr), never a gate failure. |
 | `gates.<name>.key_files` | list of paths | `[]` | Relative to repo root. Content hash is part of the key. For files git ignores. Missing file hashes as "absent". |
+| `queue.remote` | string | `origin` | Remote of the default merge-queue target (Phase 6, [[sluice/design/merge-queue.md]]). |
+| `queue.target` | string | the remote's HEAD branch | Default target branch for `sluice queue enqueue`. |
+| `queue.gates` | list | gates with a `pre-push` hook, else every gate | Gates a train must pass; each must exist. |
+| `queue.max_train` | int ≥ 1 | 4 | Jobs combined into one train; 1 disables batching. |
+| `queue.audit_ref` | bool | `true` | Push `refs/sluice/landed/<sha>` atomically with the target. |
+| `queue.push_timeout` | duration | `10m` | Limit for the push, including the repository's `pre-push` hook. |
+
 | `gates.<name>.env` | table | `{}` | Added to the gate's environment and to the key. |
 | `gates.<name>.depends_on` | list | `[]` | Gate names; validated (must exist, no self-reference) but not scheduled in v1. |
 | `gates.<name>.cache` | bool | `true` | `false` makes the gate always run (still queued). |
@@ -95,6 +102,11 @@ ionice_level = 7
 log_retention_days = 7
 idle_exit = "0s"           # 0 = never exit when idle
 last_subscriber_gone = "cancel"   # cancel | finish
+
+[queue]
+enabled = true             # user-level kill switch for the merge queue runner
+allow_agent_approval = false   # let the MCP queue_approve tool approve trains
+tick = "5s"                # runner housekeeping period
 
 [admission]
 psi_enabled = true

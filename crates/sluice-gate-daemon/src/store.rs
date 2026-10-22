@@ -259,6 +259,11 @@ impl Store {
         &self.path
     }
 
+    /// The underlying connection (for [`crate::server::DaemonHandle::store_tx`]).
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
     fn tx(&self) -> Result<Transaction<'_>> {
         Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate).map_err(db)
     }

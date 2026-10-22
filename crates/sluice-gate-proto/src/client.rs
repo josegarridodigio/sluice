@@ -79,6 +79,7 @@ pub struct Client {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
     daemon_pid: u32,
+    features: Vec<String>,
 }
 
 /// Connects to a Unix socket without blocking longer than `timeout`
@@ -115,10 +116,15 @@ fn hello() -> ClientMessage {
     }
 }
 
-/// Checks a handshake reply; returns the daemon pid.
-fn check_welcome(line: &str) -> std::result::Result<u32, ClientError> {
+/// Checks a handshake reply; returns the daemon pid and its features.
+fn check_welcome(line: &str) -> std::result::Result<(u32, Vec<String>), ClientError> {
     match proto::decode_server(line) {
-        Ok(ServerMessage::Welcome { protocol, pid, .. }) if protocol == PROTOCOL_VERSION => Ok(pid),
+        Ok(ServerMessage::Welcome {
+            protocol,
+            pid,
+            features,
+            ..
+        }) if protocol == PROTOCOL_VERSION => Ok((pid, features)),
         Ok(ServerMessage::Welcome { protocol, .. }) => Err(anyhow!(
             "the running daemon speaks protocol {protocol}, this client speaks \
              {PROTOCOL_VERSION}; run `sluice daemon stop` (the next command starts a matching daemon)"
@@ -170,10 +176,11 @@ fn handshake(socket: &Path) -> std::result::Result<Client, ClientError> {
         reader: BufReader::new(stream),
         writer,
         daemon_pid: 0,
+        features: Vec::new(),
     };
     client.send(&hello())?;
     let line = client.read_line()?.ok_or(ClientError::Closed)?;
-    client.daemon_pid = check_welcome(&line)?;
+    (client.daemon_pid, client.features) = check_welcome(&line)?;
     Ok(client)
 }
 
@@ -181,6 +188,17 @@ impl Client {
     /// Process id announced by the daemon in `welcome`.
     pub fn daemon_pid(&self) -> u32 {
         self.daemon_pid
+    }
+
+    /// Optional features announced by the daemon in `welcome` (empty for a
+    /// daemon that predates them).
+    pub fn features(&self) -> &[String] {
+        &self.features
+    }
+
+    /// True when the daemon announced `feature` (e.g. [`proto::FEATURE_QUEUE`]).
+    pub fn supports(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
     }
 
     fn send(&mut self, msg: &ClientMessage) -> std::result::Result<(), ClientError> {
@@ -278,6 +296,28 @@ impl Client {
             ServerMessage::Log { path, lines, .. } => Ok((path, lines)),
             other => Err(anyhow!("unexpected reply to logs: {other:?}").into()),
         }
+    }
+
+    /// Sends a single-reply request (for example a `queue-*` message) and
+    /// returns the daemon's one reply as is. An `error` reply is returned as
+    /// [`ServerMessage::Error`], not as [`ClientError::Daemon`], so the
+    /// caller can map its code (`conflict-state`, `stale-plan`, ...). Not
+    /// for `run`, which streams several replies (use [`Client::run`]).
+    ///
+    /// # Errors
+    ///
+    /// I/O or protocol errors, and [`ClientError::Closed`] when the daemon
+    /// closes the connection without replying.
+    pub fn request(
+        mut self,
+        msg: &ClientMessage,
+    ) -> std::result::Result<ServerMessage, ClientError> {
+        self.send(msg)?;
+        let line = self.read_line()?.ok_or(ClientError::Closed)?;
+        if proto::line_too_long(&line) {
+            return Err(anyhow!("the daemon sent a line longer than 1 MiB").into());
+        }
+        Ok(proto::decode_server(&line).context("malformed reply from the daemon")?)
     }
 
     /// Asks the daemon to stop; returns the number of running jobs.
@@ -479,9 +519,15 @@ mod tests {
             instance: "i".into(),
             pid: 42,
             started_at: "t".into(),
+            features: vec![proto::FEATURE_QUEUE.into()],
         })
         .unwrap();
-        assert_eq!(check_welcome(&line).unwrap(), 42);
+        assert_eq!(
+            check_welcome(&line).unwrap(),
+            (42, vec![proto::FEATURE_QUEUE.to_owned()])
+        );
+        let old = r#"{"type":"welcome","protocol":1,"daemon":"d","instance":"i","pid":7,"started_at":"t"}"#;
+        assert_eq!(check_welcome(old).unwrap(), (7, Vec::new()));
     }
 
     #[test]
@@ -492,6 +538,7 @@ mod tests {
             instance: "i".into(),
             pid: 42,
             started_at: "t".into(),
+            features: Vec::new(),
         })
         .unwrap();
         let err = check_welcome(&line).unwrap_err().to_string();

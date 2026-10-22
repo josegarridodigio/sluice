@@ -21,7 +21,8 @@ section 5, [[sluice/design/scheduler.md]], [[sluice/design/executor.md]].
 - Newline-delimited JSON: one JSON object per line, UTF-8, no pretty
   printing. Lines longer than 1 MiB are rejected.
 - The first line in each direction is the handshake. One connection serves
-  one request: `run`, `status`, `logs`, `stop` or `event`. A `run`
+  one request: `run`, `status`, `logs`, `stop`, `event` or one of the
+  `queue-*` requests (section "Merge queue"). A `run`
   connection stays open until the job finishes or either side closes it.
 - Closing a `run` connection unsubscribes the client (see "Disconnects").
 
@@ -31,6 +32,13 @@ Client → `{"type":"hello","protocol":1,"client":"sluice-gate 0.1.0","pid":4242
 Server → `{"type":"welcome","protocol":1,"daemon":"sluice-gate 0.1.0","instance":"<pid>-<start unix ms>","pid":1234,"started_at":"<rfc3339>"}`
 
 `instance` is also the value fenced into `jobs.daemon_instance`.
+
+`welcome` has an optional `features` array of strings, omitted when empty
+(so a daemon without extensions sends exactly the line above). A daemon
+running the merge-queue extension sends `"features":["queue"]`
+(`sluice_gate_proto::FEATURE_QUEUE`); the blocking client exposes it as
+`Client::features()` / `Client::supports("queue")`. A `welcome` without
+`features` parses as an empty list.
 
 A daemon that does not speak the client's `protocol` answers
 `{"type":"error","id":0,"code":"protocol","message":"..."}` and closes. A
@@ -112,6 +120,13 @@ A pass whose request had a `key` but no `tree` is reported with
            "wait_ms_total":..., "run_ms_total":..., "time_saved_ms":..., "psi_blocked_ms_total":...}}
 ```
 
+`status` has an optional `queue` object, omitted when no extension provides
+one (so the frozen fixture `status-schema-1.json` is unchanged):
+`"queue":{"active":3,"ready":1,"needs_reconcile":0}` (`QueueSummary`;
+`active` = jobs not `landed`/`cancelled`/`conflict`/`failed`, `ready` and
+`needs_reconcile` = trains in that state). The daemon fills it from the
+first extension whose `status_summary()` returns one.
+
 `schema` is bumped when a field changes meaning; Phase 4 freezes it and
 adds a test. `sluice status --json` prints this object (pretty-printed,
 without the `type`/`id` envelope); with no daemon running it prints
@@ -163,6 +178,54 @@ the daemon then closes its side. Equivalent to closing the connection
 (what the CLI does; the MCP server sends `cancel`). Any other message on a
 `run` connection is answered with `error{bad-request}` and ignored.
 
+### Merge queue (`queue-*`)
+
+Single-reply requests served by a daemon extension (the merge queue,
+[[sluice/design/merge-queue.md]] sections 8 and 9). `id` is optional on
+these messages (`#[serde(default)]`, 0 when absent) and echoed in the reply.
+Timestamps in the views are RFC 3339; paths are absolute.
+
+| Client request | Fields | Reply |
+|---|---|---|
+| `queue-enqueue` | `id`, `repo` (git common dir), `worktree`, `branch`, `head_sha`, `base` (as typed, optional), `caller` (`agent`/`human`), `session` (optional), `env` (map, default `{}`) | `queue-job` |
+| `queue-status` | `id`, `repo` (common dir, optional = all) | `queue-status` |
+| `queue-approve` | `id`, `train_id`, `train_hash`, `via` (`cli`/`mcp`), `env` (map, default `{}`) | `queue-approved` |
+| `queue-retry` | `id`, `job_id`, `head_sha` | `queue-job` |
+| `queue-cancel` | `id`, `job_id` | `queue-job` |
+| `queue-reconcile` | `id`, `repo` (common dir, optional = all) | `queue-reconcile` |
+
+Server replies:
+
+- `queue-job {id, job}`; `queue-approved {id, train}`;
+  `queue-reconcile {id, results: [{train_id, decision, reason?}]}` with
+  `decision` one of `landed`, `ready`, `queued`, `cancelled`, `refused`.
+- `queue-status {id, schema: 1, trains: [...], jobs: [...]}` (the report is
+  flattened like `status`; `QUEUE_STATUS_SCHEMA_VERSION = 1`).
+- `job` (`QueueJobView`): `job_id`, `repo`, `worktree`, `branch`,
+  `head_sha`, `remote` (`""` for a local target), `target`, `state`,
+  `train_id?`, `position?` (1-based among the target's queued jobs),
+  `caller`, `session?`, `reason?`, `detail?` (any JSON), `cancel_requested`,
+  `attempts`, `enqueued_at`, `updated_at`, `finished_at?`. Job `state` is
+  snake_case: `queued`, `merging`, `verifying`, `ready`, `approved`,
+  `pushing`, `landed`, `conflict`, `failed`, `cancelled`, `needs_reconcile`.
+- `train` (`QueueTrainView`): `train_id`, `repo`, `remote`, `target`,
+  `base_sha`, `state` (`building`, `verifying`, `ready`, `approved`,
+  `pushing`, `landed`, `dissolved`, `needs_reconcile`), `members` (job ids
+  in merge order), `merge_sha?`, `gates: [{gate, key?, job_id?, status,
+  duration_ms?}]` (`status`: `pending`, `running`, `pass`, `cached`,
+  `fail`, `timeout`, `killed`, `error`), `train_hash?`, `approved_via?`,
+  `approved_at?`, `created_at`, `updated_at`, `landed_at?`, `note?`.
+  Fields marked `?` are omitted when absent.
+- Unknown job/train states and reconcile decisions from a newer daemon
+  parse as `Unknown` (`#[serde(other)]`).
+
+A daemon without an extension that handles the request answers
+`{"type":"error","id":N,"code":"not-supported","message":"the running daemon does not support the merge queue; run 'sluice daemon stop' and retry"}`.
+When the extension is configured but its start-up failed, the answer is
+`error{internal}` with `the merge queue failed to start: <cause>`. The
+blocking client's `Client::request(&msg)` returns the single reply as is,
+an `error` included, so the caller can map its code.
+
 ## Disconnects
 
 A job keeps running while it has at least one subscriber. When the last
@@ -172,7 +235,12 @@ completion and write the marker so the next request hits).
 
 ## Errors
 
-`{"type":"error","id":N,"code":"protocol|bad-request|not-found|internal","message":"..."}`.
+`{"type":"error","id":N,"code":"protocol|bad-request|not-found|internal|conflict-state|not-allowed|stale-plan|duplicate-branch|not-supported","message":"..."}`.
+The last five are only sent for `queue-*` requests: `conflict-state` (the
+job or train is not in a state that allows the request), `not-allowed`
+(refused by policy, e.g. agent approval), `stale-plan` (the train hash no
+longer matches), `duplicate-branch` (the branch already has an active
+job), `not-supported` (no extension serves the request).
 Unknown `type`, malformed JSON, a line over 1 MiB or invalid UTF-8 →
 `bad-request` (`id` 0 when unknown); a first line that is not `hello` →
 `protocol` (`expected hello`), a second `hello` → `duplicate hello`; a
@@ -188,5 +256,9 @@ panics on malformed input.
 - New optional fields may be added to any message within a version; clients
   and server ignore unknown fields (`#[serde(default)]`, no
   `deny_unknown_fields` on the wire types).
+- The merge-queue additions (`queue-*` messages, `welcome.features`,
+  `status.queue`, the new error codes) keep `protocol` at 1: old clients
+  never send `queue-*`, and the new fields are optional and omitted when
+  empty.
 - `sluice-gate-proto` exposes `PROTOCOL_VERSION` and the typed enums
   `ClientMessage` / `ServerMessage`, each `#[serde(tag = "type", rename_all = "kebab-case")]`.

@@ -66,6 +66,8 @@ fn daemon_config(env: &EnvMap, user: &UserConfig) -> Result<DaemonConfig> {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         admission: user.admission.clone(),
         psi_root: PathBuf::from(sluice_gate_daemon::psi::DEFAULT_ROOT),
+        user: user.clone(),
+        extensions: Vec::new(),
     })
 }
 

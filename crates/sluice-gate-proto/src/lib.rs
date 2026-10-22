@@ -41,6 +41,13 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Version of the `status` reply schema ([`StatusReport::schema`]).
 pub const STATUS_SCHEMA_VERSION: u32 = 1;
 
+/// Version of the `queue-status` reply schema ([`QueueStatusReport::schema`]).
+pub const QUEUE_STATUS_SCHEMA_VERSION: u32 = 1;
+
+/// Feature announced in [`ServerMessage::Welcome::features`] by a daemon
+/// that serves the merge-queue messages (`queue-*`).
+pub const FEATURE_QUEUE: &str = "queue";
+
 /// Maximum accepted length of one protocol line, in bytes (1 MiB).
 pub const MAX_LINE_BYTES: usize = 1 << 20;
 
@@ -106,6 +113,102 @@ pub enum ClientMessage {
         /// Id of the `run` request to detach from.
         id: u64,
     },
+    /// Merge queue: enqueue a branch. Reply: `queue-job`.
+    QueueEnqueue {
+        /// Client-chosen request id.
+        #[serde(default)]
+        id: u64,
+        /// The enqueue payload.
+        #[serde(flatten)]
+        request: EnqueueRequest,
+    },
+    /// Merge queue: list trains and jobs. Reply: `queue-status`.
+    QueueStatus {
+        /// Client-chosen request id.
+        #[serde(default)]
+        id: u64,
+        /// Restrict to one repository (its git common dir); `None` lists all.
+        #[serde(default)]
+        repo: Option<PathBuf>,
+    },
+    /// Merge queue: approve a `ready` train. Reply: `queue-approved`.
+    QueueApprove {
+        /// Client-chosen request id.
+        #[serde(default)]
+        id: u64,
+        /// Train to approve.
+        train_id: String,
+        /// Train hash the client displayed; `stale-plan` when it no longer matches.
+        train_hash: String,
+        /// Surface the approval came from.
+        via: ApproveVia,
+        /// Allowlisted environment of the approving client, used for the push.
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+    },
+    /// Merge queue: re-queue a `conflict` or `failed` job. Reply: `queue-job`.
+    QueueRetry {
+        /// Client-chosen request id.
+        #[serde(default)]
+        id: u64,
+        /// Job to retry.
+        job_id: String,
+        /// Branch head re-read by the client.
+        head_sha: String,
+    },
+    /// Merge queue: cancel a job. Reply: `queue-job`.
+    QueueCancel {
+        /// Client-chosen request id.
+        #[serde(default)]
+        id: u64,
+        /// Job to cancel.
+        job_id: String,
+    },
+    /// Merge queue: evaluate `needs_reconcile` trains. Reply: `queue-reconcile`.
+    QueueReconcile {
+        /// Client-chosen request id.
+        #[serde(default)]
+        id: u64,
+        /// Restrict to one repository (its git common dir); `None` means all.
+        #[serde(default)]
+        repo: Option<PathBuf>,
+    },
+}
+
+/// Payload of a `queue-enqueue` request. The client resolves the branch,
+/// its SHA and the worktree's cleanliness itself and sends facts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnqueueRequest {
+    /// Absolute path of the repository's git common dir.
+    pub repo: PathBuf,
+    /// Absolute path of the root of the worktree the request comes from.
+    pub worktree: PathBuf,
+    /// Branch to queue (short name, without `refs/heads/`).
+    pub branch: String,
+    /// Commit of the branch captured by the client.
+    pub head_sha: String,
+    /// Landing target as typed by the user (`<remote>/<branch>` or a local
+    /// branch); `None` selects the configured default.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// Who enqueued.
+    pub caller: Caller,
+    /// Agent session identifier, if any.
+    #[serde(default)]
+    pub session: Option<String>,
+    /// Allowlisted environment of the enqueuing client (credentials for fetches).
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+/// Surface an approval came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApproveVia {
+    /// `sluice queue approve`.
+    Cli,
+    /// The MCP tool `queue_approve`.
+    Mcp,
 }
 
 /// Payload of a `run` request.
@@ -224,6 +327,10 @@ pub enum ServerMessage {
         pid: u32,
         /// Daemon start time (RFC 3339).
         started_at: String,
+        /// Optional features served by this daemon (for example
+        /// [`FEATURE_QUEUE`]); omitted from the wire when empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        features: Vec<String>,
     },
     /// The request entered the scheduler; always the first `run` event.
     Queued {
@@ -313,6 +420,40 @@ pub enum ServerMessage {
         #[serde(default)]
         message: String,
     },
+    /// Reply to `queue-enqueue`, `queue-retry` and `queue-cancel`.
+    QueueJob {
+        /// Request id.
+        #[serde(default)]
+        id: u64,
+        /// The job after the request was applied.
+        job: QueueJobView,
+    },
+    /// Reply to `queue-status`.
+    QueueStatus {
+        /// Request id.
+        #[serde(default)]
+        id: u64,
+        /// The report.
+        #[serde(flatten)]
+        status: QueueStatusReport,
+    },
+    /// Reply to `queue-approve`.
+    QueueApproved {
+        /// Request id.
+        #[serde(default)]
+        id: u64,
+        /// The train after approval.
+        train: QueueTrainView,
+    },
+    /// Reply to `queue-reconcile`.
+    QueueReconcile {
+        /// Request id.
+        #[serde(default)]
+        id: u64,
+        /// One entry per evaluated train.
+        #[serde(default)]
+        results: Vec<ReconcileResult>,
+    },
 }
 
 /// Final result of a job.
@@ -370,6 +511,16 @@ pub enum ErrorCode {
     NotFound,
     /// Unexpected daemon failure.
     Internal,
+    /// Merge queue: the job or train is not in a state that allows the request.
+    ConflictState,
+    /// Merge queue: the request is refused by policy (for example agent approval).
+    NotAllowed,
+    /// Merge queue: the train changed since the client displayed it.
+    StalePlan,
+    /// Merge queue: the branch already has an active job.
+    DuplicateBranch,
+    /// The daemon does not serve this request (no extension handles it).
+    NotSupported,
 }
 
 /// Payload of the `status` reply.
@@ -388,6 +539,21 @@ pub struct StatusReport {
     pub queued: Vec<QueuedJob>,
     /// Cumulative counters.
     pub totals: Totals,
+    /// Merge-queue summary; absent when the daemon serves no queue.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue: Option<QueueSummary>,
+}
+
+/// Merge-queue counters in a status report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct QueueSummary {
+    /// Jobs not in a terminal state (`landed`, `cancelled`, `conflict`, `failed`).
+    pub active: usize,
+    /// Trains waiting for approval.
+    pub ready: usize,
+    /// Trains waiting for `sluice queue reconcile`.
+    pub needs_reconcile: usize,
 }
 
 /// Daemon identity in a status report.
@@ -519,6 +685,223 @@ pub struct Totals {
     /// daemon instance only, accumulated per sample; keeps what accrued if PSI
     /// later becomes unavailable).
     pub psi_blocked_ms_total: u64,
+}
+
+/// Payload of the `queue-status` reply (also `sluice queue status --json`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct QueueStatusReport {
+    /// Schema version ([`QUEUE_STATUS_SCHEMA_VERSION`]).
+    pub schema: u32,
+    /// Trains, oldest first.
+    pub trains: Vec<QueueTrainView>,
+    /// Jobs, in queue order.
+    pub jobs: Vec<QueueJobView>,
+}
+
+/// State of a merge-queue job (`queue_jobs.state`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueJobState {
+    /// Waiting to be claimed into a train.
+    #[default]
+    Queued,
+    /// Being merged into a train.
+    Merging,
+    /// Gates running on the train.
+    Verifying,
+    /// Train verified; waiting for approval.
+    Ready,
+    /// Approved; waiting for the push.
+    Approved,
+    /// Push in progress.
+    Pushing,
+    /// Landed on the target (terminal).
+    Landed,
+    /// Merge conflict; terminal until `queue-retry`.
+    Conflict,
+    /// Gate or push failure; terminal until `queue-retry`.
+    Failed,
+    /// Cancelled (terminal).
+    Cancelled,
+    /// Push outcome unknown; waiting for `queue-reconcile`.
+    NeedsReconcile,
+    /// A state this client does not know (sent by a newer daemon).
+    #[serde(other)]
+    Unknown,
+}
+
+/// State of a merge-queue train (`queue_trains.state`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueTrainState {
+    /// Members being merged.
+    #[default]
+    Building,
+    /// Gates running.
+    Verifying,
+    /// Verified; waiting for approval.
+    Ready,
+    /// Approved; waiting for the push.
+    Approved,
+    /// Push in progress.
+    Pushing,
+    /// Landed on the target.
+    Landed,
+    /// Dissolved; its members went back to the queue or ended.
+    Dissolved,
+    /// Push outcome unknown; waiting for `queue-reconcile`.
+    NeedsReconcile,
+    /// A state this client does not know (sent by a newer daemon).
+    #[serde(other)]
+    Unknown,
+}
+
+/// One merge-queue job as shown to clients (columns of `queue_jobs`).
+/// Timestamps are RFC 3339.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct QueueJobView {
+    /// Job id.
+    pub job_id: String,
+    /// Git common dir of the repository.
+    pub repo: PathBuf,
+    /// Worktree the job was enqueued from.
+    pub worktree: PathBuf,
+    /// Queued branch.
+    pub branch: String,
+    /// Commit captured at enqueue (or retry).
+    pub head_sha: String,
+    /// Remote of the target; empty for a local target.
+    pub remote: String,
+    /// Target branch.
+    pub target: String,
+    /// Current state.
+    pub state: QueueJobState,
+    /// Train the job belongs to, if claimed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub train_id: Option<String>,
+    /// 1-based position among the `queued` jobs of its target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<usize>,
+    /// Who enqueued.
+    pub caller: Caller,
+    /// Agent session identifier, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Machine-readable reason of the last side exit (e.g. `conflict`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Structured detail (conflicting paths, gate and sluice job id, ...).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
+    /// A cancel was requested while the job was `pushing`.
+    pub cancel_requested: bool,
+    /// Number of attempts (1 on enqueue).
+    pub attempts: u32,
+    /// Enqueue time.
+    pub enqueued_at: String,
+    /// Last state change.
+    pub updated_at: String,
+    /// Time the job reached a terminal state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+}
+
+/// One gate of a train (`queue_trains.gates`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TrainGate {
+    /// Gate name.
+    pub gate: String,
+    /// Cache key of the gate on the train's tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Sluice job id of the run, when one was submitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    /// Gate state: `pending`, `running`, `pass`, `cached`, `fail`, `timeout`,
+    /// `killed` or `error`.
+    pub status: String,
+    /// Run time in milliseconds, once finished.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
+/// One merge-queue train as shown to clients (columns of `queue_trains`).
+/// Timestamps are RFC 3339.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct QueueTrainView {
+    /// Train id (`t-<unix-ms>-<6 hex>`).
+    pub train_id: String,
+    /// Git common dir of the repository.
+    pub repo: PathBuf,
+    /// Remote of the target; empty for a local target.
+    pub remote: String,
+    /// Target branch.
+    pub target: String,
+    /// Commit the members were merged onto.
+    pub base_sha: String,
+    /// Current state.
+    pub state: QueueTrainState,
+    /// Member job ids, in merge order.
+    pub members: Vec<String>,
+    /// Landing commit `S`, once built.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_sha: Option<String>,
+    /// Gates of the train.
+    pub gates: Vec<TrainGate>,
+    /// Train hash to send back in `queue-approve`, once `ready`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub train_hash: Option<String>,
+    /// Surface of the approval, once approved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approved_via: Option<ApproveVia>,
+    /// Approval time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approved_at: Option<String>,
+    /// Creation time.
+    pub created_at: String,
+    /// Last state change.
+    pub updated_at: String,
+    /// Landing time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub landed_at: Option<String>,
+    /// Free-form note (e.g. `rewritten_after_landing`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Decision taken by `queue-reconcile` for one train.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconcileDecision {
+    /// The train landed.
+    Landed,
+    /// Nothing landed; back to `ready` (approval voided).
+    Ready,
+    /// Nothing landed and the target moved; members re-queued.
+    Queued,
+    /// Nothing landed and a cancel was pending; members cancelled.
+    Cancelled,
+    /// No decision possible yet; the train is unchanged (see `reason`).
+    Refused,
+    /// A decision this client does not know (sent by a newer daemon).
+    #[serde(other)]
+    Unknown,
+}
+
+/// Result of `queue-reconcile` for one train.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReconcileResult {
+    /// Train evaluated.
+    pub train_id: String,
+    /// Decision taken.
+    pub decision: ReconcileDecision,
+    /// Why (e.g. `push_in_progress`, `endpoint_changed`, `rewritten_after_landing`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Serialises a message as compact JSON followed by `\n`.
@@ -653,6 +1036,62 @@ mod tests {
                 runs: 120,
                 ..Totals::default()
             },
+            queue: Some(QueueSummary {
+                active: 3,
+                ready: 1,
+                needs_reconcile: 0,
+            }),
+        }
+    }
+
+    fn job_view() -> QueueJobView {
+        QueueJobView {
+            job_id: "1761-1-a1b2c3".into(),
+            repo: "/abs/.git".into(),
+            worktree: "/abs/wt".into(),
+            branch: "feat/login".into(),
+            head_sha: TREE.into(),
+            remote: "origin".into(),
+            target: "main".into(),
+            state: QueueJobState::Conflict,
+            train_id: Some("t-1761-9f2e01".into()),
+            position: Some(2),
+            caller: Caller::Agent,
+            session: Some("s1".into()),
+            reason: Some("conflict".into()),
+            detail: Some(serde_json::json!({"paths": ["src/app.ts"]})),
+            cancel_requested: false,
+            attempts: 1,
+            enqueued_at: "t".into(),
+            updated_at: "t".into(),
+            finished_at: None,
+        }
+    }
+
+    fn train_view() -> QueueTrainView {
+        QueueTrainView {
+            train_id: "t-1761-9f2e01".into(),
+            repo: "/abs/.git".into(),
+            remote: "origin".into(),
+            target: "main".into(),
+            base_sha: TREE.into(),
+            state: QueueTrainState::NeedsReconcile,
+            members: vec!["1761-1-a1b2c3".into()],
+            merge_sha: Some(TREE.into()),
+            gates: vec![TrainGate {
+                gate: "test".into(),
+                key: Some(KEY.into()),
+                job_id: Some("j".into()),
+                status: "pass".into(),
+                duration_ms: Some(12_400),
+            }],
+            train_hash: Some(KEY.into()),
+            approved_via: Some(ApproveVia::Cli),
+            approved_at: Some("t".into()),
+            created_at: "t".into(),
+            updated_at: "t".into(),
+            landed_at: None,
+            note: None,
         }
     }
 
@@ -689,6 +1128,41 @@ mod tests {
             },
             ClientMessage::Stop { id: 4, force: true },
             ClientMessage::Cancel { id: 1 },
+            ClientMessage::QueueEnqueue {
+                id: 5,
+                request: EnqueueRequest {
+                    repo: "/abs/.git".into(),
+                    worktree: "/abs/wt".into(),
+                    branch: "feat/login".into(),
+                    head_sha: TREE.into(),
+                    base: Some("origin/main".into()),
+                    caller: Caller::Agent,
+                    session: Some("s1".into()),
+                    env: BTreeMap::from([("SSH_AUTH_SOCK".into(), "/a".into())]),
+                },
+            },
+            ClientMessage::QueueStatus {
+                id: 6,
+                repo: Some("/abs/.git".into()),
+            },
+            ClientMessage::QueueStatus { id: 6, repo: None },
+            ClientMessage::QueueApprove {
+                id: 7,
+                train_id: "t-1".into(),
+                train_hash: KEY.into(),
+                via: ApproveVia::Mcp,
+                env: BTreeMap::from([("HOME".into(), "/h".into())]),
+            },
+            ClientMessage::QueueRetry {
+                id: 8,
+                job_id: "j".into(),
+                head_sha: TREE.into(),
+            },
+            ClientMessage::QueueCancel {
+                id: 9,
+                job_id: "j".into(),
+            },
+            ClientMessage::QueueReconcile { id: 10, repo: None },
         ];
         for m in msgs {
             let line = encode(&m).unwrap();
@@ -706,6 +1180,7 @@ mod tests {
                 instance: "i".into(),
                 pid: 1,
                 started_at: "t".into(),
+                features: vec![FEATURE_QUEUE.into()],
             },
             ServerMessage::Queued {
                 id: 1,
@@ -756,12 +1231,61 @@ mod tests {
             ErrorCode::BadRequest,
             ErrorCode::NotFound,
             ErrorCode::Internal,
+            ErrorCode::ConflictState,
+            ErrorCode::NotAllowed,
+            ErrorCode::StalePlan,
+            ErrorCode::DuplicateBranch,
+            ErrorCode::NotSupported,
         ] {
             let m = ServerMessage::Error {
                 id: 0,
                 code,
                 message: String::new(),
             };
+            assert_eq!(decode_server(&encode(&m).unwrap()).unwrap(), m);
+        }
+    }
+
+    #[test]
+    fn queue_server_round_trip() {
+        let msgs = vec![
+            ServerMessage::QueueJob {
+                id: 6,
+                job: job_view(),
+            },
+            ServerMessage::QueueJob {
+                id: 6,
+                job: QueueJobView::default(),
+            },
+            ServerMessage::QueueStatus {
+                id: 7,
+                status: QueueStatusReport {
+                    schema: QUEUE_STATUS_SCHEMA_VERSION,
+                    trains: vec![train_view(), QueueTrainView::default()],
+                    jobs: vec![job_view()],
+                },
+            },
+            ServerMessage::QueueApproved {
+                id: 8,
+                train: train_view(),
+            },
+            ServerMessage::QueueReconcile {
+                id: 9,
+                results: vec![
+                    ReconcileResult {
+                        train_id: "t-1".into(),
+                        decision: ReconcileDecision::Landed,
+                        reason: Some("rewritten_after_landing".into()),
+                    },
+                    ReconcileResult {
+                        train_id: "t-2".into(),
+                        decision: ReconcileDecision::Refused,
+                        reason: None,
+                    },
+                ],
+            },
+        ];
+        for m in msgs {
             assert_eq!(decode_server(&encode(&m).unwrap()).unwrap(), m);
         }
     }
@@ -923,6 +1447,108 @@ mod tests {
         let st = encode(&OutcomeStatus::Cached).unwrap();
         assert_eq!(st, "\"cached\"\n");
         assert!(encode(&WaitReason::RepoCap).unwrap().contains("repo-cap"));
+    }
+
+    #[test]
+    fn welcome_without_features_parses_and_empty_features_are_omitted() {
+        let w = decode_server(
+            r#"{"type":"welcome","protocol":1,"daemon":"d","instance":"i","pid":1,"started_at":"t"}"#,
+        )
+        .unwrap();
+        let ServerMessage::Welcome { features, .. } = &w else {
+            panic!("not welcome");
+        };
+        assert_eq!(*features, Vec::<String>::new());
+        assert!(!encode(&w).unwrap().contains("features"));
+        let q = decode_server(
+            r#"{"type":"welcome","protocol":1,"daemon":"d","instance":"i","pid":1,"started_at":"t","features":["queue"]}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(q, ServerMessage::Welcome { features, .. } if features == [FEATURE_QUEUE])
+        );
+    }
+
+    #[test]
+    fn status_queue_summary_is_optional() {
+        let mut report = status_report();
+        report.queue = None;
+        let line = encode(&ServerMessage::Status {
+            id: 2,
+            status: report,
+        })
+        .unwrap();
+        assert!(!line.contains("\"queue\""));
+        let ServerMessage::Status { status, .. } = decode_server(&line).unwrap() else {
+            panic!("not status");
+        };
+        assert_eq!(status.queue, None);
+        let line = encode(&ServerMessage::Status {
+            id: 2,
+            status: status_report(),
+        })
+        .unwrap();
+        assert!(line.contains(r#""queue":{"active":3,"ready":1,"needs_reconcile":0}"#));
+    }
+
+    #[test]
+    fn queue_spellings() {
+        let m = decode_client(
+            r#"{"type":"queue-enqueue","id":1,"repo":"/r/.git","worktree":"/r","branch":"b","head_sha":"abc","caller":"human"}"#,
+        )
+        .unwrap();
+        let ClientMessage::QueueEnqueue { request, .. } = m else {
+            panic!("not queue-enqueue");
+        };
+        assert_eq!(request.base, None);
+        assert!(request.env.is_empty());
+        let m = decode_client(
+            r#"{"type":"queue-approve","train_id":"t","train_hash":"h","via":"cli"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            m,
+            ClientMessage::QueueApprove {
+                id: 0,
+                via: ApproveVia::Cli,
+                ..
+            }
+        ));
+        let job = encode(&ServerMessage::QueueJob {
+            id: 1,
+            job: job_view(),
+        })
+        .unwrap();
+        assert!(job.contains(r#""type":"queue-job""#));
+        assert!(job.contains(r#""state":"conflict""#));
+        let st = encode(&QueueTrainState::NeedsReconcile).unwrap();
+        assert_eq!(st, "\"needs_reconcile\"\n");
+        let unknown: QueueJobState = serde_json::from_str(r#""bisecting""#).unwrap();
+        assert_eq!(unknown, QueueJobState::Unknown);
+        let err = encode(&ServerMessage::Error {
+            id: 1,
+            code: ErrorCode::NotSupported,
+            message: String::new(),
+        })
+        .unwrap();
+        assert!(err.contains(r#""code":"not-supported""#));
+        assert!(
+            encode(&ErrorCode::ConflictState)
+                .unwrap()
+                .contains("conflict-state")
+        );
+        let status = encode(&ServerMessage::QueueStatus {
+            id: 3,
+            status: QueueStatusReport {
+                schema: 1,
+                ..QueueStatusReport::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            status,
+            "{\"type\":\"queue-status\",\"id\":3,\"schema\":1,\"trains\":[],\"jobs\":[]}\n"
+        );
     }
 
     #[test]
