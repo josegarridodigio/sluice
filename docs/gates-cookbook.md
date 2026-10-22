@@ -1,9 +1,9 @@
 # Gates cookbook
 
 Ready-to-adapt `.sluice.toml` files per stack. Every example uses only fields
-that exist today (see the format reference in the README and
-`kb/sluice/design/config-format.md`): `cmd`, `weight`, `timeout`, `hooks`,
-`key_inputs`, `key_files`, `env`, `cache`, `depends_on` and `[queue]`.
+that exist today (see [docs/configuration.md](configuration.md)): `cmd`,
+`weight`, `timeout`, `hooks`, `key_inputs`, `key_files`, `env`, `cache`,
+`mode`, `paths`, `paths_ignore`, `depends_on` and `[queue]`.
 
 ## Rules of thumb
 

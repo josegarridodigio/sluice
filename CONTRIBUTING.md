@@ -51,7 +51,7 @@ multi-worktree benchmark that produces the before/after numbers.
   wrapper in `sluice-gate-core`.
 - Every bug fix comes with a regression test. Integration tests create
   throwaway repositories and worktrees with `tempfile`.
-- Linux is the only supported platform in v1; do not add `cfg` branches for
+- Linux is the only supported platform for now; do not add `cfg` branches for
   other platforms.
 - Commit messages follow Conventional Commits (`feat:`, `fix:`, `chore:`,
   `docs:`). Keep the subject under 72 characters and explain the why in the

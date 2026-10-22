@@ -1,0 +1,691 @@
+# CLI reference
+
+Every `sluice` subcommand, with its complete `--help` output in a collapsible
+block. The help text is generated from the binary itself (`sluice --version`
+shows which one you have); when in doubt, `sluice <command> --help` is
+authoritative.
+
+| Command | Purpose |
+|---|---|
+| [`sluice run`](#sluice-run) | Run a gate: cache hit in milliseconds, otherwise queue it in the daemon under the budget. |
+| [`sluice exec`](#sluice-exec) | Run any command under the budget, without cache. |
+| [`sluice mcp`](#sluice-mcp) | Start the MCP stdio server (spawned by the coding agent). |
+| [`sluice daemon`](#sluice-daemon) | Start the per-user daemon, or stop or restart it. |
+| [`sluice status`](#sluice-status) | Show the daemon, budget, system pressure, jobs and totals. |
+| [`sluice cache`](#sluice-cache) | Inspect or clear cache markers for the current repository. |
+| [`sluice init`](#sluice-init) | Write a starter `.sluice.toml` and print hook snippets. |
+| [`sluice hook print`](#sluice-hook) | Print the snippet for a hook manager. |
+| [`sluice logs`](#sluice-logs) | Show the log of a job. |
+| [`sluice queue`](#sluice-queue) | Local merge queue: enqueue, approve, retry, cancel, reconcile. |
+| [`sluice doctor`](#sluice-doctor) | Check the installation; optionally write a redacted bug-report bundle. |
+| [`sluice update`](#sluice-update) | Update Sluice to the latest (or a given) release. |
+
+## Global
+
+<details>
+<summary>Full help</summary>
+
+```text
+Sluice runs named gates (tests, linters, type checks) under a global concurrency budget and caches results per git tree so each tree is verified once. Git hooks call `sluice run`; coding agents call the MCP server started by `sluice mcp` (tools verify, status, gate_list, logs and the merge-queue tools queue_enqueue, queue_status, queue_approve, queue_retry, queue_cancel).
+
+On a cache miss `sluice run` hands the gate to the per-user daemon (`sluice daemon`), starting it on demand; when the daemon cannot be reached or started the gate runs in-process. `sluice status` shows the queue. `sluice exec -- <cmd>` runs any other heavy command under the same budget, without cache.
+
+Exit codes of `sluice run`: 0 pass or cache hit; the gate's own code on failure; 3 refused by agent_hook_policy = "fail-fast"; 124 gate timeout; 143 gate killed (signal or `sluice daemon stop --force`); 1 Sluice error; 2 usage error.
+
+Environment: SLUICE_DISABLE=1 runs the gate directly (no cache, no queue); SLUICE_CACHE=0|1 forces the cache off or on (on overrides CI); CI disables the cache; SLUICE_AGENT=1|0 forces agent or human detection; SLUICE_CONFIG points at the user config; SLUICE_SOCKET overrides the daemon socket path; SLUICE_LOG sets the log filter of the daemon, `sluice mcp` and `sluice run` (then `[debug] level` of the user config, then info).
+
+Usage: sluice <COMMAND>
+
+Commands:
+  run     Run a gate: cache hit in milliseconds, otherwise queue it in the daemon under the budget
+  exec    Run any command under the budget, without cache (builds, test runs, docker builds)
+  mcp     Start the MCP stdio server (spawned by the coding agent)
+  daemon  Start the per-user daemon (detached unless --foreground), or stop it
+  doctor  Check the installation (git, PSI, daemon, lease, configs, hooks) and optionally collect a redacted diagnostics bundle for bug reports
+  status  Show the daemon, budget, system pressure (PSI), running and queued jobs, and totals
+  cache   Inspect or clear cache markers for the current repository
+  init    Write a starter `.sluice.toml` and print hook snippets
+  hook    Print hook integration snippets
+  logs    Show the log of a job
+  queue   Local merge queue: enqueue committed branches, approve trains, land them
+  update  Update sluice to the latest (or a given) release
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+```
+
+</details>
+
+## Commands
+
+### `sluice run`
+
+Run a gate: cache hit in milliseconds, otherwise queue it in the daemon under the budget.
+
+<details>
+<summary>Full help</summary>
+
+```text
+Run a gate: cache hit in milliseconds, otherwise queue it in the daemon under the budget
+
+Usage: sluice run [OPTIONS] <GATE> [-- <EXTRA>...]
+
+Arguments:
+  <GATE>      Gate name as defined in `.sluice.toml`
+  [EXTRA]...  Extra arguments appended to the gate command
+
+Options:
+      --hook <HOOK>  Name of the git hook invoking Sluice (pre-commit, pre-push, ...). Enables the hook policy on a cache miss and, for pre-commit, records the committed tree
+  -v, --verbose      Stream the gate output to stderr while it runs (it is always written to the log)
+      --explain      Explain what Sluice would do (caller detection, policy, tree, key, cache lookup) and exit
+  -h, --help         Print help
+```
+
+</details>
+
+### `sluice exec`
+
+Run any command under the budget, without cache (builds, test runs, docker builds).
+
+<details>
+<summary>Full help</summary>
+
+```text
+Run any command under the budget, without cache (builds, test runs, docker builds).
+
+The command (an argv, no shell: use `sluice exec -- sh -c '...'` for a script) is queued in the daemon like a gate and runs in its own process group with the caller's environment and directory, stdin `/dev/null` and no terminal. Its stdout and stderr are replayed byte for byte to this process's stdout and stderr; SIGINT, SIGTERM and SIGHUP are forwarded to the whole process group.
+
+Exit codes: the command's own code; 128+N when it was killed by signal N; 124 on --timeout; 143 when the daemon stopped and killed it; 127 command not found; 126 not executable; 125 Sluice error after the request was accepted.
+
+Without a usable daemon (not running and not startable, or older than 0.3.0) the command runs in-process under the same budget semaphore with inherited stdio. Inside a Sluice job (`SLUICE_JOB` set) it runs directly, without queueing. `SLUICE_DISABLE=1` always runs it in-process (with a terminal, if any).
+
+Usage: sluice exec [OPTIONS] <CMD>...
+
+Arguments:
+  <CMD>...
+          The command and its arguments (after `--`)
+
+Options:
+      --weight <N>
+          Budget units the command takes; default half the budget, rounded up
+
+      --label <L>
+          Label shown in `sluice status` and messages; default the first two words
+
+      --coalesce-key <K>
+          Share one run between simultaneous requests with this key and the same command and directory (environment differences are ignored)
+
+      --timeout <DUR>
+          Kill the command after this long (for example `90s`, `20m`); exit 124
+
+  -q, --quiet
+          Do not print Sluice's informational lines (errors are still printed)
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+</details>
+
+### `sluice mcp`
+
+Start the MCP stdio server (spawned by the coding agent).
+
+<details>
+<summary>Full help</summary>
+
+```text
+Start the MCP stdio server (spawned by the coding agent).
+
+Tools: `verify` (run gates through the cache and the daemon, blocking with progress notifications), `status`, `gate_list`, `logs`, and the merge-queue tools `queue_enqueue`, `queue_status`, `queue_approve`, `queue_retry`, `queue_cancel`. Logs go to stderr only. Register `sluice mcp` as a stdio MCP server in the agent's config.
+
+Usage: sluice mcp
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+</details>
+
+### `sluice daemon`
+
+Start the per-user daemon (detached unless --foreground), or stop it.
+
+<details>
+<summary>Full help</summary>
+
+```text
+Start the per-user daemon (detached unless --foreground), or stop it.
+
+Exits 75 when another daemon still holds the daemon lock.
+
+Usage: sluice daemon [OPTIONS] [COMMAND]
+
+Commands:
+  stop     Ask the running daemon to stop (queued jobs are dropped, running jobs finish)
+  restart  Stop the daemon and start a fresh detached one
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --foreground
+          Stay attached to the terminal instead of detaching
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+</details>
+
+#### `sluice daemon stop`
+
+Ask the running daemon to stop (queued jobs are dropped, running jobs finish).
+
+<details>
+<summary>Full help</summary>
+
+```text
+Ask the running daemon to stop (queued jobs are dropped, running jobs finish).
+
+Without --force, waits (up to 60 s) until the running jobs finished and the daemon released its lock, so the next command starts a fresh daemon.
+
+Usage: sluice daemon stop [OPTIONS]
+
+Options:
+      --force
+          Kill running jobs instead of letting them finish
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+</details>
+
+#### `sluice daemon restart`
+
+Stop the daemon and start a fresh detached one.
+
+<details>
+<summary>Full help</summary>
+
+```text
+Stop the daemon and start a fresh detached one.
+
+Refuses (exit 1) while gates are running unless --force. With --debug the new daemon logs at `debug` level (`SLUICE_LOG=debug`) until it exits; `sluice status` shows the active level and the log path.
+
+Usage: sluice daemon restart [OPTIONS]
+
+Options:
+      --debug
+          Run the new daemon with `SLUICE_LOG=debug` (only that instance)
+
+      --force
+          Kill running gates instead of refusing
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+</details>
+
+### `sluice status`
+
+Show the daemon, budget, system pressure (PSI), running and queued jobs, and totals.
+
+<details>
+<summary>Full help</summary>
+
+```text
+Show the daemon, budget, system pressure (PSI), running and queued jobs, and totals
+
+Usage: sluice status [OPTIONS]
+
+Options:
+      --json  Print machine-readable JSON instead of text
+  -h, --help  Print help
+```
+
+</details>
+
+### `sluice cache`
+
+Inspect or clear cache markers for the current repository.
+
+<details>
+<summary>Full help</summary>
+
+```text
+Inspect or clear cache markers for the current repository
+
+Usage: sluice cache <COMMAND>
+
+Commands:
+  status  Show, per gate, whether the current tree has a cached pass
+  clear   Remove markers and miss records for the current repository
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+</details>
+
+#### `sluice cache status`
+
+Show, per gate, whether the current tree has a cached pass.
+
+<details>
+<summary>Full help</summary>
+
+```text
+Show, per gate, whether the current tree has a cached pass
+
+Usage: sluice cache status [OPTIONS]
+
+Options:
+      --all   Also list every marker stored for the repository
+  -h, --help  Print help
+```
+
+</details>
+
+#### `sluice cache clear`
+
+Remove markers and miss records for the current repository.
+
+<details>
+<summary>Full help</summary>
+
+```text
+Remove markers and miss records for the current repository
+
+Usage: sluice cache clear [OPTIONS]
+
+Options:
+      --gate <GATE>  Only clear entries of this gate
+  -h, --help         Print help
+```
+
+</details>
+
+### `sluice init`
+
+Write a starter `.sluice.toml` and print hook snippets.
+
+<details>
+<summary>Full help</summary>
+
+```text
+Write a starter `.sluice.toml` and print hook snippets
+
+Usage: sluice init [OPTIONS]
+
+Options:
+      --force  Overwrite an existing `.sluice.toml`
+  -h, --help   Print help
+```
+
+</details>
+
+### `sluice hook`
+
+Print hook integration snippets.
+
+<details>
+<summary>Full help</summary>
+
+```text
+Print hook integration snippets
+
+Usage: sluice hook <COMMAND>
+
+Commands:
+  print  Print the snippet for a hook manager
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+</details>
+
+#### `sluice hook print`
+
+Print the snippet for a hook manager.
+
+<details>
+<summary>Full help</summary>
+
+```text
+Print the snippet for a hook manager
+
+Usage: sluice hook print <MANAGER>
+
+Arguments:
+  <MANAGER>
+          Hook manager to print the snippet for
+
+          Possible values:
+          - husky:      Husky: scripts in `.husky/`
+          - lefthook:   Lefthook: a `lefthook.yml` fragment
+          - pre-commit: The pre-commit / prek framework: `.pre-commit-config.yaml`
+          - plain:      Plain POSIX scripts in `.githooks/`
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+</details>
+
+### `sluice logs`
+
+Show the log of a job.
+
+<details>
+<summary>Full help</summary>
+
+```text
+Show the log of a job
+
+Usage: sluice logs [OPTIONS] [JOB_ID]
+
+Arguments:
+  [JOB_ID]  Job id; defaults to the most recent job
+
+Options:
+  -n, --lines <LINES>  Only print the last N lines
+  -h, --help           Print help
+```
+
+</details>
+
+### `sluice queue`
+
+Local merge queue: enqueue committed branches, approve trains, land them.
+
+<details>
+<summary>Full help</summary>
+
+```text
+Local merge queue: enqueue committed branches, approve trains, land them.
+
+Agents enqueue committed branches; a daemon task combines them on top of the target branch in a disposable worktree, runs the gates once on the combined tree and shows the plan. Nothing is pushed until a human runs `sluice queue approve`. Exit codes: 0 ok; 1 error; 2 usage; 4 refused by the state of the queue (conflict-state, not-allowed, stale-plan, duplicate-branch).
+
+Usage: sluice queue <COMMAND>
+
+Commands:
+  enqueue    Queue a committed branch for the next train
+  status     Show trains, their members, gates, conflicts and queued jobs
+  approve    Approve a ready train: print the plan and land it
+  retry      Re-queue a conflicted or failed job with the current head of its branch
+  cancel     Cancel a job that has not been pushed
+  reconcile  Resolve trains whose push outcome is unknown (`needs_reconcile`)
+  help       Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+</details>
+
+#### `sluice queue enqueue`
+
+Queue a committed branch for the next train.
+
+<details>
+<summary>Full help</summary>
+
+```text
+Queue a committed branch for the next train.
+
+Defaults to the current branch of this worktree. Refuses a detached HEAD, a worktree with staged or unstaged changes to tracked files (untracked files do not matter), a branch that is already queued and a branch equal to the target.
+
+Usage: sluice queue enqueue [OPTIONS] [BRANCH]
+
+Arguments:
+  [BRANCH]
+          Branch to queue; defaults to the current branch
+
+Options:
+      --base <BASE>
+          Where the train lands: `<remote>/<branch>` (pushed), `<branch>` (a local branch, updated in place) or a bare name tried first as a branch of the configured remote and then as a local branch. Defaults to `[queue] remote` and `target`. Tags, raw SHAs, HEAD and checked-out local branches are refused
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+</details>
+
+#### `sluice queue status`
+
+Show trains, their members, gates, conflicts and queued jobs.
+
+<details>
+<summary>Full help</summary>
+
+```text
+Show trains, their members, gates, conflicts and queued jobs.
+
+Inside a repository only its own trains and jobs are listed. With --json the `queue-status` payload is printed verbatim (it carries `schema: 1`).
+
+Usage: sluice queue status [OPTIONS]
+
+Options:
+      --json
+          Print machine-readable JSON instead of text
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+</details>
+
+#### `sluice queue approve`
+
+Approve a ready train: print the plan and land it.
+
+<details>
+<summary>Full help</summary>
+
+```text
+Approve a ready train: print the plan and land it.
+
+On a terminal it asks `Land this train? [y/N]`; without one it requires --yes. The train hash that was displayed is sent along, so a train that changed in the meantime is refused (stale-plan, exit 4). Agents must not run this command.
+
+Usage: sluice queue approve [OPTIONS] <TRAIN_ID>
+
+Arguments:
+  <TRAIN_ID>
+          Train id, as shown by `sluice queue status`
+
+Options:
+      --yes
+          Do not ask for confirmation (required without a terminal)
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+</details>
+
+#### `sluice queue retry`
+
+Re-queue a conflicted or failed job with the current head of its branch.
+
+<details>
+<summary>Full help</summary>
+
+```text
+Re-queue a conflicted or failed job with the current head of its branch.
+
+Run it in the repository of the job after rebasing or fixing the branch; the branch head is re-read here.
+
+Usage: sluice queue retry <JOB_ID>
+
+Arguments:
+  <JOB_ID>
+          Job id, as shown by `sluice queue status`
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+</details>
+
+#### `sluice queue cancel`
+
+Cancel a job that has not been pushed.
+
+<details>
+<summary>Full help</summary>
+
+```text
+Cancel a job that has not been pushed.
+
+A job that is pushing is only cancelled if `sluice queue reconcile` proves that nothing landed.
+
+Usage: sluice queue cancel <JOB_ID>
+
+Arguments:
+  <JOB_ID>
+          Job id, as shown by `sluice queue status`
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+</details>
+
+#### `sluice queue reconcile`
+
+Resolve trains whose push outcome is unknown (`needs_reconcile`).
+
+<details>
+<summary>Full help</summary>
+
+```text
+Resolve trains whose push outcome is unknown (`needs_reconcile`).
+
+Reads the remote and prints one line per train: the decision (landed, ready, queued, cancelled or refused) and the reason. It never pushes.
+
+Usage: sluice queue reconcile
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+</details>
+
+### `sluice doctor`
+
+Check the installation (git, PSI, daemon, lease, configs, hooks) and optionally collect a redacted diagnostics bundle for bug reports.
+
+<details>
+<summary>Full help</summary>
+
+```text
+Check the installation (git, PSI, daemon, lease, configs, hooks) and optionally collect a redacted diagnostics bundle for bug reports.
+
+Exits 1 when a check fails, 0 otherwise. Never uses the network. `--bundle` writes a `.tar.gz` with the doctor report, versions, configs, `status --json`, `queue status --json`, recent daemon, client and MCP logs and the logs of the last failed jobs. Home paths, secret-looking values and URL credentials are redacted; review the file before attaching it to an issue.
+
+Usage: sluice doctor [OPTIONS]
+
+Options:
+      --json
+          Print machine-readable JSON instead of text
+
+      --bundle [<PATH>]
+          Write a diagnostics bundle (default `./sluice-doctor-<timestamp>.tar.gz`)
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+</details>
+
+### `sluice update`
+
+Update sluice to the latest (or a given) release.
+
+<details>
+<summary>Full help</summary>
+
+```text
+Update sluice to the latest (or a given) release.
+
+Downloads the release archive for this architecture with `curl` (or `wget`), verifies it against `SHA256SUMS`, checks that the new binary runs and replaces the running executable atomically. Then, unless --no-restart, it stops an idle daemon so the next `sluice` call starts the new version; a daemon running gates is left alone. `sluice mcp` servers of agent sessions keep the old binary until the agent reconnects. On a terminal it asks `Update sluice X -> Y? [y/N]`; without one it requires --yes (exit 2). Exit codes: 0 updated, up to date or --check; 1 error (network, checksum, permissions); 2 usage. Environment: `SLUICE_UPDATE_BASE_URL` points at a directory or `file://` URL holding the archives, `SHA256SUMS` and a `LATEST` file (or pass --version).
+
+Usage: sluice update [OPTIONS]
+
+Options:
+      --check
+          Only report whether an update is available; change nothing
+
+      --version <vX.Y.Z>
+          Install this release tag (for example v0.2.0), also an older one
+
+      --yes
+          Do not ask for confirmation (required without a terminal)
+
+      --no-restart
+          Do not stop the daemon after updating
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+</details>
+
+## Exit codes
+
+| Command | Codes |
+|---|---|
+| `sluice run` | 0 pass or cache hit; the gate's own code on failure; 3 refused by `agent_hook_policy = "fail-fast"`; 124 timeout; 143 gate killed by a signal; 1 Sluice error; 2 usage error. |
+| `sluice exec` | The command's own code; 128+N when killed by signal N; 124 on `--timeout`; 143 when the daemon stopped and killed it; 127 not found; 126 not executable; 125 Sluice error after the request was accepted. |
+| `sluice daemon` | 75 when another daemon already holds the lock. |
+| `sluice queue` | 0 ok; 1 error; 2 usage; 4 refused by the state of the queue (`conflict-state`, `not-allowed`, `stale-plan`, `duplicate-branch`). |
+| `sluice doctor` | 1 when a check fails, 0 otherwise. |
+| `sluice update` | 0 updated, up to date or `--check`; 1 error; 2 usage. |
+
+`sluice run --explain <gate>` shows every decision Sluice would take (caller
+detection, policy, tree, key, cache lookup) without running anything.
+
+## Environment variables
+
+| Variable | Effect |
+|---|---|
+| `SLUICE_DISABLE=1` | `sluice run` runs the gate directly (no cache, no budget, no log). Through `sluice mcp` it only turns the cache off. `sluice exec` always runs in-process. |
+| `SLUICE_CACHE=0\|1` | Force the cache off or on (on overrides `CI`). |
+| `CI` | Any value other than `0`, `false`, `no` or `off` disables the cache. |
+| `SLUICE_AGENT=1\|0` | Force agent or human detection. |
+| `SLUICE_JOB` | Set by Sluice on every process it runs. A nested `sluice exec` or `sluice run` then runs directly instead of queueing behind its own parent. Not meant to be set by hand. |
+| `SLUICE_CONFIG` | Path of the user config (default `~/.config/sluice/config.toml`). |
+| `SLUICE_SOCKET` | Override the daemon socket path. |
+| `SLUICE_LOG` | Log filter of `sluice daemon` (written to `~/.local/state/sluice/daemon.log`), `sluice mcp` (stderr and a log file) and `sluice run`; then `[debug] level` of the user config; then `info`. |
+| `SLUICE_UPDATE_BASE_URL` | `sluice update`: a directory or `file://` URL holding the release archives, `SHA256SUMS` and a `LATEST` file. |
+| `SLUICE_VERSION`, `SLUICE_INSTALL_DIR` | `scripts/install.sh` only: release tag to install (default latest) and target directory (default `$HOME/.local/bin`). |
+
+## Files
+
+- Full output of every run: `~/.local/state/sluice/logs/` (`sluice logs`
+  prints the newest one). Other logs live in the same tree; see
+  [debugging.md](debugging.md).
+- Cache markers: `$(git rev-parse --git-common-dir)/sluice/markers/`.
+
+## MCP tools
+
+`verify` (blocks until the gates finish, with progress notifications and
+cancellation), `status`, `gate_list`, `logs`, and for the merge queue
+`queue_enqueue`, `queue_status`, `queue_approve` (refused unless the user
+config sets `[queue] allow_agent_approval = true`), `queue_retry` and
+`queue_cancel`. See [agents.md](agents.md).

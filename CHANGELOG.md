@@ -45,6 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The README is short and current (no development phases, no pinned
+  release numbers); the details moved to `docs/how-it-works.md`,
+  `docs/cli.md` (generated from `--help`) and `docs/configuration.md`.
 - Markers and miss records tolerate unknown fields; cache `prune` also
   removes expired miss records and foreign-format files.
 - Wire enums parse unknown values as `unknown`; an unknown outcome is an
