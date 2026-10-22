@@ -13,11 +13,12 @@
   <img alt="Status: pre-alpha" src="https://img.shields.io/badge/status-pre--alpha-red.svg">
 </p>
 
-> **Status: pre-alpha, Phases 1–3 done.** `sluice run` caches gate results
-> per git tree, a per-user daemon queues misses under a weighted budget and
-> coalesces identical requests, and `sluice mcp` gives coding agents a
-> `verify` tool that blocks safely. Load-aware admission and packaging come
-> next; see the [roadmap](#roadmap).
+> **Status: pre-alpha, Phases 1–4 done.** `sluice run` caches gate results
+> per git tree, a per-user daemon queues misses under a weighted budget,
+> coalesces identical requests and holds new work while the machine is
+> under pressure (Linux PSI), and `sluice mcp` gives coding agents a
+> `verify` tool that blocks safely. A first release and real-world numbers
+> come next; see the [roadmap](#roadmap).
 
 ---
 
@@ -52,8 +53,9 @@ respect that.
 - **Bounds concurrency globally.** A per-user daemon runs gates under a
   budget; each gate declares a weight, so heavy suites take more of it
   than a linter. The queue is FIFO with backfill and a head-of-line
-  reservation so heavy jobs never starve. Phase 4 adds admission by real
-  pressure (PSI).
+  reservation so heavy jobs never starve, and admission pauses while the
+  machine is under real pressure (Linux PSI `some avg10` above 60 % CPU or
+  20 % memory by default, `[admission]` in the user config).
 - **Coalesces identical requests.** Two agents asking for the same tree
   and gate share one run; the second just waits for the first one's
   result. If a marker appears while a request is queued, it completes
@@ -175,9 +177,11 @@ disables the cache; `SLUICE_AGENT=1|0` forces agent or human detection;
 default.
 
 `sluice status` prints the daemon (pid, version, uptime, socket), budget
-use, running and queued jobs with the reason each one waits, and all-time
-totals (runs, passes, failures, timeouts, hits, coalesced requests, time
-saved). `sluice daemon stop` lets running gates finish and waits for the
+use, system pressure (`pressure: cpu 12.3% mem 0.4% (ok|blocking admission|unavailable)`),
+running and queued jobs with the reason each one waits (`budget`,
+`repo-cap`, `head-reserved`, `psi`), and all-time totals (runs, passes,
+failures, timeouts, hits, coalesced requests, time saved). `--json` is the
+stable export for dashboards (schema 1). `sluice daemon stop` lets running gates finish and waits for the
 daemon to exit; `--force` kills them. `sluice daemon` exits 75 when a
 daemon is already running.
 
@@ -192,7 +196,7 @@ progress notifications and cancellation), `status`, `gate_list`, `logs`.
 | 1 | Cache only, no daemon: `sluice run`, markers, TTL, hook snippets, agent detection and `agent_hook_policy`, a file-lock semaphore | done |
 | 2 | Daemon: budget scheduler, coalescing, process groups, timeouts, SQLite metrics, `sluice status` | done |
 | 3 | MCP server (`verify`, `status`, `gate_list`, `logs`), `docs/agents.md` | done (manual two-agent run pending) |
-| 4 | PSI-based admission, stable `--json` schema, metrics export | next |
+| 4 | PSI-based admission, stable `--json` schema (`sluice status --json` is the metrics export) | done |
 | 5 | Release builds, install script, real-world numbers | |
 
 Design history lives in [`kb/`](kb/sluice/plan/master-plan.md): the plan,

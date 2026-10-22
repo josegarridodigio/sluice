@@ -116,9 +116,11 @@ A pass whose request had a `key` but no `tree` is reported with
 adds a test. `sluice status --json` prints this object (pretty-printed,
 without the `type`/`id` envelope); with no daemon running it prints
 `{"schema":1,"daemon":null}`, so `daemon` is nullable in the CLI output
-and every other field is absent in that case. Queued `reason` precedence:
-`budget` when the job does not fit the budget, then `repo-cap`, then
-`head-reserved` for jobs behind a reserved head; `psi` only from Phase 4.
+and every other field is absent in that case. Queued `reason` precedence: `psi` for every queued job while PSI blocks,
+else `budget` when the job does not fit the budget, then `repo-cap`, then
+`head-reserved` for jobs behind a reserved head. `budget.psi.enabled` is
+false both when PSI is disabled in the config and when the kernel offers
+none; `totals.psi_blocked_ms_total` is per daemon instance.
 `totals` are all-time over the database (`since` = oldest job or event);
 `runs` counts every finished job except `orphaned` (so `cached` and
 `error` outcomes count), `hits` counts only client `event`s, coalescing is

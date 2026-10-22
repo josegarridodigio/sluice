@@ -84,7 +84,7 @@ enum Command {
         #[command(subcommand)]
         command: Option<DaemonCommand>,
     },
-    /// Show the daemon, budget, running and queued jobs, and totals.
+    /// Show the daemon, budget, system pressure (PSI), running and queued jobs, and totals.
     Status {
         /// Print machine-readable JSON instead of text.
         #[arg(long)]

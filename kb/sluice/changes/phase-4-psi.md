@@ -24,5 +24,9 @@ Implements [[sluice/plan/master-plan.md]] Phase 4 from
 ## Verification
 
 `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-`cargo test --workspace` green (agent run, 2026-10-22). Acceptance evidence
-and the measured pressure numbers: [[sluice/changes/phase-4-acceptance.md]].
+`cargo test --workspace`: 229 passed, 0 failed (2026-10-22, lead's run after
+the Phase 3 fixes landed). Acceptance evidence and the measured pressure
+numbers: [[sluice/changes/phase-4-acceptance.md]]. Reconciliation:
+[[sluice/changes/phase-4-reconciliation.md]] (36 findings: thresholds now
+validated as percentages, the rest documented). The daemon tests share a
+process-wide log capture for the PSI log assertions.

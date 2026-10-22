@@ -5,13 +5,17 @@
 #   loops    number of busy loops to start (default: nproc)
 #   seconds  how long to sample /proc/pressure/cpu, once per second (default 15)
 #
-# Starts the busy loops, prints the `some` line of /proc/pressure/cpu every
-# second, then stops the loops (also on Ctrl-C). Used to record real numbers
-# for the Phase 4 acceptance document; not a CI test. Exits 2 when the
-# kernel has no PSI (missing /proc/pressure or booted with psi=0).
+# Prints a `baseline:` line, starts the busy loops, prints the `some` line of
+# /proc/pressure/cpu every second, stops the loops (also on Ctrl-C) and prints
+# an `after:` line one second later. Used to record real numbers for the
+# Phase 4 acceptance document; not a CI test. Exits 2 when the kernel has no
+# PSI (missing /proc/pressure or booted with psi=0), 1 on a bad argument.
 set -eu
 
 LOOPS="${1:-$(nproc)}"
+case "$LOOPS" in
+    ''|*[!0-9]*) echo "loops must be a positive integer, got '$LOOPS'" >&2; exit 1 ;;
+esac
 SECONDS_TO_SAMPLE="${2:-15}"
 PSI=/proc/pressure/cpu
 

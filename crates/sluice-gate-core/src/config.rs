@@ -577,6 +577,23 @@ impl UserConfig {
                 "admission.psi_max_wait must be greater than zero",
             ));
         }
+        for (name, value) in [
+            (
+                "admission.cpu_some_avg10_max",
+                cfg.admission.cpu_some_avg10_max,
+            ),
+            (
+                "admission.memory_some_avg10_max",
+                cfg.admission.memory_some_avg10_max,
+            ),
+        ] {
+            if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+                return Err(config_err(
+                    path,
+                    &format!("{name} must be a percentage between 0 and 100, got {value}"),
+                ));
+            }
+        }
         for (repo, over) in &cfg.repos {
             if over.budget_share_max == Some(0) {
                 return Err(config_err(
@@ -1001,5 +1018,25 @@ budget_share_max = 4
                 || user_err("version = 1\n[admission]\npsi_max_wait = \"soon\"\n")
                     .contains("invalid")
         );
+    }
+}
+
+#[cfg(test)]
+mod psi_threshold_tests {
+    use super::UserConfig;
+    use std::path::Path;
+
+    #[test]
+    fn psi_thresholds_must_be_percentages() {
+        for bad in ["-1.0", "100.5", "nan"] {
+            let text = format!("version = 1\n[admission]\ncpu_some_avg10_max = {bad}\n");
+            let err = UserConfig::parse(&text, Path::new("u.toml")).unwrap_err();
+            assert!(
+                err.to_string().contains("cpu_some_avg10_max"),
+                "{bad}: {err}"
+            );
+        }
+        let ok = "version = 1\n[admission]\nmemory_some_avg10_max = 0.0\n";
+        assert!(UserConfig::parse(ok, Path::new("u.toml")).is_ok());
     }
 }

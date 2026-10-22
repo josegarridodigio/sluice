@@ -516,7 +516,8 @@ pub struct Totals {
     /// Estimated time saved by caching and coalescing, in milliseconds.
     pub time_saved_ms: u64,
     /// Time PSI admission spent blocking new jobs, in milliseconds (current
-    /// daemon instance only; 0 when PSI is unavailable).
+    /// daemon instance only, accumulated per sample; keeps what accrued if PSI
+    /// later becomes unavailable).
     pub psi_blocked_ms_total: u64,
 }
 

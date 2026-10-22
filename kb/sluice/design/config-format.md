@@ -101,7 +101,7 @@ psi_enabled = true
 cpu_some_avg10_max = 60.0  # percent; do not admit new jobs above this
 memory_some_avg10_max = 20.0
 psi_poll_interval = "1s"
-psi_max_wait = "5m"        # admit the head anyway after this long blocked by PSI (must be > 0)
+psi_max_wait = "5m"        # while PSI blocks, admit the queue head once it has waited this long (must be > 0)
 
 [mcp]
 progress_interval = "15s"  # progress notifications while verify runs (floored at 1s, re-read per call)
@@ -140,8 +140,12 @@ through to the `CI` rule.
 User config notes: every section and field is optional (a missing file
 means defaults); unknown fields are errors; validation: `daemon.budget >= 1`,
 `daemon.nice <= 19`, `daemon.ionice_level <= 7`, `admission.psi_poll_interval > 0`,
-`budget_share_max >= 1`. `daemon.idle_exit` (always "never" in v1) is parsed and validated but has
-no effect; everything else is live
+`admission.psi_max_wait > 0`, `admission.cpu_some_avg10_max` and
+`memory_some_avg10_max` in `[0, 100]`, `budget_share_max >= 1`. `daemon.idle_exit` (always "never" in v1) is parsed and validated but has
+no effect. The daemon reads `[daemon]`, `[scheduler]`, `[admission]`,
+`[repos]` and `cache.*` once at start (`sluice daemon stop` to apply
+changes); the client and the MCP server re-read the file per call.
+Everything else is live
 (`log_retention_days` prunes job logs daily from the daemon;
 `mcp.progress_interval` paces `verify`'s progress notifications).
 

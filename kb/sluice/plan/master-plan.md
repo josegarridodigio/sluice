@@ -148,7 +148,7 @@ Tasks:
 - [x] `psi.rs` sampler and admission state machine; server integration; `psi_max_wait`; status fields; `pressure:` line.
 - [x] Frozen `status --json` schema test with fixture.
 - [x] Integration tests with fake PSI files; `scripts/psi-pressure-demo.sh` measurements.
-- [ ] Reconciliation pass ([[sluice/changes/phase-4-reconciliation.md]]).
+- [x] Reconciliation pass ([[sluice/changes/phase-4-reconciliation.md]]): 36 findings; thresholds validated, docs corrected, metrics export defined as `status --json`.
 
 Deliverables: PSI-based admission, stable `sluice status --json` schema,
 metrics export (time saved, hit rate, wait times) for the user's existing HTML

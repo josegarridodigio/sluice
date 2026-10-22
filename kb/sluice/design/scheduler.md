@@ -70,9 +70,11 @@ for job in queue (oldest first):
   (default 30 s; `0s` means strict FIFO with no backfill), nothing behind
   it starts until it fits. Capacity drains and the heavy job runs. This
   bounds the head's extra wait to `head_reserve_after + longest running
-  job`. The reservation fires only when the head is blocked by the budget
-  (or, from Phase 4, by PSI); a head blocked only by its repository cap
-  does not stop other repositories.
+  job`. The reservation fires only when the head is blocked by the budget;
+  a head blocked only by its repository cap does not stop other
+  repositories, and while PSI blocks nothing is admitted and no
+  reservation is evaluated (the PSI starvation guard is separate, see
+  [[sluice/design/psi-admission.md]]).
 - Weights are clamped at enqueue time (see Model); there is no dynamic
   resizing.
 
