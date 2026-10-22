@@ -39,22 +39,33 @@ Procedure, ported from gate-cache's `_private_snapshot` (see
 5. `git -c core.splitIndex=false write-tree` with the same env returns the tree hash.
 6. Remove the scratch dir (also on error).
 
-Before step 3 a single `git ls-files -v -z` on the copied index rejects
-unmerged entries, assume-unchanged (lowercase tag) and skip-worktree
-(`S`) entries as unknown. Five git spawns in total on the hit path; the
-measured cost is in [[sluice/changes/hit-path-latency.md]].
+Before step 2 a single read-only `git ls-files -v -z` (with
+`--no-optional-locks`, against the index git handed us) rejects unmerged
+entries, assume-unchanged (lowercase tag) and skip-worktree (`S`) entries
+as unknown. Five git spawns in total on the hit path; the measured cost is
+in [[sluice/changes/hit-path-latency.md]]. The reasons printed are
+`unmerged index: <path>`, `skip-worktree or assume-unchanged entry: <path>`,
+`submodules are not supported yet: <path>`, `could not stage working copy: …`
+and `could not write tree: …`.
 
-Read-only probes (`rev-parse`, `status`, `ls-files`) always pass
-`--no-optional-locks` so a cache check never blocks on `index.lock` held by
-another agent.
+Read-only probes (`rev-parse`, `ls-files`, `config --get core.worktree`)
+always pass `--no-optional-locks` so a cache check never blocks on
+`index.lock` held by another agent. `git rev-parse --local-env-vars` is
+spawned only when a gate actually runs (or has `key_inputs`), to build the
+sanitised gate environment.
 
 **Unknown tree policy** (also from gate-cache): unmerged index, skip-worktree
 or assume-unchanged entries, any gitlink in the index, or any git error make
 the tree *unknown*. (Case-only mismatches on `core.ignorecase` are not
 checked: Linux only, case-sensitive filesystems assumed.)
 An unknown tree never fails the gate: Sluice runs the gate uncached (still
-queued in Phase 2) and prints the reason. A cache error must never change
-the gate's exit code.
+queued in Phase 2) and prints the reason. The same holds for every cache
+error (`cannot snapshot the tree`, `cannot derive the cache key`,
+`cannot read the cache`): a notice on stderr, then an uncached run. A
+cache error must never change the gate's exit code. Because an uncached
+run can never be cached, the agent `fail-fast` policy does not apply in
+these cases either (nor under `CI` / `SLUICE_CACHE=0` / `cache = false`):
+the gate simply runs.
 
 Cost: five git spawns plus an index copy; `git add -A` stat calls dominate
 on large repositories. Measured in [[sluice/changes/hit-path-latency.md]]
@@ -68,8 +79,8 @@ Git exports variables to hook processes; Sluice reads them explicitly:
 | Hook | Relevant env | Content to hash |
 |---|---|---|
 | `pre-commit` | `GIT_INDEX_FILE` points at the index being committed (or a temp index for `git commit -a` / partial commits) | Same procedure as outside hooks: copy the index git gave us, then `add -A` on top. The result is the **working tree** content, which is what the gate command actually sees. Hook managers that stash unstaged changes (pre-commit/prek, lefthook with `stage_fixed`) make it equal to the committed tree; Husky and plain hooks do not. The marker additionally records `committed_tree` (`write-tree` from the copied hook index without `add -A`, one extra spawn only inside `pre-commit`). In Phase 1 it is recorded but not used for lookups; a secondary lookup by committed tree (so that a `pre-push` after a commit made with unstaged changes can hit) is planned for Phase 2 and tracked in [[sluice/design/committed-tree-lookup.md]]. When the working tree was clean apart from the staged changes, the working-tree hash equals the committed tree and the normal lookup already hits at push time. Confirmed as the draft answer to Q12 in [[sluice/questions/open-questions.md]]. |
-| `pre-push` | `GIT_DIR`, stdin lists `<local ref> <local sha> <remote ref> <remote sha>` | For each pushed commit range, the tree is `<local sha>^{tree}` only if the worktree is clean; otherwise fall back to the working-tree hash. Both are computed cheaply. |
-| `commit-msg`, `post-*` | same as pre-commit | Not a target in v1. |
+| `pre-push` | `GIT_DIR` (stdin lists the pushed refs; Sluice does not read it) | Working-tree hash, like everywhere else. On a clean checkout that equals the pushed commit's tree, so a pass recorded at commit time hits. |
+| other hooks | whatever git exports | Same working-tree hash; the hook policy applies to any `--hook` value (or whenever `GIT_DIR`/`GIT_INDEX_FILE` is present). Only `pre-commit` triggers the `committed_tree` record. |
 
 When `GIT_DIR` is set without `GIT_WORK_TREE` (plain hooks), git treats the
 cwd as the worktree top; derive the real worktree (parent of `.git`, or the
@@ -121,7 +132,7 @@ repository share the common dir, so they share markers.
   "passed_at": "2026-10-22T13:05:11Z",
   "duration_ms": 32100,
   "exit_code": 0,
-  "job_id": "01J…",
+  "job_id": "1761138311123-4242-0a1b2c",
   "sluice_version": "0.1.0",
   "committed_tree": "…"   
 }
@@ -137,18 +148,40 @@ Rules:
 - A run that exits 0 but **changed the tree** (tree hash recomputed after the
   run differs) does not write a marker: auto-fixers must be re-verified on
   the new tree.
-- TTL: a marker older than `cache.ttl_days` is ignored and removed lazily
-  (pruning on write only, mtime-based, errors swallowed).
-- `sluice cache clear [--gate <name>]` removes markers for the current repo.
-- `sluice cache status` lists markers for the current tree with age.
+- TTL: a marker older than `cache.ttl_days` (by file mtime or `passed_at`,
+  whichever is older) is deleted when it is read and treated as a miss;
+  `prune` (called after every marker write) additionally removes markers
+  older than the TTL by mtime. Miss records never expire on their own.
+- `sluice cache clear [--gate <name>]` removes markers **and miss records**
+  of the current repository (optionally one gate) and prints the count.
+- `sluice cache status [--all]` prints the markers directory, the current
+  tree, and one line per configured gate: `HIT (passed <age> ago, job <id>)`,
+  `MISS (last run <age> ago: <reason>, exit <code>)`, `MISS`,
+  `always runs (cache = false)` or `ERROR (<why>)`. It runs the gates'
+  `key_inputs` to derive their keys. `--all` appends every stored marker
+  (gate, age, tree and key prefixes).
 - **Miss records**: a failed run, a timeout or a tree-changing pass writes
-  `<key>.miss.json` with `exit_code`, `reason`, `job_id`, `log_path` and a
-  timestamp. A later pass deletes it. `sluice cache status` and the MCP
+  `<key>.miss.json`:
+
+  ```json
+  {"format": 1, "key": "…", "gate": "test", "exit_code": 1,
+   "reason": "gate failed", "job_id": "…", "log_path": "/…/<job>.log",
+   "recorded_at": "2026-10-22T13:05:11Z"}
+  ```
+
+  `reason` is `gate failed`, `timed out` or `the gate modified the tree`
+  (that one with `exit_code: 0`); `exit_code` is `null` when the gate died
+  from a signal. Miss records are written only when caching was active and
+  the tree known. A later pass of the same key deletes the record. `sluice cache status` and the MCP
   `status` tool report it, which is exactly what an agent asks ("why did
   this fail last time?"). Interrupted runs write nothing.
-- The key derivation and the marker path are a **public contract**
-  documented in the README, so shell snippets can check a marker without
-  Sluice if they ever need to.
+- The key derivation (byte layout above), the marker path
+  `<common-dir>/sluice/markers/<key>.json` and the marker JSON are a
+  **public contract**: this document is referenced from the README so
+  shell snippets can check a marker without Sluice if they ever need to.
+  Markers are pretty-printed JSON with a trailing newline, written via
+  `.tmp-<pid>-<n>` files, `fsync` and rename; the directory is `0700`.
+  A marker with unknown fields is treated as corrupt (strict schema).
 - The daemon writes markers with its job id and daemon instance id; a
   marker from an unknown daemon instance is still valid (markers are facts
   about trees, not about processes).
@@ -157,8 +190,11 @@ Rules:
 
 - `CI` set and `SLUICE_CACHE != 1`: no reads, no writes.
 - `SLUICE_CACHE=0`: no reads, no writes.
-- `SLUICE_DISABLE=1`: Sluice runs the gate directly (inherited stdio, no
-  log, no queue) and exits with its code.
+- `SLUICE_DISABLE=1`: Sluice still needs the repository and `.sluice.toml`
+  to know the gate command, but reads no user config, no marker, takes no
+  slot and writes no log: it runs `sh -c '<cmd> "$@"'` with inherited stdio
+  and the sanitised environment, and exits with the gate's code (143 after
+  a signal).
 - Truthiness: `1`, `true`, `yes`, `on` (case-insensitive) are true; `0`,
   `false`, `no`, `off` are false; `CI` counts as set unless it is false.
 

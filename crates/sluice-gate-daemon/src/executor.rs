@@ -1,1 +1,689 @@
-//! Placeholder: implemented in Phase 2 (see kb/sluice/design/executor.md).
+//! Runs one gate process: a new process group, CPU and I/O priority, both
+//! output pipes captured into one log, a timeout and a cancel sequence.
+//!
+//! Design: `kb/sluice/design/executor.md`, section "Executor". The log keeps
+//! the Phase 1 framing: a `# sluice job …` / `# command: …` header followed
+//! by a blank line, the interleaved output, and a `# exit: …` footer.
+
+use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::{Child, Command};
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
+
+use crate::{Error, Result};
+
+/// Grace period between SIGTERM and SIGKILL on timeout and cancel.
+pub const KILL_GRACE: Duration = Duration::from_secs(5);
+
+/// Size of the chunks read from the child's pipes.
+const CHUNK: usize = 8 * 1024;
+
+/// Polling interval while waiting for a process group to disappear.
+const POLL: Duration = Duration::from_millis(20);
+
+/// Everything needed to run one gate.
+#[derive(Debug, Clone)]
+pub struct ExecSpec {
+    /// Job identifier (used in the log header).
+    pub job_id: String,
+    /// Gate name (used in the log header).
+    pub gate: String,
+    /// Shell command of the gate.
+    pub cmd: String,
+    /// Extra arguments appended to the command as `"$@"`.
+    pub extra: Vec<String>,
+    /// Working directory of the gate.
+    pub cwd: PathBuf,
+    /// Complete environment of the gate (nothing else is inherited).
+    pub env: BTreeMap<String, String>,
+    /// Maximum run time, measured from the spawn.
+    pub timeout: Duration,
+    /// CPU niceness applied to the gate's leader process.
+    pub nice: u8,
+    /// I/O priority, applied through the `ionice` binary when present.
+    pub ionice: Option<IoPriority>,
+    /// Log file; created (with its parent directories) and truncated.
+    pub log_path: PathBuf,
+}
+
+/// I/O scheduling priority for `ionice`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoPriority {
+    /// Scheduling class.
+    pub class: IoClass,
+    /// Level within the class (0 highest, 7 lowest; ignored by `Idle`).
+    pub level: u8,
+}
+
+/// I/O scheduling class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoClass {
+    /// Best-effort (`ionice -c 2`).
+    BestEffort,
+    /// Idle (`ionice -c 3`).
+    Idle,
+}
+
+impl IoClass {
+    /// Numeric class understood by `ionice -c`.
+    fn number(self) -> u8 {
+        match self {
+            Self::BestEffort => 2,
+            Self::Idle => 3,
+        }
+    }
+}
+
+/// How a gate run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecStatus {
+    /// The gate exited on its own with this code.
+    Exited(i32),
+    /// The gate was terminated by a signal it did not get from us.
+    Signaled,
+    /// The timeout expired and the group was killed.
+    Timeout,
+    /// The run was cancelled and the group was killed.
+    Killed,
+}
+
+/// Result of a finished run.
+#[derive(Debug, Clone)]
+pub struct Finished {
+    /// How the run ended.
+    pub status: ExecStatus,
+    /// Time from spawn to exit.
+    pub duration: Duration,
+    /// Total bytes written to the log (header and footer included).
+    pub log_bytes: u64,
+    /// The log file.
+    pub log_path: PathBuf,
+}
+
+/// Identity of the spawned process, for persistence and orphan reconciliation.
+#[derive(Debug, Clone)]
+pub struct ProcessInfo {
+    /// Pid of the gate's leader (`sh`).
+    pub pid: u32,
+    /// Process group id (equal to `pid`).
+    pub pgid: i32,
+    /// Start time in clock ticks (field 22 of `/proc/<pid>/stat`).
+    pub proc_start_ticks: Option<u64>,
+    /// Spawn time, unix milliseconds.
+    pub started_at: u64,
+}
+
+/// Cloneable handle on a running gate, usable while [`Running::wait`] is pending.
+#[derive(Debug, Clone)]
+pub struct RunningHandle {
+    cancel: Arc<Notify>,
+    bytes: Arc<AtomicU64>,
+}
+
+impl RunningHandle {
+    /// Requests the kill sequence; `wait` then resolves with [`ExecStatus::Killed`].
+    pub fn cancel(&self) {
+        self.cancel.notify_one();
+    }
+
+    /// Bytes written to the log so far.
+    pub fn log_bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+}
+
+/// A gate that is running.
+#[derive(Debug)]
+pub struct Running {
+    child: Child,
+    pumps: Vec<JoinHandle<()>>,
+    handle: RunningHandle,
+    info: ProcessInfo,
+    log: Arc<Mutex<File>>,
+    log_path: PathBuf,
+    started: Instant,
+    timeout: Duration,
+}
+
+impl Running {
+    /// Identity of the spawned process.
+    pub fn info(&self) -> &ProcessInfo {
+        &self.info
+    }
+
+    /// Bytes written to the log so far (for progress events).
+    pub fn log_bytes(&self) -> u64 {
+        self.handle.log_bytes()
+    }
+
+    /// Requests the kill sequence (SIGTERM to the group, 5 s grace, SIGKILL);
+    /// `wait` then resolves with [`ExecStatus::Killed`].
+    pub fn cancel(&self) {
+        self.handle.cancel();
+    }
+
+    /// A cloneable handle to cancel or observe the run while `wait` is pending.
+    pub fn handle(&self) -> RunningHandle {
+        self.handle.clone()
+    }
+
+    /// Waits for the process to exit (or the timeout/cancel sequence to
+    /// complete) and for both output pumps to finish, writes the footer and
+    /// returns the result.
+    pub async fn wait(mut self) -> Finished {
+        let pgid = self.info.pgid;
+        let deadline = tokio::time::Instant::from_std(self.started + self.timeout);
+        let cancel = Arc::clone(&self.handle.cancel);
+
+        let (exit, forced) = tokio::select! {
+            status = self.child.wait() => (status.ok(), None),
+            () = tokio::time::sleep_until(deadline) => (None, Some(ExecStatus::Timeout)),
+            () = cancel.notified() => (None, Some(ExecStatus::Killed)),
+        };
+        let exit = if forced.is_some() {
+            let ((), status) = tokio::join!(terminate_group(pgid, KILL_GRACE), self.child.wait());
+            status.ok()
+        } else {
+            exit
+        };
+        let duration = self.started.elapsed();
+
+        // The leader is gone; output may still be buffered or held by
+        // background processes of the group. Keep honouring the deadline and
+        // cancel so a lingering grandchild cannot hang the run forever.
+        let mut pumps = std::pin::pin!(join_all(std::mem::take(&mut self.pumps)));
+        if forced.is_some() {
+            pumps.await;
+        } else {
+            tokio::select! {
+                () = &mut pumps => {}
+                () = tokio::time::sleep_until(deadline) => {
+                    kill_group(pgid, Signal::SIGKILL);
+                    pumps.await;
+                }
+                () = cancel.notified() => {
+                    kill_group(pgid, Signal::SIGKILL);
+                    pumps.await;
+                }
+            }
+        }
+
+        let status = forced.unwrap_or_else(|| exit_status(exit));
+        let code = exit
+            .and_then(|s| s.code())
+            .map_or_else(|| "signal".to_owned(), |c| c.to_string());
+        let suffix = match status {
+            ExecStatus::Timeout => " (timed out)",
+            ExecStatus::Killed => " (killed)",
+            ExecStatus::Exited(_) | ExecStatus::Signaled => "",
+        };
+        let footer = format!(
+            "\n# exit: {code} after {:.1}s{suffix}\n",
+            duration.as_secs_f64()
+        );
+        write_log(&self.log, &self.handle.bytes, footer.as_bytes());
+        if let Ok(mut file) = self.log.lock() {
+            let _ = file.flush();
+        }
+
+        Finished {
+            status,
+            duration,
+            log_bytes: self.handle.log_bytes(),
+            log_path: self.log_path,
+        }
+    }
+}
+
+/// Maps the leader's exit status to an [`ExecStatus`].
+fn exit_status(exit: Option<ExitStatus>) -> ExecStatus {
+    exit.and_then(|s| s.code())
+        .map_or(ExecStatus::Signaled, ExecStatus::Exited)
+}
+
+/// Awaits every task, ignoring panics.
+async fn join_all(tasks: Vec<JoinHandle<()>>) {
+    for task in tasks {
+        let _ = task.await;
+    }
+}
+
+/// Spawns `sh -c '<cmd> "$@"' sh <extra...>` in its own process group, with
+/// exactly `spec.env` as environment, stdin null and both outputs captured
+/// into `spec.log_path` behind the Phase 1 header.
+///
+/// Priorities are applied right after the spawn through the `renice` and
+/// `ionice` binaries when they are in `PATH` (failures are ignored).
+///
+/// # Errors
+///
+/// [`Error::Io`] when the log cannot be created or the process cannot start
+/// (for example, a missing working directory).
+pub async fn spawn(spec: ExecSpec) -> Result<Running> {
+    let io = |context: String| move |source| Error::Io { context, source };
+
+    if let Some(parent) = spec.log_path.parent() {
+        fs::create_dir_all(parent).map_err(io(format!("cannot create {}", parent.display())))?;
+    }
+    let file = File::create(&spec.log_path)
+        .map_err(io(format!("cannot create {}", spec.log_path.display())))?;
+    let log = Arc::new(Mutex::new(file));
+    let bytes = Arc::new(AtomicU64::new(0));
+    let header = format!(
+        "# sluice job {}: gate '{}' in {}\n# command: {}\n\n",
+        spec.job_id,
+        spec.gate,
+        spec.cwd.display(),
+        spec.cmd
+    );
+    write_log(&log, &bytes, header.as_bytes());
+
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(format!("{} \"$@\"", spec.cmd))
+        .arg("sh")
+        .args(&spec.extra)
+        .current_dir(&spec.cwd)
+        .env_clear()
+        .envs(&spec.env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(false)
+        .spawn()
+        .map_err(io(format!(
+            "cannot start gate '{}' in {}",
+            spec.gate,
+            spec.cwd.display()
+        )))?;
+    let started = Instant::now();
+    let started_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    let Some(pid) = child.id() else {
+        return Err(Error::Io {
+            context: format!("gate '{}' exited before it could be tracked", spec.gate),
+            source: std::io::Error::other("no pid"),
+        });
+    };
+    let group = i32::try_from(pid).unwrap_or(i32::MAX);
+    let proc_start_ticks = proc_start_ticks(pid);
+
+    apply_priority(pid, spec.nice, spec.ionice).await;
+
+    let mut pumps = Vec::with_capacity(2);
+    if let Some(out) = child.stdout.take() {
+        pumps.push(tokio::spawn(pump(
+            out,
+            Arc::clone(&log),
+            Arc::clone(&bytes),
+        )));
+    }
+    if let Some(err) = child.stderr.take() {
+        pumps.push(tokio::spawn(pump(
+            err,
+            Arc::clone(&log),
+            Arc::clone(&bytes),
+        )));
+    }
+
+    Ok(Running {
+        child,
+        pumps,
+        handle: RunningHandle {
+            cancel: Arc::new(Notify::new()),
+            bytes,
+        },
+        info: ProcessInfo {
+            pid,
+            pgid: group,
+            proc_start_ticks,
+            started_at,
+        },
+        log,
+        log_path: spec.log_path,
+        started,
+        timeout: spec.timeout,
+    })
+}
+
+/// Lowers the CPU and I/O priority of `pid` with the `renice` and `ionice`
+/// binaries. Everything here is best effort.
+async fn apply_priority(pid: u32, nice: u8, ionice: Option<IoPriority>) {
+    if nice > 0 {
+        if let Some(renice) = find_in_path("renice") {
+            run_quietly(Command::new(renice).args([
+                "-n",
+                &nice.to_string(),
+                "-p",
+                &pid.to_string(),
+            ]))
+            .await;
+        } else {
+            tracing::debug!("renice not found; gate {pid} keeps the daemon's niceness");
+        }
+    }
+    if let Some(prio) = ionice {
+        if let Some(ionice) = find_in_path("ionice") {
+            run_quietly(Command::new(ionice).args([
+                "-c",
+                &prio.class.number().to_string(),
+                "-n",
+                &prio.level.to_string(),
+                "-p",
+                &pid.to_string(),
+            ]))
+            .await;
+        } else {
+            tracing::debug!("ionice not found; gate {pid} keeps the default I/O class");
+        }
+    }
+}
+
+/// Runs a helper command with null stdio, logging failures at debug level.
+async fn run_quietly(cmd: &mut Command) {
+    let result = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    match result {
+        Ok(status) if status.success() => {}
+        Ok(status) => tracing::debug!("priority helper {cmd:?} ended with {status}"),
+        Err(e) => tracing::debug!("priority helper {cmd:?} failed: {e}"),
+    }
+}
+
+/// Finds an executable named `name` in the daemon's `PATH`.
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|p| fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+}
+
+/// Appends `data` to the log and adds its length to the byte counter.
+fn write_log(log: &Mutex<File>, bytes: &AtomicU64, data: &[u8]) {
+    if let Ok(mut file) = log.lock()
+        && file.write_all(data).is_ok()
+    {
+        bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Copies a child stream into the log in 8 KiB chunks until end of file.
+async fn pump<R: AsyncRead + Unpin>(mut reader: R, log: Arc<Mutex<File>>, bytes: Arc<AtomicU64>) {
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => write_log(&log, &bytes, &buf[..n]),
+        }
+    }
+}
+
+/// Sends `signal` to the whole process group `pgid`. Errors (typically
+/// `ESRCH`, the group is gone) are ignored.
+pub fn kill_group(pgid: i32, signal: Signal) {
+    if pgid > 1 {
+        let _ = killpg(Pid::from_raw(pgid), signal);
+    }
+}
+
+/// True while at least one process (zombies included) belongs to `pgid`.
+fn group_alive(pgid: i32) -> bool {
+    pgid > 1 && killpg(Pid::from_raw(pgid), None).is_ok()
+}
+
+/// Sends SIGTERM to the group, then SIGKILL after `grace` unless the group
+/// is gone sooner. Used on timeout, cancel and orphan reconciliation.
+pub async fn terminate_group(pgid: i32, grace: Duration) {
+    if !group_alive(pgid) {
+        return;
+    }
+    kill_group(pgid, Signal::SIGTERM);
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if !group_alive(pgid) {
+            return;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    kill_group(pgid, Signal::SIGKILL);
+}
+
+/// True when `/proc/<pid>` exists and its start ticks equal `expected`
+/// (guard against pid reuse); false otherwise, including when `expected`
+/// is `None`.
+pub fn process_matches(pid: u32, expected: Option<u64>) -> bool {
+    expected.is_some() && proc_start_ticks(pid) == expected
+}
+
+/// Start time of `pid` in clock ticks since boot: field 22 of
+/// `/proc/<pid>/stat`. `None` when the process does not exist.
+pub fn proc_start_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // "<pid> (<comm>) <state> ..."; comm may contain spaces and parentheses,
+    // so fields are counted after the last ')': index 0 is field 3.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Last `n` lines of a file (empty when it cannot be read).
+pub fn tail_lines(path: &Path, n: usize) -> Vec<String> {
+    let Ok(file) = File::open(path) else {
+        return Vec::new();
+    };
+    let mut all: Vec<String> = BufReader::new(file)
+        .lines()
+        .map_while(std::result::Result::ok)
+        .collect();
+    let start = all.len().saturating_sub(n);
+    all.split_off(start)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(dir: &Path, cmd: &str) -> ExecSpec {
+        let mut env = BTreeMap::new();
+        env.insert(
+            "PATH".to_owned(),
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_owned()),
+        );
+        ExecSpec {
+            job_id: "j1".to_owned(),
+            gate: "test".to_owned(),
+            cmd: cmd.to_owned(),
+            extra: Vec::new(),
+            cwd: dir.to_path_buf(),
+            env,
+            timeout: Duration::from_secs(20),
+            nice: 5,
+            ionice: Some(IoPriority {
+                class: IoClass::Idle,
+                level: 7,
+            }),
+            log_path: dir.join("logs").join("j1.log"),
+        }
+    }
+
+    fn read(path: &Path) -> String {
+        fs::read_to_string(path).unwrap()
+    }
+
+    /// Members of `pgid`, found by scanning `/proc` (field 5 is the pgrp).
+    fn group_members(pgid: i32) -> Vec<i32> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir("/proc")
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+        {
+            let Ok(member) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                continue;
+            };
+            let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let Some(i) = stat.rfind(')') else { continue };
+            let fields: Vec<&str> = stat[i + 1..].split_whitespace().collect();
+            if fields.first() != Some(&"Z") && fields.get(2) == Some(&pgid.to_string().as_str()) {
+                out.push(member);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn exit_code_output_and_footer() {
+        let dir = tempfile::tempdir().unwrap();
+        let running = spawn(spec(dir.path(), "echo out; echo err >&2; exit 3"))
+            .await
+            .unwrap();
+        let done = running.wait().await;
+        assert_eq!(done.status, ExecStatus::Exited(3));
+        assert!(done.log_bytes > 0);
+        let log = read(&done.log_path);
+        assert!(log.starts_with(&format!(
+            "# sluice job j1: gate 'test' in {}\n# command: echo out; echo err >&2; exit 3\n\n",
+            dir.path().display()
+        )));
+        assert!(log.contains("out\n"));
+        assert!(log.contains("err\n"));
+        assert!(log.contains("\n# exit: 3 after "), "{log}");
+        assert_eq!(done.log_bytes, log.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn extra_args_reach_the_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = spec(dir.path(), "echo");
+        s.extra = vec!["a".to_owned(), "b".to_owned()];
+        let done = spawn(s).await.unwrap().wait().await;
+        assert_eq!(done.status, ExecStatus::Exited(0));
+        assert!(read(&done.log_path).contains("\na b\n"));
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_the_whole_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = spec(dir.path(), "sh -c 'sleep 30; true' & sleep 30");
+        s.timeout = Duration::from_millis(300);
+        let running = spawn(s).await.unwrap();
+        let info = running.info().clone();
+        assert_eq!(i64::from(info.pid), i64::from(info.pgid));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(group_members(info.pgid).len() >= 3, "grandchildren running");
+        let t = Instant::now();
+        let done = running.wait().await;
+        assert_eq!(done.status, ExecStatus::Timeout);
+        assert!(t.elapsed() < Duration::from_secs(2));
+        assert!(!Path::new(&format!("/proc/{}", info.pid)).exists());
+        let ok = std::process::Command::new("kill")
+            .args(["-0", &info.pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!ok.success());
+        // SIGKILLed members may linger as zombies until init reaps them.
+        for _ in 0..50 {
+            if group_members(info.pgid).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(group_members(info.pgid), Vec::<i32>::new());
+        assert!(read(&done.log_path).contains("(timed out)"));
+    }
+
+    #[tokio::test]
+    async fn cancel_kills_the_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let running = spawn(spec(dir.path(), "sleep 30")).await.unwrap();
+        let pgid = running.info().pgid;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        running.cancel();
+        let t = Instant::now();
+        let done = running.wait().await;
+        assert_eq!(done.status, ExecStatus::Killed);
+        assert!(t.elapsed() < Duration::from_secs(2));
+        assert_eq!(group_members(pgid), Vec::<i32>::new());
+    }
+
+    #[tokio::test]
+    async fn cancel_through_handle_while_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let running = spawn(spec(dir.path(), "sleep 30")).await.unwrap();
+        let handle = running.handle();
+        let waiter = tokio::spawn(running.wait());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle.cancel();
+        let done = waiter.await.unwrap();
+        assert_eq!(done.status, ExecStatus::Killed);
+    }
+
+    #[tokio::test]
+    async fn process_matches_guards_pid_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let running = spawn(spec(dir.path(), "sleep 30")).await.unwrap();
+        let info = running.info().clone();
+        let ticks = info.proc_start_ticks;
+        assert!(ticks.is_some());
+        assert!(process_matches(info.pid, ticks));
+        assert!(!process_matches(info.pid, ticks.map(|t| t + 1)));
+        assert!(!process_matches(info.pid, None));
+        running.cancel();
+        running.wait().await;
+        assert!(!process_matches(info.pid, ticks));
+    }
+
+    #[test]
+    fn tail_lines_returns_the_last_n() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        let body = (1..=10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&path, body).unwrap();
+        assert_eq!(tail_lines(&path, 3), ["line 8", "line 9", "line 10"]);
+        assert_eq!(tail_lines(&path, 30).len(), 10);
+        assert_eq!(tail_lines(&dir.path().join("missing"), 3).len(), 0);
+    }
+
+    #[tokio::test]
+    async fn environment_is_exactly_the_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = spec(dir.path(), "env | sort");
+        s.env.insert("SLUICE_MARKER".to_owned(), "yes".to_owned());
+        let done = spawn(s).await.unwrap().wait().await;
+        assert_eq!(done.status, ExecStatus::Exited(0));
+        let log = read(&done.log_path);
+        assert!(log.contains("\nSLUICE_MARKER=yes\n"));
+        assert!(!log.contains("\nHOME="), "{log}");
+    }
+
+    #[tokio::test]
+    async fn missing_cwd_is_an_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = spec(dir.path(), "true");
+        s.cwd = dir.path().join("does-not-exist");
+        assert!(matches!(spawn(s).await, Err(Error::Io { .. })));
+    }
+}

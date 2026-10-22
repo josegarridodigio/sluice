@@ -28,13 +28,15 @@ const EXIT_NOT_IMPLEMENTED: u8 = 70;
     name = "sluice",
     version,
     about = "Verification queue and cache for parallel coding agents",
-    long_about = "Sluice runs named gates (tests, linters, type checks) with a bounded global \
-                  budget, caches results per git tree so each tree is verified once, and \
-                  coalesces duplicate requests. Git hooks call `sluice run`; agents call the \
-                  MCP server started by `sluice mcp`.\n\n\
+    long_about = "Sluice runs named gates (tests, linters, type checks) under a global \
+                  concurrency budget and caches results per git tree so each tree is verified \
+                  once. Git hooks call `sluice run`; agents will call the MCP server started by \
+                  `sluice mcp` once Phase 3 lands.\n\n\
+                  Phase 1 ships `run`, `cache`, `init`, `hook print` and `logs`; `daemon` and \
+                  `status` (Phase 2) and `mcp` (Phase 3) exit 70 until then.\n\n\
                   Exit codes of `sluice run`: 0 pass or cache hit; the gate's own code on \
                   failure; 3 refused by agent_hook_policy = \"fail-fast\"; 124 gate timeout; \
-                  1 Sluice error.\n\n\
+                  143 gate killed by a signal; 1 Sluice error; 2 usage error.\n\n\
                   Environment: SLUICE_DISABLE=1 runs the gate directly (no cache, no queue); \
                   SLUICE_CACHE=0|1 forces the cache off or on (on overrides CI); CI disables \
                   the cache; SLUICE_AGENT=1|0 forces agent or human detection; SLUICE_CONFIG \
@@ -47,7 +49,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run a gate, using the cache and the queue.
+    /// Run a gate: cache hit in milliseconds, otherwise run it under the concurrency budget.
     Run {
         /// Gate name as defined in `.sluice.toml`.
         gate: String,
@@ -58,6 +60,9 @@ enum Command {
         /// Stream the gate output to stderr while it runs (it is always written to the log).
         #[arg(short, long)]
         verbose: bool,
+        /// Explain what Sluice would do (caller detection, policy, tree, key, cache lookup) and exit.
+        #[arg(long)]
+        explain: bool,
         /// Extra arguments appended to the gate command.
         #[arg(last = true)]
         extra: Vec<String>,
@@ -130,12 +135,14 @@ fn main() -> ExitCode {
             gate,
             hook,
             verbose,
+            explain,
             extra,
         } => run::run(&run::RunArgs {
             gate,
             extra,
-            hook,
+            hook: hook.filter(|h| !h.is_empty()),
             verbose,
+            explain,
         }),
         Command::Cache {
             command: CacheCommand::Status { all },

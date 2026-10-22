@@ -16,15 +16,17 @@ Inputs: [[sluice/research/problem-statement.md]],
 ## 1. One binary, several modes
 
 ```
-sluice run <gate> [-- extra args]   # thin client: hooks, terminal, scripts
-sluice mcp                          # thin client: MCP stdio server spawned by Claude Code
-sluice daemon                       # the brain: one per user, Unix socket
-sluice status [--json]              # queue, in-flight, cache stats, time saved
-sluice cache status|clear [--gate]  # inspect / clear markers for the current repo
-sluice init                         # write a starter .sluice.toml and print hook snippets
-sluice hook print <manager>         # husky | lefthook | pre-commit | plain
-sluice logs [<job-id>]              # show job logs
+sluice run <gate> [--hook <hook>] [-v] [--explain] [-- extra args]   # hooks, terminal, scripts (Phase 1)
+sluice cache status [--all] | clear [--gate <gate>]                  # markers of the current repo (Phase 1)
+sluice init [--force]                                                # starter .sluice.toml + plain hook snippet (Phase 1)
+sluice hook print husky|lefthook|pre-commit|plain                    # integration snippets (Phase 1)
+sluice logs [<job-id>] [-n <lines>]                                  # job logs (Phase 1)
+sluice daemon                                                        # the brain: one per user, Unix socket (Phase 2)
+sluice status [--json]                                               # queue, in-flight, cache stats, time saved (Phase 2)
+sluice mcp                                                           # MCP stdio server spawned by the agent (Phase 3)
 ```
+
+Commands of a later phase exit 70 with `sluice: '<cmd>' is not implemented yet`.
 
 Process topology:
 
@@ -79,9 +81,12 @@ Summarised here; authoritative in [[sluice/design/cache-key.md]].
 - Tree hash from a private copy of the index (`GIT_INDEX_FILE` pointed at a
   temp copy, `git add -A`, `git write-tree`). The real index is never used.
 - Inside hooks, git exports `GIT_INDEX_FILE`, `GIT_DIR`, `GIT_WORK_TREE`,
-  `GIT_PREFIX`; Sluice reads them explicitly and decides per hook type.
-- Key = SHA-256 over (tree, gate name, normalised command, sorted env,
-  `key_inputs` outputs, `key_files` hashes, cache-format version).
+  `GIT_PREFIX`; Sluice honours them for its own probes and strips them from
+  the gate's environment. The tree is always the working-tree content.
+- Key = SHA-256 over (`sluice-cache-v1` prefix, tree, gate name,
+  normalised command, sorted env, `key_inputs` outputs, `key_files`
+  hashes). The prefix tracks the cache-format version; markers also carry
+  a `format` field that is checked on read.
 - Markers under `$(git rev-parse --git-common-dir)/sluice/markers/` so all
   worktrees share them. JSON content. Only successful, non-mutating runs
   write a marker. Default TTL 30 days.
@@ -95,8 +100,10 @@ Summarised here; authoritative in [[sluice/design/cache-key.md]].
 | Job logs, SQLite database | `$XDG_STATE_HOME/sluice/` (fallback `~/.local/state/sluice/`) | `logs/<job-id>.log`, `sluice.db` (Phase 2) |
 | User config | `$SLUICE_CONFIG` or `$XDG_CONFIG_HOME/sluice/config.toml` (fallback `~/.config/sluice/config.toml`) | optional |
 
-Job ids are `<unix-ms>-<pid>-<random hex>`; they are unique per machine
-and sort chronologically.
+Job ids are `<unix-ms>-<pid>-<6 hex digits of the sub-second nanoseconds>`;
+they are unique per machine and sort chronologically. `$XDG_STATE_HOME`
+is ignored when empty; with no `HOME` the state dir falls back to
+`/.local/state/sluice`.
 
 ## 5. Daemon
 
@@ -174,10 +181,16 @@ invoked the hook:
 
 | Caller | Default policy | Behaviour |
 |---|---|---|
-| agent | `fail-fast` | exit 3 with an actionable message pointing to `sluice run <gate>` and the `verify` MCP tool |
-| agent | `wait` | wait in the queue (risky under Bash timeouts) |
+| agent | `fail-fast` | exit 3 with a three-line message naming the gate, the detection rule and the fix (`run 'sluice run <gate>' from your shell first`; Phase 3 adds the `verify` MCP tool). Applies only when the cache was consulted and missed; with caching off or an unknown tree the gate runs instead. |
+| agent | `wait` | wait for budget (risky under Bash timeouts) |
 | agent | `run-unqueued` | run immediately outside the queue |
-| human | `wait` | wait in the queue, show progress |
+| human | `wait` | wait for budget; one `waiting for N of M budget units` notice when blocked (progress output arrives with the daemon) |
+| human | `run-unqueued` | run immediately outside the queue |
+| anyone, not in a hook | `wait` | the policies only apply inside hooks (`--hook` given, or `GIT_DIR`/`GIT_INDEX_FILE` present) |
+
+`sluice run --explain <gate>` prints every decision (repository, git
+version, cache mode, caller and rule, hook, policies, budget, tree, key,
+lookup result) and exits 0 without running anything.
 
 Agent detection: see [[sluice/design/adr/0004-agent-detection.md]].
 
@@ -191,7 +204,16 @@ Agent detection: see [[sluice/design/adr/0004-agent-detection.md]].
 - Timeout: `sluice: test TIMEOUT after 20m (job …) log=<path>` + tail, exit 124.
 - Exit codes of `sluice run`: 0 pass or hit; the gate's exit code on
   failure; 3 refused by `fail-fast`; 124 timeout; 143 gate killed by a
-  signal; 1 Sluice error; 2 usage error.
+  signal (`FAIL exit=signal`); 1 Sluice error (`sluice: error: <message>`
+  on stderr: no repository, bad config, unknown gate, spawn or log
+  failure); 2 usage error; 70 command not implemented yet.
+- Stderr notices on the way to an uncached run: `sluice: cache disabled
+  (<reason>)`, `sluice: tree unknown (<reason>); running uncached`,
+  `sluice: cannot snapshot the tree / derive the cache key / read the cache
+  (<error>); running uncached`, `sluice: SLUICE_DISABLE is set; running
+  '<gate>' directly`, `sluice: waiting for N of M budget units for '<gate>'`.
+- The failure tail is introduced by `--- last N lines of <log> ---` and
+  skips Sluice's own framing lines of the log.
 - `-v/--verbose` streams the gate output to stderr while it runs; the log
   file always has everything.
 - `--json` variants (Phase 2, `status`); the MCP tool returns the same text block.
@@ -203,10 +225,17 @@ Until the daemon exists, `sluice run` itself runs the gate: it takes
 counting semaphore with `daemon.budget` slots under the runtime dir, spawns
 `sh -c '<cmd> "$@"' sh <extra…>` in the worktree root with the sanitised
 environment, captures stdout and stderr interleaved into
-`<state>/logs/<job-id>.log`, and enforces the timeout by killing the
-process tree found through `/proc` (SIGTERM, 5 s grace, SIGKILL). The gate
-shares the client's process group so Ctrl-C reaches it. No coalescing in
-Phase 1. See [[sluice/changes/phase-1-cache-only.md]].
+`<state>/logs/<job-id>.log` (header `# sluice job <id>: gate '<gate>' in
+<root>` and `# command: <cmd>`, footer `# exit: <code> after <s>s`; stdout
+and stderr pumped by two threads, so ordering is by arrival; the gate's
+stdin is `/dev/null`), and enforces the timeout by killing the process
+tree found through `/proc` (SIGTERM, 5 s grace, SIGKILL). The gate shares
+the client's process group so Ctrl-C reaches it. The weight is clamped to
+`[1, budget]`, slots are `<runtime>/semaphore/slot-<n>.lock`, waiting
+polls with 25–500 ms backoff and has no timeout. No coalescing in
+Phase 1. `sluice logs` prints the newest log (by file name) or the given
+job id, with `-n` for a tail; the path goes to stderr and the content to
+stdout. See [[sluice/changes/phase-1-cache-only.md]].
 
 ## 10. Security and safety
 

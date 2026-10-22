@@ -56,6 +56,10 @@ pub fn status(all: bool) -> ExitCode {
                 Err(e) => return fail(&e.to_string()),
             };
             for (name, gate) in &config.gates {
+                if !gate.cache {
+                    println!("{name:<16} always runs (cache = false)");
+                    continue;
+                }
                 let mut gate_env = child_env.clone();
                 gate_env.extend(gate.env.iter().map(|(k, v)| (k.clone(), v.clone())));
                 let line = match key::collect_inputs(

@@ -83,8 +83,8 @@ pub struct Defaults {
     pub agent_hook_policy: HookPolicy,
     /// Policy for hooks invoked by a human on a cache miss.
     pub human_hook_policy: HookPolicy,
-    /// Lines of log shown on failure.
-    pub tail_lines: usize,
+    /// Lines of log shown on failure; overrides the user config's `cache.tail_lines`.
+    pub tail_lines: Option<usize>,
 }
 
 impl Default for Defaults {
@@ -92,7 +92,7 @@ impl Default for Defaults {
         Self {
             agent_hook_policy: HookPolicy::FailFast,
             human_hook_policy: HookPolicy::Wait,
-            tail_lines: 40,
+            tail_lines: None,
         }
     }
 }
@@ -145,7 +145,7 @@ impl Gate {
     /// The command with surrounding whitespace trimmed and every whitespace
     /// run collapsed to a single space; this is what enters the cache key.
     pub fn normalized_cmd(&self) -> String {
-        self.cmd.split_whitespace().collect::<Vec<_>>().join(" ")
+        crate::key::normalize_cmd(&self.cmd)
     }
 }
 
@@ -587,7 +587,7 @@ depends_on = ["lint"]
     #[test]
     fn parses_doc_example() {
         let c = parse(DOC_REPO).unwrap();
-        assert_eq!(c.defaults.tail_lines, 28);
+        assert_eq!(c.defaults.tail_lines, Some(28));
         assert_eq!(c.gates.len(), 2);
         let t = c.gate("test").unwrap();
         assert_eq!(t.weight, 4);
@@ -616,7 +616,7 @@ depends_on = ["lint"]
         let c = parse("version = 1").unwrap();
         assert_eq!(c.defaults.agent_hook_policy, HookPolicy::FailFast);
         assert_eq!(c.defaults.human_hook_policy, HookPolicy::Wait);
-        assert_eq!(c.defaults.tail_lines, 40);
+        assert_eq!(c.defaults.tail_lines, None);
         assert!(c.gates.is_empty());
     }
 

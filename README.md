@@ -48,20 +48,21 @@ respect that.
   plus the gate definition. A tree that passed `test` once passes `test`
   everywhere: in another worktree, after a no-op rebase, at push time. Hits
   return in milliseconds and never need the daemon.
-- **Bounds concurrency globally.** One per-user daemon runs gates under a
-  budget. Each gate declares a weight; heavy suites take more of the budget
-  than a linter. On Linux, admission also watches real pressure (PSI), not
-  just a slot count.
-- **Coalesces identical requests.** Two agents asking for the same tree and
-  gate share one run. The second one just waits for the first one's result.
-  No other tool in this space does this.
+- **Bounds concurrency globally.** Gates run under a per-user budget; each
+  gate declares a weight, so heavy suites take more of it than a linter.
+  Today that is a file-lock semaphore; the daemon (Phase 2) adds a queue
+  with fair ordering, and Phase 4 adds admission by real pressure (PSI).
+- **Coalesces identical requests** (Phase 2). Two agents asking for the
+  same tree and gate will share one run; the second just waits for the
+  first one's result. No other tool in this space does this.
 - **Two front-ends, one brain.** `sluice run <gate>` for git hooks, humans
-  and scripts. `sluice mcp` for agents, as an MCP server over stdio. Both
-  talk to the same daemon and share cache, queue and logs.
+  and scripts today; `sluice mcp` for agents, as an MCP server over stdio,
+  in Phase 3. Both will talk to the same daemon and share cache, queue and
+  logs.
 - **Never hangs inside an agent.** On a cache miss in a hook invoked by an
-  agent, Sluice fails fast with an actionable message ("run the `verify`
-  tool first, then retry the commit") instead of waiting in the queue.
-  Humans get the queue, because humans are not subject to tool timeouts.
+  agent, Sluice fails fast with an actionable message (run the gate
+  through Sluice first, then retry) instead of waiting. Humans wait,
+  because humans are not subject to tool timeouts.
 - **Stays out of your stack.** Sluice knows nothing about npm, cargo or
   pytest. It runs named shell commands ("gates") from a small TOML file and
   works with any hook manager: Husky, lefthook, pre-commit/prek, plain
@@ -74,11 +75,15 @@ respect that.
 ```
  git hook ──▶ sluice run ──┐                        ┌──▶ gate (process group)
  terminal ──▶ sluice run ──┼──(Unix socket)──▶ daemon ─┼──▶ gate (process group)
- agent    ──▶ sluice mcp ──┘                        └──▶ …  bounded by budget
+ agent    ──▶ sluice mcp ──┘      (Phase 2)         └──▶ …  bounded by budget
                 │
                 └── cache hit: marker found under .git/, exit 0 in milliseconds,
                     no daemon involved
 ```
+
+Until the daemon lands, `sluice run` runs the gate itself after taking
+`weight` slots of a per-user file-lock semaphore, so the budget already
+bounds concurrency across all your worktrees and repositories.
 
 1. The client computes the tree hash from a **private copy of the index**
    (`git add -A` + `git write-tree` against a scratch index and a scratch
@@ -87,10 +92,13 @@ respect that.
 2. It derives the cache key from the tree, the gate name, the normalised
    command, the gate's environment, and any extra inputs you declare
    (`key_inputs` such as `node --version`, `key_files` such as `.env.test`).
-3. If a marker for that key exists under `$(git rev-parse --git-common-dir)/sluice/`,
-   that is a hit. Markers are shared by every worktree of the repository.
-4. Otherwise the request goes to the daemon, which either attaches it to an
-   identical in-flight run or queues it under the budget.
+3. If a marker for that key exists under
+   `$(git rev-parse --git-common-dir)/sluice/markers/<key>.json`, that is a
+   hit. Markers are shared by every worktree of the repository. The key
+   layout and the marker format are a documented contract
+   ([design note](kb/sluice/design/cache-key.md)).
+4. Otherwise the gate runs under the budget (through the daemon from Phase
+   2 on, which also coalesces identical in-flight requests).
 5. Only a run that exits 0 **and leaves the tree unchanged** writes a
    marker. Auto-fixers that modify files always get re-verified.
 
@@ -132,11 +140,20 @@ sluice mcp                                               # MCP stdio server for 
 ```
 
 Exit codes of `sluice run`: 0 pass or cache hit; the gate's own code on
-failure; 3 refused by `agent_hook_policy = "fail-fast"`; 124 timeout;
-1 Sluice error.
+failure; 3 refused by `agent_hook_policy = "fail-fast"`; 124 timeout; 143
+gate killed by a signal; 1 Sluice error; 2 usage error. Commands of a later
+phase exit 70. `sluice run --explain <gate>` shows every decision Sluice
+would take without running anything.
 
-Environment switches: `SLUICE_DISABLE=1` runs the gate directly;
-`SLUICE_CACHE=0|1` forces the cache off or on (on overrides `CI`); `CI`
+Defaults worth knowing: gate timeout 30 m, weight 1, cache TTL 30 days,
+budget `max(2, cpus - 1)`, 40 log lines shown on failure (set
+`defaults.tail_lines` per repository or `cache.tail_lines` in the user
+config). Full output of every run is kept in
+`~/.local/state/sluice/logs/`; `sluice logs` prints the newest one.
+
+Environment switches: `SLUICE_DISABLE=1` runs the gate directly (no
+cache, no budget, no log); `SLUICE_CACHE=0|1` forces the cache off or on
+(on overrides `CI`); `CI` (any value other than `0`/`false`/`no`/`off`)
 disables the cache; `SLUICE_AGENT=1|0` forces agent or human detection;
 `SLUICE_CONFIG` points at the user config
 (`~/.config/sluice/config.toml`).
@@ -149,9 +166,9 @@ with progress notifications), `status`, `gate_list`, `logs`.
 | Phase | Scope | Status |
 |---|---|---|
 | 0 | Research, design, ADRs, workspace | done |
-| 1 | Cache only, no daemon: `sluice run`, markers, TTL, hook snippets, a file-lock semaphore | done |
+| 1 | Cache only, no daemon: `sluice run`, markers, TTL, hook snippets, agent detection and `agent_hook_policy`, a file-lock semaphore | done |
 | 2 | Daemon: budget scheduler, coalescing, process groups, timeouts, SQLite metrics, `sluice status` | next |
-| 3 | MCP server, agent detection, `agent_hook_policy`, `docs/agents.md` | |
+| 3 | MCP server (`verify`, `status`, `gate_list`, `logs`), `docs/agents.md` | |
 | 4 | PSI-based admission, stable `--json` schema, metrics export | |
 | 5 | Release builds, install script, real-world numbers | |
 

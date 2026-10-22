@@ -111,3 +111,25 @@ is not documented anywhere.
 
 Counts: Table 1 (documented but not implemented) = 10; Table 2 (implemented but
 not documented) = 27; Table 3 (mismatches) = 24.
+
+## Resolution (2026-10-22, lead)
+
+Every finding was handled the same day, in code or in documentation:
+
+| Table | Items | Resolution |
+|---|---|---|
+| 1.1–1.4, 1.10 | README/`--help` present daemon, coalescing, PSI, MCP, `docs/agents.md` as present | Rewritten with phase markers; exit 70 documented; ADR-0004 points `docs/agents.md` to Phase 3. |
+| 1.5 | pre-push tree selection | Design simplified to "always the working-tree hash" (equal to the pushed commit's tree on a clean checkout); `cache-key.md` and `architecture.md` updated. |
+| 1.6 | `--explain` | Implemented (`sluice run --explain <gate>`), tested. |
+| 1.7 | `SLUICE_LOG` | Removed from the docs; unused tracing dependencies removed from the CLI crate. |
+| 1.8 | public contract | `cache-key.md` now documents path, file name, JSON and layout as the contract; README links it. |
+| 1.9 | git ≥ 2.31 | `discover()` maps the `--path-format` failure to `git <v> is too old: Sluice needs git 2.31 or newer`. |
+| 2.1–2.27 | undocumented behaviour | Documented in `architecture.md` (sections 1, 4b, 8, 9, 9b), `cache-key.md`, `config-format.md`, README; `cache status` now also reports `cache = false` gates. |
+| 3.1 | `SLUICE_DISABLE` | Needs the repo and gate command (documented); user config is no longer loaded under bypass (code). |
+| 3.2 | `defaults.tail_lines` | Now `Option<usize>` overriding `cache.tail_lines` (code, tested). |
+| 3.3, 3.16 | `CI` rule and `env_any_set` example | Docs aligned with the code (`CI` falsy keeps the cache; default `["CLAUDECODE"]`). |
+| 3.4 | `depends_on` | Documented as validated, not scheduled. |
+| 3.5, 3.13 | fail-fast on uncached runs; exit codes | Policy now applies only to a consulted-and-missed cache (code, tested); exit codes 2/70/143 documented everywhere. |
+| 3.6–3.12, 3.17–3.19, 3.21–3.24 | wording | Docs corrected (TTL on read, `cache status/clear` semantics, probe list, key prefix pinned to `CACHE_FORMAT_VERSION` by a test, job id format, `.sluice.toml` location and error message, roadmap row, markers path, command list, duplicate `normalize_cmd` removed). |
+| 3.14, 3.15 | ADR-0004 | Accepted; `CLAUDE*` stripping and crate name corrected. |
+| 3.20 | fail-fast message | Now points to `sluice run <gate>` only; the `verify` mention returns with Phase 3. |

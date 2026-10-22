@@ -126,7 +126,10 @@ mod tests {
         env.insert("XDG_STATE_HOME".into(), "/tmp/state".into());
         assert_eq!(state_dir(&env), PathBuf::from("/tmp/state/sluice"));
         assert_eq!(logs_dir(&env), PathBuf::from("/tmp/state/sluice/logs"));
-        assert_eq!(database_path(&env), PathBuf::from("/tmp/state/sluice/sluice.db"));
+        assert_eq!(
+            database_path(&env),
+            PathBuf::from("/tmp/state/sluice/sluice.db")
+        );
     }
 
     #[test]

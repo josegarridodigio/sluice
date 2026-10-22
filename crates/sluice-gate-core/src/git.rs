@@ -15,6 +15,9 @@ use crate::tree::TreeHash;
 /// A snapshot of an environment: variable name to value.
 pub type EnvMap = BTreeMap<String, String>;
 
+/// Oldest git release Sluice works with (`rev-parse --path-format` appeared in 2.31).
+pub const MIN_GIT_VERSION: &str = "2.31";
+
 /// Absolute locations of one repository, as seen from one worktree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoPaths {
@@ -204,7 +207,16 @@ pub fn discover(cwd: &Path, env: &EnvMap) -> Result<RepoPaths> {
     ];
     let stdout = match run(&args, cwd, &probe, true) {
         Ok(s) => s,
-        Err(Error::GitCommand { .. }) => return Err(Error::NotARepository(cwd.to_path_buf())),
+        Err(Error::GitCommand { stderr, .. }) => {
+            if stderr.contains("path-format") {
+                let found = version().unwrap_or_else(|_| "unknown".to_owned());
+                return Err(Error::GitTooOld {
+                    found,
+                    required: MIN_GIT_VERSION,
+                });
+            }
+            return Err(Error::NotARepository(cwd.to_path_buf()));
+        }
         Err(e) => return Err(e),
     };
     let lines: Vec<&str> = stdout.lines().collect();

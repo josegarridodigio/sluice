@@ -5,7 +5,7 @@ tags: [sluice, adr, agents]
 
 # ADR-0004: Detecting that a hook runs inside a coding agent
 
-Status: proposed (2026-10-22). Needs user confirmation of the evidence.
+Status: accepted (2026-10-22). Implemented in Phase 1 (`sluice-gate-core::agent`); the evidence below was shown to the user with the Phase-0 answers.
 
 ## Context
 
@@ -41,8 +41,8 @@ hooks. Details in [[sluice/research/claude-code-facts.md]].
 
 Because `sluice mcp` (and a daemon it autostarts) also carries
 `CLAUDECODE=1`, detection is evaluated only in the `sluice run` client at
-hook/terminal time, never inside the daemon, and the daemon removes
-`CLAUDECODE` and `CLAUDE_CODE_*` from the environment it builds for gate
+hook/terminal time, never inside the daemon, and every variable whose
+name starts with `CLAUDE` is removed from the environment built for gate
 processes.
 
 ## Decision
@@ -59,13 +59,15 @@ evaluated in order:
    (default empty; users can add other agents' markers, e.g. for Codex or
    Gemini CLI, once verified).
 
-Detection lives in `sluice-core` (`agent.rs`), is pure (takes an env map),
-and is unit-tested. `sluice run --explain` prints which rule fired.
+Detection lives in `sluice-gate-core` (`agent.rs`), is pure (takes an env
+map), and is unit-tested. `sluice run --explain` prints which rule fired;
+the fail-fast message names it too. `SLUICE_AGENT` accepts the truthy and
+falsy words of the config format; any other value is ignored.
 
 ## Consequences
 
-- Other agents are not detected by default; documented in `docs/agents.md`
-  with instructions to add their markers or export `SLUICE_AGENT=1`.
+- Other agents are not detected by default; `docs/agents.md` (Phase 3)
+  will explain how to add their markers or export `SLUICE_AGENT=1`.
 - Users who run Claude Code with their own terminal wrapper that strips the
   environment lose detection; the `fail-fast` message still explains what to
   do.

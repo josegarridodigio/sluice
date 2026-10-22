@@ -11,6 +11,7 @@ use crate::tree::TreeHash;
 use crate::{Error, Result};
 
 /// Domain-separation prefix hashed first into every key.
+/// Must end with [`crate::CACHE_FORMAT_VERSION`]; a unit test enforces it.
 pub const KEY_PREFIX: &str = "sluice-cache-v1";
 
 /// A cache key: 64 lowercase hex characters (SHA-256).
@@ -244,5 +245,16 @@ mod tests {
         let err =
             collect_inputs(&["exit 3".into()], &[], dir.path(), &BTreeMap::new()).unwrap_err();
         assert!(matches!(err, Error::KeyInput { ref cmd, .. } if cmd == "exit 3"));
+    }
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    #[test]
+    fn key_prefix_tracks_cache_format_version() {
+        assert_eq!(
+            super::KEY_PREFIX,
+            format!("sluice-cache-v{}", crate::CACHE_FORMAT_VERSION)
+        );
     }
 }

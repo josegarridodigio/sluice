@@ -792,8 +792,6 @@ dependencies = [
  "serde_json",
  "sluice-gate-core",
  "tempfile",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

@@ -28,8 +28,17 @@ pub enum Error {
     #[error("not a git repository: {0}")]
     NotARepository(PathBuf),
 
-    /// `.sluice.toml` could not be found walking up from the given directory.
-    #[error("no .sluice.toml found in {0} or its parents")]
+    /// The installed git is older than Sluice needs.
+    #[error("git {found} is too old: Sluice needs git {required} or newer")]
+    GitTooOld {
+        /// Version string reported by `git --version`.
+        found: String,
+        /// Minimum supported version.
+        required: &'static str,
+    },
+
+    /// `.sluice.toml` is missing from the worktree root.
+    #[error("no .sluice.toml found in {0} (run 'sluice init' there)")]
     ConfigNotFound(PathBuf),
 
     /// A configuration file could not be parsed or failed validation.

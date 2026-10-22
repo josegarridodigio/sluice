@@ -242,9 +242,24 @@ fn agent_in_hook_fails_fast_on_miss_and_hits_on_pass() {
         .code(3)
         .stderr(
             predicate::str::contains("has not passed on this tree")
-                .and(predicate::str::contains("verify")),
+                .and(predicate::str::contains("sluice run test")),
         );
     assert_eq!(sb.runs(), 0, "fail-fast must not run the gate");
+
+    // With the cache off the gate can never be cached, so fail-fast must not refuse.
+    sb.sluice()
+        .env("CLAUDECODE", "1")
+        .env("CI", "true")
+        .args(["run", "--hook", "pre-commit", "test"])
+        .assert()
+        .success();
+    assert_eq!(sb.runs(), 1);
+    sb.sluice()
+        .env("CLAUDECODE", "1")
+        .args(["run", "--hook", "pre-commit", "test"])
+        .assert()
+        .code(3);
+    assert_eq!(sb.runs(), 1);
 
     // Outside a hook the agent may run the gate (it is the Phase 1 way to verify).
     sb.sluice()
@@ -252,7 +267,7 @@ fn agent_in_hook_fails_fast_on_miss_and_hits_on_pass() {
         .args(["run", "test"])
         .assert()
         .success();
-    assert_eq!(sb.runs(), 1);
+    assert_eq!(sb.runs(), 2);
 
     sb.sluice()
         .env("CLAUDECODE", "1")
@@ -269,7 +284,7 @@ fn agent_in_hook_fails_fast_on_miss_and_hits_on_pass() {
         .args(["run", "--hook", "pre-commit", "test"])
         .assert()
         .success();
-    assert_eq!(sb.runs(), 2);
+    assert_eq!(sb.runs(), 3);
 
     // run-unqueued policy lets the agent run inside the hook.
     sb.write_config(
@@ -286,7 +301,62 @@ cmd = "echo run >> \"$SLUICE_TEST_COUNTER\""
         .args(["run", "--hook", "pre-commit", "test"])
         .assert()
         .success();
-    assert_eq!(sb.runs(), 3);
+    assert_eq!(sb.runs(), 4);
+}
+
+#[test]
+fn explain_prints_decisions_without_running() {
+    let sb = Sandbox::standard();
+    sb.sluice()
+        .env("CLAUDECODE", "1")
+        .args(["run", "--hook", "pre-commit", "--explain", "test"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("caller:       Agent")
+                .and(predicate::str::contains("lookup:       MISS"))
+                .and(predicate::str::contains("key:          ")),
+        );
+    assert_eq!(sb.runs(), 0);
+}
+
+#[test]
+fn repo_tail_lines_override_the_user_default() {
+    let sb = Sandbox::new(
+        r#"
+[defaults]
+tail_lines = 2
+
+[gates.fail]
+cmd = "echo one; echo two; echo three; exit 1"
+"#,
+    );
+    sb.sluice().args(["run", "fail"]).assert().code(1).stderr(
+        predicate::str::contains("last 2 lines")
+            .and(predicate::str::contains("three"))
+            .and(predicate::str::contains("one").not()),
+    );
+}
+
+#[test]
+fn disable_works_without_a_user_config_but_needs_the_gate() {
+    let sb = Sandbox::standard();
+    fs::write(
+        sb.home.join(".config/sluice/config.toml"),
+        "this is not toml",
+    )
+    .unwrap();
+    sb.sluice()
+        .env("SLUICE_DISABLE", "1")
+        .args(["run", "test"])
+        .assert()
+        .success();
+    assert_eq!(sb.runs(), 1);
+    sb.sluice()
+        .env("SLUICE_DISABLE", "1")
+        .args(["run", "nope"])
+        .assert()
+        .code(1);
 }
 
 #[test]

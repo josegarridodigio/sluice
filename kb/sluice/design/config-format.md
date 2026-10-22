@@ -51,24 +51,36 @@ Field reference:
 | `version` | int | required | Config format version. |
 | `defaults.agent_hook_policy` | enum | `fail-fast` | See [[sluice/design/adr/0004-agent-detection.md]]. |
 | `defaults.human_hook_policy` | enum | `wait` | |
-| `defaults.tail_lines` | int | 40 | |
+| `defaults.tail_lines` | int | unset | Overrides the user config's `cache.tail_lines` (40) for this repository. |
 | `gates.<name>.cmd` | string | required | Run with `sh -c` in the repo worktree root. |
 | `gates.<name>.weight` | int ≥ 1 | 1 | Budget units consumed while running. |
 | `gates.<name>.timeout` | duration | `30m` | Execution time only; queue wait does not count. Formats: `90s`, `5m`, `1h`. |
 | `gates.<name>.hooks` | list | `[]` | Hook names this gate is meant for. Free-form, but `pre-commit` and `pre-push` are recognised by `sluice hook print`. |
-| `gates.<name>.key_inputs` | list of commands | `[]` | Each command's stdout is part of the key. Keep them fast; they run on every invocation, including hits. |
+| `gates.<name>.key_inputs` | list of commands | `[]` | Each command's stdout (via `sh -c` in the worktree root, stderr discarded) is part of the key. Keep them fast; they run on every invocation that consults the cache, including hits. A failing command makes the run uncached (notice on stderr), never a gate failure. |
 | `gates.<name>.key_files` | list of paths | `[]` | Relative to repo root. Content hash is part of the key. For files git ignores. Missing file hashes as "absent". |
 | `gates.<name>.env` | table | `{}` | Added to the gate's environment and to the key. |
-| `gates.<name>.depends_on` | list | `[]` | Gate names. Not in Phase 1; reserved. |
+| `gates.<name>.depends_on` | list | `[]` | Gate names; validated (must exist, no self-reference) but not scheduled in v1. |
 | `gates.<name>.cache` | bool | `true` | `false` makes the gate always run (still queued). |
 
 Rules:
 
 - Gate names: `[a-z0-9][a-z0-9_-]*`, max 64 chars.
-- Unknown fields are an error (strict parsing), so typos cannot silently
-  change behaviour.
+- Unknown fields are an error (strict parsing, at every level), so typos
+  cannot silently change behaviour.
+- `version` must be `1` (`unsupported version N` otherwise); `cmd` must be
+  non-empty after trimming; `weight >= 1`; `key_files` must be relative
+  paths without `..`; `depends_on` entries must name existing gates other
+  than the gate itself; `human_hook_policy` may not be `fail-fast`.
+  `[defaults]` and `[gates]` are optional; a file with only `version = 1`
+  is valid (and every `sluice run` then fails with `unknown gate`).
 - `cmd` is normalised for the key by trimming and collapsing whitespace
   runs; nothing else.
+- The file is read from the current worktree's root (`git rev-parse
+  --show-toplevel`); there is no parent-directory search. `sluice init`
+  and `sluice hook print` work on `./.sluice.toml` in the current
+  directory and do not need a repository.
+- Error messages: `no .sluice.toml found in <root> (run 'sluice init' there)`,
+  `invalid configuration in <path>: <reason>`, `unknown gate '<name>'`.
 
 ## User config: `~/.config/sluice/config.toml`
 
@@ -98,8 +110,8 @@ tail_lines = 40
 head_reserve_after = "30s" # backfill behind the queue head only this long (ADR-0007)
 
 [agent_detection]
-env_any_set = ["CLAUDECODE", "SLUICE_AGENT"]   # any of these set and non-empty => agent
-env_any_equals = { CLAUDE_CODE_ENTRYPOINT = "cli" }
+env_any_set = ["CLAUDECODE"]      # any of these set and non-empty => agent (SLUICE_AGENT is the override, see below)
+env_any_equals = {}               # e.g. { CLAUDE_CODE_ENTRYPOINT = "cli" }
 
 [repos."/home/jose/Escritorio/Proyectos/foo"]
 budget_share_max = 4       # optional per-repo cap
@@ -111,11 +123,22 @@ Environment variables (highest precedence):
 |---|---|
 | `SLUICE_DISABLE=1` | Bypass Sluice entirely: run the gate directly, no cache, no queue. |
 | `SLUICE_CACHE=0` / `1` | Force cache off / on (on overrides the `CI` rule). |
-| `CI` (any value) | Cache off unless `SLUICE_CACHE=1`. |
-| `SLUICE_AGENT=1` / `0` | Force agent / human detection. |
+| `CI` | Cache off unless `SLUICE_CACHE` is truthy. A falsy `CI` (`0`, `false`, `no`, `off`) does not count as set. |
+| `SLUICE_AGENT=1` / `0` | Force agent / human detection (truthy / falsy words as below; any other value is ignored). |
 | `SLUICE_SOCKET` | Override the daemon socket path (Phase 2). |
-| `SLUICE_CONFIG` | Override the user config path. |
-| `SLUICE_LOG` | Tracing filter for the client (`info`, `debug`, …). |
+| `SLUICE_CONFIG` | Override the user config path (ignored when empty). |
+
+Truthy words: `1`, `true`, `yes`, `on`; falsy: `0`, `false`, `no`, `off`
+(case-insensitive, trimmed). An unrecognised `SLUICE_CACHE` value falls
+through to the `CI` rule.
+
+User config notes: every section and field is optional (a missing file
+means defaults); unknown fields are errors; validation: `daemon.budget >= 1`,
+`daemon.nice <= 19`, `daemon.ionice_level <= 7`, `admission.psi_poll_interval > 0`,
+`budget_share_max >= 1`. In Phase 1 only `daemon.budget`, `cache.ttl_days`,
+`cache.tail_lines` and `agent_detection.*` have an effect; the other
+fields are parsed and validated for Phases 2–4 (logs are not pruned before
+the daemon exists).
 
 ## Decisions on this format
 

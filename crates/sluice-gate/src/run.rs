@@ -58,6 +58,8 @@ pub struct RunArgs {
     pub hook: Option<String>,
     /// Stream the gate output to stderr while it runs.
     pub verbose: bool,
+    /// Print what Sluice would do (detection, policy, tree, key, lookup) and exit.
+    pub explain: bool,
 }
 
 /// Everything resolved before deciding between hit, policy and run.
@@ -67,6 +69,10 @@ struct Context {
     user: UserConfig,
     gate_name: String,
     gate: Gate,
+    /// `[defaults]` of the repository config.
+    defaults: sluice_gate_core::config::Defaults,
+    /// Lines of log shown on failure (repo override or user config).
+    tail_lines: usize,
     /// Environment of the gate process, computed on first use (it costs a git spawn).
     child_env: std::cell::OnceCell<EnvMap>,
     probe_env: EnvMap,
@@ -97,12 +103,15 @@ pub fn run(args: &RunArgs) -> ExitCode {
         Ok(d) => d,
         Err(e) => return fail(&format!("cannot read the current directory: {e}")),
     };
-    let ctx = match resolve(&env, &cwd, args) {
+    let mode = cache_mode(&env);
+    let ctx = match resolve(&env, &cwd, args, &mode) {
         Ok(ctx) => ctx,
         Err(e) => return fail(&e),
     };
 
-    let mode = cache_mode(&env);
+    if args.explain {
+        return explain(&ctx, &env, &mode);
+    }
     if mode == CacheMode::Bypass {
         eprintln!(
             "sluice: SLUICE_DISABLE is set; running '{}' directly",
@@ -123,22 +132,10 @@ pub fn run(args: &RunArgs) -> ExitCode {
         Decision::Run(state) => state,
     };
 
-    // Policy on a miss, only inside a hook.
-    let in_hook =
-        ctx.hook.is_some() || env.contains_key("GIT_DIR") || env.contains_key("GIT_INDEX_FILE");
-    let caller = agent::detect(
-        &env,
-        &ctx.user.agent_detection.env_any_set,
-        &ctx.user.agent_detection.env_any_equals,
-    );
-    let defaults = &RepoConfig::load(&ctx.paths.toplevel)
-        .map(|c| c.defaults)
-        .unwrap_or_default();
-    let policy = match (&caller, in_hook) {
-        (Caller::Agent { .. }, true) => defaults.agent_hook_policy,
-        (Caller::Human, true) => defaults.human_hook_policy,
-        (_, false) => HookPolicy::Wait,
-    };
+    // Policy on a miss, only inside a hook and only when the cache was consulted:
+    // with caching off or an unknown tree the gate can never be cached, so
+    // refusing to run would block the caller forever.
+    let (caller, in_hook, policy) = decide_policy(&ctx, &env, &state);
     if policy == HookPolicy::FailFast {
         let why = match &state {
             CacheState::Miss {
@@ -156,12 +153,14 @@ pub fn run(args: &RunArgs) -> ExitCode {
             Caller::Agent { rule } => rule.as_str(),
             Caller::Human => "human",
         };
+        let hook = ctx.hook.as_deref().unwrap_or("a git hook");
         eprintln!(
             "sluice: '{}' has not passed on this tree ({why}).\n\
-             sluice: this hook was invoked by a coding agent ({rule}) and agent_hook_policy is \"fail-fast\".\n\
-             sluice: run 'sluice run {}' or the 'verify' MCP tool first, then retry the commit.",
+             sluice: {hook} was invoked by a coding agent ({rule}) and agent_hook_policy is \"fail-fast\".\n\
+             sluice: run 'sluice run {}' from your shell first, then retry the git command.",
             ctx.gate_name, ctx.gate_name
         );
+        let _ = in_hook;
         return ExitCode::from(EXIT_FAIL_FAST);
     }
 
@@ -182,12 +181,100 @@ fn fail(message: &str) -> ExitCode {
     ExitCode::from(EXIT_ERROR)
 }
 
+/// Who called, whether we are inside a hook, and which policy applies on this miss.
+fn decide_policy(ctx: &Context, env: &EnvMap, state: &CacheState) -> (Caller, bool, HookPolicy) {
+    let in_hook =
+        ctx.hook.is_some() || env.contains_key("GIT_DIR") || env.contains_key("GIT_INDEX_FILE");
+    let caller = agent::detect(
+        env,
+        &ctx.user.agent_detection.env_any_set,
+        &ctx.user.agent_detection.env_any_equals,
+    );
+    let policy = match (&caller, in_hook, state) {
+        (_, false, _) => HookPolicy::Wait,
+        (Caller::Agent { .. }, true, CacheState::Miss { .. }) => ctx.defaults.agent_hook_policy,
+        (Caller::Agent { .. }, true, CacheState::Off(_)) => match ctx.defaults.agent_hook_policy {
+            HookPolicy::FailFast => HookPolicy::Wait,
+            other => other,
+        },
+        (Caller::Human, true, _) => ctx.defaults.human_hook_policy,
+    };
+    (caller, in_hook, policy)
+}
+
+/// `sluice run --explain`: print every decision without running anything.
+fn explain(ctx: &Context, env: &EnvMap, mode: &CacheMode) -> ExitCode {
+    println!("repository:   {}", ctx.paths.toplevel.display());
+    println!("common dir:   {}", ctx.paths.common_dir.display());
+    println!(
+        "git:          {}",
+        git::version().unwrap_or_else(|e| e.to_string())
+    );
+    println!("gate:         {} ({})", ctx.gate_name, ctx.gate.cmd.trim());
+    println!("cache mode:   {mode:?}");
+    let caller = agent::detect(
+        env,
+        &ctx.user.agent_detection.env_any_set,
+        &ctx.user.agent_detection.env_any_equals,
+    );
+    println!("caller:       {caller:?}");
+    let in_hook =
+        ctx.hook.is_some() || env.contains_key("GIT_DIR") || env.contains_key("GIT_INDEX_FILE");
+    println!(
+        "hook:         {} (in_hook = {in_hook})",
+        ctx.hook.as_deref().unwrap_or("none")
+    );
+    println!(
+        "policies:     agent = {:?}, human = {:?}",
+        ctx.defaults.agent_hook_policy, ctx.defaults.human_hook_policy
+    );
+    println!(
+        "budget:       {} units, gate weight {}",
+        ctx.user.daemon.budget, ctx.gate.weight
+    );
+    match tree::snapshot(&ctx.paths, &ctx.probe_env, &ctx.scratch) {
+        Ok(Snapshot::Known(tree)) => {
+            println!("tree:         {tree}");
+            match derive_key(ctx, &tree) {
+                Ok((_, key)) => {
+                    println!("key:          {key}");
+                    match ctx.store.lookup(&key, ctx.ttl) {
+                        Ok(Lookup::Hit(m)) => println!(
+                            "lookup:       HIT (passed {} ago, job {})",
+                            age(&m.passed_at),
+                            m.job_id
+                        ),
+                        Ok(Lookup::Miss(Some(m))) => println!(
+                            "lookup:       MISS (last run {} ago: {})",
+                            age(&m.recorded_at),
+                            m.reason
+                        ),
+                        Ok(Lookup::Miss(None)) => println!("lookup:       MISS"),
+                        Err(e) => println!("lookup:       error ({e})"),
+                    }
+                }
+                Err(e) => println!("key:          error ({e})"),
+            }
+        }
+        Ok(Snapshot::Unknown { reason }) => println!("tree:         unknown ({reason})"),
+        Err(e) => println!("tree:         error ({e})"),
+    }
+    println!("markers:      {}", ctx.store.dir().display());
+    ExitCode::SUCCESS
+}
+
 /// Resolves repository, config and derived environments.
-fn resolve(env: &EnvMap, cwd: &Path, args: &RunArgs) -> Result<Context, String> {
+fn resolve(env: &EnvMap, cwd: &Path, args: &RunArgs, mode: &CacheMode) -> Result<Context, String> {
     let paths = git::discover(cwd, env).map_err(|e| e.to_string())?;
     let config = RepoConfig::load(&paths.toplevel).map_err(|e| e.to_string())?;
     let gate = config.gate(&args.gate).map_err(|e| e.to_string())?.clone();
-    let user = UserConfig::load(env).map_err(|e| e.to_string())?;
+    // SLUICE_DISABLE needs the gate command but nothing from the user config.
+    let user = if *mode == CacheMode::Bypass {
+        UserConfig::default()
+    } else {
+        UserConfig::load(env).map_err(|e| e.to_string())?
+    };
+    let tail_lines = config.defaults.tail_lines.unwrap_or(user.cache.tail_lines);
     let probe_env = git::probe_env(env, Some(&paths));
     let scratch = tree::scratch_root(env).map_err(|e| e.to_string())?;
     let store = MarkerStore::new(&paths.common_dir);
@@ -198,6 +285,8 @@ fn resolve(env: &EnvMap, cwd: &Path, args: &RunArgs) -> Result<Context, String> 
         user,
         gate_name: args.gate.clone(),
         gate,
+        defaults: config.defaults.clone(),
+        tail_lines,
         child_env: std::cell::OnceCell::new(),
         probe_env,
         scratch,
@@ -391,7 +480,7 @@ fn execute(ctx: &Context, args: &RunArgs, state: CacheState) -> ExitCode {
             exec.job_id,
             exec.log_path.display()
         );
-        print_tail(&exec.log_path, ctx.user.cache.tail_lines);
+        print_tail(&exec.log_path, ctx.tail_lines);
         return ExitCode::from(EXIT_TIMEOUT);
     }
 
@@ -407,7 +496,7 @@ fn execute(ctx: &Context, args: &RunArgs, state: CacheState) -> ExitCode {
             exec.job_id,
             exec.log_path.display()
         );
-        print_tail(&exec.log_path, ctx.user.cache.tail_lines);
+        print_tail(&exec.log_path, ctx.tail_lines);
         return exit_code_of(exec.exit_code);
     }
 
@@ -645,7 +734,22 @@ fn record_miss(
 /// Prints the last `lines` lines of the log to stderr.
 pub fn print_tail(path: &Path, lines: usize) {
     let Ok(file) = File::open(path) else { return };
-    let all: Vec<String> = BufReader::new(file).lines().map_while(Result::ok).collect();
+    // Skip Sluice's own framing lines so the tail shows what the gate printed.
+    let mut all: Vec<String> = BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| {
+            !(l.starts_with("# sluice job ")
+                || l.starts_with("# command: ")
+                || l.starts_with("# exit: "))
+        })
+        .collect();
+    while all.last().is_some_and(|l| l.trim().is_empty()) {
+        all.pop();
+    }
+    while all.first().is_some_and(|l| l.trim().is_empty()) {
+        all.remove(0);
+    }
     let start = all.len().saturating_sub(lines);
     eprintln!(
         "--- last {} lines of {} ---",
