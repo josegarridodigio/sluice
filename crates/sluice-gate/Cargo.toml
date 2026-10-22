@@ -26,6 +26,7 @@ sluice-gate-core.workspace = true
 sluice-gate-daemon.workspace = true
 sluice-gate-mcp.workspace = true
 sluice-gate-proto = { workspace = true, features = ["client"] }
+sluice-gate-queue.workspace = true
 thiserror.workspace = true
 tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "signal", "sync"] }
 tracing = "0.1.44"

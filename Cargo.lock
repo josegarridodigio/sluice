@@ -1121,6 +1121,7 @@ dependencies = [
  "sluice-gate-daemon",
  "sluice-gate-mcp",
  "sluice-gate-proto",
+ "sluice-gate-queue",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1193,6 +1194,26 @@ dependencies = [
  "sluice-gate-core",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "sluice-gate-queue"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "humantime",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sluice-gate-core",
+ "sluice-gate-daemon",
+ "sluice-gate-proto",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -1,0 +1,1373 @@
+//! The runner (design section 5): one tokio task per daemon, woken by a
+//! [`Notify`] (enqueue, retry, approve, cancel) and by the `[queue] tick`.
+//! Building a train and pushing it run as child tasks so that one long gate
+//! run never delays approvals or the watch of ready trains.
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+
+use anyhow::{Context as _, Result, anyhow};
+use rusqlite::Transaction;
+use serde_json::json;
+use sluice_gate_core::config::{Gate, REPO_CONFIG_FILE, RepoConfig};
+use sluice_gate_core::git::RepoPaths;
+use sluice_gate_core::key::{self, KeyMaterial};
+use sluice_gate_core::marker::{Lookup, MarkerStore};
+use sluice_gate_core::tree::{self, Snapshot};
+use sluice_gate_daemon::server::{DaemonHandle, RunSubscription, StoreError};
+use sluice_gate_proto::{
+    Caller, GateSpec, OutcomeStatus, QueueJobState as J, QueueTrainState as T, RepoInfo,
+    RunRequest, ServerMessage, TrainGate,
+};
+use tokio::sync::Notify;
+use tokio::task::JoinSet;
+
+use crate::git::{EnvMap, Git, worktree_git_dir};
+use crate::model::{TrainHashInput, train_hash};
+use crate::push::{self, PushEnd, PushVerdict};
+use crate::store::{
+    self, Actor, JobEdit, JobRow, MarkerRow, NewTrain, TrainEdit, TrainRow, TrainSettings, Writer,
+};
+use crate::target::endpoint_hash;
+
+/// Shared state of the queue inside one daemon.
+#[derive(Debug)]
+pub struct Core {
+    /// The daemon.
+    pub handle: DaemonHandle,
+    /// Git runner (daemon env without `GIT_*`).
+    pub git: Git,
+    /// Environment of gate processes and `key_inputs` (the daemon's sanitised env).
+    pub child_env: EnvMap,
+    /// Wakes the runner.
+    pub notify: Notify,
+    busy: Mutex<HashSet<String>>,
+    /// Scratch root for tree snapshots.
+    pub scratch: PathBuf,
+    /// `<state>/merge`.
+    pub merge_dir: PathBuf,
+}
+
+/// A merge-queue error message for a request or a log line.
+pub(crate) fn store_msg(e: &StoreError) -> String {
+    store::refusal(e).map_or_else(|| e.to_string(), ToString::to_string)
+}
+
+impl Core {
+    /// Builds the core from the daemon handle; `base_env` replaces the
+    /// daemon's sanitised env (tests).
+    ///
+    /// # Errors
+    ///
+    /// No usable scratch directory.
+    pub fn new(handle: DaemonHandle, base_env: Option<EnvMap>) -> Result<Self> {
+        let child_env = base_env.unwrap_or_else(|| handle.sanitised_env());
+        let git = Git::new(&child_env);
+        let scratch = tree::scratch_root(&child_env).context("scratch directory")?;
+        let merge_dir = handle.state_dir().join("merge");
+        Ok(Self {
+            handle,
+            git,
+            child_env,
+            notify: Notify::new(),
+            busy: Mutex::new(HashSet::new()),
+            scratch,
+            merge_dir,
+        })
+    }
+
+    fn busy(&self) -> MutexGuard<'_, HashSet<String>> {
+        self.busy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// True while a build or push task owns the train.
+    pub fn is_busy(&self, train: &str) -> bool {
+        self.busy().contains(train)
+    }
+
+    fn claim_busy(&self, train: &str) -> bool {
+        self.busy().insert(train.to_owned())
+    }
+
+    fn release_busy(&self, train: &str) {
+        self.busy().remove(train);
+        self.notify.notify_one();
+    }
+
+    /// Read-only access in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Store errors.
+    pub fn read<R>(
+        &self,
+        f: impl FnOnce(&Transaction<'_>) -> rusqlite::Result<R>,
+    ) -> Result<R, StoreError> {
+        self.handle.store_tx(f)
+    }
+
+    /// A fenced write in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Store errors, refusals included.
+    pub fn write<R>(
+        &self,
+        actor: Actor,
+        f: impl FnOnce(&Writer<'_, '_>) -> rusqlite::Result<R>,
+    ) -> Result<R, StoreError> {
+        let fence = self.handle.fence();
+        self.handle.store_tx(|tx| {
+            let w = Writer::new(tx, &fence, actor)?;
+            f(&w)
+        })
+    }
+
+    /// A fenced write committed with `synchronous = FULL` (push marker).
+    ///
+    /// # Errors
+    ///
+    /// Store errors, refusals included.
+    pub fn write_durable<R>(
+        &self,
+        actor: Actor,
+        f: impl FnOnce(&Writer<'_, '_>) -> rusqlite::Result<R>,
+    ) -> Result<R, StoreError> {
+        let fence = self.handle.fence();
+        self.handle.store_tx_durable(|tx| {
+            let w = Writer::new(tx, &fence, actor)?;
+            f(&w)
+        })
+    }
+
+    /// Git with a client's allowlisted env on top.
+    pub fn git_for(&self, client: &EnvMap) -> Git {
+        self.git.with_client_env(client)
+    }
+}
+
+/// Runs blocking work (git) off the async threads.
+async fn blocking<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> Result<R> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| anyhow!("blocking task failed: {e}"))
+}
+
+/// The runner loop: returns when the daemon stops.
+pub async fn run(core: Arc<Core>) {
+    let mut shutdown = core.handle.shutdown();
+    let tick = core
+        .handle
+        .config()
+        .queue
+        .tick
+        .max(Duration::from_millis(50));
+    let enabled = core.handle.config().queue.enabled;
+    let mut tasks: JoinSet<()> = JoinSet::new();
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        if enabled
+            && core.handle.lease_held()
+            && let Err(e) = step(&core, &mut tasks).await
+        {
+            tracing::warn!("merge queue step failed: {e:#}");
+        }
+        while tasks.try_join_next().is_some() {}
+        tokio::select! {
+            () = core.notify.notified() => {}
+            () = tokio::time::sleep(tick) => {}
+            _ = shutdown.changed() => {}
+        }
+    }
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+}
+
+async fn step(core: &Arc<Core>, tasks: &mut JoinSet<()>) -> Result<()> {
+    let trains = core
+        .read(|tx| store::trains(tx, None))
+        .map_err(|e| anyhow!(store_msg(&e)))?;
+    // Housekeeping: worktrees of finished trains.
+    for t in &trains {
+        if matches!(t.state, T::Dissolved | T::Landed)
+            && t.worktree.exists()
+            && !core.is_busy(&t.id)
+        {
+            let (git, repo, wt) = (core.git.clone(), t.repo.clone(), t.worktree.clone());
+            blocking(move || git.remove_worktree(&repo, &wt)).await?;
+        }
+    }
+    // Ready trains: cheap re-check. Approved trains: push.
+    for t in trains
+        .iter()
+        .filter(|t| matches!(t.state, T::Ready | T::Approved))
+    {
+        if core.is_busy(&t.id) {
+            continue;
+        }
+        if t.state == T::Approved {
+            if core.claim_busy(&t.id) {
+                let (c, id) = (Arc::clone(core), t.id.clone());
+                tasks.spawn(async move {
+                    if let Err(e) = push_train(&c, &id).await {
+                        tracing::warn!(train = %id, "push failed: {e:#}");
+                    }
+                    c.release_busy(&id);
+                });
+            }
+            continue;
+        }
+        watch_ready(core, t).await;
+    }
+    claim_next(core, tasks).await
+}
+
+/// Ready train: dissolve when a member was cancelled or the target moved.
+async fn watch_ready(core: &Arc<Core>, t: &TrainRow) {
+    let Ok(jobs) = core.read(|tx| store::train_jobs(tx, t)) else {
+        return;
+    };
+    let ready: Vec<&JobRow> = jobs.iter().filter(|j| j.state == J::Ready).collect();
+    let lost_member = ready.is_empty() || jobs.iter().any(|j| j.state == J::Cancelled);
+    let note = if lost_member {
+        Some("member cancelled".to_owned())
+    } else {
+        let env = ready.first().map(|j| j.env.clone()).unwrap_or_default();
+        let (git, t2) = (core.git_for(&env), t.clone());
+        match blocking(move || current_target(&git, &t2)).await {
+            Ok(Ok(cur)) if cur.as_deref() != Some(t.base_sha.as_str()) => {
+                Some("target moved".to_owned())
+            }
+            _ => None,
+        }
+    };
+    if let Some(note) = note {
+        tracing::info!(train = %t.id, "dissolving ready train: {note}");
+        if let Err(e) = core.write(Actor::Runner, |w| w.dissolve(t, t.state, &note, false)) {
+            tracing::debug!(train = %t.id, "dissolve refused: {}", store_msg(&e));
+        }
+        core.notify.notify_one();
+    }
+}
+
+/// Current SHA of the target (`ls-remote` for a remote, the local ref otherwise).
+fn current_target(git: &Git, t: &TrainRow) -> Result<Option<String>> {
+    let head = format!("refs/heads/{}", t.target);
+    if t.remote.is_empty() {
+        return git.ref_sha(&t.repo, &head);
+    }
+    Ok(git
+        .ls_remote(&t.repo, &t.remote, &[&head])?
+        .get(&head)
+        .cloned())
+}
+
+/// Picks the oldest claimable (repo, remote, target), prepares its base and
+/// trusted config, claims up to `max_train` jobs and spawns the build.
+async fn claim_next(core: &Arc<Core>, tasks: &mut JoinSet<()>) -> Result<()> {
+    let (queued, trains) = core
+        .read(|tx| {
+            Ok((
+                store::jobs_in_state(tx, J::Queued)?,
+                store::trains(tx, None)?,
+            ))
+        })
+        .map_err(|e| anyhow!(store_msg(&e)))?;
+    let mut seen: HashSet<(PathBuf, String, String)> = HashSet::new();
+    for first in &queued {
+        let group = (
+            first.repo.clone(),
+            first.remote.clone(),
+            first.target.clone(),
+        );
+        if !seen.insert(group.clone()) {
+            continue;
+        }
+        let occupied = trains.iter().any(|t| {
+            crate::model::train_is_active(t.state)
+                && t.repo == group.0
+                && t.remote == group.1
+                && t.target == group.2
+        });
+        if occupied {
+            continue;
+        }
+        let (git, j) = (core.git_for(&first.env), first.clone());
+        let prepared = blocking(move || prepare(&git, &j)).await?;
+        let (base_sha, endpoint, config) = match prepared {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(job = %first.id, "cannot prepare a train for {}: {e:#}", first.target);
+                continue;
+            }
+        };
+        let id = train_id();
+        let settings = TrainSettings {
+            push_timeout_ms: u64::try_from(
+                config
+                    .as_ref()
+                    .map_or(600_000, |c| c.queue.push_timeout.as_millis()),
+            )
+            .unwrap_or(u64::MAX),
+            audit_ref: config.as_ref().is_none_or(|c| c.queue.audit_ref),
+        };
+        let max = config.as_ref().map_or(4, |c| c.queue.max_train).max(1) as usize;
+        let worktree = core.merge_dir.join(&id);
+        let claimed = core.write(Actor::Runner, |w| {
+            claim(
+                w, &group, max, &id, &base_sha, &endpoint, &worktree, settings,
+            )
+        });
+        let train = match claimed {
+            Ok(Some(t)) => t,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::debug!("claim refused: {}", store_msg(&e));
+                continue;
+            }
+        };
+        tracing::info!(train = %train.id, members = ?train.members, base = %base_sha, "train claimed");
+        if core.claim_busy(&train.id) {
+            let c = Arc::clone(core);
+            tasks.spawn(async move {
+                let id = train.id.clone();
+                build(&c, train, config).await;
+                c.release_busy(&id);
+            });
+        }
+    }
+    Ok(())
+}
+
+/// `t-<unix-ms>-<6 hex>`.
+fn train_id() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!(
+        "t-{}-{:06x}",
+        now.as_millis(),
+        (now.subsec_nanos() ^ std::process::id()) & 0xff_ffff
+    )
+}
+
+type Prepared = (String, String, Option<RepoConfig>);
+
+/// Step 2: base SHA (fetch for a remote), endpoint hash, config of the base.
+fn prepare(git: &Git, j: &JobRow) -> Result<Prepared> {
+    let base_sha = if j.remote.is_empty() {
+        git.ref_sha(&j.repo, &format!("refs/heads/{}", j.target))?
+            .ok_or_else(|| anyhow!("local branch {} does not exist", j.target))?
+    } else {
+        let base_ref = format!("refs/sluice/base/{}/{}", j.remote, j.target);
+        let spec = format!("+refs/heads/{}:{base_ref}", j.target);
+        git.repo(
+            &j.repo,
+            &["fetch", "--no-tags", "--quiet", &j.remote, &spec],
+        )?;
+        git.ref_sha(&j.repo, &base_ref)?
+            .ok_or_else(|| anyhow!("fetch did not produce {base_ref}"))?
+    };
+    let endpoint = endpoint_hash(git, &j.repo, &j.remote)?;
+    let config = read_config(git, &j.repo, &base_sha)?;
+    Ok((base_sha, endpoint, config))
+}
+
+/// `git show <rev>:.sluice.toml` parsed with `RepoConfig::parse`; `None`
+/// when the base has no config.
+///
+/// # Errors
+///
+/// An invalid config.
+pub fn read_config(git: &Git, common: &Path, rev: &str) -> Result<Option<RepoConfig>> {
+    let spec = format!("{rev}:{REPO_CONFIG_FILE}");
+    let out = git.repo_out(common, &["show", &spec])?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let path = PathBuf::from(format!("{rev}:{REPO_CONFIG_FILE}"));
+    Ok(Some(
+        RepoConfig::parse(&text, &path).context("invalid .sluice.toml on the base")?,
+    ))
+}
+
+/// Step 1, in one transaction: re-reads the queued jobs of the group, takes
+/// up to `max` of them (a `solo` job alone), creates the train, moves them to
+/// `merging`.
+#[allow(clippy::too_many_arguments)]
+fn claim(
+    w: &Writer<'_, '_>,
+    group: &(PathBuf, String, String),
+    max: usize,
+    id: &str,
+    base_sha: &str,
+    endpoint: &str,
+    worktree: &Path,
+    settings: TrainSettings,
+) -> rusqlite::Result<Option<TrainRow>> {
+    let tx = w.tx();
+    let busy = store::trains(tx, Some(&group.0))?.into_iter().any(|t| {
+        crate::model::train_is_active(t.state) && t.remote == group.1 && t.target == group.2
+    });
+    if busy {
+        return Ok(None);
+    }
+    let mut members = Vec::new();
+    for j in store::jobs_in_state(tx, J::Queued)? {
+        if j.repo != group.0 || j.remote != group.1 || j.target != group.2 {
+            continue;
+        }
+        if j.solo {
+            if members.is_empty() {
+                members.push(j.id);
+            }
+            break;
+        }
+        members.push(j.id);
+        if members.len() >= max {
+            break;
+        }
+    }
+    if members.is_empty() {
+        return Ok(None);
+    }
+    w.insert_train(&NewTrain {
+        id: id.to_owned(),
+        repo: group.0.clone(),
+        remote: group.1.clone(),
+        target: group.2.clone(),
+        endpoint_hash: endpoint.to_owned(),
+        base_sha: base_sha.to_owned(),
+        worktree: worktree.to_path_buf(),
+        members: members.clone(),
+        settings,
+    })?;
+    for m in &members {
+        w.job_to(
+            m,
+            J::Queued,
+            J::Merging,
+            &JobEdit {
+                train_id: Some(Some(id.to_owned())),
+                reason: Some(None),
+                detail: Some(None),
+                ..JobEdit::default()
+            },
+        )?;
+    }
+    store::train(tx, id)
+}
+
+// ---------------------------------------------------------------------------
+// Build: worktree, merge, key, gates, outcome (steps 3–7)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+struct Merged {
+    s: String,
+    t: String,
+    survivors: Vec<(String, bool)>,
+    conflicts: Vec<(String, &'static str, Vec<String>)>,
+}
+
+async fn build(core: &Arc<Core>, train: TrainRow, config: Option<RepoConfig>) {
+    let id = train.id.clone();
+    if let Err(e) = build_inner(core, &train, config).await {
+        tracing::warn!(train = %id, "train failed: {e:#}");
+        let msg = format!("{e:#}");
+        let r = core.write(Actor::Runner, |w| {
+            let Some(t) = store::train(w.tx(), &id)? else {
+                return Ok(());
+            };
+            if !matches!(t.state, T::Building | T::Verifying) {
+                return Ok(());
+            }
+            for j in store::train_jobs(w.tx(), &t)? {
+                if matches!(j.state, J::Merging | J::Verifying) {
+                    w.job_to(
+                        &j.id,
+                        j.state,
+                        J::Failed,
+                        &JobEdit {
+                            reason: Some(Some("internal".into())),
+                            detail: Some(Some(json!({"error": msg}))),
+                            ..JobEdit::default()
+                        },
+                    )?;
+                }
+            }
+            w.dissolve(&t, t.state, "internal error", false)
+        });
+        if let Err(e) = r {
+            tracing::warn!(train = %id, "cannot record the failure: {}", store_msg(&e));
+        }
+    }
+    let t2 = core.read(|tx| store::train(tx, &id)).ok().flatten();
+    if let Some(t) = t2.filter(|t| t.state == T::Dissolved) {
+        let (git, repo, wt) = (core.git.clone(), t.repo.clone(), t.worktree.clone());
+        let _ = blocking(move || git.remove_worktree(&repo, &wt)).await;
+    }
+}
+
+#[allow(clippy::too_many_lines, reason = "steps 4-7 of the design, in order")]
+async fn build_inner(core: &Arc<Core>, train: &TrainRow, config: Option<RepoConfig>) -> Result<()> {
+    let jobs = core
+        .read(|tx| store::train_jobs(tx, train))
+        .map_err(|e| anyhow!(store_msg(&e)))?;
+    let members: Vec<(String, String, String)> = jobs
+        .iter()
+        .filter(|j| j.state == J::Merging)
+        .map(|j| (j.id.clone(), j.branch.clone(), j.head_sha.clone()))
+        .collect();
+    let (git, t) = (core.git.clone(), train.clone());
+    let merged = blocking(move || merge_members(&git, &t, &members)).await??;
+
+    // Record merge results.
+    let id = train.id.clone();
+    let survivors = merged.survivors.clone();
+    let done = core
+        .write(Actor::Runner, |w| {
+            // A member cancelled while merging: drop the train, re-queue the rest.
+            let t = store::train(w.tx(), &id)?
+                .ok_or_else(|| store::refuse(store::Refusal::NotFound(id.clone())))?;
+            if store::train_jobs(w.tx(), &t)?
+                .iter()
+                .any(|j| j.state == J::Cancelled)
+            {
+                w.dissolve(&t, T::Building, "member cancelled", false)?;
+                return Ok(true);
+            }
+            for (job, reason, paths) in &merged.conflicts {
+                w.job_to(
+                    job,
+                    J::Merging,
+                    J::Conflict,
+                    &JobEdit {
+                        reason: Some(Some((*reason).to_owned())),
+                        detail: Some(Some(json!({ "paths": paths }))),
+                        note: Some((*reason).to_owned()),
+                        ..JobEdit::default()
+                    },
+                )?;
+            }
+            if survivors.is_empty() {
+                w.dissolve(&t, T::Building, "no member merged", false)?;
+                return Ok(true);
+            }
+            for (job, config_changed) in &survivors {
+                w.job_to(
+                    job,
+                    J::Merging,
+                    J::Verifying,
+                    &JobEdit {
+                        detail: Some(config_changed.then(|| json!({ "config_changed": true }))),
+                        ..JobEdit::default()
+                    },
+                )?;
+            }
+            w.train_to(
+                &id,
+                T::Building,
+                T::Verifying,
+                &TrainEdit {
+                    merge_sha: Some(merged.s.clone()),
+                    merge_tree: Some(merged.t.clone()),
+                    ..TrainEdit::default()
+                },
+            )?;
+            Ok(false)
+        })
+        .map_err(|e| anyhow!(store_msg(&e)))?;
+    if done {
+        return Ok(());
+    }
+
+    // Step 5: the clean merge worktree must snapshot to T.
+    let wt_git = {
+        let (git, wt) = (core.git.clone(), train.worktree.clone());
+        blocking(move || worktree_git_dir(&git, &wt)).await??
+    };
+    let paths = RepoPaths {
+        toplevel: train.worktree.clone(),
+        git_dir: wt_git.clone(),
+        common_dir: train.repo.clone(),
+        index_file: wt_git.join("index"),
+        objects_dir: train.repo.join("objects"),
+    };
+    let (p2, env, scratch) = (paths.clone(), core.git.env().clone(), core.scratch.clone());
+    let snap = blocking(move || tree::snapshot(&p2, &env, &scratch)).await?;
+    let tree_ok = matches!(&snap, Ok(Snapshot::Known(t)) if t.as_str() == merged.t);
+    if !tree_ok {
+        let why = match snap {
+            Ok(Snapshot::Known(t)) => format!("snapshot {t} != {}", merged.t),
+            Ok(Snapshot::Unknown { reason }) => reason,
+            Err(e) => e.to_string(),
+        };
+        return fail_survivors(core, train, "tree_mismatch", &json!({ "error": why }))
+            .map_err(|e| anyhow!(store_msg(&e)));
+    }
+
+    // Step 5–6: keys, markers, runs.
+    let gates = select_gates(config.as_ref());
+    let tree_hash = sluice_gate_core::tree::TreeHash::try_from(merged.t.clone())
+        .map_err(|e| anyhow!("invalid tree {}: {e}", merged.t))?;
+    let mut views: Vec<TrainGate> = Vec::new();
+    let mut to_run: Vec<(usize, String, Gate, Option<sluice_gate_core::key::CacheKey>)> =
+        Vec::new();
+    let ttl = core.handle.daemon_config().marker_ttl;
+    for (name, gate) in gates {
+        let key = if gate.cache {
+            let (g2, wt, env, tr, n) = (
+                gate.clone(),
+                train.worktree.clone(),
+                core.child_env.clone(),
+                tree_hash.clone(),
+                name.clone(),
+            );
+            Some(blocking(move || derive_key(&g2, &n, &tr, &wt, &env)).await??)
+        } else {
+            None
+        };
+        let hit = match &key {
+            Some(k) => matches!(
+                MarkerStore::new(&train.repo).lookup(k, ttl),
+                Ok(Lookup::Hit(_))
+            ),
+            None => false,
+        };
+        views.push(TrainGate {
+            gate: name.clone(),
+            key: key.as_ref().map(|k| k.as_str().to_owned()),
+            job_id: None,
+            status: if hit { "cached" } else { "pending" }.to_owned(),
+            duration_ms: None,
+        });
+        if !hit {
+            to_run.push((views.len() - 1, name, gate, key));
+        }
+    }
+    let mut failure: Option<(usize, serde_json::Value)> = None;
+    if !to_run.is_empty() {
+        let mut subs: Vec<(usize, RunSubscription)> = Vec::new();
+        for (idx, name, gate, key) in to_run {
+            let req = RunRequest {
+                repo: RepoInfo {
+                    toplevel: train.worktree.clone(),
+                    common_dir: train.repo.clone(),
+                    git_dir: wt_git.clone(),
+                },
+                gate: GateSpec {
+                    name: name.clone(),
+                    cmd: gate.cmd.clone(),
+                    weight: gate.weight,
+                    timeout_ms: u64::try_from(gate.timeout.as_millis()).unwrap_or(u64::MAX),
+                    env: gate.env.clone(),
+                    cache: gate.cache,
+                },
+                key,
+                tree: Some(tree_hash.clone()),
+                committed_tree: Some(tree_hash.clone()),
+                cmd: gate.cmd.trim().to_owned(),
+                extra: Vec::new(),
+                cwd: train.worktree.clone(),
+                child_env: core.child_env.clone(),
+                probe_env: core.git.env().clone(),
+                caller: Caller::Human,
+                session: Some(format!("queue:{}", train.id)),
+                client_pid: std::process::id(),
+                hook: None,
+            };
+            let sub = core.handle.submit_run(req);
+            views[idx].job_id = (!sub.job_id().is_empty()).then(|| sub.job_id().to_owned());
+            "running".clone_into(&mut views[idx].status);
+            subs.push((idx, sub));
+        }
+        let v2 = views.clone();
+        let _ = core.write(Actor::Runner, |w| {
+            w.train_to(
+                &train.id,
+                T::Verifying,
+                T::Verifying,
+                &TrainEdit {
+                    gates: Some(v2),
+                    ..TrainEdit::default()
+                },
+            )
+        });
+        failure = await_gates(core, train, subs, &mut views).await;
+    }
+
+    // Step 7: outcome.
+    let jobs_now = core
+        .read(|tx| store::train_jobs(tx, train))
+        .map_err(|e| anyhow!(store_msg(&e)))?;
+    let alive: Vec<&JobRow> = jobs_now
+        .iter()
+        .filter(|j| j.state == J::Verifying)
+        .collect();
+    let cancelled = alive.len() != merged.survivors.len();
+    let id = train.id.clone();
+    if cancelled {
+        core.write(Actor::Runner, |w| {
+            let t = store::train(w.tx(), &id)?
+                .ok_or_else(|| store::refuse(store::Refusal::NotFound(id.clone())))?;
+            w.dissolve(&t, T::Verifying, "member cancelled", false)
+        })
+        .map_err(|e| anyhow!(store_msg(&e)))?;
+        return Ok(());
+    }
+    if let Some((idx, detail)) = failure {
+        let gate = views[idx].gate.clone();
+        let v2 = views.clone();
+        core.write(Actor::Runner, |w| {
+            w.train_to(
+                &id,
+                T::Verifying,
+                T::Verifying,
+                &TrainEdit {
+                    gates: Some(v2),
+                    ..TrainEdit::default()
+                },
+            )?;
+            let t = store::train(w.tx(), &id)?
+                .ok_or_else(|| store::refuse(store::Refusal::NotFound(id.clone())))?;
+            if alive.len() == 1 {
+                w.job_to(
+                    &alive[0].id,
+                    J::Verifying,
+                    J::Failed,
+                    &JobEdit {
+                        reason: Some(Some("gate_failed".into())),
+                        detail: Some(Some(detail.clone())),
+                        note: Some(format!("gate {gate} failed")),
+                        ..JobEdit::default()
+                    },
+                )?;
+                w.dissolve(&t, T::Verifying, &format!("gate {gate} failed"), false)
+            } else {
+                w.dissolve(
+                    &t,
+                    T::Verifying,
+                    &format!("gate {gate} failed; members split"),
+                    true,
+                )
+            }
+        })
+        .map_err(|e| anyhow!(store_msg(&e)))?;
+        return Ok(());
+    }
+    let member_heads: Vec<(String, String)> = alive
+        .iter()
+        .map(|j| (j.id.clone(), j.head_sha.clone()))
+        .collect();
+    let gate_keys: Vec<String> = views
+        .iter()
+        .map(|g| format!("{}={}", g.gate, g.key.as_deref().unwrap_or("-")))
+        .collect();
+    let repo_s = train.repo.to_string_lossy().into_owned();
+    let hash = train_hash(&TrainHashInput {
+        repo: &repo_s,
+        remote: &train.remote,
+        endpoint_hash: &train.endpoint_hash,
+        target: &train.target,
+        base_sha: &train.base_sha,
+        members: &member_heads,
+        merge_sha: &merged.s,
+        merge_tree: &merged.t,
+        gate_keys: &gate_keys,
+    });
+    core.write(Actor::Runner, |w| {
+        for (j, _) in &member_heads {
+            w.job_to(j, J::Verifying, J::Ready, &JobEdit::default())?;
+        }
+        w.train_to(
+            &id,
+            T::Verifying,
+            T::Ready,
+            &TrainEdit {
+                gates: Some(views.clone()),
+                train_hash: Some(Some(hash.clone())),
+                ..TrainEdit::default()
+            },
+        )
+    })
+    .map_err(|e| anyhow!(store_msg(&e)))?;
+    tracing::info!(train = %id, "train ready");
+    Ok(())
+}
+
+/// Waits for every gate; the first failure drops the other subscriptions
+/// (unsubscribe). Also stops when a member leaves `verifying` (cancel).
+async fn await_gates(
+    core: &Arc<Core>,
+    train: &TrainRow,
+    subs: Vec<(usize, RunSubscription)>,
+    views: &mut [TrainGate],
+) -> Option<(usize, serde_json::Value)> {
+    let mut set: JoinSet<(usize, Option<ServerMessage>)> = JoinSet::new();
+    for (idx, mut sub) in subs {
+        set.spawn(async move {
+            let mut last = None;
+            while let Some(m) = sub.recv().await {
+                let end = matches!(m, ServerMessage::Done { .. } | ServerMessage::Error { .. });
+                last = Some(m);
+                if end {
+                    break;
+                }
+            }
+            (idx, last)
+        });
+    }
+    let tick = core
+        .handle
+        .config()
+        .queue
+        .tick
+        .max(Duration::from_millis(50));
+    loop {
+        tokio::select! {
+            r = set.join_next() => {
+                let r = r?;
+                let Ok((idx, msg)) = r else { continue };
+                match msg {
+                    Some(ServerMessage::Done { job_id, outcome, .. }) => {
+                        views[idx].duration_ms = Some(outcome.duration_ms);
+                        let ok = matches!(outcome.status, OutcomeStatus::Pass | OutcomeStatus::Cached);
+                        match outcome.status {
+                            OutcomeStatus::Pass => "pass",
+                            OutcomeStatus::Cached => "cached",
+                            OutcomeStatus::Fail => "fail",
+                            OutcomeStatus::Timeout => "timeout",
+                            OutcomeStatus::Killed => "killed",
+                            OutcomeStatus::Error => "error",
+                        }.clone_into(&mut views[idx].status);
+                        if !ok {
+                            set.abort_all();
+                            return Some((idx, json!({
+                                "gate": views[idx].gate,
+                                "job_id": job_id,
+                                "status": views[idx].status,
+                                "exit_code": outcome.exit_code,
+                                "log_path": outcome.log_path,
+                                "message": outcome.message,
+                            })));
+                        }
+                    }
+                    other => {
+                        "error".clone_into(&mut views[idx].status);
+                        set.abort_all();
+                        let message = match other {
+                            Some(ServerMessage::Error { message, .. }) => message,
+                            _ => "the gate run ended without a result".to_owned(),
+                        };
+                        return Some((idx, json!({
+                            "gate": views[idx].gate,
+                            "job_id": views[idx].job_id,
+                            "status": "error",
+                            "message": message,
+                        })));
+                    }
+                }
+            }
+            () = tokio::time::sleep(tick) => {
+                let jobs = core.read(|tx| store::train_jobs(tx, train)).unwrap_or_default();
+                if jobs.iter().any(|j| j.state == J::Cancelled) {
+                    set.abort_all();
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// Gates a train must pass: `[queue] gates`, else the gates whose hooks
+/// contain `pre-push`, else every gate.
+fn select_gates(config: Option<&RepoConfig>) -> Vec<(String, Gate)> {
+    let Some(c) = config else {
+        return Vec::new();
+    };
+    if let Some(names) = &c.queue.gates {
+        return names
+            .iter()
+            .filter_map(|n| c.gates.get(n).map(|g| (n.clone(), g.clone())))
+            .collect();
+    }
+    let pre_push = c.gates_for_hook("pre-push");
+    if !pre_push.is_empty() {
+        return pre_push
+            .into_iter()
+            .map(|(n, g)| (n.to_owned(), g.clone()))
+            .collect();
+    }
+    c.gates
+        .iter()
+        .map(|(n, g)| (n.clone(), g.clone()))
+        .collect()
+}
+
+/// The key a client would derive for `gate` on `tree` (`key_inputs` run in
+/// the merge worktree, `key_files` read there, no extra arguments).
+fn derive_key(
+    gate: &Gate,
+    name: &str,
+    tree: &sluice_gate_core::tree::TreeHash,
+    wt: &Path,
+    child_env: &EnvMap,
+) -> Result<sluice_gate_core::key::CacheKey> {
+    let (key_inputs, key_files) = if gate.key_inputs.is_empty() && gate.key_files.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        let mut env = child_env.clone();
+        env.extend(gate.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        key::collect_inputs(&gate.key_inputs, &gate.key_files, wt, &env)?
+    };
+    Ok(key::derive(&KeyMaterial {
+        tree: tree.clone(),
+        gate_name: name.to_owned(),
+        cmd: sluice_gate_core::lookup::key_command(gate, &[]),
+        env: gate.env.clone(),
+        key_inputs,
+        key_files,
+    }))
+}
+
+fn fail_survivors(
+    core: &Core,
+    train: &TrainRow,
+    reason: &str,
+    detail: &serde_json::Value,
+) -> Result<(), StoreError> {
+    let id = train.id.clone();
+    core.write(Actor::Runner, |w| {
+        let t = store::train(w.tx(), &id)?
+            .ok_or_else(|| store::refuse(store::Refusal::NotFound(id.clone())))?;
+        for j in store::train_jobs(w.tx(), &t)? {
+            if j.state == J::Verifying {
+                w.job_to(
+                    &j.id,
+                    J::Verifying,
+                    J::Failed,
+                    &JobEdit {
+                        reason: Some(Some(reason.to_owned())),
+                        detail: Some(Some(detail.clone())),
+                        note: Some(reason.to_owned()),
+                        ..JobEdit::default()
+                    },
+                )?;
+            }
+        }
+        w.dissolve(&t, t.state, reason, false)
+    })
+}
+
+/// Steps 3–4: worktree and merges. Blocking.
+fn merge_members(git: &Git, t: &TrainRow, members: &[(String, String, String)]) -> Result<Merged> {
+    if let Some(parent) = t.worktree.parent() {
+        sluice_gate_core::dirs::create_private_dir(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    if t.worktree.exists() {
+        git.remove_worktree(&t.repo, &t.worktree);
+    }
+    let wt_s = t.worktree.to_string_lossy().into_owned();
+    git.repo(
+        &t.repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            "--lock",
+            "--reason",
+            "sluice merge queue",
+            &wt_s,
+            &t.base_sha,
+        ],
+    )?;
+    let wt = &t.worktree;
+    let ident_ok = git
+        .wt_out(wt, &["var", "GIT_COMMITTER_IDENT"])
+        .is_ok_and(|o| o.status.success());
+    let mut merged = Merged::default();
+    let ff =
+        members.len() == 1 && git.is_ancestor(&t.repo, &t.base_sha, &members[0].2)? == Some(true);
+    for (job, branch, head) in members {
+        let config_changed = !git
+            .repo_out(
+                &t.repo,
+                &["diff", "--quiet", &t.base_sha, head, "--", REPO_CONFIG_FILE],
+            )?
+            .status
+            .success();
+        if ff {
+            git.wt(wt, &["checkout", "--quiet", "--detach", head])?;
+            merged.survivors.push((job.clone(), config_changed));
+            continue;
+        }
+        let before = git.wt(wt, &["rev-parse", "HEAD"])?;
+        let msg = format!("Merge {branch} (sluice job {job})");
+        let mut args: Vec<&str> = Vec::new();
+        if !ident_ok {
+            args.extend([
+                "-c",
+                "user.name=Sluice merge queue",
+                "-c",
+                "user.email=sluice@localhost",
+            ]);
+        }
+        args.extend(["merge", "--no-ff", "--no-edit", "-m", &msg, head]);
+        let out = git.wt_out(wt, &args)?;
+        if !out.status.success() {
+            let paths: Vec<String> = git
+                .wt(wt, &["diff", "--name-only", "--diff-filter=U"])
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            if git
+                .wt_out(wt, &["merge", "--abort"])
+                .map_or(true, |o| !o.status.success())
+            {
+                git.wt(wt, &["reset", "--quiet", "--hard", &before])?;
+            }
+            let reason = if paths.is_empty() {
+                "merge_failed"
+            } else {
+                "conflict"
+            };
+            merged.conflicts.push((job.clone(), reason, paths));
+            continue;
+        }
+        let dirty = git.wt(wt, &["status", "--porcelain"])?;
+        if !dirty.is_empty() {
+            git.wt(wt, &["reset", "--quiet", "--hard", &before])?;
+            let _ = git.wt(wt, &["clean", "-fdq"]);
+            let paths = dirty
+                .lines()
+                .map(|l| l.get(3..).unwrap_or(l).to_owned())
+                .collect();
+            merged.conflicts.push((job.clone(), "dirty_merge", paths));
+            continue;
+        }
+        merged.survivors.push((job.clone(), config_changed));
+    }
+    merged.s = git.wt(wt, &["rev-parse", "HEAD"])?;
+    merged.t = git.wt(wt, &["rev-parse", "HEAD^{tree}"])?;
+    Ok(merged)
+}
+
+// ---------------------------------------------------------------------------
+// Push (step 9, section 6)
+// ---------------------------------------------------------------------------
+
+/// Recomputes the train hash from the stored rows (members in `state`).
+pub(crate) fn current_hash(t: &TrainRow, jobs: &[JobRow], state: J) -> Option<String> {
+    let members: Vec<(String, String)> = jobs
+        .iter()
+        .filter(|j| j.state == state)
+        .map(|j| (j.id.clone(), j.head_sha.clone()))
+        .collect();
+    let gate_keys: Vec<String> = t
+        .gates
+        .iter()
+        .map(|g| format!("{}={}", g.gate, g.key.as_deref().unwrap_or("-")))
+        .collect();
+    let repo = t.repo.to_string_lossy().into_owned();
+    Some(train_hash(&TrainHashInput {
+        repo: &repo,
+        remote: &t.remote,
+        endpoint_hash: &t.endpoint_hash,
+        target: &t.target,
+        base_sha: &t.base_sha,
+        members: &members,
+        merge_sha: t.merge_sha.as_deref()?,
+        merge_tree: t.merge_tree.as_deref()?,
+        gate_keys: &gate_keys,
+    }))
+}
+
+enum PreCheck {
+    Ok,
+    Dissolve(String),
+    FailMembers(&'static str, String),
+    Retry(String),
+}
+
+fn pre_push_checks(git: &Git, t: &TrainRow, s: &str) -> PreCheck {
+    let head = git
+        .wt(&t.worktree, &["rev-parse", "HEAD"])
+        .unwrap_or_default();
+    if head != s {
+        return PreCheck::Dissolve(format!("merge worktree HEAD {head} != {s}"));
+    }
+    match git.wt(&t.worktree, &["status", "--porcelain"]) {
+        Ok(st) if st.is_empty() => {}
+        _ => return PreCheck::Dissolve("merge worktree is not clean".into()),
+    }
+    match endpoint_hash(git, &t.repo, &t.remote) {
+        Ok(h) if h == t.endpoint_hash => {}
+        Ok(_) => return PreCheck::Dissolve("endpoint_changed".into()),
+        Err(e) => return PreCheck::Retry(format!("{e:#}")),
+    }
+    if t.remote.is_empty()
+        && git
+            .checked_out_branches(&t.repo)
+            .is_ok_and(|b| b.contains(&t.target))
+    {
+        return PreCheck::FailMembers(
+            "target_checked_out",
+            format!("local branch {} is checked out in a worktree", t.target),
+        );
+    }
+    match current_target(git, t) {
+        Ok(Some(cur)) if cur == t.base_sha => PreCheck::Ok,
+        Ok(_) => PreCheck::Dissolve("target moved".into()),
+        Err(e) => PreCheck::Retry(format!("{e:#}")),
+    }
+}
+
+#[allow(clippy::too_many_lines, reason = "section 6 steps 1-3, in order")]
+async fn push_train(core: &Arc<Core>, id: &str) -> Result<()> {
+    let (t, jobs) = core
+        .read(|tx| {
+            let t = store::train(tx, id)?;
+            let jobs = match &t {
+                Some(t) => store::train_jobs(tx, t)?,
+                None => Vec::new(),
+            };
+            Ok((t, jobs))
+        })
+        .map_err(|e| anyhow!(store_msg(&e)))?;
+    let Some(t) = t.filter(|t| t.state == T::Approved) else {
+        return Ok(());
+    };
+    if !core.handle.lease_held() {
+        return Ok(());
+    }
+    let s = t.merge_sha.clone().context("approved train without S")?;
+    let env = t.push_env.clone().unwrap_or_default();
+    let git = core.git_for(&env);
+    // Re-verify: hash, members, HEAD, cleanliness, endpoint, target.
+    if current_hash(&t, &jobs, J::Approved) != t.approved_hash
+        || jobs.iter().any(|j| j.cancel_requested)
+    {
+        core.write(Actor::Runner, |w| {
+            w.dissolve(&t, T::Approved, "stale_plan", false)
+        })
+        .map_err(|e| anyhow!(store_msg(&e)))?;
+        return Ok(());
+    }
+    let (g2, t2, s2) = (git.clone(), t.clone(), s.clone());
+    match blocking(move || pre_push_checks(&g2, &t2, &s2)).await? {
+        PreCheck::Ok => {}
+        PreCheck::Retry(why) => {
+            tracing::warn!(train = %id, "push postponed: {why}");
+            return Ok(());
+        }
+        PreCheck::Dissolve(why) => {
+            core.write(Actor::Runner, |w| w.dissolve(&t, T::Approved, &why, false))
+                .map_err(|e| anyhow!(store_msg(&e)))?;
+            return Ok(());
+        }
+        PreCheck::FailMembers(reason, why) => {
+            core.write(Actor::Runner, |w| {
+                for j in jobs.iter().filter(|j| j.state == J::Approved) {
+                    w.job_to(
+                        &j.id,
+                        J::Approved,
+                        J::Failed,
+                        &JobEdit {
+                            reason: Some(Some(reason.to_owned())),
+                            detail: Some(Some(json!({ "error": why }))),
+                            ..JobEdit::default()
+                        },
+                    )?;
+                }
+                w.dissolve(&t, T::Approved, reason, false)
+            })
+            .map_err(|e| anyhow!(store_msg(&e)))?;
+            return Ok(());
+        }
+    }
+    // 1. Pin ref.
+    let pin = format!("refs/sluice/pending/{id}");
+    {
+        let (g2, repo, pin2, s2) = (git.clone(), t.repo.clone(), pin.clone(), s.clone());
+        blocking(move || g2.repo(&repo, &["update-ref", &pin2, &s2])).await??;
+    }
+    // 2. Marker + pushing, one transaction.
+    let audit = t.settings.audit_ref;
+    let target_ref = format!("refs/heads/{}", t.target);
+    let audit_ref = format!("refs/sluice/landed/{s}");
+    let mut push_refs = vec![target_ref.clone()];
+    if audit {
+        push_refs.push(audit_ref.clone());
+    }
+    let marker = MarkerRow {
+        train_id: id.to_owned(),
+        sha: s.clone(),
+        base_sha: t.base_sha.clone(),
+        remote: t.remote.clone(),
+        endpoint_hash: t.endpoint_hash.clone(),
+        push_refs,
+        audit_ref: audit.then(|| audit_ref.clone()),
+        pin_ref: pin.clone(),
+        claim_token: String::new(),
+        push_pid: None,
+        push_start_ticks: None,
+        written_at: 0,
+    };
+    let wrote = core.write_durable(Actor::Runner, |w| {
+        // Re-read inside the transaction: fenced on the members' state and
+        // on `cancel_requested = 0`.
+        let now = store::train_jobs(w.tx(), &t)?;
+        let approved: Vec<&JobRow> = now.iter().filter(|j| j.state == J::Approved).collect();
+        if approved.is_empty() || approved.iter().any(|j| j.cancel_requested) {
+            return Err(store::refuse(store::Refusal::State(
+                "no approved member left, or a cancel is pending".into(),
+            )));
+        }
+        w.insert_marker(&marker)?;
+        for j in &approved {
+            w.job_to(&j.id, J::Approved, J::Pushing, &JobEdit::default())?;
+        }
+        w.train_to(id, T::Approved, T::Pushing, &TrainEdit::default())
+    });
+    if let Err(e) = wrote {
+        tracing::info!(train = %id, "push not started: {}", store_msg(&e));
+        let (g2, repo, pin2) = (git.clone(), t.repo.clone(), pin.clone());
+        let _ = blocking(move || g2.repo(&repo, &["update-ref", "-d", &pin2])).await;
+        return Ok(());
+    }
+    tracing::info!(train = %id, target = %t.target, "pushing");
+    // 3. Push (or local ref update).
+    let verdict = if t.remote.is_empty() {
+        let (g2, t2, s2) = (git.clone(), t.clone(), s.clone());
+        match blocking(move || {
+            push::land_local(&g2, &t2.repo, &t2.id, &t2.target, &t2.base_sha, &s2, audit)
+        })
+        .await?
+        {
+            Ok(true) => PushVerdict::Landed,
+            Ok(false) => PushVerdict::Moved("update-ref compare-and-swap failed".into()),
+            Err(e) => PushVerdict::Ambiguous(format!("{e:#}")),
+        }
+    } else {
+        let args = push::push_args(&t.remote, &t.target, &t.base_sha, &s, audit);
+        let proc_ = push::spawn(&git, &t.worktree, &args)?;
+        let (pid, ticks) = (proc_.pid, proc_.start_ticks);
+        if let Err(e) = core.write(Actor::Runner, |w| w.set_marker_pid(id, pid, ticks)) {
+            tracing::warn!(train = %id, "cannot record the push pid: {}", store_msg(&e));
+        }
+        let timeout = Duration::from_millis(t.settings.push_timeout_ms.max(1));
+        match proc_.wait(timeout).await {
+            PushEnd::TimedOut => PushVerdict::Ambiguous("push_timeout".into()),
+            PushEnd::Exited {
+                code,
+                stdout,
+                stderr,
+            } => push::classify(code, &stdout, &stderr, &target_ref),
+        }
+    };
+    tracing::info!(train = %id, ?verdict, "push ended");
+    apply_verdict(core, &t, &verdict).await
+}
+
+async fn apply_verdict(core: &Arc<Core>, t: &TrainRow, verdict: &PushVerdict) -> Result<()> {
+    let id = t.id.clone();
+    let r = core.write(Actor::Runner, |w| {
+        let jobs = store::train_jobs(w.tx(), t)?;
+        let pushing: Vec<&JobRow> = jobs.iter().filter(|j| j.state == J::Pushing).collect();
+        match verdict {
+            PushVerdict::Landed => {
+                for j in &pushing {
+                    w.job_to(&j.id, J::Pushing, J::Landed, &JobEdit::default())?;
+                }
+                w.train_to(
+                    &id,
+                    T::Pushing,
+                    T::Landed,
+                    &TrainEdit {
+                        event_note: Some("outcome: landed".into()),
+                        ..TrainEdit::default()
+                    },
+                )
+            }
+            PushVerdict::Moved(why) => {
+                w.delete_marker(&id)?;
+                w.dissolve(t, T::Pushing, &format!("push rejected: {why}"), false)
+            }
+            PushVerdict::Rejected(why) | PushVerdict::HookDeclined(why) => {
+                let reason = if matches!(verdict, PushVerdict::HookDeclined(_)) {
+                    "pre_push_hook"
+                } else {
+                    "push_rejected"
+                };
+                w.delete_marker(&id)?;
+                for j in &pushing {
+                    let to = if j.cancel_requested {
+                        J::Cancelled
+                    } else {
+                        J::Failed
+                    };
+                    w.job_to(
+                        &j.id,
+                        J::Pushing,
+                        to,
+                        &JobEdit {
+                            reason: Some(Some(reason.to_owned())),
+                            detail: Some(Some(json!({ "output": why }))),
+                            note: Some(reason.to_owned()),
+                            ..JobEdit::default()
+                        },
+                    )?;
+                }
+                w.dissolve(t, T::Pushing, reason, false)
+            }
+            PushVerdict::Ambiguous(why) => {
+                for j in &pushing {
+                    w.job_to(
+                        &j.id,
+                        J::Pushing,
+                        J::NeedsReconcile,
+                        &JobEdit {
+                            reason: Some(Some("needs_reconcile".into())),
+                            detail: Some(Some(json!({ "error": why }))),
+                            ..JobEdit::default()
+                        },
+                    )?;
+                }
+                w.train_to(
+                    &id,
+                    T::Pushing,
+                    T::NeedsReconcile,
+                    &TrainEdit {
+                        note: Some(Some(why.clone())),
+                        event_note: Some(why.clone()),
+                        ..TrainEdit::default()
+                    },
+                )
+            }
+        }
+    });
+    if let Err(e) = r {
+        tracing::warn!(train = %id, "push result not recorded ({}); the next daemon start parks it", store_msg(&e));
+        return Ok(());
+    }
+    if !matches!(verdict, PushVerdict::Ambiguous(_)) {
+        let (git, repo, wt) = (core.git.clone(), t.repo.clone(), t.worktree.clone());
+        let pin = format!("refs/sluice/pending/{id}");
+        blocking(move || {
+            let _ = git.repo(&repo, &["update-ref", "-d", &pin]);
+            git.remove_worktree(&repo, &wt);
+        })
+        .await?;
+    }
+    Ok(())
+}

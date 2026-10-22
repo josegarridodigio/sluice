@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
@@ -22,6 +23,7 @@ use sluice_gate_core::dirs;
 use sluice_gate_core::git::EnvMap;
 use sluice_gate_daemon::executor::{IoClass, IoPriority};
 use sluice_gate_daemon::server::{self, DaemonConfig};
+use sluice_gate_queue::{QueueExtension, QueueOptions};
 
 use crate::run::EXIT_ERROR;
 use sluice_gate_proto::client::{self, ClientError};
@@ -67,7 +69,7 @@ fn daemon_config(env: &EnvMap, user: &UserConfig) -> Result<DaemonConfig> {
         admission: user.admission.clone(),
         psi_root: PathBuf::from(sluice_gate_daemon::psi::DEFAULT_ROOT),
         user: user.clone(),
-        extensions: Vec::new(),
+        extensions: vec![Arc::new(QueueExtension::new(QueueOptions::default()))],
     })
 }
 

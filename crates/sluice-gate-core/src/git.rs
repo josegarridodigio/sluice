@@ -54,6 +54,32 @@ pub(crate) fn output(args: &[&str], cwd: &Path, env: &EnvMap, read_only: bool) -
     cmd.output().map_err(Error::GitMissing)
 }
 
+/// Builds (without spawning) a `git` command with `args`, `cwd` and exactly
+/// `env`, stdin from `/dev/null`. For callers that need to own the process
+/// (the merge queue's push: own process group, timeout, pid tracking);
+/// everything else uses [`run`] or [`run_output`].
+#[must_use]
+pub fn command(args: &[&str], cwd: &Path, env: &EnvMap) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .envs(env)
+        .stdin(Stdio::null());
+    cmd
+}
+
+/// Runs git and returns its raw [`Output`] whatever the exit status, for
+/// callers that interpret the status themselves (`merge-base
+/// --is-ancestor`, `merge`, `diff --quiet`).
+///
+/// # Errors
+///
+/// [`Error::GitMissing`] when git cannot be spawned.
+pub fn run_output(args: &[&str], cwd: &Path, env: &EnvMap) -> Result<Output> {
+    output(args, cwd, env, false)
+}
+
 /// Converts a failed [`Output`] into [`Error::GitCommand`].
 pub(crate) fn command_error(args: &[&str], out: &Output) -> Error {
     let stderr = String::from_utf8_lossy(&out.stderr);

@@ -54,6 +54,7 @@ crates/
   sluice-gate-proto/    # IPC message types (serde), versioned; blocking client behind the `client` feature.
   sluice-gate-daemon/   # scheduler, coalescing, executor, PSI, SQLite.
   sluice-gate-mcp/      # rmcp server; thin client of the daemon.
+  sluice-gate-queue/    # local merge queue; a daemon extension (async, tokio).
   sluice-gate/          # the `sluice` binary; subcommands; thin client; integration tests.
 docs/
 kb/                     # Pando knowledge base (design history, ADRs, change log)
@@ -194,10 +195,34 @@ subscription before `done` detaches like a client disconnect), `fence() ->
 LeaseFence {instance, token}` with `LeaseFence::check(&Transaction)`,
 `lease_held()`, `shutdown()`, `store_tx(f)` (one `BEGIN IMMEDIATE` on the
 daemon's connection under the store mutex; busy is the retryable
-`StoreError::Busy`), `state_dir()`, `log_dir()`, `config()` (the
+`StoreError::Busy`), `store_tx_durable(f)` (the same, committed with
+`PRAGMA synchronous = FULL`, restored to `NORMAL` afterwards; SQLite refuses
+to change it inside a transaction), `state_dir()`, `log_dir()`, `config()` (the
 `UserConfig` passed in `DaemonConfig.user`), `daemon_config()` and
 `sanitised_env()` (the daemon's environment through
 `sluice_gate_core::git::child_env`, computed once at start).
+
+### 5.6 Merge queue crate
+
+`sluice-gate-queue` implements the local merge queue
+([[sluice/design/merge-queue.md]]) as `QueueExtension: Extension`; the
+binary wires it in `daemon_cmd.rs` (`extensions: vec![Arc::new(
+QueueExtension::new(QueueOptions::default()))]`), so the daemon crate never
+depends on it. Modules: `model` (states, transition tables, train hash),
+`store` (the `queue_*` tables in `sluice.db`, `queue_schema` v1, every write
+through a `Writer` created after `LeaseFence::check`, compare-and-swap on
+the expected state, one `queue_events` row per change), `target` (`--base`
+resolution, endpoint hash), `git` (all git calls through
+`sluice_gate_core::git`, env without `GIT_*`, client env allowlist),
+`push` (push arguments, process group, porcelain classification, local
+`update-ref` landing), `reconcile` (the decision table as a pure function
+plus its read-only queries), `runner` (the loop, train build, gates through
+`DaemonHandle::submit_run`, push orchestration) and `extension` (request
+handling, daemon-start recovery). The runner is one task woken by a
+`Notify` and the user config's `[queue] tick`; building and pushing a train
+run as child tasks so approvals and the watch of ready trains never wait for
+a gate. With `[queue] enabled = false` the runner idles and every `queue-*`
+request gets `error{not-supported}`.
 
 ## 6. IPC protocol
 

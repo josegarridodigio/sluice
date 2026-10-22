@@ -278,6 +278,36 @@ impl DaemonHandle {
         Ok(r)
     }
 
+    /// Like [`DaemonHandle::store_tx`], but the commit is made with `PRAGMA
+    /// synchronous = FULL` (fsync of the WAL at commit), restored to the
+    /// daemon's `NORMAL` afterwards. For write-ahead records that must
+    /// survive a power loss (the merge queue's push marker). SQLite refuses
+    /// to change the setting inside a transaction, hence a separate method.
+    ///
+    /// # Errors
+    ///
+    /// As [`DaemonHandle::store_tx`].
+    pub fn store_tx_durable<R>(
+        &self,
+        f: impl FnOnce(&Transaction<'_>) -> rusqlite::Result<R>,
+    ) -> Result<R, StoreError> {
+        let store = lock(&self.shared.store);
+        let conn = store.connection();
+        conn.pragma_update(None, "synchronous", "FULL")
+            .map_err(StoreError::classify)?;
+        let result = (|| {
+            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+                .map_err(StoreError::classify)?;
+            let r = f(&tx).map_err(StoreError::classify)?;
+            tx.commit().map_err(StoreError::classify)?;
+            Ok(r)
+        })();
+        if let Err(e) = conn.pragma_update(None, "synchronous", "NORMAL") {
+            tracing::warn!("cannot restore synchronous = NORMAL: {e}");
+        }
+        result
+    }
+
     /// The state directory: the directory of the database (`<state>`).
     pub fn state_dir(&self) -> &Path {
         self.shared
