@@ -105,7 +105,8 @@ Tasks:
 - [x] `sluice-gate-daemon::server`: socket, handshake, subscribers, scheduling loop, marker double-check, orphan reconciliation, stop.
 - [x] CLI: `sluice daemon [--foreground] | stop`, client on misses with autostart and fallback, `status [--json]`, `logs` via daemon, `hit` events.
 - [x] Acceptance tests and evidence document ([[sluice/changes/phase-2-acceptance.md]]); README/docs.
-- [ ] Reconciliation pass ([[sluice/changes/phase-2-reconciliation.md]]).
+- [x] Reconciliation pass ([[sluice/changes/phase-2-reconciliation.md]]): 56 findings, code items fixed, rest documented.
+- [x] Blocking client moved to `sluice-gate-proto` ([[sluice/design/adr/0008-client-in-proto-crate.md]]).
 
 Deliverables: versioned IPC protocol over a Unix socket
 ([[sluice/design/protocol.md]]), daemon autostart with a start lock, budget
@@ -156,8 +157,7 @@ project(s) with before/after numbers.
 
 ## Next steps
 
-1. Phase 2 reconciliation pass and fixes.
-2. Phase 3: `sluice-gate-mcp` with rmcp per [[sluice/design/mcp-tools.md]]
+1. Phase 3: `sluice-gate-mcp` with rmcp per [[sluice/design/mcp-tools.md]]
    (`verify`, `status`, `gate_list`, `logs`), fail-fast message pointing to
    `verify`, `docs/agents.md`, automated MCP client test, documented manual
    end-to-end run with two Claude Code agents.
