@@ -240,10 +240,9 @@ fn agent_in_hook_fails_fast_on_miss_and_hits_on_pass() {
         .args(["run", "--hook", "pre-commit", "test"])
         .assert()
         .code(3)
-        .stderr(
-            predicate::str::contains("has not passed on this tree")
-                .and(predicate::str::contains("sluice run test")),
-        );
+        .stderr(predicate::str::contains("has not passed on this tree").and(
+            predicate::str::contains("call the 'verify' MCP tool (or run 'sluice run test') first"),
+        ));
     assert_eq!(sb.runs(), 0, "fail-fast must not run the gate");
 
     // With the cache off the gate can never be cached, so fail-fast must not refuse.

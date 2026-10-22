@@ -2,7 +2,7 @@
 //!
 //! One binary, several modes: thin client for hooks and terminals
 //! (`sluice run`), MCP server for agents (`sluice mcp`), and the daemon
-//! itself (`sluice daemon`). `mcp` arrives with Phase 3.
+//! itself (`sluice daemon`).
 
 use std::fs;
 use std::path::Path;
@@ -21,9 +21,6 @@ mod status;
 
 use snippets::{HookManager, snippet};
 
-/// Exit code used while a command is not implemented yet.
-const EXIT_NOT_IMPLEMENTED: u8 = 70;
-
 #[derive(Debug, Parser)]
 #[command(
     name = "sluice",
@@ -31,8 +28,8 @@ const EXIT_NOT_IMPLEMENTED: u8 = 70;
     about = "Verification queue and cache for parallel coding agents",
     long_about = "Sluice runs named gates (tests, linters, type checks) under a global \
                   concurrency budget and caches results per git tree so each tree is verified \
-                  once. Git hooks call `sluice run`; agents will call the MCP server started by \
-                  `sluice mcp` once Phase 3 lands (it exits 70 until then).\n\n\
+                  once. Git hooks call `sluice run`; coding agents call the MCP server started by \
+                  `sluice mcp` (tools verify, status, gate_list, logs).\n\n\
                   On a cache miss `sluice run` hands the gate to the per-user daemon \
                   (`sluice daemon`), starting it on demand; when the daemon cannot be reached \
                   or started the gate runs in-process. `sluice status` shows the queue.\n\n\
@@ -44,7 +41,7 @@ const EXIT_NOT_IMPLEMENTED: u8 = 70;
                   SLUICE_CACHE=0|1 forces the cache off or on (on overrides CI); CI disables \
                   the cache; SLUICE_AGENT=1|0 forces agent or human detection; SLUICE_CONFIG \
                   points at the user config; SLUICE_SOCKET overrides the daemon socket path; \
-                  SLUICE_LOG sets the daemon's log filter (default info)."
+                  SLUICE_LOG sets the log filter of the daemon and of `sluice mcp` (default info)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -72,6 +69,10 @@ enum Command {
         extra: Vec<String>,
     },
     /// Start the MCP stdio server (spawned by the coding agent).
+    ///
+    /// Tools: `verify` (run gates through the cache and the daemon, blocking with
+    /// progress notifications), `status`, `gate_list`, `logs`. Logs go to stderr
+    /// only. Register `sluice mcp` as a stdio MCP server in the agent's config.
     Mcp,
     /// Start the per-user daemon (detached unless --foreground), or stop it.
     ///
@@ -180,7 +181,7 @@ fn main() -> ExitCode {
             command: HookCommand::Print { manager },
         } => hook_print(manager),
         Command::Logs { job_id, lines } => logs::show(job_id.as_deref(), lines),
-        Command::Mcp => not_implemented("mcp"),
+        Command::Mcp => mcp(),
         Command::Daemon {
             command: Some(DaemonCommand::Stop { force }),
             ..
@@ -193,11 +194,27 @@ fn main() -> ExitCode {
     }
 }
 
-fn not_implemented(name: &str) -> ExitCode {
-    eprintln!(
-        "sluice: '{name}' is not implemented yet (it arrives with the daemon and MCP phases)"
-    );
-    ExitCode::from(EXIT_NOT_IMPLEMENTED)
+/// `sluice mcp`: the MCP stdio server on a multi-threaded tokio runtime
+/// (only this subcommand builds one; the `sluice run` hit path stays synchronous).
+fn mcp() -> ExitCode {
+    let env = std::env::vars().collect();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("sluice: error: cannot start the async runtime: {e}");
+            return ExitCode::from(run::EXIT_ERROR);
+        }
+    };
+    match runtime.block_on(sluice_gate_mcp::serve(env)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("sluice: error: {e:#}");
+            ExitCode::from(run::EXIT_ERROR)
+        }
+    }
 }
 
 /// Gates for the hooks `(pre-commit, pre-push)`.

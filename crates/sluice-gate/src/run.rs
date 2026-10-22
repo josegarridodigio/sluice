@@ -29,10 +29,11 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use sluice_gate_core::agent::{self, Caller};
-use sluice_gate_core::config::{Gate, HookPolicy, RepoConfig, UserConfig};
-use sluice_gate_core::git::{self, EnvMap, RepoPaths};
-use sluice_gate_core::key::{self, CacheKey, KeyMaterial};
-use sluice_gate_core::marker::{Lookup, Marker, MarkerStore, MissRecord};
+use sluice_gate_core::config::HookPolicy;
+use sluice_gate_core::git::{self, EnvMap};
+use sluice_gate_core::key::CacheKey;
+use sluice_gate_core::lookup::{self, Lookup as CacheState, Resolved, RunMaterial};
+use sluice_gate_core::marker::{Lookup, Marker, MissRecord};
 use sluice_gate_core::mode::{CacheMode, cache_mode};
 use sluice_gate_core::semaphore::{Semaphore, SlotGuard};
 use sluice_gate_core::tree::{self, Snapshot, TreeHash};
@@ -73,38 +74,28 @@ pub struct RunArgs {
     pub explain: bool,
 }
 
-/// Everything resolved before deciding between hit, policy and run.
+/// Everything resolved before deciding between hit, policy and run: the
+/// shared [`Resolved`] plus what only `sluice run` needs.
 struct Context {
-    env: EnvMap,
-    paths: RepoPaths,
-    user: UserConfig,
-    gate_name: String,
-    gate: Gate,
-    /// `[defaults]` of the repository config.
-    defaults: sluice_gate_core::config::Defaults,
+    res: Resolved,
     /// Lines of log shown on failure (repo override or user config).
     tail_lines: usize,
-    /// Environment of the gate process, computed on first use (it costs a git spawn).
-    child_env: std::cell::OnceCell<EnvMap>,
-    probe_env: EnvMap,
-    scratch: PathBuf,
-    store: MarkerStore,
-    ttl: Duration,
     hook: Option<String>,
 }
 
-/// Outcome of a cache lookup for the current tree.
-#[allow(clippy::large_enum_variant)] // one value per invocation; boxing buys nothing
-enum CacheState {
-    /// Caching is off for this invocation.
-    Off(String),
-    /// The tree is known and no marker matched.
-    Miss {
-        tree: TreeHash,
-        key: CacheKey,
-        cmd: String,
-        last_miss: Option<MissRecord>,
-    },
+impl std::ops::Deref for Context {
+    type Target = Resolved;
+
+    fn deref(&self) -> &Resolved {
+        &self.res
+    }
+}
+
+impl Context {
+    /// The gate process environment ([`Resolved::child_env`]).
+    fn child_env(&self) -> Result<&EnvMap, String> {
+        self.res.child_env().map_err(|e| e.to_string())
+    }
 }
 
 /// Entry point of `sluice run`.
@@ -131,8 +122,8 @@ pub fn run(args: &RunArgs) -> ExitCode {
         return run_inline(&ctx, &args.extra);
     }
 
-    let state = match lookup(&ctx, &mode) {
-        Decision::Hit(hit) => {
+    let state = match lookup::lookup(&ctx, &mode) {
+        CacheState::Hit(hit) => {
             println!(
                 "sluice: {} PASS (cached, passed {} ago)",
                 ctx.gate_name,
@@ -150,7 +141,17 @@ pub fn run(args: &RunArgs) -> ExitCode {
             }
             return ExitCode::SUCCESS;
         }
-        Decision::Run(state) => state,
+        CacheState::Off {
+            reason,
+            notice: Some(notice),
+        } => {
+            eprintln!("sluice: {notice}");
+            CacheState::Off {
+                reason,
+                notice: None,
+            }
+        }
+        state => state,
     };
 
     // Policy on a miss, only inside a hook and only when the cache was consulted:
@@ -167,8 +168,10 @@ pub fn run(args: &RunArgs) -> ExitCode {
                 m.exit_code
                     .map_or(String::new(), |c| format!(" with exit code {c}"))
             ),
-            CacheState::Miss { .. } => "no cached pass for this tree".to_owned(),
-            CacheState::Off(reason) => reason.clone(),
+            CacheState::Miss { .. } | CacheState::Hit(_) => {
+                "no cached pass for this tree".to_owned()
+            }
+            CacheState::Off { reason, .. } => reason.clone(),
         };
         let rule = match &caller {
             Caller::Agent { rule } => rule.as_str(),
@@ -178,7 +181,7 @@ pub fn run(args: &RunArgs) -> ExitCode {
         eprintln!(
             "sluice: '{}' has not passed on this tree ({why}).\n\
              sluice: {hook} was invoked by a coding agent ({rule}) and agent_hook_policy is \"fail-fast\".\n\
-             sluice: run 'sluice run {}' from your shell first, then retry the git command.",
+             sluice: call the 'verify' MCP tool (or run 'sluice run {}') first, then retry the git command.",
             ctx.gate_name, ctx.gate_name
         );
         let _ = in_hook;
@@ -211,52 +214,46 @@ fn run_request(
     caller: &Caller,
     state: &CacheState,
 ) -> Result<RunRequest, String> {
-    let (key, tree) = match state {
-        CacheState::Miss { tree, key, .. } => (Some(key.clone()), Some(tree.clone())),
-        CacheState::Off(_) => (None, None),
-    };
-    let committed_tree = if tree.is_some() && ctx.hook.as_deref() == Some("pre-commit") {
-        tree::index_tree(&ctx.paths, &ctx.probe_env, &ctx.scratch)
-            .ok()
-            .and_then(|s| s.tree().cloned())
-    } else {
-        None
-    };
-    Ok(RunRequest {
-        repo: RepoInfo {
-            toplevel: ctx.paths.toplevel.clone(),
-            common_dir: ctx.paths.common_dir.clone(),
-            git_dir: ctx.paths.git_dir.clone(),
-        },
-        gate: GateSpec {
-            name: ctx.gate_name.clone(),
-            cmd: ctx.gate.cmd.clone(),
-            weight: ctx.gate.weight,
-            timeout_ms: u64::try_from(ctx.gate.timeout.as_millis()).unwrap_or(u64::MAX),
-            env: ctx.gate.env.clone(),
-            cache: ctx.gate.cache,
-        },
-        key,
-        tree,
-        committed_tree,
-        // Trimmed, not whitespace-collapsed: newlines are significant to `sh -c`.
-        cmd: ctx.gate.cmd.trim().to_owned(),
-        extra: args.extra.clone(),
-        cwd: ctx.paths.toplevel.clone(),
-        child_env: ctx.child_env()?.clone(),
-        probe_env: ctx.probe_env.clone(),
-        caller: match caller {
+    let material = lookup::run_material(ctx, state, &args.extra, ctx.hook.as_deref())
+        .map_err(|e| e.to_string())?;
+    Ok(to_request(
+        material,
+        match caller {
             Caller::Agent { .. } => proto::Caller::Agent,
             Caller::Human => proto::Caller::Human,
         },
-        session: ctx
-            .env
-            .get("CLAUDE_CODE_SESSION_ID")
-            .filter(|s| !s.is_empty())
-            .cloned(),
+    ))
+}
+
+/// Converts the shared run material into the protocol request.
+fn to_request(m: RunMaterial, caller: proto::Caller) -> RunRequest {
+    RunRequest {
+        repo: RepoInfo {
+            toplevel: m.paths.toplevel,
+            common_dir: m.paths.common_dir,
+            git_dir: m.paths.git_dir,
+        },
+        gate: GateSpec {
+            name: m.gate_name,
+            cmd: m.gate.cmd,
+            weight: m.gate.weight,
+            timeout_ms: m.timeout_ms,
+            env: m.gate.env,
+            cache: m.gate.cache,
+        },
+        key: m.key,
+        tree: m.tree,
+        committed_tree: m.committed_tree,
+        cmd: m.cmd,
+        extra: m.extra,
+        cwd: m.cwd,
+        child_env: m.child_env,
+        probe_env: m.probe_env,
+        caller,
+        session: m.session,
         client_pid: std::process::id(),
-        hook: ctx.hook.clone(),
-    })
+        hook: m.hook,
+    }
 }
 
 /// Copies new bytes of a log file to stderr every 500 ms (`-v` on the daemon path).
@@ -387,7 +384,7 @@ fn report_outcome(
                     Ok(Lookup::Hit(m)) => format!(", passed {} ago", age(&m.passed_at)),
                     _ => String::new(),
                 },
-                CacheState::Off(_) => String::new(),
+                CacheState::Off { .. } | CacheState::Hit(_) => String::new(),
             };
             println!("sluice: {} PASS (cached{passed})", ctx.gate_name);
             return ExitCode::SUCCESS;
@@ -395,7 +392,7 @@ fn report_outcome(
         OutcomeStatus::Error => return fail(&outcome.message),
         OutcomeStatus::Pass => Finish::Pass {
             note: match (state, &outcome.not_cached_reason) {
-                (CacheState::Off(reason), _) | (_, Some(reason)) => {
+                (CacheState::Off { reason, .. }, _) | (_, Some(reason)) => {
                     format!(" (not cached: {reason})")
                 }
                 _ => String::new(),
@@ -491,12 +488,16 @@ fn decide_policy(ctx: &Context, env: &EnvMap, state: &CacheState) -> (Caller, bo
     );
     let policy = match (&caller, in_hook, state) {
         (_, false, _) => HookPolicy::Wait,
-        (Caller::Agent { .. }, true, CacheState::Miss { .. }) => ctx.defaults.agent_hook_policy,
-        (Caller::Agent { .. }, true, CacheState::Off(_)) => match ctx.defaults.agent_hook_policy {
-            HookPolicy::FailFast => HookPolicy::Wait,
-            other => other,
-        },
-        (Caller::Human, true, _) => ctx.defaults.human_hook_policy,
+        (Caller::Agent { .. }, true, CacheState::Miss { .. } | CacheState::Hit(_)) => {
+            ctx.config.defaults.agent_hook_policy
+        }
+        (Caller::Agent { .. }, true, CacheState::Off { .. }) => {
+            match ctx.config.defaults.agent_hook_policy {
+                HookPolicy::FailFast => HookPolicy::Wait,
+                other => other,
+            }
+        }
+        (Caller::Human, true, _) => ctx.config.defaults.human_hook_policy,
     };
     (caller, in_hook, policy)
 }
@@ -525,7 +526,7 @@ fn explain(ctx: &Context, env: &EnvMap, mode: &CacheMode) -> ExitCode {
     );
     println!(
         "policies:     agent = {:?}, human = {:?}",
-        ctx.defaults.agent_hook_policy, ctx.defaults.human_hook_policy
+        ctx.config.defaults.agent_hook_policy, ctx.config.defaults.human_hook_policy
     );
     println!(
         "budget:       {} units, gate weight {}",
@@ -534,7 +535,7 @@ fn explain(ctx: &Context, env: &EnvMap, mode: &CacheMode) -> ExitCode {
     match tree::snapshot(&ctx.paths, &ctx.probe_env, &ctx.scratch) {
         Ok(Snapshot::Known(tree)) => {
             println!("tree:         {tree}");
-            match derive_key(ctx, &tree) {
+            match lookup::derive_key(ctx, &tree) {
                 Ok((_, key)) => {
                     println!("key:          {key}");
                     match ctx.store.lookup(&key, ctx.ttl) {
@@ -564,127 +565,12 @@ fn explain(ctx: &Context, env: &EnvMap, mode: &CacheMode) -> ExitCode {
 
 /// Resolves repository, config and derived environments.
 fn resolve(env: &EnvMap, cwd: &Path, args: &RunArgs, mode: &CacheMode) -> Result<Context, String> {
-    let paths = git::discover(cwd, env).map_err(|e| e.to_string())?;
-    let config = RepoConfig::load(&paths.toplevel).map_err(|e| e.to_string())?;
-    let gate = config.gate(&args.gate).map_err(|e| e.to_string())?.clone();
-    // SLUICE_DISABLE needs the gate command but nothing from the user config.
-    let user = if *mode == CacheMode::Bypass {
-        UserConfig::default()
-    } else {
-        UserConfig::load(env).map_err(|e| e.to_string())?
-    };
-    let tail_lines = config.defaults.tail_lines.unwrap_or(user.cache.tail_lines);
-    let probe_env = git::probe_env(env, Some(&paths));
-    let scratch = tree::scratch_root(env).map_err(|e| e.to_string())?;
-    let store = MarkerStore::new(&paths.common_dir);
-    let ttl = Duration::from_hours(u64::from(user.cache.ttl_days) * 24);
+    let res = lookup::resolve(cwd, env, &args.gate, mode).map_err(|e| e.to_string())?;
     Ok(Context {
-        env: env.clone(),
-        paths,
-        user,
-        gate_name: args.gate.clone(),
-        gate,
-        defaults: config.defaults.clone(),
-        tail_lines,
-        child_env: std::cell::OnceCell::new(),
-        probe_env,
-        scratch,
-        store,
-        ttl,
+        tail_lines: res.tail_lines(),
+        res,
         hook: args.hook.clone(),
     })
-}
-
-/// What `lookup` decided for this invocation.
-#[allow(clippy::large_enum_variant)]
-enum Decision {
-    /// A fresh marker matched: nothing to run.
-    Hit(Marker),
-    /// Run the gate; the state says whether a marker may be written afterwards.
-    Run(CacheState),
-}
-
-/// Looks the current tree up in the marker store.
-fn lookup(ctx: &Context, mode: &CacheMode) -> Decision {
-    if let CacheMode::Disabled { reason } = mode {
-        eprintln!("sluice: cache disabled ({reason})");
-        return Decision::Run(CacheState::Off(reason.clone()));
-    }
-    if !ctx.gate.cache {
-        return Decision::Run(CacheState::Off(format!(
-            "gate '{}' has cache = false",
-            ctx.gate_name
-        )));
-    }
-    let tree = match tree::snapshot(&ctx.paths, &ctx.probe_env, &ctx.scratch) {
-        Ok(Snapshot::Known(tree)) => tree,
-        Ok(Snapshot::Unknown { reason }) => {
-            eprintln!("sluice: tree unknown ({reason}); running uncached");
-            return Decision::Run(CacheState::Off(format!("tree unknown: {reason}")));
-        }
-        Err(e) => {
-            eprintln!("sluice: cannot snapshot the tree ({e}); running uncached");
-            return Decision::Run(CacheState::Off(format!("snapshot failed: {e}")));
-        }
-    };
-    let (cmd, key) = match derive_key(ctx, &tree) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("sluice: cannot derive the cache key ({e}); running uncached");
-            return Decision::Run(CacheState::Off(format!("key derivation failed: {e}")));
-        }
-    };
-    match ctx.store.lookup(&key, ctx.ttl) {
-        Ok(Lookup::Hit(marker)) => Decision::Hit(marker),
-        Ok(Lookup::Miss(last_miss)) => Decision::Run(CacheState::Miss {
-            tree,
-            key,
-            cmd,
-            last_miss,
-        }),
-        Err(e) => {
-            eprintln!("sluice: cannot read the cache ({e}); running uncached");
-            Decision::Run(CacheState::Off(format!("cache read failed: {e}")))
-        }
-    }
-}
-
-impl Context {
-    /// The caller's environment minus git hook and `CLAUDE*` variables, plus the gate's `env`.
-    fn child_env(&self) -> Result<&EnvMap, String> {
-        if let Some(env) = self.child_env.get() {
-            return Ok(env);
-        }
-        let mut env = git::child_env(&self.env).map_err(|e| e.to_string())?;
-        env.extend(self.gate.env.iter().map(|(k, v)| (k.clone(), v.clone())));
-        Ok(self.child_env.get_or_init(|| env))
-    }
-}
-
-/// Derives the cache key for `tree`; returns the normalised command as well.
-fn derive_key(ctx: &Context, tree: &TreeHash) -> Result<(String, CacheKey), String> {
-    let (key_inputs, key_files) = if ctx.gate.key_inputs.is_empty() && ctx.gate.key_files.is_empty()
-    {
-        (Vec::new(), Vec::new())
-    } else {
-        key::collect_inputs(
-            &ctx.gate.key_inputs,
-            &ctx.gate.key_files,
-            &ctx.paths.toplevel,
-            ctx.child_env()?,
-        )
-        .map_err(|e| e.to_string())?
-    };
-    let cmd = ctx.gate.normalized_cmd();
-    let material = KeyMaterial {
-        tree: tree.clone(),
-        gate_name: ctx.gate_name.clone(),
-        cmd: cmd.clone(),
-        env: ctx.gate.env.clone(),
-        key_inputs,
-        key_files,
-    };
-    Ok((cmd, key::derive(&material)))
 }
 
 /// Takes `weight` slots of the global semaphore, all or nothing.
@@ -785,7 +671,8 @@ fn execute(ctx: &Context, args: &RunArgs, state: CacheState) -> ExitCode {
         Finish::Fail
     } else {
         let note = match state {
-            CacheState::Off(reason) => format!(" (not cached: {reason})"),
+            CacheState::Off { reason, .. } => format!(" (not cached: {reason})"),
+            CacheState::Hit(_) => String::new(),
             CacheState::Miss { tree, key, cmd, .. } => {
                 match write_marker(ctx, &tree, &key, &cmd, &exec) {
                     Ok(()) => String::new(),
@@ -981,9 +868,7 @@ fn write_marker(
         return Err("the gate modified the tree; verify the new tree again".to_owned());
     }
     let committed_tree = if ctx.hook.as_deref() == Some("pre-commit") {
-        tree::index_tree(&ctx.paths, &ctx.probe_env, &ctx.scratch)
-            .ok()
-            .and_then(|s| s.tree().cloned())
+        lookup::committed_tree(ctx)
     } else {
         None
     };

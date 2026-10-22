@@ -31,12 +31,14 @@ fn version_prints_crate_version() {
 }
 
 #[test]
-fn unimplemented_command_exits_with_70() {
-    sluice()
-        .args(["mcp"])
-        .assert()
-        .code(70)
-        .stderr(predicate::str::contains("not implemented"));
+fn mcp_never_writes_outside_the_protocol() {
+    // Without an `initialize` request the server gives up; stdout stays empty.
+    let assert = sluice().args(["mcp"]).write_stdin("").assert();
+    assert!(
+        assert.get_output().stdout.is_empty(),
+        "stdout belongs to the MCP transport: {:?}",
+        assert.get_output()
+    );
 }
 
 #[test]

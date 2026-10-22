@@ -9,6 +9,7 @@
 //! - [`tree`]: working-tree snapshot from a private index and object dir.
 //! - [`key`]: cache-key derivation.
 //! - [`marker`]: markers and miss records under the git common dir.
+//! - [`lookup`]: the shared cache-hit check (resolve, lookup, run material).
 //! - [`agent`]: "is this hook invoked by a coding agent?" detection.
 //! - [`semaphore`]: `flock`-based counting semaphore (Phase 1 global guard).
 //! - [`mode`]: `CI` / `SLUICE_CACHE` / `SLUICE_DISABLE` handling.
@@ -20,6 +21,7 @@ pub mod dirs;
 pub mod error;
 pub mod git;
 pub mod key;
+pub mod lookup;
 pub mod marker;
 pub mod mode;
 pub mod semaphore;

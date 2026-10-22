@@ -24,6 +24,7 @@ nix = { version = "0.31.3", features = ["signal", "process", "fs", "socket"] }
 serde_json = "1.0.154"
 sluice-gate-core.workspace = true
 sluice-gate-daemon.workspace = true
+sluice-gate-mcp.workspace = true
 sluice-gate-proto = { workspace = true, features = ["client"] }
 thiserror.workspace = true
 tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "signal", "sync"] }
@@ -33,6 +34,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 [dev-dependencies]
 assert_cmd.workspace = true
 predicates.workspace = true
+rmcp = { version = "3.6.0", features = ["client", "transport-child-process"] }
 tempfile.workspace = true
 
 [lints]

@@ -347,6 +347,8 @@ pub struct UserConfig {
     pub agent_detection: AgentDetectionConfig,
     /// Scheduler settings.
     pub scheduler: SchedulerConfig,
+    /// MCP server settings.
+    pub mcp: McpConfig,
     /// Per-repository overrides keyed by repository path.
     pub repos: BTreeMap<PathBuf, RepoOverride>,
 }
@@ -425,6 +427,24 @@ impl Default for SchedulerConfig {
     }
 }
 
+/// The `[mcp]` table (the `sluice mcp` server).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct McpConfig {
+    /// Period of the progress notifications `verify` sends while a gate is
+    /// queued or running (when the client supplied a `progressToken`).
+    #[serde(with = "humantime_serde")]
+    pub progress_interval: Duration,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            progress_interval: Duration::from_secs(15),
+        }
+    }
+}
+
 /// A `[repos."<path>"]` table.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -443,6 +463,7 @@ impl Default for UserConfig {
             cache: CacheConfig::default(),
             agent_detection: AgentDetectionConfig::default(),
             scheduler: SchedulerConfig::default(),
+            mcp: McpConfig::default(),
             repos: BTreeMap::new(),
         }
     }
@@ -904,6 +925,19 @@ budget_share_max = 4
                 || user_err("version = 1\n[scheduler]\nhead_reserve_after = \"soon\"")
                     .contains("duration")
         );
+    }
+
+    #[test]
+    fn parses_mcp_table() {
+        let c = UserConfig::parse("version = 1", Path::new("/u.toml")).unwrap();
+        assert_eq!(c.mcp.progress_interval, Duration::from_secs(15));
+        let c = UserConfig::parse(
+            "version = 1\n[mcp]\nprogress_interval = \"30s\"\n",
+            Path::new("/u.toml"),
+        )
+        .unwrap();
+        assert_eq!(c.mcp.progress_interval, Duration::from_secs(30));
+        assert!(user_err("version = 1\n[mcp]\nbogus = 1\n").contains("bogus"));
     }
 
     #[test]
