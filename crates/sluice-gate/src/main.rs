@@ -2,18 +2,23 @@
 //!
 //! One binary, several modes: thin client for hooks and terminals
 //! (`sluice run`), MCP server for agents (`sluice mcp`), and the daemon
-//! itself (`sluice daemon`). Phase 0 only defines the command surface;
-//! every command reports that it is not implemented yet.
+//! itself (`sluice daemon`). Phase 1 implements the cache-only commands;
+//! `mcp`, `daemon` and `status` arrive with Phases 2 and 3.
 
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use sluice_gate_core::config::{REPO_CONFIG_FILE, RepoConfig, starter_repo_config};
 
+mod cache;
+mod dirs;
+mod logs;
+mod run;
 mod snippets;
 
-use snippets::{HookManager, STARTER_CONFIG, snippet};
+use snippets::{HookManager, snippet};
 
 /// Exit code used while a command is not implemented yet.
 const EXIT_NOT_IMPLEMENTED: u8 = 70;
@@ -26,7 +31,14 @@ const EXIT_NOT_IMPLEMENTED: u8 = 70;
     long_about = "Sluice runs named gates (tests, linters, type checks) with a bounded global \
                   budget, caches results per git tree so each tree is verified once, and \
                   coalesces duplicate requests. Git hooks call `sluice run`; agents call the \
-                  MCP server started by `sluice mcp`."
+                  MCP server started by `sluice mcp`.\n\n\
+                  Exit codes of `sluice run`: 0 pass or cache hit; the gate's own code on \
+                  failure; 3 refused by agent_hook_policy = \"fail-fast\"; 124 gate timeout; \
+                  1 Sluice error.\n\n\
+                  Environment: SLUICE_DISABLE=1 runs the gate directly (no cache, no queue); \
+                  SLUICE_CACHE=0|1 forces the cache off or on (on overrides CI); CI disables \
+                  the cache; SLUICE_AGENT=1|0 forces agent or human detection; SLUICE_CONFIG \
+                  points at the user config."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -39,6 +51,13 @@ enum Command {
     Run {
         /// Gate name as defined in `.sluice.toml`.
         gate: String,
+        /// Name of the git hook invoking Sluice (pre-commit, pre-push, ...). Enables the
+        /// hook policy on a cache miss and, for pre-commit, records the committed tree.
+        #[arg(long)]
+        hook: Option<String>,
+        /// Stream the gate output to stderr while it runs (it is always written to the log).
+        #[arg(short, long)]
+        verbose: bool,
         /// Extra arguments appended to the gate command.
         #[arg(last = true)]
         extra: Vec<String>,
@@ -71,18 +90,25 @@ enum Command {
     },
     /// Show the log of a job.
     Logs {
-        /// Job id; defaults to the most recent job of the current repository.
+        /// Job id; defaults to the most recent job.
         job_id: Option<String>,
+        /// Only print the last N lines.
+        #[arg(short = 'n', long)]
+        lines: Option<usize>,
     },
 }
 
 #[derive(Debug, Subcommand)]
 enum CacheCommand {
-    /// List markers for the current tree.
-    Status,
-    /// Remove markers for the current repository.
+    /// Show, per gate, whether the current tree has a cached pass.
+    Status {
+        /// Also list every marker stored for the repository.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Remove markers and miss records for the current repository.
     Clear {
-        /// Only clear markers of this gate.
+        /// Only clear entries of this gate.
         #[arg(long)]
         gate: Option<String>,
     },
@@ -99,31 +125,41 @@ enum HookCommand {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match &cli.command {
-        Command::Init { force } => return init(*force),
+    match cli.command {
+        Command::Run {
+            gate,
+            hook,
+            verbose,
+            extra,
+        } => run::run(&run::RunArgs {
+            gate,
+            extra,
+            hook,
+            verbose,
+        }),
+        Command::Cache {
+            command: CacheCommand::Status { all },
+        } => cache::status(all),
+        Command::Cache {
+            command: CacheCommand::Clear { gate },
+        } => cache::clear(gate.as_deref()),
+        Command::Init { force } => init(force),
         Command::Hook {
             command: HookCommand::Print { manager },
-        } => return hook_print(*manager),
-        _ => {}
+        } => hook_print(manager),
+        Command::Logs { job_id, lines } => logs::show(job_id.as_deref(), lines),
+        Command::Mcp => not_implemented("mcp"),
+        Command::Daemon => not_implemented("daemon"),
+        Command::Status { .. } => not_implemented("status"),
     }
-    let name = match cli.command {
-        Command::Run { .. } => "run",
-        Command::Mcp => "mcp",
-        Command::Daemon => "daemon",
-        Command::Status { .. } => "status",
-        Command::Cache { .. } => "cache",
-        Command::Init { .. } => "init",
-        Command::Hook { .. } => "hook",
-        Command::Logs { .. } => "logs",
-    };
+}
+
+fn not_implemented(name: &str) -> ExitCode {
     eprintln!(
-        "sluice: '{name}' is not implemented yet (cache format v{})",
-        sluice_gate_core::CACHE_FORMAT_VERSION
+        "sluice: '{name}' is not implemented yet (it arrives with the daemon and MCP phases)"
     );
     ExitCode::from(EXIT_NOT_IMPLEMENTED)
 }
-
-const CONFIG_FILE: &str = ".sluice.toml";
 
 /// Gates for the hooks `(pre-commit, pre-push)`.
 type HookGates = (Vec<String>, Vec<String>);
@@ -136,62 +172,46 @@ fn starter_gates() -> HookGates {
     )
 }
 
-/// Temporary line scanner for `.sluice.toml`: collects gate names from
-/// `[gates.<name>]` headers and assigns hooks from a `hooks = [...]` line
-/// inside the block. To be replaced by the core config loader once the lead
-/// wires it in.
-fn scan_hook_gates(text: &str) -> HookGates {
-    let (mut pre_commit, mut pre_push) = (Vec::new(), Vec::new());
-    let mut current: Option<String> = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("[gates.") {
-            let name = rest.split(']').next().unwrap_or_default();
-            let valid = name.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
-                && name
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
-                && rest[name.len()..].starts_with(']');
-            current = valid.then(|| name.to_owned());
-        } else if line.starts_with('[') {
-            current = None;
-        } else if let Some(gate) = &current
-            && line.starts_with("hooks")
-        {
-            if line.contains("\"pre-commit\"") {
-                pre_commit.push(gate.clone());
-            }
-            if line.contains("\"pre-push\"") {
-                pre_push.push(gate.clone());
-            }
-        }
-    }
-    (pre_commit, pre_push)
+fn hook_gates(config: &RepoConfig) -> HookGates {
+    let names = |hook: &str| {
+        config
+            .gates_for_hook(hook)
+            .into_iter()
+            .map(|(name, _)| name.to_owned())
+            .collect()
+    };
+    (names("pre-commit"), names("pre-push"))
 }
 
 fn hook_print(manager: HookManager) -> ExitCode {
-    let (text, gates) = match fs::read_to_string(CONFIG_FILE) {
-        Ok(text) => (String::new(), scan_hook_gates(&text)),
+    let (preface, gates) = match fs::read_to_string(REPO_CONFIG_FILE) {
+        Ok(text) => match RepoConfig::parse(&text, Path::new(REPO_CONFIG_FILE)) {
+            Ok(config) => (String::new(), hook_gates(&config)),
+            Err(e) => {
+                eprintln!("sluice: error: {e}");
+                return ExitCode::from(run::EXIT_ERROR);
+            }
+        },
         Err(_) => (
             "# No .sluice.toml found here; example gates shown. Run 'sluice init' first.\n"
                 .to_owned(),
             starter_gates(),
         ),
     };
-    print!("{text}{}", snippet(manager, &gates.0, &gates.1));
+    print!("{preface}{}", snippet(manager, &gates.0, &gates.1));
     ExitCode::SUCCESS
 }
 
 fn init(force: bool) -> ExitCode {
-    if Path::new(CONFIG_FILE).exists() && !force {
-        eprintln!("sluice: {CONFIG_FILE} already exists; not overwriting");
-        return ExitCode::from(1);
+    if Path::new(REPO_CONFIG_FILE).exists() && !force {
+        eprintln!("sluice: {REPO_CONFIG_FILE} already exists; not overwriting (use --force)");
+        return ExitCode::from(run::EXIT_ERROR);
     }
-    if let Err(err) = fs::write(CONFIG_FILE, STARTER_CONFIG) {
-        eprintln!("sluice: cannot write {CONFIG_FILE}: {err}");
-        return ExitCode::from(1);
+    if let Err(err) = fs::write(REPO_CONFIG_FILE, starter_repo_config()) {
+        eprintln!("sluice: cannot write {REPO_CONFIG_FILE}: {err}");
+        return ExitCode::from(run::EXIT_ERROR);
     }
-    println!("sluice: wrote {CONFIG_FILE}");
+    println!("sluice: wrote {REPO_CONFIG_FILE}");
     println!();
     let (pre_commit, pre_push) = starter_gates();
     print!("{}", snippet(HookManager::Plain, &pre_commit, &pre_push));

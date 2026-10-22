@@ -33,7 +33,7 @@ fn version_prints_crate_version() {
 #[test]
 fn unimplemented_command_exits_with_70() {
     sluice()
-        .args(["run", "test"])
+        .args(["daemon"])
         .assert()
         .code(70)
         .stderr(predicate::str::contains("not implemented"));
@@ -58,7 +58,9 @@ fn hook_print_without_config_shows_example() {
     in_dir(&dir, &["hook", "print", "husky"])
         .success()
         .stdout(predicate::str::contains("# No .sluice.toml found here"))
-        .stdout(predicate::str::contains("sluice run test || exit $?"));
+        .stdout(predicate::str::contains(
+            "sluice run --hook pre-commit test || exit $?",
+        ));
 }
 
 #[test]
@@ -97,7 +99,9 @@ fn hook_print_lefthook_and_plain_have_expected_lines() {
     in_dir(&dir, &["hook", "print", "lefthook"])
         .success()
         .stdout(predicate::str::contains("pre-push:\n  commands:"))
-        .stdout(predicate::str::contains("run: sluice run lint"));
+        .stdout(predicate::str::contains(
+            "run: sluice run --hook pre-commit lint",
+        ));
     in_dir(&dir, &["hook", "print", "plain"])
         .success()
         .stdout(predicate::str::contains("#!/bin/sh"))

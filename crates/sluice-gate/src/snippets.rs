@@ -1,4 +1,4 @@
-//! Hook-integration snippets and the starter `.sluice.toml`.
+//! Hook-integration snippets for `sluice hook print` and `sluice init`.
 
 use std::fmt::Write as _;
 
@@ -15,43 +15,7 @@ pub enum HookManager {
     Plain,
 }
 
-/// Starter `.sluice.toml` written by `sluice init`.
-pub const STARTER_CONFIG: &str = r#"# Sluice configuration. Commit this file: it defines the gates of the repository.
-version = 1
-
-[defaults]
-# What a hook does on a cache miss when it is invoked by a coding agent.
-agent_hook_policy = "fail-fast"
-# What a hook does on a cache miss when a human runs it.
-human_hook_policy = "wait"
-
-[gates.lint]
-cmd = "npm run lint"
-weight = 1
-hooks = ["pre-commit"]
-
-[gates.test]
-cmd = "npm test"
-weight = 4
-timeout = "20m"
-hooks = ["pre-commit", "pre-push"]
-
-# Optional per-gate keys:
-#
-# key_inputs: extra inputs that change the cache key besides the git tree,
-# for example tool versions.
-# key_inputs = ["node --version"]
-#
-# key_files: files whose content is mixed into the cache key.
-# key_files = ["package-lock.json"]
-#
-# env: environment variables passed to the gate command.
-# [gates.test.env]
-# CI = "true"
-"#;
-
-const FOOTER: &str =
-    "# A cache hit exits 0 in milliseconds; a miss runs the gate through Sluice.\n";
+const FOOTER: &str = "# A cache hit exits 0 in milliseconds; a miss runs the gate through Sluice.\n# --hook tells Sluice which hook invoked it, so the agent policy applies.\n";
 
 /// Returns the ready-to-paste integration text for a manager.
 ///
@@ -66,7 +30,7 @@ pub fn snippet(manager: HookManager, pre_commit: &[String], pre_push: &[String])
             for (hook, gates) in hooks.iter().filter(|(_, g)| !g.is_empty()) {
                 let _ = writeln!(out, "# .husky/{hook}");
                 for gate in *gates {
-                    let _ = writeln!(out, "sluice run {gate} || exit $?");
+                    let _ = writeln!(out, "sluice run --hook {hook} {gate} || exit $?");
                 }
                 out.push('\n');
             }
@@ -76,7 +40,10 @@ pub fn snippet(manager: HookManager, pre_commit: &[String], pre_push: &[String])
             for (hook, gates) in hooks.iter().filter(|(_, g)| !g.is_empty()) {
                 let _ = writeln!(out, "{hook}:\n  commands:");
                 for gate in *gates {
-                    let _ = writeln!(out, "    sluice-{gate}:\n      run: sluice run {gate}");
+                    let _ = writeln!(
+                        out,
+                        "    sluice-{gate}:\n      run: sluice run --hook {hook} {gate}"
+                    );
                 }
             }
             out.push('\n');
@@ -88,7 +55,7 @@ pub fn snippet(manager: HookManager, pre_commit: &[String], pre_push: &[String])
                     let _ = writeln!(
                         out,
                         "      - id: sluice-{gate}\n        name: sluice {gate}\n        \
-                         entry: sluice run {gate}\n        language: system\n        \
+                         entry: sluice run --hook {hook} {gate}\n        language: system\n        \
                          pass_filenames: false\n        always_run: true\n        \
                          stages: [{hook}]"
                     );
@@ -99,7 +66,7 @@ pub fn snippet(manager: HookManager, pre_commit: &[String], pre_push: &[String])
             for (hook, gates) in hooks.iter().filter(|(_, g)| !g.is_empty()) {
                 let _ = writeln!(out, "# .githooks/{hook}\n#!/bin/sh\nset -e");
                 for gate in *gates {
-                    let _ = writeln!(out, "sluice run {gate}");
+                    let _ = writeln!(out, "sluice run --hook {hook} {gate}");
                 }
                 out.push('\n');
             }
@@ -121,8 +88,8 @@ mod tests {
     #[test]
     fn husky_omits_empty_pre_push() {
         let s = snippet(HookManager::Husky, &names(&["lint", "test"]), &[]);
-        assert!(s.contains("# .husky/pre-commit\nsluice run lint || exit $?\n"));
-        assert!(s.contains("sluice run test || exit $?"));
+        assert!(s.contains("# .husky/pre-commit\nsluice run --hook pre-commit lint || exit $?\n"));
+        assert!(s.contains("sluice run --hook pre-commit test || exit $?"));
         assert!(!s.contains("pre-push"));
         assert!(s.ends_with(FOOTER));
     }
@@ -131,7 +98,7 @@ mod tests {
     fn lefthook_omits_empty_pre_push() {
         let s = snippet(HookManager::Lefthook, &names(&["lint"]), &[]);
         assert!(
-            s.contains("pre-commit:\n  commands:\n    sluice-lint:\n      run: sluice run lint")
+            s.contains("pre-commit:\n  commands:\n    sluice-lint:\n      run: sluice run --hook pre-commit lint")
         );
         assert!(!s.contains("pre-push"));
         assert!(s.ends_with(FOOTER));
@@ -150,7 +117,9 @@ mod tests {
     #[test]
     fn plain_has_scripts_and_instructions() {
         let s = snippet(HookManager::Plain, &names(&["lint"]), &[]);
-        assert!(s.contains("# .githooks/pre-commit\n#!/bin/sh\nset -e\nsluice run lint\n"));
+        assert!(s.contains(
+            "# .githooks/pre-commit\n#!/bin/sh\nset -e\nsluice run --hook pre-commit lint\n"
+        ));
         assert!(!s.contains(".githooks/pre-push"));
         assert!(s.contains("chmod +x .githooks/*\ngit config core.hooksPath .githooks\n"));
         assert!(s.ends_with(FOOTER));
