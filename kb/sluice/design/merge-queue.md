@@ -406,8 +406,9 @@ push_timeout = "10m"       # covers the pre-push hook and the transfer
 ```
 
 User config `[queue]`: `allow_agent_approval = false`, `enabled = true` (a user-level kill
-switch), `tick = "5s"`. `allow_agent_approval` is ignored in `.sluice.toml` with a warning:
-repository content is agent-writable.
+switch), `tick = "5s"`. `allow_agent_approval` is only a user-config key: in `.sluice.toml`
+it is an unknown field and the strict parser rejects the file, so repository content (which
+agents can write) can never grant approval rights.
 
 ## 12. Security notes
 

@@ -14,7 +14,6 @@ use common::Sandbox;
 use predicates::prelude::*;
 use serde_json::{Value, json};
 
-
 #[test]
 fn enqueue_on_a_dirty_worktree_fails_without_contacting_the_daemon() {
     let sb = Sandbox::standard();

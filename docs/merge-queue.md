@@ -138,8 +138,9 @@ allow_agent_approval = false   # let the MCP queue_approve tool approve trains
 tick = "5s"                    # runner housekeeping period
 ```
 
-`allow_agent_approval` is ignored in `.sluice.toml` (with a warning): repository
-content is writable by agents.
+`allow_agent_approval` only exists in the user config. Putting it in `.sluice.toml`
+is a configuration error: repository content is writable by agents, so it can
+never grant approval rights.
 
 ## Agent policy
 
