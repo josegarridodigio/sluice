@@ -298,12 +298,27 @@ async fn claim_next(core: &Arc<Core>, tasks: &mut JoinSet<()>) -> Result<()> {
         if occupied {
             continue;
         }
+        // A base that failed is retried at most once per tick, whatever
+        // wakes the runner, so the attempts before `failed` span real time.
+        if is_base_failure(first.reason.as_deref())
+            && sluice_gate_core::dirs::now_ms().saturating_sub(first.updated_at) < tick_ms(core)
+        {
+            continue;
+        }
         let (git, j) = (core.git_for(&first.env), first.clone());
         let prepared = blocking(move || prepare(&git, &j)).await?;
         let (base_sha, endpoint, config) = match prepared {
             Ok(p) => p,
             Err(e) => {
-                tracing::warn!(job = %first.id, "cannot prepare a train for {}: {e:#}", first.target);
+                tracing::warn!(job = %first.id, "cannot prepare a train for {}: {e}", first.target);
+                let ids: Vec<String> = queued
+                    .iter()
+                    .filter(|j| j.repo == group.0 && j.remote == group.1 && j.target == group.2)
+                    .map(|j| j.id.clone())
+                    .collect();
+                if let Err(err) = core.write(Actor::Runner, |w| record_unprepared(w, &ids, &e)) {
+                    tracing::debug!("recording the failure refused: {}", store_msg(&err));
+                }
                 continue;
             }
         };
@@ -359,24 +374,105 @@ fn train_id() -> String {
 
 type Prepared = (String, String, Option<RepoConfig>);
 
+/// Consecutive failed attempts to prepare a base after which the waiting
+/// jobs become `failed` (design section 7).
+pub const MAX_PREPARE_FAILURES: u32 = 3;
+
+/// Why step 2 could not produce a base for a group of queued jobs.
+#[derive(Debug)]
+pub enum PrepareError {
+    /// The fetch (or the local branch, or the endpoint) failed: reason
+    /// `base_unavailable`.
+    Unavailable(String),
+    /// The base commit's `.sluice.toml` does not parse: reason
+    /// `base_config_invalid`.
+    ConfigInvalid(String),
+}
+
+impl PrepareError {
+    /// The job `reason` recorded for this failure.
+    #[must_use]
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Unavailable(_) => "base_unavailable",
+            Self::ConfigInvalid(_) => "base_config_invalid",
+        }
+    }
+
+    /// The git or config error, as recorded in the job `detail`.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Unavailable(m) | Self::ConfigInvalid(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for PrepareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.reason(), self.message())
+    }
+}
+
 /// Step 2: base SHA (fetch for a remote), endpoint hash, config of the base.
-fn prepare(git: &Git, j: &JobRow) -> Result<Prepared> {
+fn prepare(git: &Git, j: &JobRow) -> Result<Prepared, PrepareError> {
+    let unavailable = |e: anyhow::Error| PrepareError::Unavailable(format!("{e:#}"));
     let base_sha = if j.remote.is_empty() {
-        git.ref_sha(&j.repo, &format!("refs/heads/{}", j.target))?
-            .ok_or_else(|| anyhow!("local branch {} does not exist", j.target))?
+        git.ref_sha(&j.repo, &format!("refs/heads/{}", j.target))
+            .map_err(unavailable)?
+            .ok_or_else(|| {
+                PrepareError::Unavailable(format!("local branch {} does not exist", j.target))
+            })?
     } else {
         let base_ref = format!("refs/sluice/base/{}/{}", j.remote, j.target);
         let spec = format!("+refs/heads/{}:{base_ref}", j.target);
         git.repo(
             &j.repo,
             &["fetch", "--no-tags", "--quiet", &j.remote, &spec],
-        )?;
-        git.ref_sha(&j.repo, &base_ref)?
-            .ok_or_else(|| anyhow!("fetch did not produce {base_ref}"))?
+        )
+        .map_err(unavailable)?;
+        git.ref_sha(&j.repo, &base_ref)
+            .map_err(unavailable)?
+            .ok_or_else(|| PrepareError::Unavailable(format!("fetch did not produce {base_ref}")))?
     };
-    let endpoint = endpoint_hash(git, &j.repo, &j.remote)?;
-    let config = read_config(git, &j.repo, &base_sha)?;
+    let endpoint = endpoint_hash(git, &j.repo, &j.remote).map_err(unavailable)?;
+    let config = read_config(git, &j.repo, &base_sha)
+        .map_err(|e| PrepareError::ConfigInvalid(format!("{e:#}")))?;
     Ok((base_sha, endpoint, config))
+}
+
+/// True for the reasons a queued job carries while its base cannot be prepared.
+fn is_base_failure(reason: Option<&str>) -> bool {
+    matches!(reason, Some("base_unavailable" | "base_config_invalid"))
+}
+
+/// The user config's `[queue] tick` in milliseconds.
+fn tick_ms(core: &Core) -> u64 {
+    u64::try_from(core.handle.config().queue.tick.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Records a failed step 2 on every queued job of the group (they stay
+/// `queued` with the reason); after [`MAX_PREPARE_FAILURES`] consecutive
+/// failures a job becomes `failed` with that reason.
+fn record_unprepared(w: &Writer<'_, '_>, ids: &[String], e: &PrepareError) -> rusqlite::Result<()> {
+    for id in ids {
+        // `None`: claimed or cancelled meanwhile, nothing to record.
+        let Some(failures) = w.note_queued_failure(id, e.reason(), e.message())? else {
+            continue;
+        };
+        if failures >= MAX_PREPARE_FAILURES {
+            w.job_to(
+                id,
+                J::Queued,
+                J::Failed,
+                &JobEdit {
+                    note: Some(format!("{} after {failures} attempts", e.reason())),
+                    ..JobEdit::default()
+                },
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// `git show <rev>:.sluice.toml` parsed with `RepoConfig::parse`; `None`

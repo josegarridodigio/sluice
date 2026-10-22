@@ -359,6 +359,9 @@ fn failure_text(job: &QueueJobView) -> String {
     match &job.detail {
         Some(Value::String(s)) => parts.push(s.clone()),
         Some(Value::Object(o)) => {
+            if let Some(e) = o.get("error").and_then(Value::as_str) {
+                parts.push(e.lines().next().unwrap_or_default().to_owned());
+            }
             if let Some(g) = o.get("gate").and_then(Value::as_str) {
                 parts.push(format!("gate {g}"));
             }
@@ -385,6 +388,9 @@ fn job_note(job: &QueueJobView, gates: &[TrainGate]) -> String {
                 "{paths}  -> rebase, then 'sluice queue retry {}'",
                 job.job_id
             )
+        }
+        QueueJobState::Queued if job.reason.is_some() => {
+            format!("  waiting: {}", failure_text(job))
         }
         QueueJobState::Failed => format!(
             " {}  -> fix and commit, then 'sluice queue retry {}'",
@@ -489,9 +495,14 @@ fn render_status(report: &QueueStatusReport) -> String {
             let position = j
                 .position
                 .map_or_else(String::new, |p| format!("  position {p}"));
+            // Why no train is built yet (base unavailable, base config invalid).
+            let waiting = j
+                .reason
+                .as_ref()
+                .map_or_else(String::new, |_| format!("  waiting: {}", failure_text(j)));
             let _ = writeln!(
                 out,
-                "  {}  job {}  for {}{position}",
+                "  {}  job {}  for {}{position}{waiting}",
                 j.branch,
                 j.job_id,
                 target_name(&j.remote, &j.target)
@@ -621,8 +632,12 @@ fn report_final(train: &QueueTrainView, jobs: &[QueueJobView]) -> Outcome {
                 .map(|j| format!("{}: {}", j.branch, failure_text(j)))
                 .collect();
             if failed.is_empty() {
+                let why = train
+                    .note
+                    .as_deref()
+                    .map_or_else(String::new, |n| format!(" ({n})"));
                 Err(Failure::error(format!(
-                    "train {} was dissolved; its jobs were re-queued (see 'sluice queue status')",
+                    "train {} was dissolved{why}; its jobs were re-queued (see 'sluice queue status')",
                     train.train_id
                 )))
             } else {
@@ -914,6 +929,31 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("old"), "{text}");
+    }
+
+    #[test]
+    fn a_queued_job_whose_base_cannot_be_prepared_says_why() {
+        let mut j = job("j5", "feat/api", QueueJobState::Queued);
+        j.position = Some(1);
+        j.reason = Some("base_unavailable".into());
+        j.detail = Some(json!({"error": "fatal: no such remote\nmore", "failures": 1}));
+        let mut f = job("j6", "feat/b", QueueJobState::Failed);
+        f.reason = Some("base_config_invalid".into());
+        f.detail = Some(json!({"error": "TOML parse error", "failures": 3}));
+        let report = QueueStatusReport {
+            schema: 1,
+            trains: vec![],
+            jobs: vec![j, f],
+        };
+        let text = render_status(&report);
+        assert!(
+            text.contains("position 1  waiting: base_unavailable fatal: no such remote\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("FAILED base_config_invalid TOML parse error"),
+            "{text}"
+        );
     }
 
     #[test]

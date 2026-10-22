@@ -78,6 +78,7 @@ Side exits: `conflict`, `failed`, `cancelled`, `needs_reconcile`. Exact transiti
 |---|---|---|---|
 | — | queued | `queue enqueue` | CLI / MCP client (agent or human) |
 | queued | merging | claim into a train (one `BEGIN IMMEDIATE` with job selection) | runner |
+| queued | failed | 3 consecutive failures to prepare the base (`base_unavailable`, `base_config_invalid`) | runner |
 | merging | verifying | its merge applied cleanly | runner |
 | merging | conflict | `git merge` conflicted (with base or earlier members) | runner |
 | merging | failed | internal error while building the train (reason `internal`) | runner |
@@ -177,7 +178,8 @@ next start dissolves an unfinished build and parks an unfinished push).
    member branch. A member that changes `.sluice.toml` is flagged `config_changed` in the plan
    (job `detail = {"config_changed": true}`). A base without `.sluice.toml` has no gates and
    the default `[queue]` settings; an invalid one (or a failed fetch) leaves the jobs `queued`
-   and is logged, retried at the next tick. `push_timeout` and `audit_ref` are stored with
+   with the reason recorded (section 7, "Base unavailable"), retried at most once per tick,
+   and `failed` after 3 consecutive failures. `push_timeout` and `audit_ref` are stored with
    the train (`settings`).
 3. **Worktree.** `git worktree add --detach --lock <state>/merge/<train-id> <base_sha>`
    (`--reason "sluice merge queue"`); all git calls with `-c core.hooksPath=/dev/null`, every
@@ -312,6 +314,17 @@ over `ReconcileInput`; `reconcile::gather` collects the facts.
 
 - **Gate failure**: as step 7; `queue status` names the gate, the sluice job and its log (the
   executor writes the usual miss record for the key).
+- **Base unavailable or base config invalid** (step 2 fails: the fetch, the local branch or
+  the endpoint fails, or `.sluice.toml` of the base commit does not parse): no train is
+  built. Every `queued` job of that (repo, remote, target) keeps its state but records
+  `reason = base_unavailable` or `base_config_invalid` and `detail = {"error": <the git or
+  config error>, "failures": n}`, where `n` counts consecutive failed attempts (a claim or a
+  retry clears it). `queue status` shows it on the queued line (`waiting: <reason> <error>`;
+  MCP: `waiting: <reason>: <error>`). Attempts are paced: a group whose oldest job failed
+  less than one `[queue] tick` ago is skipped, whatever wakes the runner. At the third
+  consecutive failure the jobs become `failed` with the same reason and detail
+  (`Writer::note_queued_failure`, `runner::MAX_PREPARE_FAILURES`); `queue retry` re-queues
+  them with the reason cleared.
 - **Merge conflict**: job `conflict` with paths; the agent rebases its branch and calls
   `queue retry <job>`, which re-reads `refs/heads/<branch>` and re-queues (new `queue_order`).
 - **Runner death mid-train**: daemon start dissolves `merging`/`verifying` trains (jobs

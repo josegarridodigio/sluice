@@ -280,6 +280,57 @@ fn io_err(context: impl Into<String>) -> impl FnOnce(std::io::Error) -> Error {
     move |source| Error::Io { context, source }
 }
 
+/// Takes the daemon lease, reclaiming first one left by a dead daemon.
+fn take_lease(store: &Store, owner: &str, token: &str, now: u64) -> Result<bool> {
+    reclaim_dead_lease(store, owner)?;
+    store.acquire_lease(LEASE_NAME, owner, token, now, LEASE_TTL_MS)
+}
+
+/// Frees the lease of a previous daemon of this user that died without
+/// releasing it (SIGKILL, OOM, power loss of the process): its `uid:pid`
+/// owner no longer exists or is a zombie. Without this a restart after a
+/// crash was refused for the whole lease TTL (90 s). The caller holds the
+/// daemon `flock`, and a live owner (or one of another user, or an owner
+/// string that does not parse) is never touched, so an unexpired lease of a
+/// running daemon is still never stolen.
+fn reclaim_dead_lease(store: &Store, owner: &str) -> Result<()> {
+    let Some((cur_owner, cur_token, _, _)) = store.lease(LEASE_NAME)? else {
+        return Ok(());
+    };
+    if cur_owner == owner {
+        return Ok(());
+    }
+    let Some((uid, pid)) = cur_owner
+        .split_once(':')
+        .and_then(|(u, p)| Some((u.parse::<u32>().ok()?, p.parse::<u32>().ok()?)))
+    else {
+        return Ok(());
+    };
+    if uid == current_uid() && process_is_gone(pid) {
+        tracing::warn!(
+            previous = %cur_owner,
+            "the previous daemon died without releasing its lease; reclaiming it"
+        );
+        store.release_lease(LEASE_NAME, &cur_token)?;
+    }
+    Ok(())
+}
+
+/// True when `pid` does not exist or is a zombie.
+fn process_is_gone(pid: u32) -> bool {
+    if pid <= 1 || pid == std::process::id() {
+        return false;
+    }
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // "<pid> (<comm>) <state> ...": the state follows the last ')'.
+        Ok(stat) => stat
+            .rfind(')')
+            .and_then(|i| stat[i + 1..].split_whitespace().next())
+            .is_some_and(|state| state == "Z" || state == "X"),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
 fn current_uid() -> u32 {
     std::fs::metadata("/proc/self").map_or(0, |m| m.uid())
 }
@@ -380,7 +431,7 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
     let store = Store::open(&config.db_path)?;
     let token = random_token(pid);
     let owner = format!("{}:{pid}", current_uid());
-    if !store.acquire_lease(LEASE_NAME, &owner, &token, started_ms, LEASE_TTL_MS)? {
+    if !take_lease(&store, &owner, &token, started_ms)? {
         return Err(Error::AlreadyRunning(config.lock_path.clone()));
     }
     let store = Mutex::new(store);

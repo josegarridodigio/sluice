@@ -181,7 +181,7 @@ referenced here.
 - [ ] Daemon extension API (`Extension`, `DaemonHandle`), `welcome.features`, queue messages in `sluice-gate-proto`.
 - [ ] Crate `sluice-gate-queue`: store, runner, push protocol, reconcile.
 - [ ] CLI `sluice queue enqueue|status|approve|retry|cancel|reconcile` and MCP `queue_enqueue|queue_status|queue_approve`.
-- [ ] Acceptance tests 1–8 of the design (local bare remote, kill during push).
+- [x] Acceptance tests 1–8 of the design (local bare remote, kill during push): [[sluice/changes/phase-6-acceptance.md]] (2026-10-22).
 - [ ] Docs (`docs/agents.md`, README), change note, acceptance note, reconciliation report.
 
 ## Agent integration package (after Phase 6, before the final report)

@@ -60,7 +60,12 @@ queued:
 
 One block per train with its members, the gates and, for conflicts, the paths
 and the retry hint. Jobs that are not in a train are listed as `queued` with their
-position. A train in `needs_reconcile` tells you to run `sluice queue reconcile`.
+position. When no train can be built because the target cannot be fetched or the
+base commit's `.sluice.toml` is invalid, the queued line says why
+(`waiting: base_unavailable <git error>` or `waiting: base_config_invalid <error>`);
+the queue tries again once per `[queue] tick` and, after 3 failed attempts in a
+row, marks the jobs `FAILED` with that reason. Fix the remote or the config, then
+`sluice queue retry <JOB_ID>`. A train in `needs_reconcile` tells you to run `sluice queue reconcile`.
 Inside a repository only its own trains and jobs are shown. `--json` prints the
 `queue-status` payload as is (it carries `"schema": 1`).
 

@@ -643,6 +643,48 @@ async fn second_daemon_is_refused() {
     d.shutdown().await;
 }
 
+/// Regression (Phase 6 acceptance run): a daemon killed with SIGKILL leaves
+/// an unexpired lease behind; the next daemon reclaims it when the owner
+/// process is gone instead of refusing to start for the whole TTL, and still
+/// refuses while the owner lives.
+#[tokio::test(flavor = "multi_thread")]
+async fn lease_of_a_dead_daemon_is_reclaimed_on_start() {
+    use std::os::unix::fs::MetadataExt as _;
+    let uid = std::fs::metadata("/proc/self").unwrap().uid();
+    // A live owner of this user: the lease is not stolen.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), 1, LastSubscriberGone::Cancel);
+    let mut alive = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    {
+        let store = Store::open(&cfg.db_path).unwrap();
+        let owner = format!("{uid}:{}", alive.id());
+        assert!(
+            store
+                .acquire_lease("daemon", &owner, "old-token", dirs::now_ms(), 90_000)
+                .unwrap()
+        );
+    }
+    let refused = tokio::time::timeout(
+        Duration::from_secs(5),
+        server::run(cfg.clone(), std::future::pending()),
+    )
+    .await
+    .expect("returns promptly");
+    assert!(
+        matches!(refused, Err(Error::AlreadyRunning(_))),
+        "{refused:?}"
+    );
+    // The owner dies (reaped): the next start reclaims the lease.
+    alive.kill().unwrap();
+    alive.wait().unwrap();
+    let d = start_in(dir, cfg).await;
+    assert!(d.socket.exists());
+    d.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn orphans_are_reconciled_on_start() {
     let dir = tempfile::tempdir().unwrap();

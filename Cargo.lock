@@ -1116,6 +1116,7 @@ dependencies = [
  "nix",
  "predicates",
  "rmcp",
+ "rusqlite",
  "serde_json",
  "sluice-gate-core",
  "sluice-gate-daemon",

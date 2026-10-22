@@ -59,8 +59,9 @@ to 7, 10, 11, 14), built on the daemon extension point
   git has no committer identity (the daemon may run without one).
 - **`enabled = false`**: `welcome.features` still lists `queue` (the trait's
   `features()` is static); requests get `not-supported` naming the setting.
-- **Base without `.sluice.toml`**: no gates; invalid config or failed fetch:
-  jobs stay `queued`, logged, retried each tick (no new job state).
+- **Base without `.sluice.toml`**: no gates. Invalid config or failed fetch:
+  see "Base failures are recorded" below (originally: jobs stayed `queued`,
+  logged only, retried silently every tick).
 - **Reconcile row 7** cancels the members with a pending cancel and
   re-queues the others.
 
@@ -99,11 +100,63 @@ to 7, 10, 11, 14), built on the daemon extension point
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D
   warnings`, `cargo test --workspace` pass.
 
+## Bugs found by the acceptance run
+
+Found by `crates/sluice-gate/tests/queue_e2e.rs`
+([[sluice/changes/phase-6-acceptance.md]]), fixed, regression tests kept.
+
+| Bug | Fix | Files / symbols | Regression test |
+|---|---|---|---|
+| After the daemon is killed with SIGKILL (acceptance test 2) no daemon could start for 90 s: the dead daemon's lease row was unexpired and the start refused any other owner (`AlreadyRunning`), so every CLI call failed with "the daemon could not be started", and a parked push could not be reconciled until the TTL ran out. | The starting daemon, which already holds the `flock`, frees an unexpired lease whose `uid:pid` owner is this user's and no longer exists or is a zombie; a live owner (or another user's, or an unparsable owner) is never touched. | `sluice-gate-daemon` `server.rs`: `take_lease`, `reclaim_dead_lease`, `process_is_gone`; KB [[sluice/design/architecture.md]] (single instance). | `tests/daemon.rs` `lease_of_a_dead_daemon_is_reclaimed_on_start` (refused while the owner lives, started once it is reaped); `queue_e2e.rs` `acceptance_2a_…`, `acceptance_2b_…`. |
+| `sluice queue approve` reported a train dissolved at push time without the reason ("was dissolved; its jobs were re-queued"), so `endpoint_changed` was invisible to the human. | The message carries the train note: `was dissolved (endpoint_changed); …`. | `sluice-gate` `queue.rs` `report_final`. | `queue_e2e.rs` `acceptance_7a_endpoint_changed_never_pushes`. |
+
+## Base failures are recorded (lead request, after the acceptance run)
+
+Before: when step 2 failed (fetch, local branch, endpoint, or invalid
+`.sluice.toml` on the base), the jobs stayed `queued` with nothing visible
+and were retried silently every tick, forever. Now:
+
+- Every `queued` job of the group records `reason = base_unavailable` or
+  `base_config_invalid` and `detail = {"error": <git or config error>,
+  "failures": n}` without a state change (`store::Writer::note_queued_failure`,
+  one `queue_events` row per attempt, `from = to = queued`).
+- `n` counts consecutive failures (both reasons count; a claim or a
+  `queue retry` clears reason and detail). At `runner::MAX_PREPARE_FAILURES`
+  (3) the jobs go `queued → failed` (new transition in `JOB_TRANSITIONS` and
+  design section 3) with the same reason and detail; `queue retry` re-queues.
+- Attempts are paced to one per `[queue] tick` for the group (every queue
+  request, `queue status` included, wakes the runner, so without pacing a
+  polling client would exhaust the three attempts in a fraction of a second).
+- `runner::prepare` returns `PrepareError` (`Unavailable`, `ConfigInvalid`)
+  instead of `anyhow::Error`; `record_unprepared`, `is_base_failure`, `tick_ms`.
+- Display: CLI `queue status` prints `waiting: <reason> <first error line>`
+  on queued lines (also inside a train block) and the error on `FAILED`
+  lines (`failure_text` reads `detail.error`); MCP `render_status` prints
+  `waiting: <reason>: <error>` and the error after a failed job's reason.
+- Tests: `store` unit test
+  `base_failures_are_counted_on_queued_jobs_and_reset_by_a_claim`; CLI unit
+  `a_queued_job_whose_base_cannot_be_prepared_says_why`; MCP unit
+  `status_text_says_why_a_queued_job_waits`; end to end
+  `unreachable_base_is_reported_then_fails_after_three_attempts` (remote URL
+  that does not exist; retry after fixing the URL builds the train) and
+  `invalid_base_config_is_reported_then_fails_after_three_attempts`.
+- Design: [[sluice/design/merge-queue.md]] sections 3, 5 (step 2) and 7.
+
 ## Open points
 
 - `[queue] allow_agent_approval` in `.sluice.toml` is a config **error**
   today (`QueueConfig` has `deny_unknown_fields`), while section 11 says it
   is ignored with a warning; left for the config owner.
-- Not covered by tests: `endpoint_changed`, lease loss during a push,
-  reconcile rows 5/6 against a real remote, SIGKILL of the daemon while a
-  push blocks (acceptance test 2 uses the marker-without-push variant).
+- Not covered by tests: reconcile rows 5/6 against a real remote. Now
+  covered end to end ([[sluice/changes/phase-6-acceptance.md]]):
+  `endpoint_changed` (push time and reconcile row 2), lease loss before a
+  push, SIGKILL of the daemon while a push blocks.
+- The daemon reads the user config once at start: enabling
+  `allow_agent_approval` needs `sluice daemon stop` (the MCP server reads it
+  on every call, so until the restart the MCP check passes and the daemon
+  refuses).
+- `queue status` keeps every train of the repository, dissolved and landed
+  ones included, and renders their members with their *current* state next
+  to that train's gates (a member that landed later shows `landed  gates:
+  test FAIL` under the dissolved train it was split from). Cosmetic; a
+  history filter is left for later.

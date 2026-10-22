@@ -164,6 +164,11 @@ pub const JOB_TRANSITIONS: &[(QueueJobState, QueueJobState, &str)] = &[
     (J::NeedsReconcile, J::Cancelled, "reconcile row 7"),
     (J::Conflict, J::Queued, "queue retry"),
     (J::Failed, J::Queued, "queue retry"),
+    (
+        J::Queued,
+        J::Failed,
+        "no base after 3 attempts (base_unavailable, base_config_invalid)",
+    ),
     (J::Queued, J::Cancelled, "queue cancel"),
     (J::Merging, J::Cancelled, "queue cancel"),
     (J::Verifying, J::Cancelled, "queue cancel"),

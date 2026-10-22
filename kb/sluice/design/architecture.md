@@ -370,7 +370,10 @@ From [[sluice/research/references/mergetrain.md]]:
   clobber a newer one's state.
 - PID liveness triage dead / alive / unknown (`EPERM` means alive); never
   steal an unexpired lease; reclaim an expired one only when no job is in
-  progress.
+  progress. As implemented (`server::take_lease`, Phase 6 acceptance run):
+  the starting daemon, which already holds the `flock`, frees an unexpired
+  lease whose `uid:pid` owner is this user's and no longer exists or is a
+  zombie (a daemon killed with SIGKILL); a live owner keeps it.
 - Translate SQLite busy into a typed retryable error, never into a gate
   failure (contention must never cache a false negative).
 - Read-only probes (`sluice status`) open the DB `mode=ro` and refuse other

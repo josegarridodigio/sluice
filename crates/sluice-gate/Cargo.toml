@@ -36,6 +36,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 assert_cmd.workspace = true
 predicates.workspace = true
 rmcp = { version = "3.6.0", features = ["client", "transport-child-process"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 tempfile.workspace = true
 
 [lints]

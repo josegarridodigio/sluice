@@ -429,6 +429,15 @@ fn conflict_paths(job: &QueueJobView) -> Vec<String> {
         .collect()
 }
 
+/// The `error` field of a job's `detail` (base failures), first line only.
+fn detail_error(job: &QueueJobView) -> Option<&str> {
+    job.detail
+        .as_ref()
+        .and_then(|d| d.get("error"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|e| e.lines().next())
+}
+
 fn job_line(job: &QueueJobView, target: &str, out: &mut String) {
     let state = job_state_name(job.state);
     let _ = write!(out, "  {}  job {}  {state}", job.branch, job.job_id);
@@ -452,6 +461,19 @@ fn job_line(job: &QueueJobView, target: &str, out: &mut String) {
         QueueJobState::Failed | QueueJobState::NeedsReconcile => {
             if let Some(r) = &job.reason {
                 let _ = write!(out, "  ({r})");
+            }
+            if let Some(e) = detail_error(job) {
+                let _ = write!(out, "  {e}");
+            }
+        }
+        // A queued job that cannot be built yet (base unavailable, base
+        // config invalid): say why.
+        QueueJobState::Queued => {
+            if let Some(r) = &job.reason {
+                let _ = write!(out, "  waiting: {r}");
+                if let Some(e) = detail_error(job) {
+                    let _ = write!(out, ": {e}");
+                }
             }
         }
         _ => {}
@@ -632,6 +654,21 @@ mod tests {
             "{t}"
         );
         assert!(render_status(&QueueStatusReport::default()).contains("empty"));
+    }
+
+    #[test]
+    fn status_text_says_why_a_queued_job_waits() {
+        let mut j = job(QueueJobState::Queued);
+        j.reason = Some("base_unavailable".into());
+        j.detail = Some(serde_json::json!({"error": "fatal: gone\nhint", "failures": 2}));
+        let report = QueueStatusReport {
+            schema: 1,
+            trains: vec![],
+            jobs: vec![j],
+        };
+        let t = render_status(&report);
+        assert!(t.contains("waiting: base_unavailable: fatal: gone"), "{t}");
+        assert!(!t.contains("hint"), "{t}");
     }
 
     #[test]

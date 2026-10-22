@@ -850,6 +850,58 @@ impl<'a, 'c> Writer<'a, 'c> {
         )
     }
 
+    /// Records on a `queued` job why no train could be built for it
+    /// (`reason`, `detail = {"error", "failures"}`), without a state change.
+    /// `failures` counts consecutive attempts that failed for one of the
+    /// base reasons (`base_unavailable`, `base_config_invalid`); a claim or
+    /// a retry clears it. Returns the new count, or `None` when the job is no
+    /// longer `queued`.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn note_queued_failure(
+        &self,
+        id: &str,
+        reason: &str,
+        error: &str,
+    ) -> rusqlite::Result<Option<u32>> {
+        let Some(j) = job(self.tx, id)? else {
+            return Ok(None);
+        };
+        if j.state != QueueJobState::Queued {
+            return Ok(None);
+        }
+        let previous = if matches!(
+            j.reason.as_deref(),
+            Some("base_unavailable" | "base_config_invalid")
+        ) {
+            j.detail
+                .as_ref()
+                .and_then(|d| d.get("failures"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let failures = previous.saturating_add(1);
+        let detail = serde_json::json!({ "error": error, "failures": failures });
+        self.tx.execute(
+            "UPDATE queue_jobs SET reason = ?2, detail = ?3, updated_at = ?4 \
+             WHERE id = ?1 AND state = 'queued'",
+            params![id, reason, json(&detail), i(self.now)],
+        )?;
+        self.event(
+            Some(id),
+            j.train_id.as_deref(),
+            Some("queued"),
+            "queued",
+            Some(&format!("{reason} (attempt {failures})")),
+        )?;
+        Ok(Some(failures))
+    }
+
     /// Sets `cancel_requested` without a state change.
     ///
     /// # Errors
@@ -1243,6 +1295,66 @@ pub(crate) mod tests {
         .unwrap();
         let e = with(&mut c, init).unwrap_err();
         assert_eq!(refusal_of(&e), Some(&Refusal::Schema(2)));
+    }
+
+    #[test]
+    fn base_failures_are_counted_on_queued_jobs_and_reset_by_a_claim() {
+        let mut c = conn();
+        with(&mut c, init).unwrap();
+        let f = fence("tok");
+        with(&mut c, |tx| {
+            Writer::new(tx, &f, Actor::Cli)?.insert_job(&new_job("j1", "a"))
+        })
+        .unwrap();
+        let note = |c: &mut Connection, reason: &str| {
+            with(c, |tx| {
+                Writer::new(tx, &f, Actor::Runner)?.note_queued_failure("j1", reason, "boom")
+            })
+            .unwrap()
+        };
+        assert_eq!(note(&mut c, "base_unavailable"), Some(1));
+        // Consecutive failures count whatever the base reason.
+        assert_eq!(note(&mut c, "base_config_invalid"), Some(2));
+        let j = with(&mut c, |tx| job(tx, "j1")).unwrap().unwrap();
+        assert_eq!(j.state, QueueJobState::Queued);
+        assert_eq!(j.reason.as_deref(), Some("base_config_invalid"));
+        assert_eq!(
+            j.detail,
+            Some(serde_json::json!({"error": "boom", "failures": 2}))
+        );
+        // A claim clears the reason: the next failure starts again at 1.
+        with(&mut c, |tx| {
+            let w = Writer::new(tx, &f, Actor::Runner)?;
+            w.job_to(
+                "j1",
+                QueueJobState::Queued,
+                QueueJobState::Merging,
+                &JobEdit {
+                    reason: Some(None),
+                    detail: Some(None),
+                    ..JobEdit::default()
+                },
+            )?;
+            w.job_to(
+                "j1",
+                QueueJobState::Merging,
+                QueueJobState::Queued,
+                &JobEdit::default(),
+            )
+        })
+        .unwrap();
+        assert_eq!(note(&mut c, "base_unavailable"), Some(1));
+        // Queued → failed is allowed (third failure); a non-queued job is skipped.
+        with(&mut c, |tx| {
+            Writer::new(tx, &f, Actor::Runner)?.job_to(
+                "j1",
+                QueueJobState::Queued,
+                QueueJobState::Failed,
+                &JobEdit::default(),
+            )
+        })
+        .unwrap();
+        assert_eq!(note(&mut c, "base_unavailable"), None);
     }
 
     #[test]
