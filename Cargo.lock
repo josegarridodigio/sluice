@@ -672,6 +672,11 @@ version = "0.1.0"
 [[package]]
 name = "sluice-gate-proto"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sluice-gate-core",
+]
 
 [[package]]
 name = "smallvec"
