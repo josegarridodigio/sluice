@@ -12,9 +12,11 @@
 //! - [`agent`]: "is this hook invoked by a coding agent?" detection.
 //! - [`semaphore`]: `flock`-based counting semaphore (Phase 1 global guard).
 //! - [`mode`]: `CI` / `SLUICE_CACHE` / `SLUICE_DISABLE` handling.
+//! - [`dirs`]: state, runtime and socket paths, job ids.
 
 pub mod agent;
 pub mod config;
+pub mod dirs;
 pub mod error;
 pub mod git;
 pub mod key;
