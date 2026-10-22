@@ -1466,6 +1466,14 @@ fn pre_push_checks(git: &Git, t: &TrainRow, s: &str) -> PreCheck {
     match target_at(git, t, &url) {
         Ok(Some(cur)) if cur == t.base_sha => PreCheck::Ok,
         Ok(_) => PreCheck::Dissolve("target moved".into()),
+        // The approver's credentials were refused: retrying with the same
+        // stored env can never succeed, so the approval would otherwise sit
+        // `approved` forever while `sluice queue approve` waits for nothing.
+        // Nothing was pushed; fail like a push the remote refused.
+        Err(e) if push::credentials_refused(&format!("{e:#}")) => PreCheck::FailMembers(
+            "push_rejected",
+            format!("the remote refused the approver's credentials: {e:#}"),
+        ),
         Err(e) => PreCheck::Retry(format!("{e:#}")),
     }
 }

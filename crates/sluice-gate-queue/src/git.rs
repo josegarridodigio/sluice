@@ -18,9 +18,11 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use sluice_gate_core::config::{DEFAULT_NETWORK_TIMEOUT, invalid_remote_name};
 use sluice_gate_core::git as core_git;
+
+use crate::target::strip_userinfo;
 
 /// Environment map.
 pub type EnvMap = BTreeMap<String, String>;
@@ -169,12 +171,38 @@ impl Git {
     /// # Errors
     ///
     /// Spawn failure, non-zero exit or the deadline.
-    fn net(&self, common: &Path, args: &[&str]) -> Result<String> {
+    ///
+    /// The error never carries the userinfo of `url` (a password or token
+    /// embedded in the remote URL): its text ends up in job details, train
+    /// notes and the daemon log.
+    fn net(&self, common: &Path, url: &str, args: &[&str]) -> Result<String> {
         let c = common.to_string_lossy();
         let all = Self::repo_args(&c, args, false);
-        let out = core_git::run_output_deadline(&all, common, &self.env, self.network_timeout)?;
+        let out = core_git::run_output_deadline(&all, common, &self.env, self.network_timeout)
+            .map_err(|e| anyhow!(hide_userinfo(&e.to_string(), url)))?;
         if !out.status.success() {
-            return Err(core_git::command_error(&all, &out).into());
+            let mut text = core_git::command_error(&all, &out).to_string();
+            // `command_error` keeps git's `fatal:` / `error:` lines, but the
+            // transport says why in its own words (`user@host: Permission
+            // denied (publickey).`): keep its last lines too, so a refused
+            // credential is recognised (`push::credentials_refused`).
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let others: Vec<&str> = stderr
+                .lines()
+                .map(str::trim)
+                .filter(|l| {
+                    !l.is_empty()
+                        && !l.starts_with("fatal:")
+                        && !l.starts_with("error:")
+                        && !l.starts_with("hint:")
+                })
+                .collect();
+            let others = &others[others.len().saturating_sub(3)..];
+            if others.iter().any(|l| !text.contains(l)) {
+                text.push('\n');
+                text.push_str(&others.join("\n"));
+            }
+            return Err(anyhow!(hide_userinfo(&text, url)));
         }
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
     }
@@ -225,6 +253,7 @@ impl Git {
     pub fn fetch(&self, common: &Path, url: &str, refspec: &str) -> Result<()> {
         self.net(
             common,
+            url,
             &[
                 "fetch",
                 "--no-tags",
@@ -235,7 +264,7 @@ impl Git {
                 refspec,
             ],
         )
-        .with_context(|| format!("git fetch {url} {refspec}"))?;
+        .with_context(|| format!("git fetch {} {refspec}", strip_userinfo(url)))?;
         Ok(())
     }
 
@@ -315,8 +344,8 @@ impl Git {
         let mut args = vec!["ls-remote", "--", url];
         args.extend(refs);
         let out = self
-            .net(common, &args)
-            .with_context(|| format!("git ls-remote {url}"))?;
+            .net(common, url, &args)
+            .with_context(|| format!("git ls-remote {}", strip_userinfo(url)))?;
         Ok(out
             .lines()
             .filter_map(|l| {
@@ -333,7 +362,7 @@ impl Git {
     ///
     /// The remote cannot be reached, git fails or the deadline expired.
     pub fn remote_head(&self, common: &Path, url: &str) -> Result<Option<String>> {
-        let out = self.net(common, &["ls-remote", "--symref", "--", url, "HEAD"])?;
+        let out = self.net(common, url, &["ls-remote", "--symref", "--", url, "HEAD"])?;
         Ok(out.lines().find_map(|l| {
             let rest = l.strip_prefix("ref: refs/heads/")?;
             Some(rest.split('\t').next()?.trim().to_owned())
@@ -368,6 +397,19 @@ impl Git {
     }
 }
 
+/// `text` with every occurrence of `url` replaced by `url` without its
+/// userinfo (`https://user:token@host/r` → `https://host/r`); `text`
+/// unchanged when `url` has none.
+#[must_use]
+pub fn hide_userinfo(text: &str, url: &str) -> String {
+    let bare = strip_userinfo(url);
+    if url.is_empty() || bare == url {
+        text.to_owned()
+    } else {
+        text.replace(url, &bare)
+    }
+}
+
 /// Absolute per-worktree git dir of `wt`.
 ///
 /// # Errors
@@ -383,6 +425,43 @@ pub fn worktree_git_dir(git: &Git, wt: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn userinfo_is_hidden_from_messages() {
+        let url = "https://bot:hunter2@example.com/o/r.git";
+        let text = format!("git ls-remote -- {url} refs/heads/main: exit status: 128");
+        let out = hide_userinfo(&text, url);
+        assert!(!out.contains("hunter2") && !out.contains("bot@"), "{out}");
+        assert!(
+            out.contains("https://example.com/o/r.git refs/heads/main"),
+            "{out}"
+        );
+        assert_eq!(hide_userinfo("x /srv/r.git", "/srv/r.git"), "x /srv/r.git");
+    }
+
+    #[test]
+    fn a_failed_network_call_does_not_reveal_the_url_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let common = dir.path();
+        let mut base = EnvMap::new();
+        base.insert("PATH".into(), std::env::var("PATH").unwrap_or_default());
+        base.insert("HOME".into(), common.display().to_string());
+        base.insert("GIT_CONFIG_NOSYSTEM".into(), "1".into());
+        let git = Git::new(&base).with_network_timeout(Duration::from_secs(20));
+        git.repo(common, &["init", "-q", "--bare", "."]).unwrap();
+        // Port 9 on localhost: refused at once, no network involved.
+        let url = "http://bot:s3cr3t-in-url@127.0.0.1:9/r.git";
+        let e = git
+            .ls_remote(common, url, &["refs/heads/main"])
+            .unwrap_err();
+        let e2 = git
+            .fetch(common, url, "+refs/heads/main:refs/x")
+            .unwrap_err();
+        for text in [format!("{e:#}"), format!("{e2:#}")] {
+            assert!(!text.contains("s3cr3t-in-url"), "{text}");
+            assert!(text.contains("http://127.0.0.1:9/r.git"), "{text}");
+        }
+    }
 
     #[test]
     fn env_drops_git_variables_and_keeps_allowlist() {

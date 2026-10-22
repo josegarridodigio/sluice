@@ -70,6 +70,27 @@ fn tail(text: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
+/// True when git's output says the remote refused the credentials (or
+/// there were none to give): SSH `Permission denied (publickey)`, a forge's
+/// `Permission to o/r denied`, HTTP `Authentication failed` / 401 / 403,
+/// `could not read Username/Password` (no askpass helper and no terminal),
+/// or an unknown host key under `StrictHostKeyChecking`. The server
+/// refused the connection before any ref update, and asking again with the
+/// same environment gives the same answer: a definitive failure, never a
+/// reason to retry or to reconcile.
+#[must_use]
+pub fn credentials_refused(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("permission denied")
+        || (lower.contains("permission to") && lower.contains("denied"))
+        || lower.contains("authentication failed")
+        || lower.contains("returned error: 401")
+        || lower.contains("returned error: 403")
+        || lower.contains("could not read username")
+        || lower.contains("could not read password")
+        || lower.contains("host key verification failed")
+}
+
 /// Classifies the end of `git push --atomic --porcelain`.
 /// `exit` is `None` when the process was killed by a signal; `target_ref`
 /// is `refs/heads/<target>`.
@@ -87,11 +108,7 @@ pub fn classify(exit: Option<i32>, stdout: &str, stderr: &str, target_ref: &str)
         return PushVerdict::Landed;
     }
     if lines.is_empty() {
-        let lower = stderr.to_ascii_lowercase();
-        if lower.contains("permission denied")
-            || (lower.contains("permission to") && lower.contains("denied"))
-            || lower.contains("returned error: 403")
-        {
+        if credentials_refused(stderr) {
             return PushVerdict::Rejected(format!("permission denied: {}", tail(stderr, 3)));
         }
         let fatal = stderr.lines().any(|l| l.trim_start().starts_with("fatal:"));
@@ -390,6 +407,28 @@ mod tests {
         assert!(matches!(
             classify(Some(128), "", err, T),
             PushVerdict::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn refused_credentials_are_definitive() {
+        for err in [
+            "remote: authentication required\nfatal: Authentication failed for 'http://127.0.0.1:1/r.git/'\n",
+            "fatal: unable to access 'https://h/r.git/': The requested URL returned error: 401\n",
+            "fatal: could not read Username for 'https://h': terminal prompts disabled\n",
+            "Host key verification failed.\nfatal: Could not read from remote repository.\n",
+        ] {
+            assert!(credentials_refused(err), "{err}");
+            assert!(
+                matches!(classify(Some(128), "", err, T), PushVerdict::Rejected(_)),
+                "{err}"
+            );
+        }
+        assert!(!credentials_refused(
+            "fatal: unable to access 'https://h/r.git/': Could not resolve host: h\n"
+        ));
+        assert!(!credentials_refused(
+            "ssh: connect to host h port 22: Connection timed out\n"
         ));
     }
 

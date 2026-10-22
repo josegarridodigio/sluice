@@ -73,6 +73,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Merge queue: a wrong SSH key or HTTP password fails `sluice queue
+  approve` at once with `push_rejected` instead of leaving the train
+  approved forever or parking it for reconcile; the SSH error text reaches
+  the user; a password embedded in the remote URL no longer reaches job
+  details, train notes or `daemon.log`.
 - A daemon killed by SIGKILL or the OOM killer no longer leaves its gates
   running: a detached reaper terminates them within seconds, the next
   daemon start kills any leftover group (also when only a background child

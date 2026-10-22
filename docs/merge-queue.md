@@ -140,6 +140,45 @@ the commit); a modified tracked file dissolves the train. The push is
 protected by `--force-with-lease` on the target, and by default a `refs/sluice/landed/<sha>`
 audit ref is pushed with it.
 
+## Authenticated remotes (SSH, HTTPS)
+
+The daemon has no credentials of its own and never prompts: git runs with
+`GIT_TERMINAL_PROMPT=0`, no stdin and every `GIT_*` variable of the daemon removed.
+Credentials come from the environment of the CLI (or MCP) command, and only these
+variables cross over: `SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `GIT_SSH_COMMAND`,
+`GIT_ASKPASS`, `SSH_ASKPASS`, `HOME`, `PATH`, `TERM`. Anything else (tokens in other
+variables, `GIT_CONFIG_*`) is dropped.
+
+- **Whose environment.** `enqueue` (and `retry`, which keeps it) supplies the env of the
+  fetches and `ls-remote` calls that build and watch the train; `approve` supplies the
+  env of the pre-push check, the push itself and a later `reconcile` of that train. So
+  run `sluice queue approve` in a shell that can push (`git push` works there), and make
+  sure the enqueuing agent can at least fetch. The approver's variables are stored with
+  the train until it lands, is dissolved or its approval is voided.
+- **SSH.** Load your key in an agent (`ssh-add`) so `SSH_AUTH_SOCK` reaches the push;
+  a key with a passphrase and no agent fails (there is no terminal to ask). Keep the
+  agent running until the push and any `reconcile` are done. Host keys must already be
+  known (or `GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new"`); an unknown host
+  key fails instead of asking. `core.sshCommand` in the repository config works as usual.
+- **HTTPS.** Point `GIT_ASKPASS` at a program that prints the user name (when asked
+  `Username for ...`) and the token (when asked `Password for ...`). A `credential.helper`
+  from your git config is read too (the daemon's git sees your `HOME`), but only if it
+  needs nothing outside the allowlist: a desktop keyring reached through D-Bus does not
+  get `DBUS_SESSION_BUS_ADDRESS`. A token embedded in the remote URL (`https://user:token@host/...`) works too and
+  is never stored: messages show the URL without it.
+- **Refused credentials fail at once.** A wrong key or password, an unknown host key or
+  no credentials at all fail the train's jobs with reason `push_rejected` (the error says
+  the remote refused the approver's credentials) and `approve` exits 1 right away; nothing
+  was pushed. Fix the credentials, `sluice queue retry` the jobs and approve the new train.
+- **A remote that stalls.** Every fetch and `ls-remote` is bounded by `network_timeout`
+  (an unreachable remote leaves an approved train `approved`, checked again at the next
+  tick); the push by `push_timeout`, after which the train is `needs_reconcile` and
+  `reconcile` (with the approver's stored env) tells whether it landed. A stalled remote
+  never blocks other repositories' trains.
+- **What is never written.** Passwords, tokens and keys never reach the queue database,
+  `daemon.log`, `client.log` or `sluice doctor --bundle`: the database stores variable
+  values such as the askpass path or the agent socket path, not what they give access to.
+
 ## Configuration
 
 Repository, `.sluice.toml` (read from the target commit, never from a queued branch):

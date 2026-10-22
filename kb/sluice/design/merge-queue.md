@@ -288,7 +288,11 @@ train is rebuilt against the new URL), for a local target that it is not checked
 (else jobs `failed`, reason `target_checked_out`), `ls-remote` of the push URL (train's
 `network_timeout`) target == `base_sha` (else dissolved, `target moved`). A remote that
 cannot be reached (or whose push URL cannot be resolved) leaves the train `approved` and the check is
-retried at the next tick.
+retried at the next tick, except when the remote refused the approver's credentials
+(`push::credentials_refused`: `Permission denied`, `Authentication failed`, HTTP 401/403,
+`could not read Username/Password`, `Host key verification failed`): the stored env can
+never succeed, so the members are `failed` with reason `push_rejected` (detail: "the remote
+refused the approver's credentials: …") and the train is dissolved; nothing was pushed.
 Then:
 
 1. `git update-ref refs/sluice/pending/<train-id> S` (pin ref).
@@ -329,8 +333,9 @@ Then:
    deleted, worktree removed. Classification (`push::classify`, on the line of
    `refs/heads/<target>`): `[rejected]` (`stale info`, `non-fast-forward`, `fetch first`) →
    the target moved: marker deleted, train dissolved, jobs `queued`; `[remote rejected]`
-   (server hook, protected branch) or "permission denied" (also before any ref line, e.g. SSH
-   auth) or a refspec git refused locally before sending anything (`error: src refspec`,
+   (server hook, protected branch) or refused credentials before any ref line
+   (`push::credentials_refused`: SSH `Permission denied (publickey)`, HTTP `Authentication
+   failed`, 401/403, `could not read Username`, `Host key verification failed`) or a refspec git refused locally before sending anything (`error: src refspec`,
    `error: dst refspec`, `error: unable to push to unqualified destination`) → jobs
    `failed`, reason `push_rejected`; the `pre-push` hook declined → jobs `failed`,
    reason `pre_push_hook`, detail `{"output": ...}`. A job with a pending cancel ends
@@ -404,8 +409,10 @@ over `ReconcileInput`; `reconcile::gather` collects the facts.
   the same through the `update-ref` compare-and-swap.
 - **`pre-push` hook declined or hung**: declined → jobs `failed` (`pre_push_hook`); hung →
   `push_timeout`, group killed, `needs_reconcile`.
-- **Push rejected by policy** (`[remote rejected]`, permission denied, a refspec git refuses):
-  nothing landed, jobs `failed` with reason `push_rejected`. **Local target checked out** in a
+- **Push rejected by policy** (`[remote rejected]`, refused credentials, a refspec git refuses):
+  nothing landed, jobs `failed` with reason `push_rejected`. Refused credentials are
+  recognised in the pre-push `ls-remote` too (section 6), so a wrong key or password fails
+  the approval at once instead of leaving the train `approved` forever. **Local target checked out** in a
   worktree at landing time: jobs `failed` with reason `target_checked_out`.
 - **Stalled remote**: every `fetch`/`ls-remote` has the `network_timeout` deadline and runs
   in a child task; a stall during step 2 records `base_unavailable` (`git … timed out after
@@ -546,11 +553,19 @@ agents can write) can never grant approval rights.
   (`SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `SSH_ASKPASS`, `HOME`,
   `PATH`, `TERM`; `sluice_gate_queue::git::ENV_ALLOWLIST`, mirrored by the CLI and MCP clients
 before sending), stored with the train (`push_env`) until it lands, is
-  dissolved or the approval is voided. Fetches and `ls-remote` use the enqueuing client's
+  dissolved or the approval is voided; the pre-push `ls-remote` and `reconcile` use it too.
+  The base fetch and the ready watch use the enqueuing client's
   allowlist (`queue_jobs.env`, cleared once the job is `landed` or `cancelled`); git runs with
   `GIT_TERMINAL_PROMPT=0` and no stdin, so interactive auth fails instead of hanging. Push
   URLs are never stored: only `endpoint_hash`, the hash of the push URL with its userinfo
-  stripped, is. Gates and `[queue]` come from the base. A `[queue]
+  stripped, is; the errors of network calls replace the URL by its userinfo-free form
+  (`git::hide_userinfo` in `Git::net`), since they land in job details, train notes and the
+  daemon log. Stored env values are paths (agent socket, askpass program), never the secret
+  they give access to. Confirmed end to end over SSH (unprivileged `sshd`, `ssh-agent`) and
+  smart HTTP (`git http-backend`, basic auth, `GIT_ASKPASS`, and a password embedded in the
+  URL) by `crates/sluice-gate/tests/queue_transports/`: no private key or password in the
+  queue database (with its WAL), `daemon.log`, `client.log`, job logs, `sluice doctor
+  --bundle` or the CLI output ([[sluice/changes/queue-transports.md]]). Gates and `[queue]` come from the base. A `[queue]
   remote` is a configured remote name that never starts with `-` (section 2), and
   user-derived positional arguments follow `--`.
 - Hooks are disabled in the merge worktree for merge and ref operations. The push runs the
