@@ -706,11 +706,18 @@ fn acquire_budget(ctx: &Context) -> Result<Vec<SlotGuard>, String> {
     }
 }
 
-/// Builds the gate command: `sh -c '<cmd> "$@"' sh <extra...>`.
+/// Builds the gate command: `sh -c '<cmd>'`, or `sh -c '<cmd> "$@"' sh <extra...>`
+/// when extra arguments are given (appending `"$@"` to a compound command such
+/// as a `for` loop would be a syntax error, so it is only added when needed).
 fn gate_command(ctx: &Context, extra: &[String]) -> Result<Command, String> {
     let mut cmd = Command::new("sh");
+    let script = if extra.is_empty() {
+        ctx.gate.cmd.trim().to_owned()
+    } else {
+        format!("{} \"$@\"", ctx.gate.cmd.trim())
+    };
     cmd.arg("-c")
-        .arg(format!("{} \"$@\"", ctx.gate.cmd.trim()))
+        .arg(script)
         .arg("sh")
         .args(extra)
         .current_dir(&ctx.paths.toplevel)

@@ -110,7 +110,7 @@ progress_interval = "15s"  # progress notifications while verify runs
 ttl_days = 30
 tail_lines = 40
 
-[scheduler]                # Phase 2
+[scheduler]
 head_reserve_after = "30s" # backfill behind the queue head only this long (ADR-0007)
 
 [agent_detection]
@@ -129,7 +129,8 @@ Environment variables (highest precedence):
 | `SLUICE_CACHE=0` / `1` | Force cache off / on (on overrides the `CI` rule). |
 | `CI` | Cache off unless `SLUICE_CACHE` is truthy. A falsy `CI` (`0`, `false`, `no`, `off`) does not count as set. |
 | `SLUICE_AGENT=1` / `0` | Force agent / human detection (truthy / falsy words as below; any other value is ignored). |
-| `SLUICE_SOCKET` | Override the daemon socket path (Phase 2). |
+| `SLUICE_SOCKET` | Override the daemon socket path. |
+| `SLUICE_LOG` | Log filter of the daemon process (`sluice daemon`), e.g. `debug`; default `info`. Not read by the client. |
 | `SLUICE_CONFIG` | Override the user config path (ignored when empty). |
 
 Truthy words: `1`, `true`, `yes`, `on`; falsy: `0`, `false`, `no`, `off`
@@ -139,10 +140,9 @@ through to the `CI` rule.
 User config notes: every section and field is optional (a missing file
 means defaults); unknown fields are errors; validation: `daemon.budget >= 1`,
 `daemon.nice <= 19`, `daemon.ionice_level <= 7`, `admission.psi_poll_interval > 0`,
-`budget_share_max >= 1`. In Phase 1 only `daemon.budget`, `cache.ttl_days`,
-`cache.tail_lines` and `agent_detection.*` have an effect; the other
-fields are parsed and validated for Phases 2–4 (logs are not pruned before
-the daemon exists).
+`budget_share_max >= 1`. `admission.*` (Phase 4) and `daemon.idle_exit` (always "never" in v1)
+are parsed and validated but have no effect yet; everything else is live
+since Phase 2 (`log_retention_days` prunes job logs daily from the daemon).
 
 ## Decisions on this format
 

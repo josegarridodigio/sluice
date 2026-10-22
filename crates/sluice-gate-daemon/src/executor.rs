@@ -259,7 +259,8 @@ async fn join_all(tasks: Vec<JoinHandle<()>>) {
     }
 }
 
-/// Spawns `sh -c '<cmd> "$@"' sh <extra...>` in its own process group, with
+/// Spawns `sh -c '<cmd>'` (or `sh -c '<cmd> "$@"' sh <extra...>` when extra
+/// arguments are given) in its own process group, with
 /// exactly `spec.env` as environment, stdin null and both outputs captured
 /// into `spec.log_path` behind the Phase 1 header.
 ///
@@ -289,9 +290,16 @@ pub async fn spawn(spec: ExecSpec) -> Result<Running> {
     );
     write_log(&log, &bytes, header.as_bytes());
 
+    // `"$@"` is appended only when extra arguments exist: a compound command
+    // (`for … done`) followed by `"$@"` would be a shell syntax error.
+    let script = if spec.extra.is_empty() {
+        spec.cmd.trim().to_owned()
+    } else {
+        format!("{} \"$@\"", spec.cmd.trim())
+    };
     let mut child = Command::new("sh")
         .arg("-c")
-        .arg(format!("{} \"$@\"", spec.cmd))
+        .arg(script)
         .arg("sh")
         .args(&spec.extra)
         .current_dir(&spec.cwd)

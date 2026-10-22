@@ -549,3 +549,15 @@ fn unknown_gate_and_missing_config_are_reported() {
         .code(1)
         .stderr(predicate::str::contains("not a git repository"));
 }
+
+#[test]
+fn compound_commands_work_without_extra_arguments() {
+    let sb = Sandbox::new(
+        r#"
+[gates.loop]
+cmd = "for i in 1 2; do echo run >> \"$SLUICE_TEST_COUNTER\"; done"
+"#,
+    );
+    sb.sluice().args(["run", "loop"]).assert().success();
+    assert_eq!(sb.runs(), 2);
+}

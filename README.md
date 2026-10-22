@@ -13,10 +13,10 @@
   <img alt="Status: pre-alpha" src="https://img.shields.io/badge/status-pre--alpha-red.svg">
 </p>
 
-> **Status: pre-alpha, Phase 1 done.** `sluice run` caches gate results per
-> git tree today (no daemon yet: a file-lock semaphore bounds concurrency).
-> The daemon with coalescing and the MCP server come next; see the
-> [roadmap](#roadmap).
+> **Status: pre-alpha, Phases 1 and 2 done.** `sluice run` caches gate
+> results per git tree, and a per-user daemon queues misses under a weighted
+> budget and coalesces identical requests. The MCP server for agents comes
+> next; see the [roadmap](#roadmap).
 
 ---
 
@@ -48,13 +48,15 @@ respect that.
   plus the gate definition. A tree that passed `test` once passes `test`
   everywhere: in another worktree, after a no-op rebase, at push time. Hits
   return in milliseconds and never need the daemon.
-- **Bounds concurrency globally.** Gates run under a per-user budget; each
-  gate declares a weight, so heavy suites take more of it than a linter.
-  Today that is a file-lock semaphore; the daemon (Phase 2) adds a queue
-  with fair ordering, and Phase 4 adds admission by real pressure (PSI).
-- **Coalesces identical requests** (Phase 2). Two agents asking for the
-  same tree and gate will share one run; the second just waits for the
-  first one's result. No other tool in this space does this.
+- **Bounds concurrency globally.** A per-user daemon runs gates under a
+  budget; each gate declares a weight, so heavy suites take more of it
+  than a linter. The queue is FIFO with backfill and a head-of-line
+  reservation so heavy jobs never starve. Phase 4 adds admission by real
+  pressure (PSI).
+- **Coalesces identical requests.** Two agents asking for the same tree
+  and gate share one run; the second just waits for the first one's
+  result. If a marker appears while a request is queued, it completes
+  without running. No other tool in this space does this.
 - **Two front-ends, one brain.** `sluice run <gate>` for git hooks, humans
   and scripts today; `sluice mcp` for agents, as an MCP server over stdio,
   in Phase 3. Both will talk to the same daemon and share cache, queue and
@@ -75,15 +77,16 @@ respect that.
 ```
  git hook ──▶ sluice run ──┐                        ┌──▶ gate (process group)
  terminal ──▶ sluice run ──┼──(Unix socket)──▶ daemon ─┼──▶ gate (process group)
- agent    ──▶ sluice mcp ──┘      (Phase 2)         └──▶ …  bounded by budget
+ agent    ──▶ sluice mcp ──┘      (Phase 3)         └──▶ …  bounded by budget
                 │
                 └── cache hit: marker found under .git/, exit 0 in milliseconds,
                     no daemon involved
 ```
 
-Until the daemon lands, `sluice run` runs the gate itself after taking
-`weight` slots of a per-user file-lock semaphore, so the budget already
-bounds concurrency across all your worktrees and repositories.
+The daemon starts itself the first time a miss needs it and keeps running
+until `sluice daemon stop`. If it cannot be reached, `sluice run` runs the
+gate in-process under a file-lock semaphore instead, so a broken daemon
+never blocks a commit.
 
 1. The client computes the tree hash from a **private copy of the index**
    (`git add -A` + `git write-tree` against a scratch index and a scratch
@@ -97,8 +100,10 @@ bounds concurrency across all your worktrees and repositories.
    hit. Markers are shared by every worktree of the repository. The key
    layout and the marker format are a documented contract
    ([design note](kb/sluice/design/cache-key.md)).
-4. Otherwise the gate runs under the budget (through the daemon from Phase
-   2 on, which also coalesces identical in-flight requests).
+4. Otherwise the request goes to the daemon, which attaches it to an
+   identical in-flight job or queues it under the budget, runs it in its
+   own process group with output captured to a log, and streams
+   `queued` / `started` / `done` back.
 5. Only a run that exits 0 **and leaves the tree unchanged** writes a
    marker. Auto-fixers that modify files always get re-verified.
 
@@ -134,8 +139,8 @@ sluice cache status [--all] | clear [--gate <gate>]      # markers of the curren
 sluice init [--force]                                    # starter .sluice.toml + hook snippet (Phase 1)
 sluice hook print husky|lefthook|pre-commit|plain        # integration snippets         (Phase 1)
 sluice logs [<job-id>] [-n <lines>]                      # job logs                     (Phase 1)
-sluice daemon                                            # one per user, Unix socket    (Phase 2)
-sluice status [--json]                                   # queue, in-flight, stats      (Phase 2)
+sluice daemon [--foreground] | stop [--force]            # one per user, Unix socket    (Phase 2)
+sluice status [--json]                                   # queue, in-flight, totals     (Phase 2)
 sluice mcp                                               # MCP stdio server for agents  (Phase 3)
 ```
 
@@ -167,8 +172,8 @@ with progress notifications), `status`, `gate_list`, `logs`.
 |---|---|---|
 | 0 | Research, design, ADRs, workspace | done |
 | 1 | Cache only, no daemon: `sluice run`, markers, TTL, hook snippets, agent detection and `agent_hook_policy`, a file-lock semaphore | done |
-| 2 | Daemon: budget scheduler, coalescing, process groups, timeouts, SQLite metrics, `sluice status` | next |
-| 3 | MCP server (`verify`, `status`, `gate_list`, `logs`), `docs/agents.md` | |
+| 2 | Daemon: budget scheduler, coalescing, process groups, timeouts, SQLite metrics, `sluice status` | done |
+| 3 | MCP server (`verify`, `status`, `gate_list`, `logs`), `docs/agents.md` | next |
 | 4 | PSI-based admission, stable `--json` schema, metrics export | |
 | 5 | Release builds, install script, real-world numbers | |
 

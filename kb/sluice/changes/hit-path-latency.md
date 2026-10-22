@@ -41,6 +41,16 @@ negligible (microseconds). Each spawn also probes nine `PATH` entries
 before finding `/usr/bin/git`; resolving the binary once would shave a
 fraction of a millisecond.
 
+## After Phase 2 (daemon client wired in)
+
+Measured by the CLI client agent with the same script, load average about
+10: median 24.7 ms with the daemon client linked in versus 20.5 ms for the
+saved Phase 1 binary; interleaving both binaries over 60 runs gave 25.7 vs
+24.6 ms with a daemon running and 24.4 vs 23.9 ms without, so the real
+cost of the hit event (one 20 ms-bounded socket round trip) is about 1 ms.
+No tokio runtime is created on a hit. The binary grew from 1.6 MB to
+5.6 MB.
+
 ## Verdict
 
 Target met on a 5 000-file repository even under load. Larger repositories

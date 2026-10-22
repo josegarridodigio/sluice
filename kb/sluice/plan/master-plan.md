@@ -20,8 +20,8 @@ Related: [[sluice/research/problem-statement.md]],
 |---|---|---|---|
 | 0 | Setup and research | **done** (2026-10-22) | Questions answered, decisions recorded in ADR-0001..0005, workspace scaffolded and green. See [[sluice/changes/phase-0-scaffold.md]]. |
 | 1 | Cache only, no daemon | **done** (2026-10-22) | [[sluice/changes/phase-1-cache-only.md]], [[sluice/changes/phase-1-acceptance.md]], [[sluice/changes/hit-path-latency.md]]. |
-| 2 | Daemon, scheduler, coalescing | **in progress** (started 2026-10-22) | Design: [[sluice/design/protocol.md]], [[sluice/design/scheduler.md]], [[sluice/design/executor.md]], ADR-0007. Done: proto crate, store, scheduler, executor. Pending: server, CLI client, `status`/`logs`/`daemon stop`, acceptance. |
-| 3 | MCP front-end and agent policy | not started | |
+| 2 | Daemon, scheduler, coalescing | **done** (2026-10-22) | [[sluice/changes/phase-2-daemon.md]], [[sluice/changes/phase-2-acceptance.md]]; design in [[sluice/design/protocol.md]], [[sluice/design/scheduler.md]], [[sluice/design/executor.md]], ADR-0007. |
+| 3 | MCP front-end and agent policy | **next** | Design: [[sluice/design/mcp-tools.md]]. |
 | 4 | Load-aware admission and observability | not started | |
 | 5 | Packaging and real-world validation | not started | |
 | later | Local merge queue (mergetrain-inspired) | not planned | Ask before starting. |
@@ -102,9 +102,10 @@ Tasks:
 - [x] `sluice-gate-daemon::store`: SQLite schema, fenced lease, jobs, events, totals, log pruning.
 - [x] `sluice-gate-daemon::scheduler`: budget, weights, backfill + head reservation, repo caps, coalescing by key.
 - [x] `sluice-gate-daemon::executor`: process groups, renice/ionice, log capture, timeout, cancel, kill-tree, pid-reuse guard.
-- [ ] `sluice-gate-daemon::server`: socket, handshake, subscribers, scheduling loop, marker double-check, orphan reconciliation, stop.
-- [ ] CLI: `sluice daemon [--foreground] | stop`, client on misses with autostart and fallback, `status [--json]`, `logs` via daemon, `hit` events.
-- [ ] Acceptance tests and evidence document; reconciliation pass; README/docs.
+- [x] `sluice-gate-daemon::server`: socket, handshake, subscribers, scheduling loop, marker double-check, orphan reconciliation, stop.
+- [x] CLI: `sluice daemon [--foreground] | stop`, client on misses with autostart and fallback, `status [--json]`, `logs` via daemon, `hit` events.
+- [x] Acceptance tests and evidence document ([[sluice/changes/phase-2-acceptance.md]]); README/docs.
+- [ ] Reconciliation pass ([[sluice/changes/phase-2-reconciliation.md]]).
 
 Deliverables: versioned IPC protocol over a Unix socket
 ([[sluice/design/protocol.md]]), daemon autostart with a start lock, budget
@@ -155,11 +156,8 @@ project(s) with before/after numbers.
 
 ## Next steps
 
-1. Phase 2 design docs first: [[sluice/design/protocol.md]],
-   [[sluice/design/scheduler.md]] (+ ADR on fairness),
-   [[sluice/design/executor.md]].
-2. `sluice-gate-proto`: message types; `sluice-gate-daemon`: socket server,
-   lease, scheduler, in-flight map, executor, SQLite; `sluice run` becomes a
-   thin client on misses; `sluice status`, `sluice logs` via the daemon,
-   `sluice daemon stop`.
-3. Secondary lookup by `committed_tree` ([[sluice/design/committed-tree-lookup.md]]).
+1. Phase 2 reconciliation pass and fixes.
+2. Phase 3: `sluice-gate-mcp` with rmcp per [[sluice/design/mcp-tools.md]]
+   (`verify`, `status`, `gate_list`, `logs`), fail-fast message pointing to
+   `verify`, `docs/agents.md`, automated MCP client test, documented manual
+   end-to-end run with two Claude Code agents.

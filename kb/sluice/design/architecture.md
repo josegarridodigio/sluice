@@ -21,7 +21,7 @@ sluice cache status [--all] | clear [--gate <gate>]                  # markers o
 sluice init [--force]                                                # starter .sluice.toml + plain hook snippet (Phase 1)
 sluice hook print husky|lefthook|pre-commit|plain                    # integration snippets (Phase 1)
 sluice logs [<job-id>] [-n <lines>]                                  # job logs (Phase 1)
-sluice daemon                                                        # the brain: one per user, Unix socket (Phase 2)
+sluice daemon [--foreground] | stop [--force]                        # the brain: one per user, Unix socket (Phase 2)
 sluice status [--json]                                               # queue, in-flight, cache stats, time saved (Phase 2)
 sluice mcp                                                           # MCP stdio server spawned by the agent (Phase 3)
 ```
@@ -112,11 +112,21 @@ is ignored when empty; with no `HOME` the state dir falls back to
 - Socket: `$XDG_RUNTIME_DIR/sluice/daemon.sock`; fallback
   `/tmp/sluice-<uid>/daemon.sock` with mode `0700` on the directory.
 - Autostart: a client that cannot connect takes an `flock` on
-  `<runtime-dir>/daemon.lock`, re-checks the socket, spawns
-  `sluice daemon` detached (new session, stdio to a log file), waits for the
-  socket with a short backoff, releases the lock. Double start is impossible
-  because the daemon itself holds the same lock for its whole life.
-- Idle exit: none in v1 (Q10); `sluice daemon stop` stops it.
+  `<runtime-dir>/start.lock`, re-checks the socket, spawns its own
+  executable as `sluice daemon` (which detaches itself with
+  `nix::unistd::daemon` before creating its tokio runtime and sends stdout
+  and stderr to `<state>/daemon.log`; `SLUICE_LOG` sets its log filter),
+  polls the socket every 20 ms for up to 5 s, releases the lock. The
+  spawned daemon's environment has every `GIT_*` variable removed so a
+  hook's variables never stick to it. Double start is impossible because
+  the daemon holds `<runtime-dir>/daemon.lock` for its whole life and a
+  fenced lease row in SQLite. The socket file is `0600`.
+- If the daemon cannot be reached or started, `sluice run` says
+  `daemon unavailable (<why>); running in-process` and runs the gate
+  itself under the Phase 1 `flock` semaphore, so a broken daemon never
+  blocks work.
+- Idle exit: none in v1 (Q10); `sluice daemon stop [--force]` stops it
+  (`no daemon running` when there is none).
 - `systemd --user` socket activation: later, not v1.
 
 ### 5.2 Request handling
@@ -160,10 +170,12 @@ Markers stay as files inside `.git`: the hit path must not depend on the DB.
 
 ## 6. IPC protocol
 
-Newline-delimited JSON over the Unix socket, with a `version` field in the
-hello handshake. Messages: `Hello`, `Run`, `Progress` (optional, for MCP
-progress notifications), `Outcome`, `Status`, `Cancel`, `Logs`. Authoritative
-in [[sluice/design/protocol.md]] (Phase 2).
+Newline-delimited JSON over the Unix socket, with a `protocol` field in
+the hello/welcome handshake. Client messages: `hello`, `run`, `status`,
+`logs`, `event`, `stop`, `cancel`; server messages: `welcome`, `queued`,
+`started`, `progress`, `done`, `status`, `log`, `stopping`, `error`.
+Authoritative in [[sluice/design/protocol.md]]; types in
+`sluice-gate-proto`.
 
 ## 7. MCP server
 
@@ -218,24 +230,38 @@ Agent detection: see [[sluice/design/adr/0004-agent-detection.md]].
   file always has everything.
 - `--json` variants (Phase 2, `status`); the MCP tool returns the same text block.
 
-## 9b. Phase 1 execution (no daemon yet)
+## 9b. Running a gate: daemon path and in-process fallback
 
-Until the daemon exists, `sluice run` itself runs the gate: it takes
-`weight` slots (all or nothing, capped at the budget) of a `flock`
-counting semaphore with `daemon.budget` slots under the runtime dir, spawns
-`sh -c '<cmd> "$@"' sh <extra…>` in the worktree root with the sanitised
-environment, captures stdout and stderr interleaved into
+On a miss with policy `wait`, `sluice run` sends a `run` request to the
+daemon ([[sluice/design/protocol.md]]) and prints
+`sluice: <gate> queued (position N, U of B units busy[, sharing job <id>])`
+on `queued` and `sluice: <gate> running (job <id>)` on `started`; `-v`
+tails the log file meanwhile. The daemon runs the gate as described in
+[[sluice/design/executor.md]] and the client maps `done` to the Phase 1
+output lines and exit codes (`cached` prints the hit line; `killed` prints
+`KILLED` and exits 143). A cache hit additionally sends a best-effort
+`hit` event (about 1 ms) so `status` can count hits and time saved.
+
+When the daemon is unavailable (and under `run-unqueued`), `sluice run`
+runs the gate itself: it takes `weight` slots (all or nothing, capped at
+the budget) of a `flock` counting semaphore with `daemon.budget` slots
+under the runtime dir, spawns `sh -c '<cmd>'` (with `"$@"` and the extra
+arguments appended only when there are any, because a compound command
+followed by `"$@"` is a syntax error) in the worktree root with the
+sanitised environment, captures stdout and stderr interleaved into
 `<state>/logs/<job-id>.log` (header `# sluice job <id>: gate '<gate>' in
 <root>` and `# command: <cmd>`, footer `# exit: <code> after <s>s`; stdout
 and stderr pumped by two threads, so ordering is by arrival; the gate's
 stdin is `/dev/null`), and enforces the timeout by killing the process
-tree found through `/proc` (SIGTERM, 5 s grace, SIGKILL). The gate shares
-the client's process group so Ctrl-C reaches it. The weight is clamped to
-`[1, budget]`, slots are `<runtime>/semaphore/slot-<n>.lock`, waiting
-polls with 25–500 ms backoff and has no timeout. No coalescing in
-Phase 1. `sluice logs` prints the newest log (by file name) or the given
-job id, with `-n` for a tail; the path goes to stderr and the content to
-stdout. See [[sluice/changes/phase-1-cache-only.md]].
+tree found through `/proc` (SIGTERM, 5 s grace, SIGKILL). In this path
+the gate shares the client's process group so Ctrl-C reaches it. The
+weight is clamped to `[1, budget]`, slots are
+`<runtime>/semaphore/slot-<n>.lock`, waiting polls with 25–500 ms backoff
+and has no timeout, and there is no coalescing. `sluice logs` asks the
+daemon for the newest (or the given) job's tail and otherwise prints the
+newest log file in `<state>/logs/` (by file name); the path goes to stderr
+and the content to stdout. See [[sluice/changes/phase-1-cache-only.md]]
+and [[sluice/changes/phase-2-daemon.md]].
 
 ## 10. Security and safety
 
