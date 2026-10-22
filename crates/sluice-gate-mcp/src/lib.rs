@@ -181,8 +181,8 @@ struct GateResult {
     /// Human-readable detail (errors, cancellation).
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
-    /// Last lines of the log of a failing gate.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Last lines of the log of a failing gate (absent when empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tail: Vec<String>,
 }
 
@@ -1227,6 +1227,63 @@ mod tests {
             text,
             "test  PASS 1.0s (job j)\ne2e   FAIL exit=1 0.1s (job j) log=/l/j.log\n\
              --- last 1 lines of /l/j.log ---\nboom\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    //! The structured content of every tool must validate against the
+    //! tool's own output schema, which Claude Code enforces: a field that is
+    //! skipped when empty must not be listed as required.
+
+    use super::*;
+
+    fn required_names(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::Array(req)) = map.get("required") {
+                    out.extend(req.iter().filter_map(|v| v.as_str().map(str::to_owned)));
+                }
+                for v in map.values() {
+                    required_names(v, out);
+                }
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|v| required_names(v, out)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn skipped_fields_are_never_required() {
+        let mut required = Vec::new();
+        for schema in [
+            schema_for_output::<VerifyReport>(),
+            schema_for_output::<GateList>(),
+            schema_for_output::<LogsReport>(),
+        ] {
+            required_names(
+                &serde_json::to_value(schema).expect("schema json"),
+                &mut required,
+            );
+        }
+        for skipped in [
+            "tail",
+            "cancelled",
+            "duration_ms",
+            "not_cached_reason",
+            "message",
+        ] {
+            assert!(
+                !required.iter().any(|r| r == skipped),
+                "{skipped} is skipped when empty but marked required"
+            );
+        }
+        let pass = GateResult::new("test", GateStatus::Pass);
+        let json = serde_json::to_value(&pass).expect("json");
+        assert!(
+            json.get("tail").is_none(),
+            "empty tail must be omitted: {json}"
         );
     }
 }
