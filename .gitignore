@@ -7,3 +7,6 @@
 # Pando local state and config (the kb/ documents are versioned)
 /.pando/
 /.pando.toml
+
+# Local agent commands (personal workflow, kept in ~/.claude/commands)
+/.claude/
