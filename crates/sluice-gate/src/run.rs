@@ -42,6 +42,7 @@ use sluice_gate_proto::{
     self as proto, GateSpec, Outcome, OutcomeStatus, RepoInfo, RunRequest, ServerMessage,
 };
 
+use crate::clientlog;
 use crate::dirs;
 use sluice_gate_proto::client::{self, ClientError};
 
@@ -98,8 +99,62 @@ impl Context {
     }
 }
 
-/// Entry point of `sluice run`.
+/// What `client.log` records about one invocation, filled in as the run
+/// progresses.
+#[derive(Debug, Default)]
+struct Trace {
+    /// `agent` or `human`.
+    caller: Option<&'static str>,
+    /// Working-tree hash, when it was computed.
+    tree: Option<String>,
+    /// Decision keyword (see [`crate::clientlog`]); `None` until decided.
+    decision: Option<&'static str>,
+}
+
+/// Entry point of `sluice run`: runs the gate and appends one line to
+/// `client.log` (never failing the command because of it).
 pub fn run(args: &RunArgs) -> ExitCode {
+    let started = Instant::now();
+    let mut trace = Trace::default();
+    let code = run_traced(args, &mut trace);
+    if !args.explain {
+        let env: EnvMap = std::env::vars().collect();
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let exit = exit_byte(code);
+        let decision = trace.decision.unwrap_or(if exit == EXIT_ERROR {
+            "error"
+        } else {
+            "miss-run"
+        });
+        let entry = clientlog::Entry {
+            pid: std::process::id(),
+            caller: trace.caller.unwrap_or("human"),
+            hook: args.hook.as_deref(),
+            gate: &args.gate,
+            tree: trace.tree.as_deref(),
+            decision,
+            exit,
+            duration_ms: started.elapsed().as_millis(),
+            cwd: &cwd,
+        };
+        if let Err(e) = clientlog::record(&env, &entry) {
+            tracing::debug!("cannot write client.log: {e}");
+        }
+    }
+    code
+}
+
+/// `ExitCode` has no accessor: recover the byte through its debug form.
+fn exit_byte(code: ExitCode) -> u8 {
+    format!("{code:?}")
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0)
+}
+
+fn run_traced(args: &RunArgs, trace: &mut Trace) -> ExitCode {
     let env: EnvMap = std::env::vars().collect();
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
@@ -110,11 +165,23 @@ pub fn run(args: &RunArgs) -> ExitCode {
         Ok(ctx) => ctx,
         Err(e) => return fail(&e),
     };
+    crate::logging::init_cli(&env, &ctx.user.debug.level);
+    trace.caller = Some(
+        match agent::detect(
+            &env,
+            &ctx.user.agent_detection.env_any_set,
+            &ctx.user.agent_detection.env_any_equals,
+        ) {
+            Caller::Agent { .. } => "agent",
+            Caller::Human => "human",
+        },
+    );
 
     if args.explain {
         return explain(&ctx, &env, &mode, &args.extra);
     }
     if mode == CacheMode::Bypass {
+        trace.decision = Some("disabled");
         eprintln!(
             "sluice: SLUICE_DISABLE is set; running '{}' directly",
             ctx.gate_name
@@ -124,6 +191,8 @@ pub fn run(args: &RunArgs) -> ExitCode {
 
     let state = match lookup::lookup(&ctx, &mode, &args.extra) {
         CacheState::Hit(hit) => {
+            trace.decision = Some("hit");
+            trace.tree = Some(hit.tree.as_str().to_owned());
             println!(
                 "sluice: {} PASS (cached, passed {} ago)",
                 ctx.gate_name,
@@ -157,38 +226,18 @@ pub fn run(args: &RunArgs) -> ExitCode {
     // Policy on a miss, only inside a hook and only when the cache was consulted:
     // with caching off or an unknown tree the gate can never be cached, so
     // refusing to run would block the caller forever.
+    if let CacheState::Miss { tree, .. } = &state {
+        trace.tree = Some(tree.as_str().to_owned());
+    }
     let (caller, in_hook, policy) = decide_policy(&ctx, &env, &state);
     if policy == HookPolicy::FailFast {
-        let why = match &state {
-            CacheState::Miss {
-                last_miss: Some(m), ..
-            } => format!(
-                "last run failed {} ago{}",
-                age(&m.recorded_at),
-                m.exit_code
-                    .map_or(String::new(), |c| format!(" with exit code {c}"))
-            ),
-            CacheState::Miss { .. } | CacheState::Hit(_) => {
-                "no cached pass for this tree".to_owned()
-            }
-            CacheState::Off { reason, .. } => reason.clone(),
-        };
-        let rule = match &caller {
-            Caller::Agent { rule } => rule.as_str(),
-            Caller::Human => "human",
-        };
-        let hook = ctx.hook.as_deref().unwrap_or("a git hook");
-        eprintln!(
-            "sluice: '{}' has not passed on this tree ({why}).\n\
-             sluice: {hook} was invoked by a coding agent ({rule}) and agent_hook_policy is \"fail-fast\".\n\
-             sluice: call the 'verify' MCP tool (or run 'sluice run {}') first, then retry the git command.",
-            ctx.gate_name, ctx.gate_name
-        );
+        trace.decision = Some("miss-fail-fast");
+        print_fail_fast(&ctx, &state, &caller);
         let _ = in_hook;
         return ExitCode::from(EXIT_FAIL_FAST);
     }
-
     if policy == HookPolicy::RunUnqueued {
+        trace.decision = Some("in-process");
         return execute(&ctx, args, state);
     }
 
@@ -196,15 +245,43 @@ pub fn run(args: &RunArgs) -> ExitCode {
         Ok(r) => r,
         Err(e) => return fail(&e),
     };
-    match via_daemon(&ctx, args, request, &state) {
+    match via_daemon(&ctx, args, request, &state, trace) {
         Ok(code) => return code,
         Err(why) => eprintln!("sluice: daemon unavailable ({why}); running in-process"),
     }
+    trace.decision = Some("in-process");
     let _slots = match acquire_budget(&ctx) {
         Ok(slots) => slots,
         Err(e) => return fail(&e),
     };
     execute(&ctx, args, state)
+}
+
+/// Explains on stderr why `agent_hook_policy = "fail-fast"` refused to run.
+fn print_fail_fast(ctx: &Context, state: &CacheState, caller: &Caller) {
+    let why = match state {
+        CacheState::Miss {
+            last_miss: Some(m), ..
+        } => format!(
+            "last run failed {} ago{}",
+            age(&m.recorded_at),
+            m.exit_code
+                .map_or(String::new(), |c| format!(" with exit code {c}"))
+        ),
+        CacheState::Miss { .. } | CacheState::Hit(_) => "no cached pass for this tree".to_owned(),
+        CacheState::Off { reason, .. } => reason.clone(),
+    };
+    let rule = match caller {
+        Caller::Agent { rule } => rule.as_str(),
+        Caller::Human => "human",
+    };
+    let hook = ctx.hook.as_deref().unwrap_or("a git hook");
+    eprintln!(
+        "sluice: '{}' has not passed on this tree ({why}).\n\
+         sluice: {hook} was invoked by a coding agent ({rule}) and agent_hook_policy is \"fail-fast\".\n\
+         sluice: call the 'verify' MCP tool (or run 'sluice run {}') first, then retry the git command.",
+        ctx.gate_name, ctx.gate_name
+    );
 }
 
 /// Builds the daemon `run` request with everything precomputed.
@@ -304,6 +381,7 @@ fn via_daemon(
     args: &RunArgs,
     request: RunRequest,
     state: &CacheState,
+    trace: &mut Trace,
 ) -> Result<ExitCode, String> {
     let socket = client::ensure_daemon(&ctx.env).map_err(|e| format!("{e:#}"))?;
     let conn = client::connect(&socket).map_err(|e| e.to_string())?;
@@ -318,6 +396,7 @@ fn via_daemon(
             ..
         } if !queued => {
             queued = true;
+            trace.decision = Some(if *coalesced { "coalesced" } else { "miss-run" });
             let busy = client::connect(&socket)
                 .and_then(client::Client::status)
                 .map(|s| format!(", {} of {} units busy", s.budget.used, s.budget.total))
@@ -342,7 +421,13 @@ fn via_daemon(
         f.finish();
     }
     match result {
-        Ok(done) => Ok(report_outcome(ctx, state, &done.job_id, &done.outcome)),
+        Ok(done) => {
+            if done.outcome.status == OutcomeStatus::Cached {
+                // The daemon found a fresh marker: nothing ran.
+                trace.decision = Some("hit");
+            }
+            Ok(report_outcome(ctx, state, &done.job_id, &done.outcome))
+        }
         Err(ClientError::Closed | ClientError::Daemon(_)) if !queued => {
             Err("the daemon refused or dropped the request".to_owned())
         }
@@ -987,5 +1072,12 @@ mod tests {
     fn exit_code_maps_signals_to_143() {
         assert_eq!(exit_code_of(Some(0)), ExitCode::SUCCESS);
         assert_eq!(exit_code_of(None), ExitCode::from(143));
+    }
+
+    #[test]
+    fn exit_byte_reads_the_code_back() {
+        assert_eq!(exit_byte(ExitCode::SUCCESS), 0);
+        assert_eq!(exit_byte(ExitCode::from(3)), 3);
+        assert_eq!(exit_byte(ExitCode::from(143)), 143);
     }
 }

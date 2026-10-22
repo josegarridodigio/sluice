@@ -50,6 +50,29 @@ pub fn runtime_dir(env: &EnvMap) -> Result<PathBuf> {
     crate::tree::scratch_root(env)
 }
 
+/// The runtime directory path as [`runtime_dir`] would pick it, without
+/// creating or touching anything (for diagnostics). `None` when the current
+/// uid cannot be determined.
+#[must_use]
+pub fn runtime_dir_path(env: &EnvMap) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+    match env.get("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        Some(dir) => Some(Path::new(dir).join("sluice")),
+        None => std::fs::metadata("/proc/self")
+            .ok()
+            .map(|m| PathBuf::from(format!("/tmp/sluice-{}", m.uid()))),
+    }
+}
+
+/// [`socket_path`] without creating the runtime directory (for diagnostics).
+#[must_use]
+pub fn socket_path_no_create(env: &EnvMap) -> Option<PathBuf> {
+    if let Some(path) = env.get("SLUICE_SOCKET").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    runtime_dir_path(env).map(|d| d.join("daemon.sock"))
+}
+
 /// Daemon socket path: `$SLUICE_SOCKET` or `<runtime>/daemon.sock`.
 ///
 /// # Errors

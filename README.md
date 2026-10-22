@@ -145,10 +145,11 @@ sluice cache status [--all] | clear [--gate <gate>]      # markers of the curren
 sluice init [--force]                                    # starter .sluice.toml + hook snippet (Phase 1)
 sluice hook print husky|lefthook|pre-commit|plain        # integration snippets         (Phase 1)
 sluice logs [<job-id>] [-n <lines>]                      # job logs                     (Phase 1)
-sluice daemon [--foreground] | stop [--force]            # one per user, Unix socket    (Phase 2)
+sluice daemon [--foreground] | stop [--force] | restart [--debug] [--force]   # one per user, Unix socket (Phase 2)
 sluice status [--json]                                   # queue, in-flight, totals     (Phase 2)
 sluice mcp                                               # MCP stdio server for agents  (Phase 3)
 sluice queue enqueue|status|approve|retry|cancel|reconcile   # local merge queue    (Phase 6)
+sluice doctor [--json] [--bundle [PATH]]                 # health checks, redacted bug-report bundle
 ```
 
 Point your agent at the server (`claude mcp add sluice -- sluice mcp`) and
@@ -192,6 +193,15 @@ daemon is already running.
 
 MCP tools for agents: `verify` (blocks until the gates finish, with
 progress notifications and cancellation), `status`, `gate_list`, `logs`.
+
+## Debugging
+
+Every log lives under `~/.local/state/sluice/`: `daemon.log`, `logs/mcp-<pid>.log`
+for each `sluice mcp`, `logs/client.log` (one line per `sluice run`) and one
+log per job. Raise the level with `sluice daemon restart --debug` or
+`[debug] level` in the user config. `sluice doctor` checks the installation
+and `sluice doctor --bundle` writes a redacted `.tar.gz` to attach to a bug
+report. See [docs/debugging.md](docs/debugging.md).
 
 ## Merge queue
 

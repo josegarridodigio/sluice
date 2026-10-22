@@ -110,6 +110,7 @@ fn config(dir: &Path, budget: u32, policy: LastSubscriberGone) -> DaemonConfig {
         },
         psi_root: dir.join("pressure"),
         user: server::UserConfig::default(),
+        log: sluice_gate_daemon::server::LogSettings::default(),
         extensions: Vec::new(),
     }
 }

@@ -92,17 +92,49 @@ pub async fn serve(env: EnvMap) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Installs the tracing subscriber: stderr plus `<state>/logs/mcp-<pid>.log`
+/// (stdout is the MCP channel and is never written). The filter is
+/// `SLUICE_LOG`, then `[debug] level` of the user config (an unreadable
+/// config is ignored here), then `info`. The file is best effort.
 fn init_tracing(env: &EnvMap) {
-    let filter = env
-        .get("SLUICE_LOG")
-        .filter(|v| !v.is_empty())
-        .and_then(|v| tracing_subscriber::EnvFilter::try_new(v).ok())
-        .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    let configured = sluice_gate_core::config::UserConfig::load(env)
+        .ok()
+        .map(|user| user.debug.level);
+    let level = sluice_gate_core::config::resolve_log_level(env, configured.as_deref());
+    let filter = tracing_subscriber::EnvFilter::try_new(&level)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let file = open_mcp_log(env).map(|f| {
+        tracing_subscriber::fmt::layer()
+            .with_writer(std::sync::Mutex::new(f))
+            .with_ansi(false)
+    });
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(false),
+        )
+        .with(file)
         .try_init();
+}
+
+/// Opens `<state>/logs/mcp-<pid>.log` for appending.
+fn open_mcp_log(env: &EnvMap) -> Option<std::fs::File> {
+    let dir = dirs::logs_dir(env);
+    sluice_gate_core::dirs::create_private_dir(&dir).ok()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(format!(
+            "{}{}.log",
+            sluice_gate_core::logfile::MCP_LOG_PREFIX,
+            std::process::id()
+        )))
+        .ok()
 }
 
 // ---------------------------------------------------------------- params
@@ -1443,8 +1475,12 @@ fn find_log(
             .into_iter()
             .flatten()
             .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(sluice_gate_core::logfile::is_job_log_name)
+            })
             .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "log"))
             .max()
             .ok_or_else(|| format!("no job logs in {}", dir.display()))?,
     };

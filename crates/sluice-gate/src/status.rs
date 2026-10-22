@@ -29,7 +29,7 @@ pub fn show(json: bool) -> ExitCode {
                     }
                 }
             } else {
-                print!("{}", render(&report));
+                print!("{}", render(&report, &dirs::daemon_log_path(&env)));
             }
             ExitCode::SUCCESS
         }
@@ -92,7 +92,7 @@ fn pressure(psi: &PsiInfo) -> String {
 }
 
 /// Renders the text form of a status report.
-fn render(r: &StatusReport) -> String {
+fn render(r: &StatusReport, log_path: &Path) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let _ = writeln!(
@@ -103,6 +103,9 @@ fn render(r: &StatusReport) -> String {
         age(&r.daemon.started_at),
         r.daemon.socket.display()
     );
+    if let Some(level) = &r.daemon.log_level {
+        let _ = writeln!(out, "log:      level {level}, {}", log_path.display());
+    }
     let _ = writeln!(
         out,
         "budget:   {} of {} units busy",
@@ -182,7 +185,12 @@ mod tests {
         });
         r.totals.runs = 3;
         r.totals.time_saved_ms = 90_000;
-        let text = render(&r);
+        r.daemon.log_level = Some("debug".into());
+        let text = render(&r, Path::new("/s/daemon.log"));
+        assert!(
+            text.contains("log:      level debug, /s/daemon.log"),
+            "{text}"
+        );
         assert!(text.contains("4 of 8 units busy"), "{text}");
         assert!(text.contains("test") && text.contains("repo") && text.contains("2 subscriber"));
         assert!(text.contains("#1") && text.contains("repo-cap"));

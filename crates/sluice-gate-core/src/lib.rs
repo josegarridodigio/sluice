@@ -21,6 +21,7 @@ pub mod dirs;
 pub mod error;
 pub mod git;
 pub mod key;
+pub mod logfile;
 pub mod lookup;
 pub mod marker;
 pub mod mode;

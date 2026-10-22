@@ -744,7 +744,9 @@ impl Store {
 
     /// Deletes `<logs_dir>/<id>.log` files that belong to no job row (logs of
     /// in-process fallback runs) whose mtime is before `older_than_ms`. Only
-    /// regular files named like a job id (`[A-Za-z0-9_-]+.log`) are touched.
+    /// regular files named like a job id (`[A-Za-z0-9_-]+.log`) are touched,
+    /// plus the `mcp-<pid>.log` files of `sluice mcp` (same retention). The
+    /// CLI's `client.log` is never deleted here: it rotates by size.
     fn prune_unowned_logs(&self, logs_dir: &Path, older_than_ms: u64) -> Result<usize> {
         let entries = match std::fs::read_dir(logs_dir) {
             Ok(e) => e,
@@ -763,6 +765,7 @@ impl Store {
                 continue;
             };
             if id.is_empty()
+                || name.to_str() == Some(sluice_gate_core::logfile::CLIENT_LOG)
                 || !id
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
@@ -775,7 +778,10 @@ impl Store {
             if !meta.is_file() || meta.modified().map_or(true, |m| m >= cutoff) {
                 continue;
             }
-            if known.exists([id]).map_err(db)? {
+            let is_mcp = name
+                .to_str()
+                .is_some_and(sluice_gate_core::logfile::is_mcp_log_name);
+            if !is_mcp && known.exists([id]).map_err(db)? {
                 continue;
             }
             let file = entry.path();
@@ -1059,6 +1065,32 @@ mod tests {
             "odd name.log",
             "notes.txt",
         ] {
+            assert!(logs.join(kept).exists(), "{kept}");
+        }
+    }
+
+    #[test]
+    fn prune_logs_handles_mcp_and_client_logs() {
+        let (d, p) = tmp();
+        let s = Store::open(&p).unwrap();
+        let logs = d.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let old = UNIX_EPOCH + Duration::from_millis(100);
+        for name in ["mcp-41.log", "mcp-42.log", "client.log", "client.log.1"] {
+            let f = logs.join(name);
+            std::fs::write(&f, "x").unwrap();
+            if name != "mcp-42.log" {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&f)
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+            }
+        }
+        assert_eq!(s.prune_logs(&logs, 1_000).unwrap(), 1);
+        assert!(!logs.join("mcp-41.log").exists());
+        for kept in ["mcp-42.log", "client.log", "client.log.1"] {
             assert!(logs.join(kept).exists(), "{kept}");
         }
     }

@@ -581,6 +581,11 @@ pub struct DaemonInfo {
     pub version: String,
     /// Socket path.
     pub socket: PathBuf,
+    /// Active log filter of the daemon (for example `info` or `debug`).
+    /// Optional and additive: absent from the JSON when the daemon does not
+    /// report it, and ignored by older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_level: Option<String>,
 }
 
 /// Budget usage in a status report.
@@ -1019,6 +1024,7 @@ mod tests {
                 started_at: "t".into(),
                 version: "0.1.0".into(),
                 socket: "/s".into(),
+                log_level: None,
             },
             budget: BudgetInfo {
                 total: 8,

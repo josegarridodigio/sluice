@@ -61,7 +61,7 @@ use crate::store::{JobRow, JobState, Store};
 use crate::{Error, Result};
 
 /// Name of the lease row held by the running daemon.
-const LEASE_NAME: &str = "daemon";
+pub const LEASE_NAME: &str = "daemon";
 /// Lease validity, renewed by the heartbeat.
 const LEASE_TTL_MS: u64 = 90_000;
 /// Heartbeat period.
@@ -122,9 +122,27 @@ pub struct DaemonConfig {
     /// The loaded user config, exposed to extensions through
     /// [`DaemonHandle::config`] (the fields above are derived from it).
     pub user: UserConfig,
+    /// Log level reporting and `daemon.log` rotation.
+    pub log: LogSettings,
     /// Extensions plugged into the daemon (the merge queue); empty for a
     /// plain daemon.
     pub extensions: Vec<Arc<dyn Extension>>,
+}
+
+/// How many rotated generations of `daemon.log` are kept (`.1` to `.3`).
+pub const DAEMON_LOG_KEEP: usize = 3;
+
+/// Logging facts the daemon reports and acts on. The default (used by
+/// tests and foreground runs) reports nothing and never rotates.
+#[derive(Debug, Clone, Default)]
+pub struct LogSettings {
+    /// Active log filter, shown by `sluice status`.
+    pub level: Option<String>,
+    /// The `daemon.log` file that stdout and stderr were redirected to when
+    /// the daemon detached; `None` when it logs to a terminal.
+    pub file: Option<PathBuf>,
+    /// Rotate `file` when it grows beyond this many bytes (0 = never).
+    pub max_bytes: u64,
 }
 
 /// Event of one job, broadcast to all its subscribers.
@@ -399,7 +417,34 @@ async fn reconcile_orphans(store: &Mutex<Store>, instance: &str) -> Result<()> {
     Ok(())
 }
 
+/// Rotates `daemon.log` when it exceeds the cap, then points stdout and
+/// stderr (which tracing writes to) at the fresh file with the safe
+/// `dup2` wrappers, so nothing keeps appending to the renamed file.
+fn rotate_daemon_log(settings: &LogSettings) {
+    let Some(path) = &settings.file else { return };
+    match sluice_gate_core::logfile::rotate_if_larger(path, settings.max_bytes, DAEMON_LOG_KEEP) {
+        Ok(false) => {}
+        Ok(true) => {
+            let reopened = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .and_then(|file| {
+                    nix::unistd::dup2_stdout(&file)?;
+                    nix::unistd::dup2_stderr(&file)?;
+                    Ok(())
+                });
+            match reopened {
+                Ok(()) => tracing::info!("rotated {}", path.display()),
+                Err(e) => tracing::warn!("rotated {} but cannot reopen it: {e}", path.display()),
+            }
+        }
+        Err(e) => tracing::warn!("cannot rotate {}: {e}", path.display()),
+    }
+}
+
 fn prune_logs(shared: &Shared) {
+    rotate_daemon_log(&shared.config.log);
     let cutoff = now_ms()
         .saturating_sub(u64::try_from(shared.config.log_retention.as_millis()).unwrap_or(u64::MAX));
     if let Some(n) = shared.store("pruning logs", |s| {
@@ -1397,6 +1442,7 @@ fn status_report(shared: &Shared) -> StatusReport {
             started_at: shared.started_at.clone(),
             version: shared.config.version.clone(),
             socket: shared.config.socket_path.clone(),
+            log_level: shared.config.log.level.clone(),
         },
         budget: BudgetInfo { total, used, psi },
         running,

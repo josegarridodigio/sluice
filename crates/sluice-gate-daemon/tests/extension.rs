@@ -126,6 +126,7 @@ fn config(dir: &Path, extensions: Vec<Arc<dyn Extension>>) -> DaemonConfig {
         },
         psi_root: dir.join("pressure"),
         user: UserConfig::default(),
+        log: sluice_gate_daemon::server::LogSettings::default(),
         extensions,
     }
 }

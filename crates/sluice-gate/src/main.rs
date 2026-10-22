@@ -12,8 +12,11 @@ use clap::{Parser, Subcommand};
 use sluice_gate_core::config::{REPO_CONFIG_FILE, RepoConfig, starter_repo_config};
 
 mod cache;
+mod clientlog;
 mod daemon_cmd;
 mod dirs;
+mod doctor;
+mod logging;
 mod logs;
 mod queue;
 mod run;
@@ -43,7 +46,8 @@ use snippets::{HookManager, snippet};
                   SLUICE_CACHE=0|1 forces the cache off or on (on overrides CI); CI disables \
                   the cache; SLUICE_AGENT=1|0 forces agent or human detection; SLUICE_CONFIG \
                   points at the user config; SLUICE_SOCKET overrides the daemon socket path; \
-                  SLUICE_LOG sets the log filter of the daemon and of `sluice mcp` (default info)."
+                  SLUICE_LOG sets the log filter of the daemon, `sluice mcp` and `sluice run` \
+                  (then `[debug] level` of the user config, then info)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -85,6 +89,23 @@ enum Command {
         foreground: bool,
         #[command(subcommand)]
         command: Option<DaemonCommand>,
+    },
+    /// Check the installation (git, PSI, daemon, lease, configs, hooks) and optionally
+    /// collect a redacted diagnostics bundle for bug reports.
+    ///
+    /// Exits 1 when a check fails, 0 otherwise. Never uses the network. `--bundle`
+    /// writes a `.tar.gz` with the doctor report, versions, configs, `status --json`,
+    /// `queue status --json`, recent daemon, client and MCP logs and the logs of the
+    /// last failed jobs. Home paths, secret-looking values and URL credentials are
+    /// redacted; review the file before attaching it to an issue.
+    Doctor {
+        /// Print machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+        /// Write a diagnostics bundle (default `./sluice-doctor-<timestamp>.tar.gz`).
+        #[arg(long, value_name = "PATH", num_args = 0..=1)]
+        #[allow(clippy::option_option)]
+        bundle: Option<Option<std::path::PathBuf>>,
     },
     /// Show the daemon, budget, system pressure (PSI), running and queued jobs, and totals.
     Status {
@@ -227,6 +248,19 @@ enum DaemonCommand {
         #[arg(long)]
         force: bool,
     },
+    /// Stop the daemon and start a fresh detached one.
+    ///
+    /// Refuses (exit 1) while gates are running unless --force. With --debug the new
+    /// daemon logs at `debug` level (`SLUICE_LOG=debug`) until it exits; `sluice status`
+    /// shows the active level and the log path.
+    Restart {
+        /// Run the new daemon with `SLUICE_LOG=debug` (only that instance).
+        #[arg(long)]
+        debug: bool,
+        /// Kill running gates instead of refusing.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -286,6 +320,11 @@ fn main() -> ExitCode {
             command: Some(DaemonCommand::Stop { force }),
             ..
         } => daemon_cmd::stop(force),
+        Command::Daemon {
+            command: Some(DaemonCommand::Restart { debug, force }),
+            ..
+        } => daemon_cmd::restart(debug, force),
+        Command::Doctor { json, bundle } => doctor::run(&doctor::DoctorArgs { json, bundle }),
         Command::Daemon {
             foreground,
             command: None,

@@ -432,6 +432,8 @@ pub struct UserConfig {
     pub mcp: McpConfig,
     /// Merge queue settings.
     pub queue: UserQueueConfig,
+    /// Logging settings.
+    pub debug: DebugConfig,
     /// Per-repository overrides keyed by repository path.
     pub repos: BTreeMap<PathBuf, RepoOverride>,
 }
@@ -562,6 +564,43 @@ impl Default for McpConfig {
     }
 }
 
+/// Default log filter directive.
+pub const DEFAULT_LOG_LEVEL: &str = "info";
+
+/// The `[debug]` table: logging of the daemon, `sluice mcp` and the CLI.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DebugConfig {
+    /// Log filter in `RUST_LOG` syntax (`info`, `debug`, `sluice_gate_daemon=debug`).
+    /// `SLUICE_LOG` overrides it.
+    pub level: String,
+    /// Size in MiB above which `daemon.log` is rotated (at daemon start and
+    /// by the daily pruning task); zero disables the rotation.
+    pub daemon_log_max_mib: u64,
+}
+
+impl Default for DebugConfig {
+    fn default() -> Self {
+        Self {
+            level: DEFAULT_LOG_LEVEL.to_owned(),
+            daemon_log_max_mib: 20,
+        }
+    }
+}
+
+/// The effective log filter directive: `SLUICE_LOG` (when set, non-empty and
+/// valid) beats the configured `[debug] level`, which beats `info`.
+#[must_use]
+pub fn resolve_log_level(env: &EnvMap, configured: Option<&str>) -> String {
+    let valid = |v: &str| !v.is_empty() && tracing_subscriber::EnvFilter::try_new(v).is_ok();
+    env.get("SLUICE_LOG")
+        .map(String::as_str)
+        .filter(|v| valid(v))
+        .or_else(|| configured.filter(|v| valid(v)))
+        .unwrap_or(DEFAULT_LOG_LEVEL)
+        .to_owned()
+}
+
 /// A `[repos."<path>"]` table.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -582,6 +621,7 @@ impl Default for UserConfig {
             scheduler: SchedulerConfig::default(),
             mcp: McpConfig::default(),
             queue: UserQueueConfig::default(),
+            debug: DebugConfig::default(),
             repos: BTreeMap::new(),
         }
     }
@@ -707,6 +747,15 @@ impl UserConfig {
                     format!("{name} must be a percentage between 0 and 100, got {value}"),
                 ));
             }
+        }
+        if let Err(e) = tracing_subscriber::EnvFilter::try_new(&cfg.debug.level) {
+            return Err(config_err(
+                path,
+                format!(
+                    "debug.level {:?} is not a valid log filter ({e}); use for example \"info\" or \"debug\"",
+                    cfg.debug.level
+                ),
+            ));
         }
         for (repo, over) in &cfg.repos {
             if over.budget_share_max == Some(0) {
@@ -1130,6 +1179,36 @@ budget_share_max = 4
         .unwrap();
         assert_eq!(c.mcp.progress_interval, Duration::from_secs(30));
         assert!(user_err("version = 1\n[mcp]\nbogus = 1\n").contains("bogus"));
+    }
+
+    #[test]
+    fn parses_debug_table() {
+        let c = UserConfig::parse("version = 1", Path::new("/u.toml")).unwrap();
+        assert_eq!(c.debug.level, "info");
+        assert_eq!(c.debug.daemon_log_max_mib, 20);
+        let c = UserConfig::parse(
+            "version = 1\n[debug]\nlevel = \"sluice_gate_daemon=debug,info\"\ndaemon_log_max_mib = 5\n",
+            Path::new("/u.toml"),
+        )
+        .unwrap();
+        assert_eq!(c.debug.level, "sluice_gate_daemon=debug,info");
+        assert_eq!(c.debug.daemon_log_max_mib, 5);
+        assert!(user_err("version = 1\n[debug]\nbogus = 1\n").contains("bogus"));
+        let e = user_err("version = 1\n[debug]\nlevel = \"a=b=c\"\n");
+        assert!(e.contains("debug.level"), "{e}");
+    }
+
+    #[test]
+    fn log_level_precedence() {
+        let mut env = EnvMap::new();
+        assert_eq!(resolve_log_level(&env, None), "info");
+        assert_eq!(resolve_log_level(&env, Some("debug")), "debug");
+        env.insert("SLUICE_LOG".into(), "trace".into());
+        assert_eq!(resolve_log_level(&env, Some("debug")), "trace");
+        env.insert("SLUICE_LOG".into(), String::new());
+        assert_eq!(resolve_log_level(&env, Some("debug")), "debug");
+        env.insert("SLUICE_LOG".into(), "a=b=c".into());
+        assert_eq!(resolve_log_level(&env, Some("warn")), "warn");
     }
 
     #[test]

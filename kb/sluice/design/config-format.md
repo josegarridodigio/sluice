@@ -120,6 +120,10 @@ psi_max_wait = "5m"        # while PSI blocks, admit the queue head once it has 
 [mcp]
 progress_interval = "15s"  # progress notifications while verify runs (floored at 1s, re-read per call)
 
+[debug]
+level = "info"             # log filter (RUST_LOG syntax) of the daemon, `sluice mcp` and `sluice run`; SLUICE_LOG wins
+daemon_log_max_mib = 20    # rotate daemon.log above this size (0 = never); keeps daemon.log.1 .. .3
+
 [cache]
 ttl_days = 30
 tail_lines = 40
@@ -144,7 +148,8 @@ Environment variables (highest precedence):
 | `CI` | Cache off unless `SLUICE_CACHE` is truthy. A falsy `CI` (`0`, `false`, `no`, `off`) does not count as set. |
 | `SLUICE_AGENT=1` / `0` | Force agent / human detection (truthy / falsy words as below; any other value is ignored). |
 | `SLUICE_SOCKET` | Override the daemon socket path. |
-| `SLUICE_LOG` | Log filter of the daemon (`sluice daemon`) and MCP (`sluice mcp`) processes, e.g. `debug`; default `info`; written to stderr (the daemon's goes to `daemon.log`). Not read by `sluice run`. |
+| `SLUICE_LOG` | Log filter of the daemon (`sluice daemon`), MCP (`sluice mcp`) and CLI (`sluice run`) processes, e.g. `debug`. Precedence: `SLUICE_LOG` (when valid), then `[debug] level`, then `info`. Written to stderr (the daemon's goes to `daemon.log`, the MCP server's also to `logs/mcp-<pid>.log`). |
+| `SLUICE_TEST_CLIENT_LOG_CAP` | Test-only: byte cap that triggers the `client.log` rotation instead of 5 MiB. Not a user setting. |
 | `SLUICE_CONFIG` | Override the user config path (ignored when empty). |
 
 Truthy words: `1`, `true`, `yes`, `on`; falsy: `0`, `false`, `no`, `off`
@@ -155,7 +160,10 @@ User config notes: every section and field is optional (a missing file
 means defaults); unknown fields are errors; validation: `daemon.budget >= 1`,
 `daemon.nice <= 19`, `daemon.ionice_level <= 7`, `admission.psi_poll_interval > 0`,
 `admission.psi_max_wait > 0`, `admission.cpu_some_avg10_max` and
-`memory_some_avg10_max` in `[0, 100]`, `budget_share_max >= 1`. `daemon.idle_exit` (always "never" in v1) is parsed and validated but has
+`memory_some_avg10_max` in `[0, 100]`, `budget_share_max >= 1`, `debug.level` a valid
+`EnvFilter` directive (`info`, `debug`, `sluice_gate_daemon=debug,info`; the error names the
+file and the value). `sluice daemon restart [--debug]` applies a changed `[debug]` section;
+`--debug` forces `debug` for that daemon instance only. `daemon.idle_exit` (always "never" in v1) is parsed and validated but has
 no effect. The daemon reads `[daemon]`, `[scheduler]`, `[admission]`,
 `[repos]` and `cache.*` once at start (`sluice daemon stop` to apply
 changes); the client and the MCP server re-read the file per call.

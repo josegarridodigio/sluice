@@ -289,6 +289,7 @@ pub fn daemon_config_with(
         },
         psi_root: state.join("pressure"),
         user,
+        log: sluice_gate_daemon::server::LogSettings::default(),
         extensions: vec![Arc::new(QueueExtension::new(QueueOptions {
             base_env: Some(base_env),
             push_program,

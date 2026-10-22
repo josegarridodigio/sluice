@@ -7,7 +7,13 @@
 //! `dup2_stderr` wrappers, and only then builds the tokio runtime.
 //!
 //! Logging goes to stderr through `tracing_subscriber`; the filter comes
-//! from `SLUICE_LOG` (same syntax as `RUST_LOG`, default `info`).
+//! from `SLUICE_LOG` (same syntax as `RUST_LOG`), then `[debug] level` of
+//! the user config, then `info`. `daemon.log` is rotated at start (when
+//! larger than `[debug] daemon_log_max_mib`) and by the daemon's daily task.
+//!
+//! `sluice daemon restart [--debug] [--force]` stops the daemon (refusing
+//! when gates are running unless `--force`) and starts a fresh detached one,
+//! with `SLUICE_LOG=debug` for that instance only when `--debug` is given.
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -18,11 +24,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use nix::fcntl::{Flock, FlockArg};
-use sluice_gate_core::config::{IonicClass, UserConfig};
+use sluice_gate_core::config::{IonicClass, UserConfig, resolve_log_level};
 use sluice_gate_core::dirs;
 use sluice_gate_core::git::EnvMap;
+use sluice_gate_core::logfile;
 use sluice_gate_daemon::executor::{IoClass, IoPriority};
-use sluice_gate_daemon::server::{self, DaemonConfig};
+use sluice_gate_daemon::server::{self, DaemonConfig, LogSettings};
 use sluice_gate_queue::{QueueExtension, QueueOptions};
 
 use crate::run::EXIT_ERROR;
@@ -34,7 +41,7 @@ const STOP_WAIT: Duration = Duration::from_secs(10);
 const DRAIN_WAIT: Duration = Duration::from_secs(60);
 
 /// Builds the daemon configuration from the user config and the environment.
-fn daemon_config(env: &EnvMap, user: &UserConfig) -> Result<DaemonConfig> {
+fn daemon_config(env: &EnvMap, user: &UserConfig, detached: bool) -> Result<DaemonConfig> {
     let ionice = match user.daemon.ionice_class {
         IonicClass::None => None,
         IonicClass::BestEffort => Some(IoPriority {
@@ -69,8 +76,23 @@ fn daemon_config(env: &EnvMap, user: &UserConfig) -> Result<DaemonConfig> {
         admission: user.admission.clone(),
         psi_root: PathBuf::from(sluice_gate_daemon::psi::DEFAULT_ROOT),
         user: user.clone(),
+        log: LogSettings {
+            level: Some(log_level(env, user)),
+            file: detached.then(|| dirs::daemon_log_path(env)),
+            max_bytes: log_max_bytes(user),
+        },
         extensions: vec![Arc::new(QueueExtension::new(QueueOptions::default()))],
     })
+}
+
+/// The effective log filter: `SLUICE_LOG`, then `[debug] level`, then `info`.
+fn log_level(env: &EnvMap, user: &UserConfig) -> String {
+    resolve_log_level(env, Some(&user.debug.level))
+}
+
+/// `[debug] daemon_log_max_mib` in bytes (0 disables the rotation).
+fn log_max_bytes(user: &UserConfig) -> u64 {
+    user.debug.daemon_log_max_mib.saturating_mul(1024 * 1024)
 }
 
 /// True when another process holds the daemon lock right now.
@@ -100,11 +122,16 @@ fn check_socket_path(socket: &Path) -> Result<()> {
 }
 
 /// Redirects stdout and stderr to the daemon log after `daemon(3)`.
-fn detach(env: &EnvMap) -> Result<()> {
+fn detach(env: &EnvMap, max_bytes: u64) -> Result<()> {
     let log_path = dirs::daemon_log_path(env);
     if let Some(parent) = log_path.parent() {
         dirs::create_private_dir(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    // Rotate before opening, while nothing else writes to the file (the
+    // previous daemon is gone; a live one makes us exit before this point).
+    if let Err(e) = logfile::rotate_if_larger(&log_path, max_bytes, server::DAEMON_LOG_KEEP) {
+        eprintln!("sluice: cannot rotate {}: {e}", log_path.display());
     }
     let log = OpenOptions::new()
         .create(true)
@@ -117,8 +144,8 @@ fn detach(env: &EnvMap) -> Result<()> {
     Ok(())
 }
 
-fn init_tracing() {
-    let filter = tracing_subscriber::EnvFilter::try_from_env("SLUICE_LOG")
+fn init_tracing(level: &str) {
+    let filter = tracing_subscriber::EnvFilter::try_new(level)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -148,7 +175,7 @@ pub fn start(foreground: bool) -> ExitCode {
     let env: EnvMap = std::env::vars().collect();
     let config = match UserConfig::load(&env)
         .map_err(anyhow::Error::from)
-        .and_then(|user| daemon_config(&env, &user))
+        .and_then(|user| daemon_config(&env, &user, !foreground))
     {
         Ok(c) => c,
         Err(e) => {
@@ -170,11 +197,11 @@ pub fn start(foreground: bool) -> ExitCode {
         return ExitCode::from(EXIT_ERROR);
     }
     // Fork only while single-threaded: before the runtime exists.
-    if !foreground && let Err(e) = detach(&env) {
+    if !foreground && let Err(e) = detach(&env, config.log.max_bytes) {
         eprintln!("sluice: error: {e:#}");
         return ExitCode::from(EXIT_ERROR);
     }
-    init_tracing();
+    init_tracing(config.log.level.as_deref().unwrap_or("info"));
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -271,6 +298,58 @@ pub fn stop(force: bool) -> ExitCode {
         }
         Err(e) => {
             eprintln!("sluice: error: {e}");
+            ExitCode::from(EXIT_ERROR)
+        }
+    }
+}
+
+/// `sluice daemon restart [--debug] [--force]`.
+///
+/// Gates that are running block a graceful restart (the message says so);
+/// `--force` kills them. With `--debug` the new daemon runs with
+/// `SLUICE_LOG=debug`, only for that instance.
+pub fn restart(debug: bool, force: bool) -> ExitCode {
+    let mut env: EnvMap = std::env::vars().collect();
+    if let Ok(socket) = dirs::socket_path(&env)
+        && let Ok(client) = client::connect(&socket)
+    {
+        if !force {
+            match client.status() {
+                Ok(report) if !report.running.is_empty() => {
+                    eprintln!(
+                        "sluice: {} gate(s) are running; not restarting the daemon. \
+                         Wait for them or use 'sluice daemon restart --force' to kill them",
+                        report.running.len()
+                    );
+                    return ExitCode::from(EXIT_ERROR);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("sluice: error: {e}");
+                    return ExitCode::from(EXIT_ERROR);
+                }
+            }
+        }
+        let code = stop(force);
+        if code != ExitCode::SUCCESS {
+            return code;
+        }
+    } else {
+        println!("sluice: no daemon running; starting one");
+    }
+    if debug {
+        env.insert("SLUICE_LOG".to_owned(), "debug".to_owned());
+    }
+    match client::ensure_daemon(&env) {
+        Ok(_) => {
+            println!(
+                "sluice: daemon started{}",
+                if debug { " (log level debug)" } else { "" }
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("sluice: error: {e:#}");
             ExitCode::from(EXIT_ERROR)
         }
     }

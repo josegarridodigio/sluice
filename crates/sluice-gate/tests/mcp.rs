@@ -568,3 +568,32 @@ async fn queue_enqueue_and_status_report_not_supported_when_the_queue_is_disable
     }
     client.cancel().await.expect("shutdown");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_writes_a_persistent_log_next_to_stderr() {
+    let sb = Sandbox::standard();
+    let client = connect(&sb, Counter::default()).await;
+    let args = json!({"working_directory": repo_arg(&sb), "gates": ["test"]});
+    let r = call(&client, "verify", &args).await;
+    assert_eq!(r.is_error, Some(false), "{}", text(&r));
+
+    let logs = sb.home.join("state/sluice/logs");
+    let mcp_logs: Vec<_> = fs::read_dir(&logs)
+        .expect("logs dir")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("mcp-"))
+                && p.extension().is_some_and(|x| x == "log")
+        })
+        .collect();
+    assert_eq!(mcp_logs.len(), 1, "{mcp_logs:?}");
+    let content = fs::read_to_string(&mcp_logs[0]).expect("read mcp log");
+    assert!(content.contains("sluice mcp starting"), "{content}");
+    assert!(content.contains("verify"), "{content}");
+    // `sluice logs` without an id must still pick a job log, not this file.
+    let out = sb.sluice().arg("logs").output().expect("logs");
+    assert!(out.status.success(), "{out:?}");
+}

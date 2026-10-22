@@ -96,8 +96,25 @@ Status: implemented in Phase 2 (`sluice-gate-daemon`, CLI `daemon_cmd`, proto `c
 - Log retention: on start and daily (from the heartbeat task, so it stops
   if the lease is lost), delete job logs older than
   `daemon.log_retention_days` whose job row is terminal or that belong to
-  no row at all (in-process fallback runs). `daemon.log` is appended to
-  and never rotated.
+  no row at all (in-process fallback runs). The same pass deletes
+  `mcp-<pid>.log` files (the `sluice mcp` logs) older than the retention by
+  mtime; `client.log` is never deleted by it (it rotates by size, below).
+- Other files in `<state>/logs/`: `mcp-<pid>.log` (tracing output of one
+  `sluice mcp` process, in addition to its stderr), `client.log` (one line
+  per `sluice run`, see `docs/debugging.md`; one `O_APPEND` write per line;
+  above 5 MiB it is renamed to `client.log.1`, one generation kept).
+  Job-log lookups (`sluice logs`, MCP `logs`) only consider names that start
+  with a digit, i.e. job ids.
+- `daemon.log` rotation: when larger than `[debug] daemon_log_max_mib`
+  (default 20) it is renamed `daemon.log.1`, shifting `.1` to `.2` and `.2`
+  to `.3` (three generations). It runs in `sluice daemon` before detaching
+  (nothing writes the file then) and from the daily pruning task. At runtime
+  the task renames the file, reopens `daemon.log` for appending and points
+  stdout and stderr at it with the safe `nix::unistd::dup2_stdout` /
+  `dup2_stderr` wrappers (the same helpers used at start-up), so tracing
+  keeps writing to the new file. A foreground daemon logs to the terminal
+  and never rotates. The runtime path is not covered by an integration test
+  (the task runs every 24 h); the start-up path is.
 
 ## Persistence (SQLite, `rusqlite` bundled, WAL)
 

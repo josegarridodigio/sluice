@@ -66,6 +66,10 @@ design history honest, and reviewers read it first.
 
 ## Reporting a bug
 
-Include: the `sluice` version, the hook manager, whether the hook was
-invoked by a human or an agent, the gate definition, and the output of
-`sluice status --json` and `sluice cache status` where available.
+Run `sluice doctor --bundle` in the affected repository and attach the
+`.tar.gz` it writes (review it first: home paths, secret-looking values and
+URL credentials are redacted, but logs can still name projects and commands;
+see [docs/debugging.md](docs/debugging.md)). Also say which hook manager you
+use, whether the hook was invoked by a human or an agent, and the gate
+definition. If the problem is reproducible, run `sluice daemon restart --debug`
+first, reproduce it, and then collect the bundle.

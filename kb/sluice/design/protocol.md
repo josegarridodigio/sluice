@@ -112,13 +112,19 @@ A pass whose request had a `key` but no `tree` is reported with
 
 ```json
 {"type":"status","id":2,"schema":1,
- "daemon":{"instance":"...","pid":1,"started_at":"...","version":"0.1.0","socket":"..."},
+ "daemon":{"instance":"...","pid":1,"started_at":"...","version":"0.1.0","socket":"...","log_level":"info"},
  "budget":{"total":8,"used":5,"psi":{"enabled":true,"cpu_some_avg10":12.3,"memory_some_avg10":0.4,"blocking":false}},
  "running":[{"job_id":"...","repo":"/abs","gate":"test","weight":4,"started_at":"...","elapsed_ms":1200,"subscribers":2,"caller":"agent"}],
  "queued":[{"job_id":"...","repo":"/abs","gate":"lint","weight":1,"queued_at":"...","waiting_ms":300,"subscribers":1,"reason":"budget|psi|repo-cap|head-reserved"}],
  "totals":{"since":"...","runs":120,"passes":110,"failures":8,"timeouts":2,"hits":430,"coalesced":37,
            "wait_ms_total":..., "run_ms_total":..., "time_saved_ms":..., "psi_blocked_ms_total":...}}
 ```
+
+`daemon.log_level` is an optional string (the daemon's active log filter,
+for example `info` or `debug`), omitted when the daemon does not report it,
+so the frozen fixture is unchanged and the protocol stays at version 1; a
+second additive test (`log_level_is_an_additive_optional_field`) pins its
+shape. `sluice status` prints it as `log:      level <level>, <path>/daemon.log`.
 
 `status` has an optional `queue` object, omitted when no extension provides
 one (so the frozen fixture `status-schema-1.json` is unchanged):

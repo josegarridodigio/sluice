@@ -35,8 +35,12 @@ pub fn show(job_id: Option<&str>, lines: Option<usize>) -> ExitCode {
             .into_iter()
             .flatten()
             .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(sluice_gate_core::logfile::is_job_log_name)
+            })
             .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "log"))
             .max();
         let Some(newest) = newest else {
             eprintln!("sluice: no job logs in {}", dir.display());

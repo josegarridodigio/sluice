@@ -22,6 +22,7 @@ fn report() -> StatusReport {
             started_at: "2026-10-22T10:00:00Z".into(),
             version: "0.1.0".into(),
             socket: "/run/user/1000/sluice/sluice.sock".into(),
+            log_level: None,
         },
         budget: BudgetInfo {
             total: 8,
@@ -113,4 +114,22 @@ fn queue_summary_is_an_additive_optional_field() {
     let back: StatusReport =
         serde_json::from_value(serde_json::to_value(&with_queue).unwrap()).unwrap();
     assert_eq!(back, with_queue);
+}
+
+#[test]
+fn log_level_is_an_additive_optional_field() {
+    let mut with_level = report();
+    with_level.daemon.log_level = Some("debug".into());
+    let mut actual = serde_json::to_value(&with_level).unwrap();
+    let level = actual["daemon"]
+        .as_object_mut()
+        .unwrap()
+        .remove("log_level")
+        .unwrap();
+    assert_eq!(level, serde_json::json!("debug"));
+    let expected: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+    assert_eq!(actual, expected);
+    let back: StatusReport =
+        serde_json::from_value(serde_json::to_value(&with_level).unwrap()).unwrap();
+    assert_eq!(back, with_level);
 }
