@@ -101,6 +101,10 @@ psi_enabled = true
 cpu_some_avg10_max = 60.0  # percent; do not admit new jobs above this
 memory_some_avg10_max = 20.0
 psi_poll_interval = "1s"
+psi_max_wait = "5m"        # Phase 4: admit the head anyway after this long blocked by PSI
+
+[mcp]                      # Phase 3
+progress_interval = "15s"  # progress notifications while verify runs
 
 [cache]
 ttl_days = 30
