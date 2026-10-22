@@ -24,7 +24,7 @@ Related: [[sluice/research/problem-statement.md]],
 | 3 | MCP front-end and agent policy | **done** (2026-10-22) | [[sluice/changes/phase-3-mcp.md]], [[sluice/changes/phase-3-acceptance.md]] (end to end with real sessions via `scripts/phase3-e2e.sh`). |
 | 4 | Load-aware admission and observability | **done** (2026-10-22) | [[sluice/changes/phase-4-psi.md]], [[sluice/changes/phase-4-acceptance.md]]; design [[sluice/design/psi-admission.md]]. |
 | 5 | Packaging and real-world validation | **done** (2026-10-22) | [[sluice/changes/packaging.md]] (release `v0.1.0` published, installer verified against it), [[sluice/changes/phase-5-validation.md]] (benchmark on this repository), README demo. |
-| later | Local merge queue (mergetrain-inspired) | not planned | Ask before starting. |
+| 6 | Local merge queue (mergetrain-inspired) | **in progress** (design approved 2026-10-22) | [[sluice/design/merge-queue.md]], ADR-0009 accepted; user answers in section 14 of the design. |
 
 ## Phase 0 — Setup and research
 
@@ -175,6 +175,15 @@ repository (Sluice runs its own gates) with before/after numbers from a
 reproducible multi-worktree benchmark; private repositories are never
 referenced here.
 
+## Phase 6 — Local merge queue
+
+- [x] Design and ADR-0009 ([[sluice/design/merge-queue.md]]); user answers recorded 2026-10-22.
+- [ ] Daemon extension API (`Extension`, `DaemonHandle`), `welcome.features`, queue messages in `sluice-gate-proto`.
+- [ ] Crate `sluice-gate-queue`: store, runner, push protocol, reconcile.
+- [ ] CLI `sluice queue enqueue|status|approve|retry|cancel|reconcile` and MCP `queue_enqueue|queue_status|queue_approve`.
+- [ ] Acceptance tests 1–8 of the design (local bare remote, kill during push).
+- [ ] Docs (`docs/agents.md`, README), change note, acceptance note, reconciliation report.
+
 ## Working agreements
 
 - Everything in English (code, docs, commits, KB).
@@ -187,7 +196,7 @@ referenced here.
 
 ## Next steps
 
-1. Phase 6: the user answers the open questions of [[sluice/design/merge-queue.md]]; implement after approval.
+1. Phase 6 implementation per the checklist above.
 2. Final reconciliation over the whole KB and the final report.
 
 Earlier plan for Phase 3: `sluice-gate-mcp` with rmcp per [[sluice/design/mcp-tools.md]]

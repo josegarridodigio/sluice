@@ -5,7 +5,7 @@ tags: [sluice, adr, merge-queue, phase-6]
 
 # ADR-0009: Local merge queue runs inside the daemon and lands only on explicit approval
 
-Status: proposed (2026-10-22), for Phase 6. Design: [[sluice/design/merge-queue.md]].
+Status: accepted (2026-10-22, user approval with the answers in section 14 of the design). Design: [[sluice/design/merge-queue.md]].
 Reference: [[sluice/research/references/mergetrain.md]].
 
 ## Context
@@ -24,8 +24,10 @@ recoverable (write-ahead marker, pin ref, atomic push, endpoint-bound reconcile)
   every queue write is a compare-and-swap on the lease token and the expected state; no push
   starts while the lease is lost.
 - Agents enqueue committed branches (`sluice queue enqueue`, MCP `queue_enqueue`); Sluice
-  captures the SHA. The runner merges the train onto the fetched remote target in a
-  disposable worktree under `<state>/merge/`, with hooks disabled.
+  captures the SHA. The target is any branch: `<remote>/<branch>` lands by push, a local
+  branch lands by a compare-and-swap ref update (never a branch checked out in a worktree).
+  The runner merges the train (`--no-ff`) onto the fetched or local base in a disposable
+  worktree under `<state>/merge/`, with hooks disabled for merge and ref operations.
 - Gates run **through Sluice**: the runner derives each gate's cache key from the combined
   tree (snapshot asserted equal to the commit tree) and submits ordinary `run` requests, so
   markers, budget, repository caps and coalescing apply. A combined tree that already has
@@ -37,7 +39,9 @@ recoverable (write-ahead marker, pin ref, atomic push, endpoint-bound reconcile)
 - Push protocol: pin ref `refs/sluice/pending/<train>`, then a fsynced write-ahead marker in
   the same transaction that moves the train to `pushing`, then
   `git push --atomic --force-with-lease=<target>:<base>` together with the audit ref
-  `refs/sluice/landed/<sha>`. Ambiguous outcomes park the train as `needs_reconcile`;
+  `refs/sluice/landed/<sha>`. The repository's `pre-push` hook runs (the user chose not to
+  bypass it; a Sluice hook answers from the markers the train produced, and a declining hook
+  fails the train). Ambiguous outcomes park the train as `needs_reconcile`;
   `sluice queue reconcile` decides from the remote with a fixed table, refusing when the
   endpoint changed, the push process is alive or ancestry is unknown.
 - Gate definitions and `[queue]` are read from the base commit, not from member branches.

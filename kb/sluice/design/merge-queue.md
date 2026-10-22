@@ -5,7 +5,7 @@ tags: [sluice, design, merge-queue, phase-6]
 
 # Local merge queue (Phase 6)
 
-Status: draft, awaiting the user's approval before any code. Decision record:
+Status: approved by the user on 2026-10-22 (answers in section 14). Decision record:
 [[sluice/design/adr/0009-merge-queue.md]]. Reference analysis:
 [[sluice/research/references/mergetrain.md]]. Builds on
 [[sluice/design/architecture.md]], [[sluice/design/protocol.md]],
@@ -33,8 +33,16 @@ from bypassing the queue (documented, enforced by the forge, not by Sluice).
 
 ## 2. Concepts
 
-- **Job**: one queued branch: `(repo, branch, head_sha, remote, target)`. The SHA is captured
+- **Job**: one queued branch: `(repo, branch, head_sha, target)`. The SHA is captured
   by Sluice at enqueue time; later commits on the branch are not part of the job.
+- **Target**: where a train lands. Two kinds: `remote` (`<remote>/<branch>`: the train is
+  pushed to `refs/heads/<branch>` on that remote) and `local` (`<branch>`: the train updates
+  the local `refs/heads/<branch>` with a compare-and-swap, no network). `--base` accepts
+  `<remote>/<branch>`, `<branch>`, or a bare name that is first tried as a branch of
+  `[queue] remote` and then as a local branch; the default is `[queue] remote`/`target`.
+  Refused: tags, raw SHAs, `HEAD`, the job's own branch, and a local branch checked out in
+  any worktree (`target_checked_out`: updating it would desync that worktree, which product
+  code never touches). The columns `remote`/`target` store `""`/`<branch>` for local targets.
 - **Train**: the unit the runner builds, verifies, gets approved and pushes: an ordered list of
   jobs merged onto one `base_sha`. It yields a commit `S` (the landing SHA) and its tree `T`.
 - **Train hash**: `sha256(repo, remote, endpoint_hash, target, base_sha, [(job_id, head_sha)…],
@@ -134,8 +142,10 @@ at most one train is active.
    `queued` jobs of the oldest (repo, target) by `queue_order`, create the train row, move
    them to `merging` with `claim_token`. No train is built while an older train of the same
    target is `ready`/`approved`/`pushing`/`needs_reconcile`.
-2. **Trusted config.** `git fetch --no-tags <remote> +refs/heads/<target>:refs/sluice/base/<target>`
-   (env: sanitised daemon env plus the enqueuer's allowlist), `base_sha` = that ref. Read
+2. **Trusted config.** Remote target: `git fetch --no-tags <remote>
+   +refs/heads/<target>:refs/sluice/base/<remote>/<target>` (env: sanitised daemon env plus
+   the enqueuer's allowlist), `base_sha` = that ref. Local target: `base_sha` =
+   `refs/heads/<target>` (no fetch; later "ls-remote" checks read the local ref). Read
    `[queue]` and the gate definitions from `git show <base_sha>:.sluice.toml`, never from a
    member branch. A member that changes `.sluice.toml` is flagged `config_changed` in the plan.
 3. **Worktree.** `git worktree add --detach --lock <state>/merge/<train-id> <base_sha>`
@@ -184,15 +194,31 @@ the merge worktree, `endpoint_hash` unchanged, `ls-remote` target == `base_sha`.
 2. One transaction: insert `queue_push_markers` (`synchronous=FULL`), train and jobs →
    `pushing`, fenced on `claim_token` and `cancel_requested = 0`.
 3. Spawn, in its own process group, with the approver's env allowlist:
-   `git push --atomic --porcelain --no-verify --no-follow-tags --recurse-submodules=no
+   `git push --atomic --porcelain --no-follow-tags --recurse-submodules=no
    --force-with-lease=refs/heads/<target>:<base_sha> --force-with-lease=refs/sluice/landed/<S>:
    <remote> <S>:refs/heads/<target> <S>:refs/sluice/landed/<S>`; record `push_pid` and
    `push_start_ticks` (`executor::proc_start_ticks`) in the marker right after spawn.
+   The repository's `pre-push` hook **runs** (user decision, section 14): the push is a
+   regular push from the merge worktree with the repository's `core.hooksPath`, so a
+   Sluice-based hook answers from the markers the train just produced (the daemon's env
+   carries no agent marker, so the human policy `wait` applies and the hook never
+   fails fast). A hook that declines (`git` exits non-zero before any ref line appears in
+   the porcelain output, with the hook's stderr captured) is a definitive rejection:
+   jobs `failed` with reason `pre_push_hook` and the hook output in `detail`; the marker is
+   deleted. The push has `[queue] push_timeout` (default `10m`); on expiry the process
+   group is killed and the train goes to `needs_reconcile`, like any other ambiguous end.
+   Local target: no push process; the same transaction's follow-up is
+   `git update-ref -m "sluice: land <train-id>" refs/heads/<target> <S> <base_sha>` plus
+   `git update-ref refs/sluice/landed/<S> <S>`, run with hooks disabled (there is no
+   `pre-push` for a ref update); a failed compare-and-swap is a definitive rejection
+   (train dissolved, jobs `queued`). A local ref update cannot end ambiguously, so
+   `needs_reconcile` only arises for it when the daemon dies between the marker and the
+   update; reconcile then applies rows 4 to 9 against the local refs.
 4. Exit 0 → `landed`, marker kept as history (`outcome` in `queue_events`), pin ref deleted.
    Porcelain shows a definitive rejection (`stale info`, `non-fast-forward`, `rejected`,
-   permission denied) → marker deleted; stale lease → train dissolved, jobs `queued`;
-   policy/permission → jobs `failed`. Anything else (signal, network error, unparsable) →
-   `needs_reconcile`.
+   permission denied) or the `pre-push` hook declined → marker deleted; stale lease →
+   train dissolved, jobs `queued`; policy/permission/hook → jobs `failed`. Anything else
+   (signal, timeout, network error, unparsable) → `needs_reconcile`.
 
 Daemon start: markers whose train is still `pushing` → `needs_reconcile`; a push process
 still alive (`executor::process_matches(pid, ticks)`) is **not** killed and is reported.
@@ -201,9 +227,9 @@ still alive (`executor::process_matches(pid, ticks)`) is **not** killed and is r
 
 | # | Condition | Decision |
 |---|---|---|
-| 1 | recorded push process still alive | refuse `push_in_progress`, unchanged |
-| 2 | current endpoint hash ≠ recorded | refuse `endpoint_changed`, unchanged |
-| 3 | remote unreachable / `ls-remote` fails | refuse `remote_unreachable`, unchanged |
+| 1 | recorded push process still alive (remote targets) | refuse `push_in_progress`, unchanged |
+| 2 | current endpoint hash ≠ recorded (remote targets) | refuse `endpoint_changed`, unchanged |
+| 3 | remote unreachable / `ls-remote` fails (remote targets) | refuse `remote_unreachable`, unchanged |
 | 4 | target == `S` | `landed` |
 | 5 | audit ref `refs/sluice/landed/<S>` exists on the remote | `landed` (note `rewritten_after_landing` if target ∌ `S`) |
 | 6 | target ≠ `S`, fetched, and `S` is an ancestor of target | `landed` (someone pushed on top) |
@@ -228,7 +254,10 @@ reads the remote; it never pushes. With the push atomic, rows 4–6 and 7–9 ar
   and its result is written only if the fence still matches, otherwise the next daemon parks
   it as `needs_reconcile`.
 - **Remote moved**: detected while `ready`/`approved` (dissolve, rebuild, re-approve) or at
-  push time through `--force-with-lease` (definitive rejection → dissolve).
+  push time through `--force-with-lease` (definitive rejection → dissolve). Local targets:
+  the same through the `update-ref` compare-and-swap.
+- **`pre-push` hook declined or hung**: declined → jobs `failed` (`pre_push_hook`); hung →
+  `push_timeout`, group killed, `needs_reconcile`.
 - **SQLite busy**: typed retryable error, never a job state change.
 
 ## 8. Protocol additions
@@ -239,8 +268,8 @@ fields); old clients never send them. To avoid relying on `bad-request` from an 
 `the running daemon does not support the merge queue; run 'sluice daemon stop'`. A bump would
 force every hook client to restart the daemon for a feature most repositories do not use.
 
-Client: `queue-enqueue {repo, worktree, branch, head_sha, remote?, target?, caller, session,
-env}`, `queue-status {repo?}`, `queue-approve {train_id, train_hash, via: cli|mcp, env}`,
+Client: `queue-enqueue {repo, worktree, branch, head_sha, base?, caller, session, env}`
+(`base` as typed by the user; the daemon resolves it against the repository, section 2), `queue-status {repo?}`, `queue-approve {train_id, train_hash, via: cli|mcp, env}`,
 `queue-retry {job_id, head_sha}`, `queue-cancel {job_id}`, `queue-reconcile {repo?}`.
 Server: `queue-job {job}`, `queue-status {schema: 1, trains, jobs}`, `queue-approved {train}`,
 `queue-reconcile {results: [{train_id, decision, reason}]}`; errors reuse `error` with new
@@ -253,7 +282,7 @@ SHA and cleanliness itself (git in the caller's worktree) and sends facts, like 
 ```
 $ sluice queue enqueue                     # current branch of this worktree
 sluice: queued feat/login (job 1761…-a1b2c3) for origin/main, position 2
-$ sluice queue enqueue feat/api --base release-1.2
+$ sluice queue enqueue feat/api --base origin/release-1.2   # or --base integration (local branch)
 $ sluice queue status
 train t-1761…-9f2e01  origin/main  base 4e1c9a0  READY (awaiting approval)
   feat/login  job …a1b2c3  merged   gates: test PASS (cached)  lint PASS 12.4s
@@ -264,8 +293,8 @@ sluice: landed 3b7d2f1 on origin/main (train t-1761…-9f2e01)
 $ sluice queue retry …77d0e4 | cancel <job> | reconcile | status --json
 ```
 
-`enqueue` refuses a dirty worktree, a detached HEAD, a branch already active and a branch
-equal to the target. `approve` without a TTY requires `--yes`; it always sends the train hash
+`enqueue` refuses a dirty worktree, a detached HEAD, a branch already active, a branch
+equal to the target, and a base that is not a branch (section 2). `approve` without a TTY requires `--yes`; it always sends the train hash
 it displayed (`stale-plan` if the train changed). Exit codes: 0 ok, 1 error, 2 usage, 4
 refused by state (`conflict-state`, `not-allowed`, `stale-plan`).
 
@@ -299,6 +328,7 @@ target = "main"            # default: the remote's HEAD branch
 gates = ["test", "lint"]   # default: gates whose hooks contain pre-push, else every gate
 max_train = 4              # 1 disables batching
 audit_ref = true           # push refs/sluice/landed/<sha> atomically with the target
+push_timeout = "10m"       # covers the pre-push hook and the transfer
 ```
 
 User config `[queue]`: `allow_agent_approval = false`, `enabled = true` (a user-level kill
@@ -317,7 +347,10 @@ repository content is agent-writable.
 - Pushes use the user's own credentials, taken from the approving client's env allowlist
   (`SSH_AUTH_SOCK`, `GIT_ASKPASS`, `SSH_ASKPASS`, `HOME`, `PATH`), never stored beyond the
   train. Endpoint URLs are stored without userinfo. Gates and `[queue]` come from the base.
-- Hooks are disabled in the merge worktree and on push (`--no-verify`): the gates already ran.
+- Hooks are disabled in the merge worktree for merge and ref operations. The push runs the
+  repository's `pre-push` hook on purpose (user decision): a Sluice-based hook answers from
+  the markers; any other hook keeps its say, and a hook that declines fails the train
+  rather than being bypassed.
 
 ## 13. Acceptance tests
 
@@ -334,17 +367,18 @@ repository content is agent-writable.
 7. `endpoint_changed` refusal after `git remote set-url`; lost lease → no push.
 8. Multi-member train with one failing member → split, other members land after approval.
 
-## 14. Open questions for the user
+## 14. Decisions (user answers, 2026-10-22)
 
-1. Landing order: strict enqueue order (a conflicting head blocks nothing, but a failed
-   head is retried in place) or best-effort batch (the v1 draft)?
-2. What is "base": the remote target branch (draft: `--base` names that branch) or any ref?
-3. Merge commits (`--no-ff`, draft) or rebase/cherry-pick members onto the base (linear
-   history, but rewritten SHAs and the agents' verified trees no longer match)?
-4. Batching in v1 (`max_train = 4` with split-to-singles) or one job per train first?
-   Bisection stays a stretch goal either way.
-5. Gates and `[queue]` from the base commit (draft, safe) or from the combined tree?
-6. Reconcile row 8: return to `ready` needing a new approval (draft) or keep the approval?
-7. Push the audit ref `refs/sluice/landed/<sha>` by default (some forges reject custom refs)?
-8. Should the daemon run `reconcile` itself at start, or only on command (draft)?
-9. Push with `--no-verify` (draft) or run the user's pre-push hook?
+| # | Question | Answer |
+|---|---|---|
+| 1 | Landing order | Best-effort batch (section 5); a conflicting job never blocks the others |
+| 2 | What "base" is | **Any branch ref**: `<remote>/<branch>` (push) or a local branch (ref update); tags, SHAs and checked-out local branches refused (section 2) |
+| 3 | Merge commits or rebase | `--no-ff` merge commits; agents' SHAs and verified trees are preserved |
+| 4 | Batching in v1 | Yes, `max_train = 4`, split-to-singles on failure; bisection stays a stretch goal |
+| 5 | Config source | Gates and `[queue]` from the base commit, never from a member |
+| 6 | Reconcile row 8 | Back to `ready`, approval voided: a new approval is required |
+| 7 | Audit ref | Pushed by default, `[queue] audit_ref = false` disables it |
+| 8 | Reconcile trigger | Only on command (`sluice queue reconcile`); daemon start only parks trains |
+| 9 | `pre-push` hook on push | **The hook runs** (no `--no-verify`); a Sluice hook hits the cache, a declining hook fails the train (section 6) |
+
+Answers 2 and 9 changed the draft; the rest confirmed it.
