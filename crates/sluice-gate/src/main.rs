@@ -19,6 +19,7 @@ mod queue;
 mod run;
 mod snippets;
 mod status;
+mod update;
 
 use snippets::{HookManager, snippet};
 
@@ -125,6 +126,32 @@ enum Command {
     Queue {
         #[command(subcommand)]
         command: QueueCommand,
+    },
+    /// Update sluice to the latest (or a given) release.
+    ///
+    /// Downloads the release archive for this architecture with `curl` (or `wget`),
+    /// verifies it against `SHA256SUMS`, checks that the new binary runs and replaces
+    /// the running executable atomically. Then, unless --no-restart, it stops an idle
+    /// daemon so the next `sluice` call starts the new version; a daemon running gates
+    /// is left alone. `sluice mcp` servers of agent sessions keep the old binary until
+    /// the agent reconnects. On a terminal it asks `Update sluice X -> Y? [y/N]`;
+    /// without one it requires --yes (exit 2). Exit codes: 0 updated, up to date or
+    /// --check; 1 error (network, checksum, permissions); 2 usage. Environment:
+    /// `SLUICE_UPDATE_BASE_URL` points at a directory or `file://` URL holding the
+    /// archives, `SHA256SUMS` and a `LATEST` file (or pass --version).
+    Update {
+        /// Only report whether an update is available; change nothing.
+        #[arg(long)]
+        check: bool,
+        /// Install this release tag (for example v0.2.0), also an older one.
+        #[arg(long, value_name = "vX.Y.Z")]
+        version: Option<String>,
+        /// Do not ask for confirmation (required without a terminal).
+        #[arg(long)]
+        yes: bool,
+        /// Do not stop the daemon after updating.
+        #[arg(long)]
+        no_restart: bool,
     },
 }
 
@@ -264,6 +291,17 @@ fn main() -> ExitCode {
             command: None,
         } => daemon_cmd::start(foreground),
         Command::Status { json } => status::show(json),
+        Command::Update {
+            check,
+            version,
+            yes,
+            no_restart,
+        } => update::run(&update::UpdateArgs {
+            check,
+            version,
+            yes,
+            no_restart,
+        }),
         Command::Queue { command } => match command {
             QueueCommand::Enqueue { branch, base } => {
                 queue::enqueue(branch.as_deref(), base.as_deref())

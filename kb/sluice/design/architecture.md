@@ -24,6 +24,7 @@ sluice logs [<job-id>] [-n <lines>]                                  # job logs 
 sluice daemon [--foreground] | stop [--force]                        # the brain: one per user, Unix socket (Phase 2)
 sluice status [--json]                                               # queue, in-flight, cache stats, time saved (Phase 2)
 sluice mcp                                                           # MCP stdio server spawned by the agent (Phase 3)
+sluice update [--check] [--version <vX.Y.Z>] [--yes] [--no-restart]  # self-update from the release assets (curl + tar + SHA256SUMS, no HTTP crate)
 ```
 
 Process topology:

@@ -231,6 +231,9 @@ installer downloads the latest one into `~/.local/bin` (set
 curl -fsSL https://raw.githubusercontent.com/josegarridodigio/sluice/main/scripts/install.sh | sh
 ```
 
+Later, `sluice update` upgrades in place (checksum-verified; `--check` only
+reports whether a newer release exists).
+
 Or from source, with a stable Rust toolchain (git ≥ 2.31 at runtime):
 
 ```sh
