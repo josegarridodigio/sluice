@@ -152,10 +152,20 @@ sluice queue enqueue|status|approve|retry|cancel|reconcile   # local merge queue
 sluice doctor [--json] [--bundle [PATH]]                 # health checks, redacted bug-report bundle
 ```
 
-Point your agent at the server (`claude mcp add sluice -- sluice mcp`) and
-paste the `CLAUDE.md` block from [docs/agents.md](docs/agents.md); the
-agent then calls `verify` before committing instead of running suites
-through its shell.
+### Use with coding agents
+
+For Claude Code, install the plugin: it registers the MCP server, loads a
+skill that teaches the agent the verify and merge-queue flow, and adds a hook
+that redirects raw test commands to `verify`. With `sluice` in your `PATH`:
+
+```
+/plugin marketplace add josegarridodigio/sluice
+/plugin install sluice@sluice
+```
+
+No `CLAUDE.md` block is needed. Details in [plugin/README.md](plugin/README.md).
+Other agents: register `sluice mcp` as an MCP server and paste the
+`AGENTS.md` block from [docs/agents.md](docs/agents.md).
 
 ```
 ```
@@ -276,9 +286,10 @@ in `PATH`.
   `key_files`, or a stale pass is possible.
 - Agents bypass the queue whenever they can run the test command directly
   through their shell tool. Permission rules such as `Bash(npm test:*)`, or
-  running with permissions bypassed, make that easy. Tell your agents to
-  verify through Sluice; [docs/agents.md](docs/agents.md) ships a ready-to-paste
-  `CLAUDE.md` section.
+  running with permissions bypassed, make that easy. The Claude Code
+  plugin ([plugin/README.md](plugin/README.md)) ships a hook that denies the
+  raw commands your gates run; for other agents, tell them to verify through
+  Sluice ([docs/agents.md](docs/agents.md) has a ready-to-paste section).
 
 ## Prior art
 

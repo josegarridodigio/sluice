@@ -4,10 +4,9 @@ This guide is for developers who run coding agents (Claude Code first, others
 second) on a repository that uses Sluice. It assumes `.sluice.toml` and your
 git hooks are already set up (`sluice init`, `sluice hook print`).
 
-> Status: `sluice run`, the hook policy and `sluice mcp` (the MCP server
-> with the `verify`, `status`, `gate_list` and `logs` tools) all work. The
-> manual two-agent run that proves the Claude Code side end to end is still
-> pending (`docs/manual-test-phase-3.md`).
+For Claude Code, the recommended path is the Sluice plugin (section 2): one
+install per user, no block to paste into every repository. Other agents use
+the MCP server and a short instruction block (section 3).
 
 ## 1. Why agents need Sluice
 
@@ -27,9 +26,39 @@ later instead of cancelling it (background tasks do not survive the
 session). If you lower `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`, keep it above
 `[mcp] progress_interval` (15 s by default).
 
-## 2. Install the MCP server
+## 2. Install the Claude Code plugin (recommended)
 
-Add Sluice to the project's `.mcp.json`:
+Prerequisite: `sluice` in the `PATH` that Claude Code sees (see the install
+section of the README: `curl -fsSL .../scripts/install.sh | sh`). Then, in
+Claude Code:
+
+```
+/plugin marketplace add josegarridodigio/sluice
+/plugin install sluice@sluice
+```
+
+(From a shell: `claude plugin marketplace add josegarridodigio/sluice`, then
+`claude plugin install sluice@sluice`.) The plugin, in `plugin/` of this
+repository, contains:
+
+- the MCP server, registered as `sluice` (`sluice mcp`). Because it comes from
+  a plugin, its tools are named `mcp__plugin_sluice_sluice__verify` and so on:
+  use those names in permission rules;
+- the `sluice` skill: loaded when the agent is about to run tests, commit,
+  push or land a branch in a repository with a `.sluice.toml`. It teaches the
+  `verify` flow, exit code 3 from hooks, and the merge queue (verify,
+  `queue_enqueue`, stop, never approve);
+- a `PreToolUse` hook on `Bash` that denies the raw commands your gates run
+  (and the common raw runners the repository has a gate for) with a message
+  that names the gate to verify, and denies `sluice queue approve`. It fails
+  open, and `SLUICE_GUARD=0` disables it.
+
+With the plugin, the repository needs no `CLAUDE.md` block. Details and the
+hook's limits: [plugin/README.md](../plugin/README.md).
+
+### Manual MCP registration (any MCP-capable agent)
+
+Without the plugin, add Sluice to the project's `.mcp.json`:
 
 ```json
 {"mcpServers": {"sluice": {"command": "sluice", "args": ["mcp"]}}}
@@ -44,7 +73,8 @@ claude mcp add sluice -- sluice mcp
 
 `sluice` must be in the `PATH` that Claude Code sees. The `claude mcp add`
 form above follows the documented `claude mcp add <name> <command> [args]`
-syntax; check `claude mcp list` afterwards.
+syntax; check `claude mcp list` afterwards. Registered this way, the tools are
+named `mcp__sluice__verify` and so on.
 
 The server exposes nine tools (the last five are the merge queue, see
 section 3):
@@ -67,9 +97,11 @@ worktree, required) and optionally `gates`, `timeout_seconds` and
 model reads the tail. It never runs a gate in the agent's process: if the
 daemon is unreachable it reports an error.
 
-## 3. Tell the agent what to do
+## 3. Fallback: tell the agent what to do
 
-Paste this into `CLAUDE.md` (Claude Code) or `AGENTS.md` (other agents):
+With the plugin you can skip this section: the skill carries the same
+instructions. For agents without the plugin, paste this into `AGENTS.md` (or
+`CLAUDE.md`):
 
 ```markdown
 ## Verification (Sluice)
@@ -93,8 +125,8 @@ Adapt the examples in the second bullet to your stack.
 ### Landing work through the merge queue
 
 If the repository uses the Sluice merge queue, add these lines to the same
-file. The MCP server also sends the gist as its own instructions, but the
-file is read first:
+file (the plugin's skill already covers them). The MCP server also sends the
+gist as its own instructions, but the file is read first:
 
 ```markdown
 ## Landing work (Sluice merge queue)
@@ -126,7 +158,8 @@ agents in `.claude/settings.json`:
 {"permissions": {"deny": ["Bash(sluice queue approve:*)"]}}
 ```
 
-Deny rules still apply in `bypassPermissions` mode. An agent with shell
+The plugin's hook already denies this command; the settings rule is a second,
+independent layer. Deny rules still apply in `bypassPermissions` mode. An agent with shell
 access and push credentials can still `git push` directly: protect the target
 branch on the forge as well.
 
@@ -207,11 +240,12 @@ it bypasses the queue and the cache.
 - In `bypassPermissions` mode, allow rules have no effect: everything is
   allowed except what deny rules and explicit ask rules cover.
 
-Two levers, in order:
+Levers, in order:
 
-1. The `CLAUDE.md` / `AGENTS.md` section from step 3. It is the first lever
-   and, in `bypassPermissions` mode, the only one that does not need a deny
-   rule.
+1. The plugin (section 2). Its skill tells the agent to verify, and its hook
+   denies the gate commands of `.sluice.toml` run through Bash with a reason
+   the model reads. Hooks run in `bypassPermissions` mode too. Without the
+   plugin, use the `CLAUDE.md` / `AGENTS.md` section from section 3.
 2. A deny rule for the raw command is the enforcement option. In
    `.claude/settings.json`:
 
@@ -223,7 +257,8 @@ Two levers, in order:
    `bypassPermissions` mode.
 
 MCP tool rules use the form `mcp__<server>__<tool>`, so the `verify` tool is
-`mcp__sluice__verify`. A rule like `Bash(sluice run:*)` is reasonable:
+`mcp__sluice__verify`, or `mcp__plugin_sluice_sluice__verify` when the server
+comes from the plugin. A rule like `Bash(sluice run:*)` is reasonable:
 `sluice run` goes through the daemon queue (it only runs in-process when the
 daemon is unavailable, and `run-unqueued` must be configured explicitly).
 Prefer it to a blanket `Bash(sluice:*)`, which would also allow
@@ -251,7 +286,7 @@ data for scripts.
 
 Anything that spawns `sluice run <gate>` from git hooks works with Sluice
 today, because hooks do not care who triggered them: add the agent's marker
-to `[agent_detection]` (step 5) so the fail-fast policy applies. Agents that
-support MCP can use `sluice mcp` the same way as Claude Code, with the same
+to `[agent_detection]` (section 5) so the fail-fast policy applies. Agents that
+support MCP can use `sluice mcp` the same way as Claude Code (manual registration), with the same
 `mcpServers` entry in their own config format. For agents that expose no
 reliable marker, export `SLUICE_AGENT=1` in the shell the agent uses.

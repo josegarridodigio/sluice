@@ -1,0 +1,14 @@
+{
+  "name": "sluice",
+  "description": "Sluice: a verification queue and cache for parallel coding agents",
+  "owner": {
+    "name": "Jose Antonio Garrido"
+  },
+  "plugins": [
+    {
+      "name": "sluice",
+      "source": "./plugin",
+      "description": "Verify each git tree once: the sluice MCP server, a skill that teaches agents the verify and merge-queue flow, and a guard hook for raw test commands"
+    }
+  ]
+}

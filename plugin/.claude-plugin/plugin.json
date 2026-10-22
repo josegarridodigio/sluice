@@ -1,0 +1,11 @@
+{
+  "name": "sluice",
+  "description": "Verify each git tree once: registers the sluice MCP server, ships the sluice skill and a PreToolUse hook that redirects raw test commands to the verify tool",
+  "version": "0.1.0",
+  "author": {
+    "name": "Jose Antonio Garrido"
+  },
+  "homepage": "https://github.com/josegarridodigio/sluice",
+  "repository": "https://github.com/josegarridodigio/sluice",
+  "license": "MIT"
+}

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "sluice": {
+      "command": "sluice",
+      "args": ["mcp"]
+    }
+  }
+}
