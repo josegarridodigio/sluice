@@ -229,7 +229,7 @@ in `PATH`.
 - Agents bypass the queue whenever they can run the test command directly
   through their shell tool. Permission rules such as `Bash(npm test:*)`, or
   running with permissions bypassed, make that easy. Tell your agents to
-  verify through Sluice; `docs/agents.md` (Phase 3) ships a ready-to-paste
+  verify through Sluice; [docs/agents.md](docs/agents.md) ships a ready-to-paste
   `CLAUDE.md` section.
 
 ## Prior art
