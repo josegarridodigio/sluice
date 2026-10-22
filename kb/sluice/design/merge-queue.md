@@ -234,11 +234,11 @@ dissolves an unfinished build and parks an unfinished push).
    `dirty_merge` and the dirty paths in `detail`. No member left → the train is `dissolved`.
    Survivors → `verifying`. The train keeps every claimed member in `members`; the hash uses
    the survivors.
-5. **Key.** `T = git rev-parse S^{tree}`. Take `tree::snapshot` of the clean worktree (the same
+5. **Key.** `T = git rev-parse S^{tree}`. Take `tree::snapshot_entries` of the clean worktree (the same
    code path as every client) and assert it equals `T` (a mismatch, e.g. from eol filters,
    makes the train fail with `tree_mismatch`, never silently uncached). For each queue gate
    (`[queue] gates`, else the gates whose `hooks` contain `pre-push`, else every gate)
-   derive the key with `sluice_gate_core::key` from `T`, the base config's gate
+   derive the key with the shared `lookup::key_tree` + `lookup::derive_key_at` from `T` (or, for a gate with `paths`/`paths_ignore`, the scope hash of the snapshot entries; [[sluice/design/path-scoped-keys.md]] section 7), the base config's gate
    (name, normalised cmd, env), `key_inputs` run in the merge worktree and `key_files` read
    there (no extra arguments; a gate with `cache = false` has no key, always runs and enters
    the hash as `<gate>=-`). Markers live in the repo's common dir, so keys computed by agents' `verify` calls

@@ -139,6 +139,14 @@ key_files  = [".env.test"]
 env        = { NODE_ENV = "test" }
 ```
 
+A gate can key on part of the tree only: `paths = ["src/**",
+"package.json", "package-lock.json"]` and `paths_ignore = ["src/**/*.md"]`
+(git glob pathspecs, root-relative; `.sluice.toml` always counts). A change
+outside the scope then keeps the cached pass. This **requires Sluice ≥
+0.3.0** (older binaries reject the fields) and is opt-in: a gate that reads
+files outside its scope can pass stale. See "Choosing paths" in
+[docs/gates-cookbook.md](docs/gates-cookbook.md).
+
 ## Command surface
 
 ```
@@ -308,6 +316,9 @@ in `PATH`.
 - Inputs git cannot see (tool versions, environment variables, ignored
   files, running services) must be declared with `key_inputs` and
   `key_files`, or a stale pass is possible.
+- A path-scoped gate (`paths`) ignores every change outside its scope: if
+  it reads a file there (a root lockfile, shared fixtures), add that file
+  to `paths`. `sluice doctor` flags the usual suspects.
 - Agents bypass the queue whenever they can run the test command directly
   through their shell tool. Permission rules such as `Bash(npm test:*)`, or
   running with permissions bypassed, make that easy. The Claude Code

@@ -5,8 +5,8 @@ tags: [sluice, design, cache, alpha, d0]
 
 # Path-scoped cache keys (D0)
 
-Status: draft for D1 (alpha plan task D0; ADR-0012 to be written by the lead
-from section 2). Builds on [[sluice/design/cache-key.md]],
+Status: implemented in D1 (2026-10-23; ADR-0012). Implementation notes and
+the deviations from this text: [[sluice/changes/path-scoped-keys.md]]. Builds on [[sluice/design/cache-key.md]],
 [[sluice/design/committed-tree-lookup.md]], [[sluice/design/config-format.md]]
 and [[sluice/design/merge-queue.md]] section 5. Latency baseline:
 [[sluice/changes/hit-path-latency.md]].

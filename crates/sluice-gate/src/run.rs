@@ -43,7 +43,7 @@ use sluice_gate_core::key::CacheKey;
 use sluice_gate_core::lookup::{self, Lookup as CacheState, Resolved, RunMaterial};
 use sluice_gate_core::marker::{Lookup, Marker, MissRecord};
 use sluice_gate_core::mode::{CacheMode, cache_mode};
-use sluice_gate_core::tree::{self, Snapshot, TreeHash};
+use sluice_gate_core::tree::{self, SnapshotFull, TreeHash};
 use sluice_gate_core::{CACHE_FORMAT_VERSION, JOB_ENV_VAR, SLUICE_VERSION};
 use sluice_gate_proto::{
     self as proto, FEATURE_QUEUE_ONLY, GateSpec, Outcome, OutcomeStatus, RepoInfo, RunRequest,
@@ -211,9 +211,10 @@ fn run_traced(args: &RunArgs, trace: &mut Trace) -> ExitCode {
         lookup::lookup(&ctx, &mode, &args.extra)
     };
     let state = match lookup_state {
-        CacheState::Hit(hit) => {
+        CacheState::Hit { marker: hit, tree } => {
             trace.decision = Some("hit");
-            trace.tree = Some(hit.tree.as_str().to_owned());
+            // The current tree: on a scoped hit `hit.tree` is an earlier one.
+            trace.tree = Some(tree.as_str().to_owned());
             println!(
                 "sluice: {} PASS (cached, passed {} ago)",
                 ctx.gate_name,
@@ -317,10 +318,15 @@ fn run_queued(
 /// where K is the gate's normal key on the current tree, so it can never
 /// match a marker. `None` when the tree or K is unknown (no coalescing).
 fn queue_only_key(ctx: &Context, extra: &[String]) -> Option<(TreeHash, CacheKey)> {
-    let Ok(Snapshot::Known(tree)) = tree::snapshot(&ctx.paths, &ctx.probe_env, &ctx.scratch) else {
+    let Ok(SnapshotFull::Known {
+        root: tree,
+        entries,
+    }) = tree::snapshot_entries(&ctx.paths, &ctx.probe_env, &ctx.scratch)
+    else {
         return None;
     };
-    let (_, key) = lookup::derive_key(ctx, &tree, extra).ok()?;
+    let scoped = lookup::key_tree(&ctx.gate, &tree, &entries);
+    let (_, key) = lookup::derive_key(ctx, scoped, extra).ok()?;
     let digest = Sha256::new()
         .chain_update(b"queue-only\0")
         .chain_update(key.as_str().as_bytes())
@@ -340,7 +346,9 @@ fn print_fail_fast(ctx: &Context, state: &CacheState, caller: &Caller) {
             m.exit_code
                 .map_or(String::new(), |c| format!(" with exit code {c}"))
         ),
-        CacheState::Miss { .. } | CacheState::Hit(_) => "no cached pass for this tree".to_owned(),
+        CacheState::Miss { .. } | CacheState::Hit { .. } => {
+            "no cached pass for this tree".to_owned()
+        }
         CacheState::Off { reason, .. } => reason.clone(),
     };
     let rule = match caller {
@@ -553,7 +561,7 @@ fn report_outcome(
                     Ok(Lookup::Hit(m)) => format!(", passed {} ago", age(&m.passed_at)),
                     _ => String::new(),
                 },
-                CacheState::Off { .. } | CacheState::Hit(_) => String::new(),
+                CacheState::Off { .. } | CacheState::Hit { .. } => String::new(),
             };
             println!("sluice: {} PASS (cached{passed})", ctx.gate_name);
             return ExitCode::SUCCESS;
@@ -666,7 +674,7 @@ fn decide_policy(ctx: &Context, env: &EnvMap, state: &CacheState) -> (Caller, bo
                 other => other,
             }
         }
-        (Caller::Agent { .. }, true, CacheState::Miss { .. } | CacheState::Hit(_)) => {
+        (Caller::Agent { .. }, true, CacheState::Miss { .. } | CacheState::Hit { .. }) => {
             ctx.config.defaults.agent_hook_policy
         }
         (Caller::Agent { .. }, true, CacheState::Off { .. }) => {
@@ -710,10 +718,19 @@ fn explain(ctx: &Context, env: &EnvMap, mode: &CacheMode, extra: &[String]) -> E
         "budget:       {} units, gate weight {}",
         ctx.user.daemon.budget, ctx.gate.weight
     );
-    match tree::snapshot(&ctx.paths, &ctx.probe_env, &ctx.scratch) {
-        Ok(Snapshot::Known(tree)) => {
+    match tree::snapshot_entries(&ctx.paths, &ctx.probe_env, &ctx.scratch) {
+        Ok(SnapshotFull::Known {
+            root: tree,
+            entries,
+        }) => {
             println!("tree:         {tree}");
-            match lookup::derive_key(ctx, &tree, extra) {
+            if let Some(s) = lookup::scope_summary(&ctx.gate, &entries) {
+                println!(
+                    "scope:        {} of {} files, {}",
+                    s.count.files, s.count.total, s.hash
+                );
+            }
+            match lookup::derive_key(ctx, lookup::key_tree(&ctx.gate, &tree, &entries), extra) {
                 Ok((_, key)) => {
                     println!("key:          {key}");
                     match ctx.store.lookup(&key, ctx.ttl) {
@@ -734,7 +751,7 @@ fn explain(ctx: &Context, env: &EnvMap, mode: &CacheMode, extra: &[String]) -> E
                 Err(e) => println!("key:          error ({e})"),
             }
         }
-        Ok(Snapshot::Unknown { reason }) => println!("tree:         unknown ({reason})"),
+        Ok(SnapshotFull::Unknown { reason }) => println!("tree:         unknown ({reason})"),
         Err(e) => println!("tree:         error ({e})"),
     }
     println!("markers:      {}", ctx.store.dir().display());
@@ -822,7 +839,7 @@ fn execute(ctx: &Context, args: &RunArgs, state: CacheState) -> ExitCode {
         let note = match state {
             _ if ctx.gate.is_queue_only() => String::new(),
             CacheState::Off { reason, .. } => format!(" (not cached: {reason})"),
-            CacheState::Hit(_) => String::new(),
+            CacheState::Hit { .. } => String::new(),
             CacheState::Miss { tree, key, cmd, .. } => {
                 match write_marker(ctx, &tree, &key, &cmd, &exec) {
                     Ok(()) => String::new(),

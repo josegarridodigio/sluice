@@ -6,7 +6,7 @@ use sluice_gate_core::git::{self, EnvMap};
 use sluice_gate_core::lookup;
 use sluice_gate_core::marker::{Lookup, MarkerStore};
 use sluice_gate_core::mode::CacheMode;
-use sluice_gate_core::tree::{self, Snapshot};
+use sluice_gate_core::tree::{self, SnapshotFull};
 
 use crate::run::{EXIT_ERROR, age};
 
@@ -33,8 +33,11 @@ pub fn status(all: bool) -> ExitCode {
     let store = &repo.store;
     println!("markers: {}", store.dir().display());
 
-    match tree::snapshot(&repo.paths, &repo.probe_env, &repo.scratch) {
-        Ok(Snapshot::Known(tree)) => {
+    match tree::snapshot_entries(&repo.paths, &repo.probe_env, &repo.scratch) {
+        Ok(SnapshotFull::Known {
+            root: tree,
+            entries,
+        }) => {
             println!("tree:    {tree}");
             // Passes recorded in `pre-commit` on a superset of this tree
             // (unstaged changes present): shown as evidence, never a hit.
@@ -50,9 +53,10 @@ pub fn status(all: bool) -> ExitCode {
                     println!("{name:<16} always runs (cache = false)");
                     continue;
                 }
+                let key_tree = lookup::key_tree(gate, &tree, &entries);
                 let line = match repo
                     .select(name)
-                    .and_then(|r| lookup::derive_key(&r, &tree, &[]))
+                    .and_then(|r| lookup::derive_key(&r, key_tree, &[]))
                 {
                     Ok((_, cache_key)) => match store.lookup(&cache_key, repo.ttl) {
                         Ok(Lookup::Hit(m)) => {
@@ -83,10 +87,13 @@ pub fn status(all: bool) -> ExitCode {
                 } else {
                     String::new()
                 };
-                println!("{name:<16} {line}{note}");
+                let scope = lookup::scope_summary(gate, &entries)
+                    .map(|s| s.status_suffix())
+                    .unwrap_or_default();
+                println!("{name:<16} {line}{scope}{note}");
             }
         }
-        Ok(Snapshot::Unknown { reason }) => {
+        Ok(SnapshotFull::Unknown { reason }) => {
             println!("tree:    unknown ({reason}); every gate runs uncached");
         }
         Err(e) => println!("tree:    error ({e})"),

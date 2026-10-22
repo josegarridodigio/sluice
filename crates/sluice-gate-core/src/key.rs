@@ -7,8 +7,32 @@ use std::process::{Command, Stdio};
 
 use sha2::{Digest, Sha256};
 
+use crate::scope::{SCOPE_KEY_PREFIX, ScopeHash};
 use crate::tree::TreeHash;
 use crate::{Error, Result};
+
+/// The tree field of the key material: the root tree of an unscoped gate
+/// (same bytes as 0.2, so existing markers keep hitting) or the scope hash
+/// of a path-scoped gate (`scope-v1:<64 hex>`; the `:` cannot occur in a
+/// tree id, so the two never collide).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyTree {
+    /// Unscoped gate: the root working tree.
+    Root(TreeHash),
+    /// Path-scoped gate: hash of the selected entries.
+    Scoped(ScopeHash),
+}
+
+impl KeyTree {
+    /// The bytes hashed as the tree field of the key.
+    #[must_use]
+    pub fn key_field(&self) -> String {
+        match self {
+            Self::Root(tree) => tree.as_str().to_owned(),
+            Self::Scoped(scope) => format!("{SCOPE_KEY_PREFIX}{scope}"),
+        }
+    }
+}
 
 /// Domain-separation prefix hashed first into every key.
 /// Must end with [`crate::CACHE_FORMAT_VERSION`]; a unit test enforces it.
@@ -53,8 +77,8 @@ impl TryFrom<String> for CacheKey {
 /// Everything that feeds into a cache key.
 #[derive(Debug, Clone)]
 pub struct KeyMaterial {
-    /// Hash of the working tree.
-    pub tree: TreeHash,
+    /// Root tree (unscoped gate) or scope hash (path-scoped gate).
+    pub tree: KeyTree,
     /// Name of the gate.
     pub gate_name: String,
     /// Command, already normalised with [`normalize_cmd`].
@@ -79,7 +103,7 @@ pub fn derive(material: &KeyMaterial) -> CacheKey {
         h.update([0u8]);
     };
     field(KEY_PREFIX);
-    field(material.tree.as_str());
+    field(&material.tree.key_field());
     field(&material.gate_name);
     field(&material.cmd);
     for (k, v) in &material.env {
@@ -188,7 +212,7 @@ mod tests {
 
     fn material() -> KeyMaterial {
         KeyMaterial {
-            tree: tree("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            tree: KeyTree::Root(tree("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             gate_name: "test".into(),
             cmd: "npm test".into(),
             env: BTreeMap::from([("A".into(), "1".into()), ("B".into(), "2".into())]),
@@ -205,6 +229,23 @@ mod tests {
         let key = derive(&material());
         assert_eq!(key.as_str(), expected);
         assert_eq!(key.as_str().len(), 64);
+    }
+
+    #[test]
+    fn scoped_tree_field_golden_vector() {
+        let scope = ScopeHash::try_from("b".repeat(64)).unwrap();
+        let mut m = material();
+        m.tree = KeyTree::Scoped(scope);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"sluice-cache-v1\0scope-v1:");
+        bytes.extend_from_slice("b".repeat(64).as_bytes());
+        bytes.extend_from_slice(b"\0test\0npm test\0A=1\0B=2\0echo hi\0f00\0Cargo.lock\0absent\0");
+        assert_eq!(derive(&m).as_str(), hex::encode(Sha256::digest(&bytes)));
+        assert_ne!(derive(&m), derive(&material()));
+        assert_eq!(
+            KeyTree::Root(tree(&"c".repeat(40))).key_field(),
+            "c".repeat(40)
+        );
     }
 
     #[test]

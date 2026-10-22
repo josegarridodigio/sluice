@@ -134,7 +134,8 @@ No parameters beyond `working_directory` (optional). Returns the daemon
 when none runs; no `output_schema`, the report type is not schema-derived)
 plus, when a directory is given, `cache: {repository, tree, tree_unknown,
 gates: [{gate, state: hit|miss|uncached|error, passed_at?, job_id?,
-last_run?, message?}]}` for its current tree (computed with caching
+last_run?, message?, scope?: {files, total, hash}}]}` for its current tree
+(`scope` only for a path-scoped gate with caching on; computed with caching
 enabled whatever the environment; `gates` is empty and `tree_unknown`
 set when the tree is unknown), and the text marks that repository's jobs
 with `*`. A non-repository directory is `invalid_params`. Never starts

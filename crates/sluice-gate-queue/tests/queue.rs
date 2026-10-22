@@ -920,3 +920,100 @@ async fn a_push_spawn_failure_parks_the_train_and_reconcile_cleans_up_only_on_su
     assert_eq!(fx.bare_ref("refs/heads/main").unwrap(), base);
     d.shutdown().await;
 }
+
+// ------------------------------------------------- path-scoped keys (D1)
+
+/// `.sluice.toml` with one pre-push gate scoped to `src`, counting its runs
+/// in a file outside the repository.
+fn scoped_toml(counter: &std::path::Path) -> String {
+    format!(
+        "version = 1\n[gates.test]\ncmd = \"echo run >> {}\"\nhooks = [\"pre-push\"]\n\
+         paths = [\"src\"]\n",
+        counter.display()
+    )
+}
+
+/// Records a pass of `gate` for the clean worktree `wt` exactly as an
+/// agent's `verify` would (key derived by the client-side lookup).
+fn mark_verified(fx: &Fixture, wt: &std::path::Path, gate: &str) {
+    use sluice_gate_core::lookup::{self, Lookup};
+    use sluice_gate_core::marker::Marker;
+    use sluice_gate_core::mode::CacheMode;
+
+    let mut env = fx.env.clone();
+    let run = fx.root.join("agent-run");
+    std::fs::create_dir_all(&run).unwrap();
+    env.insert("XDG_RUNTIME_DIR".into(), run.display().to_string());
+    env.insert(
+        "SLUICE_CONFIG".into(),
+        fx.root.join("none.toml").display().to_string(),
+    );
+    let r = lookup::resolve(wt, &env, gate, &CacheMode::Enabled).unwrap();
+    let Lookup::Miss { tree, key, cmd, .. } = lookup::lookup(&r, &CacheMode::Enabled, &[]) else {
+        panic!("expected a miss in {}", wt.display());
+    };
+    r.store
+        .write(&Marker {
+            format: sluice_gate_core::CACHE_FORMAT_VERSION,
+            key,
+            tree,
+            gate: gate.into(),
+            cmd,
+            passed_at: sluice_gate_core::dirs::now_rfc3339(),
+            duration_ms: 1,
+            exit_code: 0,
+            job_id: "agent-job".into(),
+            sluice_version: sluice_gate_core::SLUICE_VERSION.into(),
+            committed_tree: None,
+        })
+        .unwrap();
+}
+
+fn runs(counter: &std::path::Path) -> usize {
+    std::fs::read_to_string(counter).map_or(0, |s| s.lines().count())
+}
+
+/// Design section 9 case 24: a single-member train fast-forwarded to the
+/// tree an agent verified hits the scoped gate; nothing runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scoped_gate_hits_the_agents_verified_tree() {
+    let fx = Fixture::new("");
+    let counter = fx.root.join("counter");
+    std::fs::write(fx.repo.join(".sluice.toml"), scoped_toml(&counter)).unwrap();
+    fx.git(&["commit", "-q", "-am", "scoped gate"]);
+    fx.git(&["push", "-q", "origin", "main"]);
+    let (wa, a) = fx.branch("feat/a", "main", &[("src/a.rs", "a\n")]);
+    mark_verified(&fx, &wa, "test");
+    let d = Daemon::start(&fx, user_config(false)).await;
+    d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    let t = d.wait_train("ready", ready).await;
+    assert_eq!(t.gates[0].status, "cached", "{t:#?}");
+    assert!(t.gates[0].job_id.is_none());
+    assert_eq!(runs(&counter), 0);
+    d.shutdown().await;
+}
+
+/// Design section 9 case 25: the second member only touches files outside
+/// the scope, so the combined tree hits the first member's pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn out_of_scope_member_keeps_the_scoped_hit() {
+    let fx = Fixture::new("");
+    let counter = fx.root.join("counter");
+    std::fs::write(fx.repo.join(".sluice.toml"), scoped_toml(&counter)).unwrap();
+    fx.git(&["commit", "-q", "-am", "scoped gate"]);
+    fx.git(&["push", "-q", "origin", "main"]);
+    let (wa, a) = fx.branch("feat/a", "main", &[("src/a.rs", "a\n")]);
+    let (wb, b) = fx.branch("feat/b", "main", &[("docs/b.md", "b\n")]);
+    mark_verified(&fx, &wa, "test");
+    let d = Daemon::start(&fx, user_config(false)).await;
+    d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    let jb = d.enqueue_ok(&fx, &wb, "feat/b", &b, None).await;
+    let t = d
+        .wait_train("a ready train with B", |t| {
+            t.state == T::Ready && t.members.contains(&jb.job_id)
+        })
+        .await;
+    assert_eq!(t.gates[0].status, "cached", "{t:#?}");
+    assert_eq!(runs(&counter), 0, "no gate ran");
+    d.shutdown().await;
+}

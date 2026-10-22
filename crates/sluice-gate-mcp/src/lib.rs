@@ -36,7 +36,7 @@ use sluice_gate_core::git::{self, EnvMap};
 use sluice_gate_core::lookup::{self, Lookup, RepoContext, Resolved, RunMaterial};
 use sluice_gate_core::marker::{self, Marker};
 use sluice_gate_core::mode::{CacheMode, cache_mode};
-use sluice_gate_core::tree::{self, Snapshot};
+use sluice_gate_core::tree::{self, SnapshotFull};
 use sluice_gate_core::{SLUICE_VERSION, dirs};
 use sluice_gate_proto::client::{self, ClientError};
 use sluice_gate_proto::{
@@ -348,6 +348,9 @@ struct GateCache {
     last_run: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+    /// Path scope of a scoped gate: `{files, total, hash}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<serde_json::Value>,
 }
 
 // ---------------------------------------------------------------- helpers
@@ -493,7 +496,7 @@ fn prepare(
     timeout_seconds: Option<u64>,
 ) -> Result<Prepared, String> {
     let state = lookup::lookup(&res, mode, extra);
-    if let Lookup::Hit(marker) = state {
+    if let Lookup::Hit { marker, .. } = state {
         return Ok(Prepared::Hit(marker));
     }
     // A queue-only gate is never cached by design: no "not cached" note.
@@ -1368,13 +1371,14 @@ fn cache_state(dir: &Path, env: &EnvMap) -> Result<(PathBuf, String, serde_json:
     let repo = lookup::resolve_repo(dir, env, &CacheMode::Enabled).map_err(|e| e.to_string())?;
     let mut out = String::new();
     let mut gates = Vec::new();
-    let (tree, unknown) = match tree::snapshot(&repo.paths, &repo.probe_env, &repo.scratch) {
-        Ok(Snapshot::Known(t)) => (Some(t), None),
-        Ok(Snapshot::Unknown { reason }) => (None, Some(reason)),
+    let (tree, unknown) = match tree::snapshot_entries(&repo.paths, &repo.probe_env, &repo.scratch)
+    {
+        Ok(SnapshotFull::Known { root, entries }) => (Some((root, entries)), None),
+        Ok(SnapshotFull::Unknown { reason }) => (None, Some(reason)),
         Err(e) => (None, Some(e.to_string())),
     };
     match (&tree, &unknown) {
-        (Some(t), _) => {
+        (Some((t, _)), _) => {
             let _ = writeln!(out, "tree:    {t}");
         }
         (None, Some(why)) => {
@@ -1382,7 +1386,7 @@ fn cache_state(dir: &Path, env: &EnvMap) -> Result<(PathBuf, String, serde_json:
         }
         (None, None) => {}
     }
-    if let Some(tree) = &tree {
+    if let Some((tree, entries)) = &tree {
         for (name, gate) in &repo.config.gates {
             let mut g = GateCache {
                 gate: name.clone(),
@@ -1391,11 +1395,13 @@ fn cache_state(dir: &Path, env: &EnvMap) -> Result<(PathBuf, String, serde_json:
                 job_id: None,
                 last_run: None,
                 message: None,
+                scope: None,
             };
             let line = if gate.cache {
+                let key_tree = lookup::key_tree(gate, tree, entries);
                 match repo
                     .select(name)
-                    .and_then(|r| lookup::derive_key(&r, tree, &[]))
+                    .and_then(|r| lookup::derive_key(&r, key_tree, &[]))
                     .and_then(|(_, key)| repo.store.lookup(&key, repo.ttl))
                 {
                     Ok(marker::Lookup::Hit(m)) => {
@@ -1437,13 +1443,18 @@ fn cache_state(dir: &Path, env: &EnvMap) -> Result<(PathBuf, String, serde_json:
             } else {
                 "always runs (cache = false)".to_owned()
             };
-            let _ = writeln!(out, "{name:<16} {line}");
+            let summary = lookup::scope_summary(gate, entries).filter(|_| gate.cache);
+            let scope = summary.as_ref().map(lookup::ScopeSummary::status_suffix);
+            g.scope = summary.map(|s| {
+                serde_json::json!({ "files": s.count.files, "total": s.count.total, "hash": s.hash.as_str() })
+            });
+            let _ = writeln!(out, "{name:<16} {line}{}", scope.unwrap_or_default());
             gates.push(g);
         }
     }
     let json = serde_json::json!({
         "repository": repo.paths.toplevel,
-        "tree": tree.as_ref().map(|t| t.as_str().to_owned()),
+        "tree": tree.as_ref().map(|(t, _)| t.as_str().to_owned()),
         "tree_unknown": unknown,
         "gates": gates,
     });

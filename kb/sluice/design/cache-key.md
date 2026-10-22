@@ -111,6 +111,38 @@ key = sha256(
 
 Hex-encoded, 64 chars. The marker filename is the key.
 
+**Path-scoped gates** (`paths` / `paths_ignore`, Sluice >= 0.3.0,
+[[sluice/design/path-scoped-keys.md]], ADR-0012): the `tree_hash` field
+becomes `scope-v1:<scope hash>`; everything else is unchanged, and so is
+`"sluice-cache-v1"`. The scope hash is computed in process (no extra git
+spawn) from the `ls-files -s -z` output of the private index after
+`add -A` (step 4 above):
+
+```
+scope = sha256(
+  "sluice-scope-v1"                                      \0
+  for each paths pattern (config order):  "p:" pattern  \0
+  for each paths_ignore pattern:          "i:" pattern  \0
+                                                         \0
+  ".sluice.toml " mode " " oid   or   ".sluice.toml absent" \0
+  for each selected entry other than .sluice.toml, in path byte order:
+    mode " " oid "\t" path                               \0
+)
+```
+
+`mode` is the octal mode and `oid` the hex blob id as git prints them;
+paths are raw bytes. Unscoped gates keep the root tree id, so their keys
+are byte-identical to 0.2 and every existing marker still hits (golden
+tests `lookup::tests::unscoped_key_is_byte_identical_to_v0_2` and
+`tests/scoped.rs::markers_written_by_0_2_still_hit`). The `:` cannot occur
+in a tree id, so scoped and unscoped fields never collide. Implementation:
+`sluice-gate-core::scope` (`PathScope`, `ScopeHash`), `key::KeyTree`,
+`lookup::key_tree` and `lookup::derive_key_at` (the one derivation shared
+by `sluice run`, `cache status`, MCP `verify`/`status` and the merge
+queue). Markers do not change: `tree` stays the root working tree the gate
+passed on, and the post-run "the gate modified the tree" check compares
+root trees.
+
 What is deliberately **not** in the key:
 
 - The repository path or worktree path (so worktrees share hits).
@@ -157,7 +189,9 @@ Rules:
 - `sluice cache status [--all]` prints the markers directory, the current
   tree, and one line per configured gate: `HIT (passed <age> ago, job <id>)`,
   `MISS (last run <age> ago: <reason>, exit <code>)`, `MISS`,
-  `always runs (cache = false)` or `ERROR (<why>)`. It runs the gates'
+  `always runs (cache = false)` or `ERROR (<why>)`; a path-scoped gate's
+  line gets ` [scoped: <n> of <total> files, <12 hex of the scope hash>]`
+  (MCP `status`: `scope: {files, total, hash}` per gate). It runs the gates'
   `key_inputs` to derive their keys. `--all` appends every stored marker
   (gate, age, tree and key prefixes).
 - **Miss records**: a failed run, a timeout or a tree-changing pass writes
@@ -205,6 +239,10 @@ Rules:
   possible.
 - A cache hit is a local optimisation. CI stays authoritative.
 
-The merge queue derives the keys of its gates with this same code from the tree `T` of the combined commit, so a pass on that exact tree hit or written by any client counts ([[sluice/design/merge-queue.md]] section 5).
+- A path-scoped gate that reads files outside its scope can pass stale;
+  scoping is opt-in, and `sluice doctor` (`scoped-gates`) warns about
+  well-known manifests and lockfiles left outside a scope.
+
+The merge queue derives the keys of its gates with this same code (`lookup::key_tree` and `lookup::derive_key_at`) from the snapshot of the clean merge worktree at the tree `T` of the combined commit, so a pass on that exact tree, or for a scoped gate on any tree with the same scope, hit or written by any client counts ([[sluice/design/merge-queue.md]] section 5).
 
 Related: [[sluice/design/architecture.md]], [[sluice/design/config-format.md]].

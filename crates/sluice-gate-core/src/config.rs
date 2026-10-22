@@ -24,6 +24,9 @@ const SUPPORTED_VERSION: u32 = 1;
 /// Maximum length of a gate name.
 const MAX_GATE_NAME_LEN: usize = 64;
 
+/// Maximum number of patterns in `paths` or `paths_ignore`.
+const MAX_PATH_PATTERNS: usize = 64;
+
 /// What a hook does when it misses the cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -206,6 +209,14 @@ pub struct Gate {
     /// parse time). Needs sluice >= 0.3.0.
     #[serde(default)]
     pub mode: GateMode,
+    /// Path scope: when set, the cache key hashes only the tree entries
+    /// matching one of these patterns (plus `.sluice.toml`). Requires
+    /// Sluice >= 0.3.0. See `kb/sluice/design/path-scoped-keys.md`.
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
+    /// Entries matching any of these patterns are removed from the scope.
+    #[serde(default)]
+    pub paths_ignore: Vec<String>,
 }
 
 /// The `mode` of a gate.
@@ -231,6 +242,63 @@ impl Gate {
     pub fn normalized_cmd(&self) -> String {
         crate::key::normalize_cmd(&self.cmd)
     }
+}
+
+/// Why `pattern` cannot be a `paths`/`paths_ignore` entry, `None` when it
+/// is acceptable (see `path-scoped-keys.md`, section 3).
+fn invalid_path_pattern(pattern: &str) -> Option<&'static str> {
+    if pattern.is_empty() {
+        return Some("must not be empty");
+    }
+    if pattern.starts_with(':') {
+        return Some("magic pathspecs are not supported; use paths_ignore");
+    }
+    if pattern.starts_with('!') {
+        return Some("negation is not supported; use paths_ignore");
+    }
+    if pattern.starts_with('/') {
+        return Some("must be relative to the repository root (no leading '/')");
+    }
+    if pattern.starts_with("./") {
+        return Some("must not start with './'");
+    }
+    if pattern.contains('\\') {
+        return Some("backslashes are not supported (no escapes)");
+    }
+    if pattern.chars().any(char::is_control) {
+        return Some("must not contain NUL or control characters");
+    }
+    // A trailing '/' is allowed (`docs/`); any other empty, `.` or `..`
+    // component would be normalised by git and is rejected instead.
+    let body = pattern.strip_suffix('/').unwrap_or(pattern);
+    for component in body.split('/') {
+        match component {
+            ".." => return Some("must not contain '..' components"),
+            "." => return Some("must not contain '.' components"),
+            "" => return Some("must not contain empty components ('//')"),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Validates one `paths`/`paths_ignore` list of gate `name`.
+fn check_path_patterns(path: &Path, name: &str, field: &str, patterns: &[String]) -> Result<()> {
+    if patterns.len() > MAX_PATH_PATTERNS {
+        return Err(config_err(
+            path,
+            format!("gates.{name}.{field}: at most {MAX_PATH_PATTERNS} patterns are allowed"),
+        ));
+    }
+    for (i, pattern) in patterns.iter().enumerate() {
+        if let Some(why) = invalid_path_pattern(pattern) {
+            return Err(config_err(
+                path,
+                format!("gates.{name}.{field}[{i}]: {why}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn valid_gate_name(name: &str) -> bool {
@@ -390,6 +458,19 @@ impl RepoConfig {
                     ));
                 }
             }
+            if let Some(paths) = &gate.paths {
+                if paths.is_empty() {
+                    return Err(config_err(
+                        path,
+                        format!(
+                            "gates.{name}.paths: must not be empty (remove the field to use \
+                             the whole tree)"
+                        ),
+                    ));
+                }
+                check_path_patterns(path, name, "paths", paths)?;
+            }
+            check_path_patterns(path, name, "paths_ignore", &gate.paths_ignore)?;
             for dep in &gate.depends_on {
                 if dep == name {
                     return Err(config_err(
@@ -996,6 +1077,99 @@ depends_on = ["lint"]
         }
         parse(&gate_with(
             "cmd = \"x\"\nkey_files = [\"a/b.env\", \"./c\"]",
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn path_scope_fields_parse_and_default_to_unscoped() {
+        let c = parse(&gate_with("cmd = \"x\"")).unwrap();
+        let g = c.gate("g").unwrap();
+        assert!(g.paths.is_none() && g.paths_ignore.is_empty());
+
+        let c = parse(&gate_with(
+            "cmd = \"x\"\npaths = [\"crates/**\", \"docs/\", \"Cargo.toml\"]\n\
+             paths_ignore = [\"crates/**/*.md\"]",
+        ))
+        .unwrap();
+        let g = c.gate("g").unwrap();
+        assert_eq!(
+            g.paths.as_deref(),
+            Some(&["crates/**".to_owned(), "docs/".into(), "Cargo.toml".into()][..])
+        );
+        assert_eq!(g.paths_ignore, ["crates/**/*.md"]);
+
+        // paths_ignore alone, and both with cache = false (accepted, no effect).
+        parse(&gate_with("cmd = \"x\"\npaths_ignore = [\"docs\"]")).unwrap();
+        parse(&gate_with(
+            "cmd = \"x\"\ncache = false\npaths = [\"src\"]\npaths_ignore = [\"a\"]",
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn path_scope_validation_errors() {
+        let full = match parse(&gate_with("cmd = \"x\"\npaths = []")) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("empty paths accepted"),
+        };
+        assert!(
+            full.contains("/r/.sluice.toml")
+                && full.contains(
+                    "gates.g.paths: must not be empty (remove the field to use the whole tree)"
+                ),
+            "{full}"
+        );
+        // paths_ignore = [] is the default and therefore fine.
+        parse(&gate_with("cmd = \"x\"\npaths_ignore = []")).unwrap();
+
+        let cases = [
+            ("", "must not be empty"),
+            ("/src", "no leading '/'"),
+            ("./src", "must not start with './'"),
+            ("src/../x", "'..' components"),
+            ("..", "'..' components"),
+            ("src/./x", "'.' components"),
+            ("src//x", "empty components"),
+            (
+                ":(exclude)src",
+                "magic pathspecs are not supported; use paths_ignore",
+            ),
+            (
+                ":!src",
+                "magic pathspecs are not supported; use paths_ignore",
+            ),
+            ("!src", "negation is not supported; use paths_ignore"),
+            ("src\\\\x", "backslashes are not supported"),
+            ("src\\u0001x", "control characters"),
+            ("src\\u0000x", "control characters"),
+        ];
+        for field in ["paths", "paths_ignore"] {
+            for (bad, why) in cases {
+                let m = msg(&gate_with(&format!(
+                    "cmd = \"x\"\n{field} = [\"ok\", \"{bad}\"]"
+                )));
+                assert!(
+                    m.starts_with(&format!("gates.g.{field}[1]: ")) && m.contains(why),
+                    "{field} {bad:?}: {m}"
+                );
+            }
+            let many: Vec<String> = (0..65).map(|i| format!("\"p{i}\"")).collect();
+            let m = msg(&gate_with(&format!(
+                "cmd = \"x\"\n{field} = [{}]",
+                many.join(", ")
+            )));
+            assert!(m.contains("at most 64 patterns"), "{m}");
+            let ok: Vec<String> = (0..64).map(|i| format!("\"p{i}\"")).collect();
+            parse(&gate_with(&format!(
+                "cmd = \"x\"\n{field} = [{}]",
+                ok.join(", ")
+            )))
+            .unwrap();
+        }
+        // Trailing slash, wildcards, unicode and spaces are fine.
+        parse(&gate_with(
+            "cmd = \"x\"\npaths = [\"docs/\", \"src/**/*.rs\", \"a b/ñ?[0-9]\"]",
         ))
         .unwrap();
     }

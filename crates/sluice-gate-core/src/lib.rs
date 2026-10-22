@@ -8,6 +8,7 @@
 //! - [`git`]: the only place that spawns the `git` binary.
 //! - [`tree`]: working-tree snapshot from a private index and object dir.
 //! - [`key`]: cache-key derivation.
+//! - [`scope`]: path-scoped keys (pattern matching and the scope hash).
 //! - [`marker`]: markers and miss records under the git common dir.
 //! - [`lookup`]: the shared cache-hit check (resolve, lookup, run material).
 //! - [`agent`]: "is this hook invoked by a coding agent?" detection.
@@ -26,6 +27,7 @@ pub mod logfile;
 pub mod lookup;
 pub mod marker;
 pub mod mode;
+pub mod scope;
 pub mod semaphore;
 pub mod tree;
 pub mod which;

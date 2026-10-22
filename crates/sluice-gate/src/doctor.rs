@@ -9,6 +9,7 @@
 //! recent daemon, client and MCP logs and the logs of the last failed
 //! jobs. Every text file goes through [`redact`] first.
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -18,10 +19,12 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 use serde::Serialize;
-use sluice_gate_core::config::{REPO_CONFIG_FILE, RepoConfig, UserConfig};
+use sluice_gate_core::config::{Gate, REPO_CONFIG_FILE, RepoConfig, UserConfig};
 use sluice_gate_core::dirs;
 use sluice_gate_core::git::{self, EnvMap, RepoPaths};
 use sluice_gate_core::logfile;
+use sluice_gate_core::scope::{self, PathScope};
+use sluice_gate_core::tree::{self, SnapshotFull, StagedEntries};
 use sluice_gate_daemon::server::LEASE_NAME;
 use sluice_gate_daemon::store::{JobState, Store};
 use sluice_gate_proto::client;
@@ -479,9 +482,10 @@ pub fn queue_only_hook_warning(cfg: &RepoConfig) -> Option<String> {
 fn check_repo(env: &EnvMap, paths: &RepoPaths) -> Vec<Check> {
     let mut out = Vec::new();
     let mut warning = None;
-    out.push(match RepoConfig::load(&paths.toplevel) {
+    let config = RepoConfig::load(&paths.toplevel);
+    out.push(match &config {
         Ok(cfg) => {
-            warning = queue_only_hook_warning(&cfg);
+            warning = queue_only_hook_warning(cfg);
             check(
                 "repo-config",
                 Status::Ok,
@@ -499,7 +503,186 @@ fn check_repo(env: &EnvMap, paths: &RepoPaths) -> Vec<Check> {
     }
     out.push(check_hooks(env, paths));
     out.push(check_markers(paths));
+    if let Ok(cfg) = &config {
+        out.extend(check_scoped_gates(env, paths, cfg));
+    }
     out
+}
+
+/// Well-known build inputs a scoped gate usually depends on even when they
+/// live outside its directories (design path-scoped-keys.md, section 8).
+const BUILD_INPUTS: &[&str] = &[
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain*",
+    "package.json",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "yarn.lock",
+    "tsconfig*.json",
+    "go.mod",
+    "go.sum",
+    "go.work",
+    "pyproject.toml",
+    "uv.lock",
+    "poetry.lock",
+    "requirements*.txt",
+    "setup.cfg",
+    "Makefile",
+    "Dockerfile",
+    ".nvmrc",
+    ".tool-versions",
+];
+
+/// `scoped-gates`: one warning line per path-scoped gate whose scope looks
+/// too small (never a failure). Uses one snapshot of the working tree.
+fn check_scoped_gates(env: &EnvMap, paths: &RepoPaths, cfg: &RepoConfig) -> Vec<Check> {
+    let scoped: Vec<_> = cfg
+        .gates
+        .iter()
+        .filter_map(|(name, gate)| PathScope::from_gate(gate).map(|s| (name, gate, s)))
+        .collect();
+    if scoped.is_empty() {
+        return Vec::new();
+    }
+    let probe = git::probe_env(env, Some(paths));
+    let snapshot =
+        tree::scratch_root(env).and_then(|scratch| tree::snapshot_entries(paths, &probe, &scratch));
+    let entries = match snapshot {
+        Ok(SnapshotFull::Known { entries, .. }) => entries,
+        Ok(SnapshotFull::Unknown { reason }) => {
+            return vec![check(
+                "scoped-gates",
+                Status::Ok,
+                format!("skipped: tree unknown ({reason})"),
+            )];
+        }
+        Err(e) => {
+            return vec![check(
+                "scoped-gates",
+                Status::Ok,
+                format!("skipped: cannot snapshot the tree ({e})"),
+            )];
+        }
+    };
+    scoped
+        .into_iter()
+        .map(|(name, gate, scope)| {
+            let notes = scope_warnings(name, gate, &scope, &entries, &paths.toplevel);
+            if notes.is_empty() {
+                let count = scope.count(&entries);
+                check(
+                    "scoped-gates",
+                    Status::Ok,
+                    format!(
+                        "gate '{name}': {} of {} files in scope; no well-known build input outside it",
+                        count.files, count.total
+                    ),
+                )
+            } else {
+                check("scoped-gates", Status::Warn, notes.join("; "))
+            }
+        })
+        .collect()
+}
+
+/// The warnings of one scoped gate (empty when it looks fine).
+fn scope_warnings(
+    name: &str,
+    gate: &Gate,
+    scope: &PathScope,
+    entries: &StagedEntries,
+    toplevel: &Path,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    if !gate.cache {
+        notes.push(format!(
+            "gate '{name}' has cache = false, so paths and paths_ignore have no effect"
+        ));
+    }
+    for i in scope.unmatched_paths(entries) {
+        notes.push(format!("gate '{name}': paths[{i}] matches no file"));
+    }
+    // Directories holding a selected path, the root included.
+    let mut dirs: HashSet<&[u8]> = HashSet::from([&b""[..]]);
+    let mut selected = 0usize;
+    for e in entries.iter().filter(|e| scope.matches(e.path)) {
+        selected += 1;
+        for (i, b) in e.path.iter().enumerate() {
+            if *b == b'/' {
+                dirs.insert(&e.path[..i]);
+            }
+        }
+    }
+    if selected == 0 {
+        notes.push(format!(
+            "gate '{name}': its scope matches no file, so it hits until .sluice.toml changes"
+        ));
+    }
+    let key_files: HashSet<String> = gate
+        .key_files
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    for e in entries.iter() {
+        let (dir, base) = match e.path.iter().rposition(|b| *b == b'/') {
+            Some(i) => (&e.path[..i], &e.path[i + 1..]),
+            None => (&b""[..], e.path),
+        };
+        let path = String::from_utf8_lossy(e.path);
+        if dirs.contains(dir)
+            && BUILD_INPUTS
+                .iter()
+                .any(|p| scope::wildmatch(p.as_bytes(), base))
+            && !scope.matches(e.path)
+            && !key_files.contains(path.as_ref())
+        {
+            notes.push(format!(
+                "gate '{name}' is scoped by paths but {path} is outside its scope; edits to it \
+                 will not invalidate the cache"
+            ));
+        }
+    }
+    for e in entries
+        .iter()
+        .filter(|e| e.mode == b"120000" && scope.matches(e.path))
+    {
+        let path = String::from_utf8_lossy(e.path).into_owned();
+        let Ok(target) = fs::read_link(toplevel.join(&path)) else {
+            continue;
+        };
+        let inside = symlink_target(&path, &target).is_some_and(|t| scope.matches(t.as_bytes()));
+        if !inside {
+            notes.push(format!(
+                "gate '{name}': symlink {path} points outside the scope ({}); edits to the target \
+                 will not invalidate the cache",
+                target.display()
+            ));
+        }
+    }
+    notes
+}
+
+/// Root-relative, lexically normalised target of the symlink at `link`
+/// (root-relative); `None` when it is absolute or leaves the repository.
+fn symlink_target(link: &str, target: &Path) -> Option<String> {
+    if target.is_absolute() {
+        return None;
+    }
+    let mut parts: Vec<String> = link.split('/').map(str::to_owned).collect();
+    parts.pop();
+    for c in target.components() {
+        match c {
+            std::path::Component::Normal(s) => parts.push(s.to_string_lossy().into_owned()),
+            std::path::Component::ParentDir => {
+                parts.pop()?;
+            }
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    Some(parts.join("/"))
 }
 
 fn check_hooks(env: &EnvMap, paths: &RepoPaths) -> Check {

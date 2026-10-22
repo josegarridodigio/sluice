@@ -97,6 +97,112 @@ impl Snapshot {
     }
 }
 
+/// The staged entries of a snapshot: the raw `ls-files -s -z` output of the
+/// private index after `add -A` (`<mode> SP <oid> SP <stage> TAB <path> NUL`
+/// per record), parsed on iteration. Path scoping filters and hashes these
+/// in process (see `kb/sluice/design/path-scoped-keys.md`, section 4).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StagedEntries {
+    raw: Vec<u8>,
+}
+
+/// One record of [`StagedEntries`], borrowing from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StagedEntry<'a> {
+    /// Octal mode as written by git (`100644`, `100755`, `120000`, ...).
+    pub mode: &'a [u8],
+    /// Object id as hex text (40 or 64 characters).
+    pub oid: &'a [u8],
+    /// Root-relative path, raw bytes.
+    pub path: &'a [u8],
+}
+
+impl StagedEntries {
+    /// Wraps raw `ls-files -s -z` output.
+    #[must_use]
+    pub fn from_raw(raw: Vec<u8>) -> Self {
+        Self { raw }
+    }
+
+    /// The records in output order (index order: byte order of the paths).
+    /// Malformed records are skipped.
+    pub fn iter(&self) -> impl Iterator<Item = StagedEntry<'_>> {
+        self.raw
+            .split(|b| *b == 0)
+            .filter(|r| !r.is_empty())
+            .filter_map(parse_stage_record)
+    }
+
+    /// Number of records.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.iter().count()
+    }
+
+    /// `true` when there is no record.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.iter().next().is_none()
+    }
+}
+
+/// Parses `<mode> SP <oid> SP <stage> TAB <path>`.
+fn parse_stage_record(record: &[u8]) -> Option<StagedEntry<'_>> {
+    let tab = record.iter().position(|b| *b == b'\t')?;
+    let (meta, path) = (&record[..tab], &record[tab + 1..]);
+    let mut fields = meta.split(|b| *b == b' ');
+    let mode = fields.next()?;
+    let oid = fields.next()?;
+    Some(StagedEntry { mode, oid, path })
+}
+
+/// [`Snapshot`] plus the staged entries the tree was written from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotFull {
+    /// The content is exactly this tree, made of these entries.
+    Known {
+        /// Root tree of the working copy.
+        root: TreeHash,
+        /// Staged entries of the private index.
+        entries: StagedEntries,
+    },
+    /// No tree can be trusted; the gate runs uncached.
+    Unknown {
+        /// Human-readable reason, printed to the user.
+        reason: String,
+    },
+}
+
+impl SnapshotFull {
+    /// Returns the root tree when known.
+    #[must_use]
+    pub fn tree(&self) -> Option<&TreeHash> {
+        match self {
+            Self::Known { root, .. } => Some(root),
+            Self::Unknown { .. } => None,
+        }
+    }
+}
+
+impl From<SnapshotFull> for Snapshot {
+    fn from(value: SnapshotFull) -> Self {
+        match value {
+            SnapshotFull::Known { root, .. } => Self::Known(root),
+            SnapshotFull::Unknown { reason } => Self::Unknown { reason },
+        }
+    }
+}
+
+/// Converts the result of [`git_failure`] (always `Unknown`).
+fn failure_full(s: Snapshot) -> SnapshotFull {
+    SnapshotFull::Unknown {
+        reason: match s {
+            Snapshot::Unknown { reason } => reason,
+            Snapshot::Known(t) => format!("unexpected tree {t} from a git failure"),
+        },
+    }
+}
+
 /// Returns the directory that holds scratch snapshots, creating it with mode
 /// `0700`: `$XDG_RUNTIME_DIR/sluice/` when set, else `/tmp/sluice-<uid>/`.
 ///
@@ -353,26 +459,48 @@ fn first_gitlink(stage_output: &[u8]) -> Option<String> {
 /// [`Error::GitMissing`] when git cannot be spawned, [`Error::Io`] when the
 /// scratch dir or the index copy cannot be created.
 pub fn snapshot(paths: &RepoPaths, env: &EnvMap, scratch_root: &Path) -> Result<Snapshot> {
+    snapshot_entries(paths, env, scratch_root).map(Snapshot::from)
+}
+
+/// [`snapshot`] that also returns the staged entries (the `ls-files -s -z`
+/// output it already reads to reject gitlinks), so path-scoped keys cost no
+/// extra git spawn.
+///
+/// # Errors
+///
+/// See [`snapshot`].
+pub fn snapshot_entries(
+    paths: &RepoPaths,
+    env: &EnvMap,
+    scratch_root: &Path,
+) -> Result<SnapshotFull> {
     if let Some(reason) = hidden_entry_reason(paths, env)? {
-        return Ok(Snapshot::unknown(reason));
+        return Ok(SnapshotFull::Unknown { reason });
     }
     let private = PrivateIndex::new(paths, env, scratch_root)?;
     if let Err(e) = private.git(&[NO_SPLIT[0], NO_SPLIT[1], "add", "-A"], paths, false) {
-        return git_failure("could not stage working copy", e);
+        return git_failure("could not stage working copy", e).map(failure_full);
     }
-    match private.git(&["ls-files", "-s", "-z"], paths, true) {
+    let staged = match private.git(&["ls-files", "-s", "-z"], paths, true) {
         Ok(out) => {
             if let Some(path) = first_gitlink(&out) {
-                return Ok(Snapshot::unknown(format!(
-                    "submodules are not supported yet: {path}"
-                )));
+                return Ok(SnapshotFull::Unknown {
+                    reason: format!("submodules are not supported yet: {path}"),
+                });
             }
+            out
         }
-        Err(e) => return git_failure("could not list the staged index", e),
-    }
+        Err(e) => return git_failure("could not list the staged index", e).map(failure_full),
+    };
     let result = private.write_tree(paths);
     drop(private.dir);
-    result
+    Ok(match result? {
+        Snapshot::Known(root) => SnapshotFull::Known {
+            root,
+            entries: StagedEntries::from_raw(staged),
+        },
+        Snapshot::Unknown { reason } => SnapshotFull::Unknown { reason },
+    })
 }
 
 /// Tree of the index as git handed it to us, without `add -A`: the content
@@ -503,6 +631,44 @@ mod tests {
 
         fs::set_permissions(f.root.join("a.txt"), fs::Permissions::from_mode(0o755)).unwrap();
         assert_ne!(snap(&f.root, &f.scratch), clean);
+    }
+
+    #[test]
+    fn snapshot_entries_are_root_relative_staged_records() {
+        let f = fixture();
+        let sub = f.root.join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("inner.txt"), "i\n").unwrap();
+        fs::write(f.root.join("x y.sh"), "#!/bin/sh\n").unwrap();
+        fs::set_permissions(f.root.join("x y.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        let paths = discover(&sub, &base_env()).unwrap();
+        let probe = probe_env(&base_env(), Some(&paths));
+        let SnapshotFull::Known { root, entries } =
+            snapshot_entries(&paths, &probe, &f.scratch).unwrap()
+        else {
+            panic!("unknown");
+        };
+        assert_eq!(root, snap(&f.root, &f.scratch));
+        let got: Vec<(String, String)> = entries
+            .iter()
+            .map(|e| {
+                (
+                    String::from_utf8_lossy(e.mode).into_owned(),
+                    String::from_utf8_lossy(e.path).into_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("100644".to_owned(), "a.txt".to_owned()),
+                ("100644".into(), "sub/inner.txt".into()),
+                ("100755".into(), "x y.sh".into()),
+            ]
+        );
+        assert_eq!(entries.len(), 3);
+        assert!(entries.iter().all(|e| e.oid.len() == 40));
+        assert!(StagedEntries::default().is_empty());
     }
 
     #[test]

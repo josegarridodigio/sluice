@@ -7,8 +7,8 @@ tags: [sluice, design, config]
 
 Status: approved 2026-10-22 (Phase-0 answers Q10, Q11, Q14). `version = 1`
 is frozen: only additive, optional fields are allowed (the merge-queue
-`[queue]` tables, the user `[mcp]` and `[debug]` tables and `gates.<name>.cache`
-were added this way). Renames and incompatible changes bump the version
+`[queue]` tables, the user `[mcp]` and `[debug]` tables, `gates.<name>.cache`
+and `gates.<name>.paths` / `paths_ignore` were added this way). Renames and incompatible changes bump the version
 with a migration note.
 
 ## Repository config: `.sluice.toml`
@@ -43,6 +43,8 @@ key_inputs = ["node --version"]     # stdout of each command is folded into the 
 key_files  = [".env.test"]          # ignored/untracked files whose content must invalidate the cache
 env        = { NODE_ENV = "test" }
 depends_on = ["lint"]               # optional: reserved, validated but not scheduled in v1
+paths        = ["src/**", "package.json", "package-lock.json"]  # optional, >= 0.3.0: key only these
+paths_ignore = ["src/**/*.md"]      # optional, >= 0.3.0: minus these
 
 [queue]                             # merge queue defaults, all optional (read from the base commit)
 remote = "origin"
@@ -72,6 +74,8 @@ Field reference:
 | `gates.<name>.depends_on` | list | `[]` | Gate names; validated (must exist, no self-reference) but not scheduled in v1. |
 | `gates.<name>.cache` | bool | `true` | `false` makes the gate always run (still queued). |
 | `gates.<name>.mode` | `"gate"` \| `"queue-only"` | `"gate"` | Needs sluice ≥ 0.3.0 (older binaries refuse the file: ``unknown field `mode` ``). `queue-only`: the gate always runs under the budget, never looks up, writes a marker or a miss record, and simultaneous identical requests (same tree, definition and extra arguments) share one run; the agent `fail-fast` hook policy does not apply (the hook waits). Its `cache` is treated as `false`; an explicit `cache = true` is an error (`gates.<name>: mode = "queue-only" never caches; remove cache = true`), `cache = false` is accepted. `sluice hook print` and `sluice doctor` warn when a queue-only gate has `hooks`. |
+| `gates.<name>.paths` | list of patterns | unset | Requires Sluice >= 0.3.0. When set, the cache key hashes only the tree entries matching one of these patterns, plus `.sluice.toml` (always). Must not be empty. See "Path scoping" below. |
+| `gates.<name>.paths_ignore` | list of patterns | `[]` | Requires Sluice >= 0.3.0. Entries matching any of these are removed from the scope (never `.sluice.toml`). Alone, it scopes "everything except". |
 | `queue.remote` | string | `origin` | Remote of the default merge-queue target (Phase 6, [[sluice/design/merge-queue.md]]). Must not be empty, start with `-` or contain whitespace/control characters (it reaches git as an argument); at enqueue it must also be a configured remote of the repository (`invalid_remote`). |
 | `queue.target` | string | the remote's HEAD branch | Default target branch for `sluice queue enqueue`. |
 | `queue.gates` | list | gates with a `pre-push` hook, else every gate | Gates a train must pass; each must exist. |
@@ -103,6 +107,15 @@ Rules:
   repo keys are rejected in the user file.
 - `cmd` is normalised for the key by trimming and collapsing whitespace
   runs; nothing else.
+- `paths` / `paths_ignore` (errors read `invalid configuration in <path>:
+  gates.<name>.paths[<i>]: <reason>`): `paths = []` gives `gates.<name>.paths:
+  must not be empty (remove the field to use the whole tree)`; per pattern:
+  empty, leading `/`, leading `./`, a `..`, `.` or empty (`//`) component
+  (one trailing `/` is fine), leading `:` (`magic pathspecs are not
+  supported; use paths_ignore`), leading `!` (`negation is not supported;
+  use paths_ignore`), a backslash (no escapes), NUL or control characters;
+  at most 64 patterns per list. With `cache = false` they are accepted and
+  have no effect (`sluice doctor` notes it).
 - The file is read from the current worktree's root (`git rev-parse
   --show-toplevel`); there is no parent-directory search. `sluice init`
   and `sluice hook print` work on `./.sluice.toml` in the current
@@ -198,6 +211,35 @@ daemon's own start-time check, and the CLI and MCP take `queue.tick` live to
 bound their wait for a landing). Everything else is live
 (`log_retention_days` prunes job logs daily from the daemon;
 `mcp.progress_interval` paces `verify`'s progress notifications).
+
+## Path scoping (`paths`, `paths_ignore`)
+
+Design and rationale: [[sluice/design/path-scoped-keys.md]], ADR-0012.
+
+- Patterns are git `:(glob)` pathspecs (what `git --glob-pathspecs
+  ls-files -- <pattern>` selects), relative to the repository root
+  whatever the current directory, byte-wise and case-sensitive.
+- A pattern without `*`, `?` or `[` is literal: it matches the path itself
+  and, as a directory, everything under it (`docs` and `docs/` match
+  `docs/a/b.md`; `doc` does not match `docs/x`).
+- A pattern with wildcards must match the full path (`WM_PATHNAME`): `*`
+  and `?` never cross `/`, `[...]` is a class, `**/` matches zero or more
+  leading directories, a trailing `/**` everything inside, `a/**/b` zero or
+  more middle directories. A wildcard pattern does not recurse into a
+  directory it matches: `src/1*` selects no file under `src/12/`; write
+  `src/1*/**`.
+- Selected = (`paths` unset or any `paths` pattern matches) and no
+  `paths_ignore` pattern matches; `.sluice.toml` is then always added.
+  Each pattern is evaluated on its own (unlike `git ls-files -- <paths>
+  ':(exclude)<ignore>'`, which also strips the common literal prefix of
+  the positive pathspecs from the exclusions).
+- Every entry of the working-tree snapshot counts: tracked and untracked
+  non-ignored files, with mode and blob id (so `chmod +x` and a symlink
+  retarget invalidate; a symlink's target content is not followed).
+  Ignored files never do: use `key_files` for those.
+- Binaries older than 0.3.0 reject a `.sluice.toml` that uses these fields
+  (`unknown field paths`): every clone and worktree that runs Sluice on
+  that config needs 0.3.0 or later.
 
 ## Decisions on this format
 

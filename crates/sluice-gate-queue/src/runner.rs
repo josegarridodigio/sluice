@@ -15,9 +15,10 @@ use rusqlite::Transaction;
 use serde_json::json;
 use sluice_gate_core::config::{Gate, REPO_CONFIG_FILE, RepoConfig};
 use sluice_gate_core::git::RepoPaths;
-use sluice_gate_core::key::{self, KeyMaterial};
+use sluice_gate_core::key::CacheKey;
+use sluice_gate_core::lookup;
 use sluice_gate_core::marker::{Lookup, MarkerStore};
-use sluice_gate_core::tree::{self, Snapshot};
+use sluice_gate_core::tree::{self, SnapshotFull, StagedEntries, TreeHash};
 use sluice_gate_daemon::server::{DaemonHandle, RunSubscription, StoreError};
 use sluice_gate_proto::{
     Caller, GateSpec, OutcomeStatus, QueueJobState as J, QueueTrainState as T, RepoInfo,
@@ -911,17 +912,21 @@ async fn build_inner(core: &Arc<Core>, train: &TrainRow, config: Option<RepoConf
         objects_dir: train.repo.join("objects"),
     };
     let (p2, env, scratch) = (paths.clone(), core.git.env().clone(), core.scratch.clone());
-    let snap = blocking(move || tree::snapshot(&p2, &env, &scratch)).await?;
-    let tree_ok = matches!(&snap, Ok(Snapshot::Known(t)) if t.as_str() == merged.t);
-    if !tree_ok {
-        let why = match snap {
-            Ok(Snapshot::Known(t)) => format!("snapshot {t} != {}", merged.t),
-            Ok(Snapshot::Unknown { reason }) => reason,
-            Err(e) => e.to_string(),
-        };
-        return fail_survivors(core, train, "tree_mismatch", &json!({ "error": why }))
-            .map_err(|e| anyhow!(store_msg(&e)));
-    }
+    let snap = blocking(move || tree::snapshot_entries(&p2, &env, &scratch)).await?;
+    // The staged entries of the merge worktree feed path-scoped keys
+    // (design path-scoped-keys.md, section 7): no extra git spawn.
+    let entries = match snap {
+        Ok(SnapshotFull::Known { root, entries }) if root.as_str() == merged.t => Arc::new(entries),
+        other => {
+            let why = match other {
+                Ok(SnapshotFull::Known { root, .. }) => format!("snapshot {root} != {}", merged.t),
+                Ok(SnapshotFull::Unknown { reason }) => reason,
+                Err(e) => e.to_string(),
+            };
+            return fail_survivors(core, train, "tree_mismatch", &json!({ "error": why }))
+                .map_err(|e| anyhow!(store_msg(&e)));
+        }
+    };
 
     // Step 5–6: keys, markers, runs.
     let gates = select_gates(config.as_ref());
@@ -933,14 +938,15 @@ async fn build_inner(core: &Arc<Core>, train: &TrainRow, config: Option<RepoConf
     let ttl = core.handle.daemon_config().marker_ttl;
     for (name, gate) in gates {
         let key = if gate.cache {
-            let (g2, wt, env, tr, n) = (
+            let (g2, wt, env, tr, n, es) = (
                 gate.clone(),
                 train.worktree.clone(),
                 core.child_env.clone(),
                 tree_hash.clone(),
                 name.clone(),
+                Arc::clone(&entries),
             );
-            Some(blocking(move || derive_key(&g2, &n, &tr, &wt, &env)).await??)
+            Some(blocking(move || derive_key(&g2, &n, &tr, &es, &wt, &env)).await??)
         } else {
             None
         };
@@ -1237,30 +1243,32 @@ fn select_gates(config: Option<&RepoConfig>) -> Vec<(String, Gate)> {
         .collect()
 }
 
-/// The key a client would derive for `gate` on `tree` (`key_inputs` run in
-/// the merge worktree, `key_files` read there, no extra arguments).
-fn derive_key(
+/// The key a client would derive for `gate` on the merge worktree's
+/// snapshot (`tree` and its staged `entries`; `key_inputs` run in the merge
+/// worktree, `key_files` read there, no extra arguments), through the same
+/// shared core function the front-ends use.
+pub(crate) fn derive_key(
     gate: &Gate,
     name: &str,
-    tree: &sluice_gate_core::tree::TreeHash,
+    tree: &TreeHash,
+    entries: &StagedEntries,
     wt: &Path,
     child_env: &EnvMap,
-) -> Result<sluice_gate_core::key::CacheKey> {
-    let (key_inputs, key_files) = if gate.key_inputs.is_empty() && gate.key_files.is_empty() {
-        (Vec::new(), Vec::new())
-    } else {
-        let mut env = child_env.clone();
-        env.extend(gate.env.iter().map(|(k, v)| (k.clone(), v.clone())));
-        key::collect_inputs(&gate.key_inputs, &gate.key_files, wt, &env)?
-    };
-    Ok(key::derive(&KeyMaterial {
-        tree: tree.clone(),
-        gate_name: name.to_owned(),
-        cmd: sluice_gate_core::lookup::key_command(gate, &[]),
-        env: gate.env.clone(),
-        key_inputs,
-        key_files,
-    }))
+) -> Result<CacheKey> {
+    let mut env = None;
+    let (_, key) = lookup::derive_key_at(
+        gate,
+        name,
+        lookup::key_tree(gate, tree, entries),
+        &[],
+        wt,
+        || {
+            let mut e = child_env.clone();
+            e.extend(gate.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+            Ok(&*env.insert(e))
+        },
+    )?;
+    Ok(key)
 }
 
 fn fail_survivors(
@@ -1801,5 +1809,74 @@ mod tests {
         assert_eq!(t.state, T::Ready);
         let jobs = with(&mut c, |tx| store::train_jobs(tx, &t)).unwrap();
         assert_eq!(t.train_hash, current_hash(&t, &jobs, J::Ready));
+    }
+
+    /// Path-scoped keys, design section 9 case 26: an agent's `verify` and
+    /// the runner derive the same key for the same clean tree, scoped or not.
+    #[test]
+    fn agent_and_runner_derive_the_same_key() {
+        use sluice_gate_core::lookup::Lookup as State;
+        use sluice_gate_core::mode::CacheMode;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let dir = root.join("r");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        let mut env: EnvMap = std::env::vars()
+            .filter(|(k, _)| !k.starts_with("GIT_") && !k.starts_with("CLAUDE"))
+            .collect();
+        for (k, v) in [
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_AUTHOR_NAME", "T"),
+            ("GIT_AUTHOR_EMAIL", "t@example.com"),
+            ("GIT_COMMITTER_NAME", "T"),
+            ("GIT_COMMITTER_EMAIL", "t@example.com"),
+        ] {
+            env.insert(k.into(), v.into());
+        }
+        env.insert("XDG_RUNTIME_DIR".into(), root.display().to_string());
+        env.insert(
+            "SLUICE_CONFIG".into(),
+            root.join("none.toml").display().to_string(),
+        );
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .env_clear()
+                .envs(&env)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("src/a.rs"), "a\n").unwrap();
+        std::fs::write(dir.join("docs/x.md"), "x\n").unwrap();
+        std::fs::write(
+            dir.join(REPO_CONFIG_FILE),
+            "version = 1\n[gates.scoped]\ncmd = \"true\"\npaths = [\"src\"]\n\
+             key_inputs = [\"echo $FOO\"]\nenv = { FOO = \"1\" }\n\
+             [gates.plain]\ncmd = \"true\"\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        for name in ["scoped", "plain"] {
+            let r = lookup::resolve(&dir, &env, name, &CacheMode::Enabled).unwrap();
+            let State::Miss { tree, key, .. } = lookup::lookup(&r, &CacheMode::Enabled, &[]) else {
+                panic!("expected a miss");
+            };
+            let Ok(SnapshotFull::Known { root, entries }) =
+                tree::snapshot_entries(&r.paths, &r.probe_env, &r.scratch)
+            else {
+                panic!("snapshot");
+            };
+            assert_eq!(root, tree);
+            let runner = derive_key(&r.gate, name, &root, &entries, &dir, &env).unwrap();
+            assert_eq!(runner, key, "gate {name}");
+        }
     }
 }

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Path-scoped gates: optional `paths` / `paths_ignore` (git glob pathspecs,
+  root-relative; `.sluice.toml` always counts). The key hashes only the
+  selected files, so changes outside the scope keep the cached pass, with
+  no extra git call; unscoped keys and markers are unchanged. `cache
+  status` and MCP `status` show the scope and `sluice doctor` warns about
+  manifests and lockfiles outside it. A config using them needs Sluice
+  0.3.0 or newer.
 - `sluice exec [--weight N] [--label L] [--coalesce-key K] [--timeout DUR]
   [-q] -- <cmd>` runs any command under the budget without cache, replays
   its output byte for byte, propagates the exit code (128+N on signals),

@@ -258,10 +258,11 @@ run. Without a daemon it runs in-process under the same budget semaphore.
 
 ## Monorepos with several packages
 
-Today a gate's key is the whole tree: a change in any package re-runs every
-gate. Path-scoped gates, which would let a change in one package skip the
-others, are planned for 0.3.0. Until then, split the work into one gate per
-package so a failure is easy to read, and give each its own weight:
+By default a gate's key is the whole tree: a change in any package re-runs
+every gate. Give each package its own gate and, from Sluice 0.3.0, scope
+each gate with `paths` (and `paths_ignore`) so its key only covers the files
+it reads: an edit under `services/api/` then leaves `web-test` and
+`worker-test` cached, and a README edit leaves all of them cached.
 
 ```toml
 version = 1
@@ -275,6 +276,8 @@ weight = 1
 timeout = "5m"
 hooks = ["pre-commit"]
 key_inputs = ["node --version"]
+paths = ["web", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"]
+paths_ignore = ["web/**/*.md"]
 
 [gates.web-test]
 cmd = "pnpm --filter web test -- --maxWorkers=2"
@@ -283,6 +286,8 @@ timeout = "15m"
 hooks = ["pre-push"]
 key_inputs = ["node --version"]
 depends_on = ["web-lint"]
+paths = ["web", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"]
+paths_ignore = ["web/**/*.md"]
 
 [gates.api-test]
 cmd = "cd services/api && python3 -m pytest -n 2 -q"
@@ -290,6 +295,7 @@ weight = 2
 timeout = "15m"
 hooks = ["pre-push"]
 key_inputs = ["python3 --version"]
+paths = ["services/api"]
 
 [gates.worker-test]
 cmd = "cd services/worker && go test -p 2 ./..."
@@ -297,11 +303,70 @@ weight = 2
 timeout = "15m"
 hooks = ["pre-push"]
 key_inputs = ["go version"]
+paths = ["services/worker", "go.work", "go.work.sum"]
+
+[gates.docs]
+cmd = "mdbook build docs"
+paths = ["docs"]
 
 [queue]
 gates = ["web-lint", "web-test", "api-test", "worker-test"]
 max_train = 4
 ```
+
+A Rust workspace scoped so that documentation-only commits never re-run the
+test suite:
+
+```toml
+[gates.test]
+cmd = "cargo test --workspace"
+weight = 6
+hooks = ["pre-push"]
+key_inputs = ["rustc --version"]
+paths = ["crates/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo"]
+paths_ignore = ["crates/**/*.md"]
+```
+
+`paths_ignore` alone means "everything except": `paths_ignore = ["docs",
+"**/*.png"]`.
+
+### Choosing paths
+
+Path scoping is opt-in because a scope that is too small gives **stale
+passes**: if the gate reads a file outside its scope, editing that file no
+longer re-runs it. Before scoping a gate, list everything it reads:
+
+- the package directory itself;
+- root manifests and lockfiles: Rust `Cargo.toml`, `Cargo.lock`,
+  `rust-toolchain.toml`, `.cargo/config.toml`; Node `package.json`,
+  `package-lock.json` / `pnpm-lock.yaml` / `yarn.lock`,
+  `pnpm-workspace.yaml`, `tsconfig*.json`, `.nvmrc`; Python
+  `pyproject.toml`, `uv.lock` / `poetry.lock`, `requirements*.txt`,
+  `setup.cfg`; Go `go.mod`, `go.sum`, `go.work`; plus `Makefile`,
+  `Dockerfile`, `.tool-versions`;
+- shared code, fixtures, generated code and `build.rs` inputs that live in
+  other directories;
+- symlink targets: a symlink in the scope is hashed by its target path,
+  not by the target's content.
+
+Rules that catch people out:
+
+- Patterns are root-relative git glob pathspecs. `docs` (no wildcard)
+  covers the whole directory; `src/*.rs` matches only files directly in
+  `src/`; `**/*.rs` matches at any depth.
+- A wildcard pattern does not recurse: `src/1*` does not cover the files in
+  `src/12/`; write `src/1*/**`.
+- `.sluice.toml` is always in the scope, so editing any gate invalidates
+  every scoped gate (as it does unscoped ones).
+- Files git ignores are never in the scope; declare them in `key_files`.
+- Every Sluice that reads the config must be 0.3.0 or later: older
+  binaries reject `paths` as an unknown field.
+
+`sluice cache status` shows how many files each scoped gate covers
+(`[scoped: 212 of 5000 files, 3f2a…]`), and `sluice doctor` warns when a
+well-known manifest or lockfile next to the scoped files is outside the
+scope, when a pattern matches nothing, and when a symlink in the scope
+points outside it.
 
 Notes:
 

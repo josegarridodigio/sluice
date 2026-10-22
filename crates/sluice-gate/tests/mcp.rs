@@ -597,3 +597,43 @@ async fn mcp_writes_a_persistent_log_next_to_stderr() {
     let out = sb.sluice().arg("logs").output().expect("logs");
     assert!(out.status.success(), "{out:?}");
 }
+
+/// Path-scoped keys, design section 9 case 22: MCP `status` reports the
+/// scope of a scoped gate (`files`, `total`, `hash`) and none for others.
+#[tokio::test(flavor = "multi_thread")]
+async fn status_reports_the_scope_of_scoped_gates() {
+    let sb = Sandbox::new(
+        "\n[gates.scoped]\ncmd = \"true\"\npaths = [\"src\"]\n[gates.plain]\ncmd = \"true\"\n",
+    );
+    fs::create_dir_all(sb.repo.join("src")).unwrap();
+    fs::write(sb.repo.join("src/a.rs"), "a\n").unwrap();
+    let client = connect(&sb, Counter::default()).await;
+    let r = call(
+        &client,
+        "status",
+        &json!({"working_directory": repo_arg(&sb)}),
+    )
+    .await;
+    let s = structured(&r);
+    let gate = |name: &str| {
+        s["cache"]["gates"]
+            .as_array()
+            .expect("cache gates")
+            .iter()
+            .find(|g| g["gate"] == name)
+            .unwrap_or_else(|| panic!("no gate {name} in {s}"))
+            .clone()
+    };
+    let scoped = gate("scoped");
+    // .gitignore, a.txt, .sluice.toml and the untracked src/a.rs.
+    assert_eq!(scoped["scope"]["files"], 1, "{s}");
+    assert_eq!(scoped["scope"]["total"], 4, "{s}");
+    assert_eq!(
+        scoped["scope"]["hash"].as_str().map(str::len),
+        Some(64),
+        "{s}"
+    );
+    assert!(gate("plain").get("scope").is_none(), "{s}");
+    assert!(text(&r).contains("[scoped: 1 of 4 files, "), "{}", text(&r));
+    client.cancel().await.expect("shutdown");
+}

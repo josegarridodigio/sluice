@@ -12,10 +12,11 @@ use std::time::Duration;
 use crate::Result;
 use crate::config::{Gate, RepoConfig, UserConfig};
 use crate::git::{self, EnvMap, RepoPaths};
-use crate::key::{self, CacheKey, KeyMaterial};
+use crate::key::{self, CacheKey, KeyMaterial, KeyTree};
 use crate::marker::{self, Marker, MarkerStore, MissRecord};
 use crate::mode::CacheMode;
-use crate::tree::{self, Snapshot, TreeHash};
+use crate::scope::{PathScope, ScopeCount, ScopeHash};
+use crate::tree::{self, SnapshotFull, StagedEntries, TreeHash};
 
 /// Environment variable carrying the Claude Code session id.
 const SESSION_VAR: &str = "CLAUDE_CODE_SESSION_ID";
@@ -144,7 +145,14 @@ pub fn resolve(cwd: &Path, env: &EnvMap, gate_name: &str, mode: &CacheMode) -> R
 #[allow(clippy::large_enum_variant)] // one value per gate; boxing buys nothing
 pub enum Lookup {
     /// A fresh marker matched: nothing to run.
-    Hit(Marker),
+    Hit {
+        /// The marker that matched.
+        marker: Marker,
+        /// The current root working tree. For a path-scoped gate it can
+        /// differ from `marker.tree` (the tree of the earlier pass), so
+        /// anything about "now" must use this one.
+        tree: TreeHash,
+    },
     /// The tree is known and no marker matched.
     Miss {
         /// Snapshot of the working tree.
@@ -192,9 +200,9 @@ pub fn lookup(r: &Resolved, mode: &CacheMode, extra: &[String]) -> Lookup {
     if !r.gate.cache {
         return Lookup::off(format!("gate '{}' has cache = false", r.gate_name), None);
     }
-    let tree = match tree::snapshot(&r.paths, &r.probe_env, &r.scratch) {
-        Ok(Snapshot::Known(tree)) => tree,
-        Ok(Snapshot::Unknown { reason }) => {
+    let (tree, entries) = match tree::snapshot_entries(&r.paths, &r.probe_env, &r.scratch) {
+        Ok(SnapshotFull::Known { root, entries }) => (root, entries),
+        Ok(SnapshotFull::Unknown { reason }) => {
             return Lookup::off(
                 format!("tree unknown: {reason}"),
                 Some(format!("tree unknown ({reason}); running uncached")),
@@ -207,7 +215,7 @@ pub fn lookup(r: &Resolved, mode: &CacheMode, extra: &[String]) -> Lookup {
             );
         }
     };
-    let (cmd, key) = match derive_key(r, &tree, extra) {
+    let (cmd, key) = match derive_key(r, key_tree(&r.gate, &tree, &entries), extra) {
         Ok(v) => v,
         Err(e) => {
             return Lookup::off(
@@ -219,7 +227,7 @@ pub fn lookup(r: &Resolved, mode: &CacheMode, extra: &[String]) -> Lookup {
         }
     };
     match r.store.lookup(&key, r.ttl) {
-        Ok(marker::Lookup::Hit(marker)) => Lookup::Hit(marker),
+        Ok(marker::Lookup::Hit(marker)) => Lookup::Hit { marker, tree },
         Ok(marker::Lookup::Miss(last_miss)) => Lookup::Miss {
             tree,
             key,
@@ -277,33 +285,98 @@ pub fn key_command(gate: &Gate, extra: &[String]) -> String {
     crate::key::command_with_args(&gate.normalized_cmd(), extra)
 }
 
-/// Derives the cache key of the gate for `tree` and the extra arguments of
-/// the call; returns the key command ([`key_command`]) as well.
+/// The tree field of `gate`'s key for a snapshot: the root tree when the
+/// gate is unscoped, else the hash of the entries its `paths` and
+/// `paths_ignore` select (plus `.sluice.toml`). Used by every front-end and
+/// by the merge queue, so they always agree.
+pub fn key_tree(gate: &Gate, root: &TreeHash, entries: &StagedEntries) -> KeyTree {
+    match PathScope::from_gate(gate) {
+        None => KeyTree::Root(root.clone()),
+        Some(scope) => KeyTree::Scoped(scope.hash(entries)),
+    }
+}
+
+/// What a scoped gate selects in a snapshot (`cache status`, MCP `status`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeSummary {
+    /// Selected and total entries.
+    pub count: ScopeCount,
+    /// The scope hash.
+    pub hash: ScopeHash,
+}
+
+impl ScopeSummary {
+    /// The ` [scoped: <n> of <total> files, <12 hex>]` suffix of a status line.
+    #[must_use]
+    pub fn status_suffix(&self) -> String {
+        format!(
+            " [scoped: {} of {} files, {}]",
+            self.count.files,
+            self.count.total,
+            &self.hash.as_str()[..12]
+        )
+    }
+}
+
+/// [`ScopeSummary`] of `gate`, `None` for an unscoped gate.
+pub fn scope_summary(gate: &Gate, entries: &StagedEntries) -> Option<ScopeSummary> {
+    PathScope::from_gate(gate).map(|scope| ScopeSummary {
+        count: scope.count(entries),
+        hash: scope.hash(entries),
+    })
+}
+
+/// The one key derivation shared by the front-ends ([`derive_key`]) and the
+/// merge queue: `key_inputs` run and `key_files` read in `root_dir`;
+/// `child_env` (the gate process environment, `gate.env` included) is only
+/// requested when the gate has key inputs or files. Returns the key command
+/// ([`key_command`]) and the key.
 ///
 /// # Errors
 ///
-/// When a `key_inputs` command or a `key_files` entry cannot be read.
-pub fn derive_key(r: &Resolved, tree: &TreeHash, extra: &[String]) -> Result<(String, CacheKey)> {
-    let (key_inputs, key_files) = if r.gate.key_inputs.is_empty() && r.gate.key_files.is_empty() {
+/// When the environment cannot be built, or a `key_inputs` command or a
+/// `key_files` entry cannot be read.
+pub fn derive_key_at<'e>(
+    gate: &Gate,
+    gate_name: &str,
+    tree: KeyTree,
+    extra: &[String],
+    root_dir: &Path,
+    child_env: impl FnOnce() -> Result<&'e EnvMap>,
+) -> Result<(String, CacheKey)> {
+    let (key_inputs, key_files) = if gate.key_inputs.is_empty() && gate.key_files.is_empty() {
         (Vec::new(), Vec::new())
     } else {
-        key::collect_inputs(
-            &r.gate.key_inputs,
-            &r.gate.key_files,
-            &r.paths.toplevel,
-            r.child_env()?,
-        )?
+        key::collect_inputs(&gate.key_inputs, &gate.key_files, root_dir, child_env()?)?
     };
-    let cmd = key_command(&r.gate, extra);
+    let cmd = key_command(gate, extra);
     let material = KeyMaterial {
-        tree: tree.clone(),
-        gate_name: r.gate_name.clone(),
+        tree,
+        gate_name: gate_name.to_owned(),
         cmd: cmd.clone(),
-        env: r.gate.env.clone(),
+        env: gate.env.clone(),
         key_inputs,
         key_files,
     };
     Ok((cmd, key::derive(&material)))
+}
+
+/// Derives the cache key of the resolved gate for `tree` (see [`key_tree`])
+/// and the extra arguments of the call; returns the key command
+/// ([`key_command`]) as well.
+///
+/// # Errors
+///
+/// When a `key_inputs` command or a `key_files` entry cannot be read.
+pub fn derive_key(r: &Resolved, tree: KeyTree, extra: &[String]) -> Result<(String, CacheKey)> {
+    derive_key_at(
+        &r.gate,
+        &r.gate_name,
+        tree,
+        extra,
+        &r.paths.toplevel,
+        || r.child_env(),
+    )
 }
 
 /// Tree of the index (the content being committed inside `pre-commit`).
@@ -360,7 +433,9 @@ pub fn run_material(
 ) -> Result<RunMaterial> {
     let (key, tree) = match state {
         Lookup::Miss { tree, key, .. } => (Some(key.clone()), Some(tree.clone())),
-        Lookup::Hit(m) => (Some(m.key.clone()), Some(m.tree.clone())),
+        // The current tree, never `marker.tree`: on a scoped hit that is the
+        // tree of the earlier pass.
+        Lookup::Hit { marker, tree } => (Some(marker.key.clone()), Some(tree.clone())),
         Lookup::Off { .. } => (None, None),
     };
     let committed_tree = if tree.is_some() && hook == Some("pre-commit") {
@@ -434,7 +509,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             lookup(&r, &CacheMode::Enabled, &[]),
-            Lookup::Hit(_)
+            Lookup::Hit { .. }
         ));
 
         let disabled = CacheMode::Disabled {
@@ -454,6 +529,81 @@ mod tests {
         assert_eq!(m.extra, vec!["-x".to_owned()]);
 
         assert!(resolve(&cwd, &env, "nope", &CacheMode::Enabled).is_err());
+    }
+
+    fn pass(r: &Resolved, key: CacheKey, tree: TreeHash, cmd: String) {
+        r.store
+            .write(&Marker {
+                format: crate::CACHE_FORMAT_VERSION,
+                key,
+                tree,
+                gate: r.gate_name.clone(),
+                cmd,
+                passed_at: crate::dirs::now_rfc3339(),
+                duration_ms: 5,
+                exit_code: 0,
+                job_id: "j".into(),
+                sluice_version: crate::SLUICE_VERSION.into(),
+                committed_tree: None,
+            })
+            .unwrap();
+    }
+
+    /// Design section 9 case 18: a scoped hit after an out-of-scope edit
+    /// reports the current root tree, never the marker's.
+    #[test]
+    fn scoped_hit_carries_the_current_tree() {
+        let (tmp, env) = repo("[gates.s]\ncmd = \"true\"\npaths = [\"src\"]\n");
+        let cwd = tmp.path().join("r");
+        let r = resolve(&cwd, &env, "s", &CacheMode::Enabled).unwrap();
+        let Lookup::Miss { tree, key, cmd, .. } = lookup(&r, &CacheMode::Enabled, &[]) else {
+            panic!("expected a miss");
+        };
+        pass(&r, key.clone(), tree.clone(), cmd);
+
+        std::fs::write(cwd.join("a.txt"), "edited outside the scope\n").unwrap();
+        let state = lookup(&r, &CacheMode::Enabled, &[]);
+        let Lookup::Hit {
+            marker,
+            tree: current,
+        } = &state
+        else {
+            panic!("expected a scoped hit, got {state:?}");
+        };
+        assert_eq!(marker.tree, tree);
+        assert_ne!(current, &tree, "the root tree moved");
+        let m = run_material(&r, &state, &[], None).unwrap();
+        assert_eq!(m.tree.as_ref(), Some(current));
+        assert_eq!(m.key.as_ref(), Some(&key));
+
+        // An in-scope edit misses.
+        std::fs::create_dir(cwd.join("src")).unwrap();
+        std::fs::write(cwd.join("src/x.rs"), "x\n").unwrap();
+        assert!(matches!(
+            lookup(&r, &CacheMode::Enabled, &[]),
+            Lookup::Miss { .. }
+        ));
+    }
+
+    /// Pins the key of an unscoped gate on a fixed tree, computed with the
+    /// 0.2 code before path scoping existed: markers written by 0.2 must keep
+    /// hitting (design path-scoped-keys.md, section 6).
+    #[test]
+    fn unscoped_key_is_byte_identical_to_v0_2() {
+        let (tmp, env) = repo(
+            "[gates.t]\ncmd = \"cargo  test\"\nkey_inputs = [\"echo hi\"]\n\
+             key_files = [\"missing.txt\"]\nenv = { A = \"1\" }\n",
+        );
+        let r = resolve(&tmp.path().join("r"), &env, "t", &CacheMode::Enabled).unwrap();
+        let Lookup::Miss { tree, key, cmd, .. } = lookup(&r, &CacheMode::Enabled, &[]) else {
+            panic!("expected a miss");
+        };
+        assert_eq!(cmd, "cargo test");
+        assert_eq!(tree.as_str(), "ac55a1347b7ff3e9a45d482d556ffe9993bd54bf");
+        assert_eq!(
+            key.as_str(),
+            "08351912397b2ba196e749077d406de3f70abc2b4b533d5c63f271c524431d46"
+        );
     }
 
     #[test]
