@@ -160,11 +160,14 @@ result; a job id with unsafe characters is `invalid_params`.
 
 ## Merge-queue tools (Phase 6)
 
-Three tools, thin clients of the `queue-*` messages
+Five tools, thin clients of the `queue-*` messages
 ([[sluice/design/protocol.md]] "Merge queue",
 [[sluice/design/merge-queue.md]] sections 8, 9 and 12; change record
 [[sluice/changes/phase-6-mcp.md]]). Code: `crates/sluice-gate-mcp/src/queue.rs`
-(helpers, text, schema mirrors) and the three `#[tool]` methods in `lib.rs`.
+(helpers, text, schema mirrors) and the five `#[tool]` methods in `lib.rs`.
+Every request the tools send carries `via: mcp` (`queue-approve` always did;
+`queue-enqueue`, `queue-retry`, `queue-cancel` through their optional
+`via`), so `queue_events.actor` records `mcp`.
 
 Common rules:
 
@@ -183,8 +186,8 @@ Common rules:
   `not-supported`, `not-found`, `internal`, plus codes minted by the server
   before or around the daemon call: `dirty-worktree`, `detached-head`,
   `unknown-branch`, `not-a-repository`, `git`, `unavailable` (daemon cannot be
-  reached). Only a bad or relative `working_directory` or an unsafe `train_id`
-  is an MCP error (`invalid_params`).
+  reached). Only a bad or relative `working_directory` or an unsafe
+  `train_id`/`job_id` is an MCP error (`invalid_params`).
 - The env sent to the daemon is the allowlist `SSH_AUTH_SOCK`,
   `SSH_AGENT_PID`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `SSH_ASKPASS`, `HOME`,
   `PATH`, `TERM` (only variables that are present).
@@ -207,9 +210,11 @@ even when `branch` names another branch), a detached HEAD without `branch`
 (`detached-head`), and a branch with no local ref (`unknown-branch`). It
 then sends `queue-enqueue {repo: git common dir, worktree: toplevel, branch,
 head_sha: refs/heads/<branch>^{commit}, base, caller: agent, session:
-$CLAUDE_CODE_SESSION_ID, env}`. A branch equal to the target, a base that is
-not a branch and an already active branch are refused by the daemon
-(`conflict-state`, `duplicate-branch`).
+$CLAUDE_CODE_SESSION_ID, env, via: mcp}`. A branch equal to the target, a
+base that is not a branch and an already active branch are refused by the
+daemon (`not-allowed`, `bad-request`, `duplicate-branch`). A job in
+`conflict` or `failed` still holds its branch: the way back is
+`queue_retry`, not a new `queue_enqueue`.
 
 Text: `queued <branch> (job <id>) for <remote>/<target>, position N` (no
 `position` when the job is not queued: `, state <state>`), then one line
@@ -223,8 +228,10 @@ view (`QueueJobView`: `job_id`, `branch`, `head_sha`, `remote`, `target`,
 Inputs: `working_directory`. Sends `queue-status {repo: common dir}`. Text:
 one block per train (`train <id>  <remote>/<target>  base <sha7>  <STATE>`),
 its members (`<branch>  job <id>  <state>`, queued position, `CONFLICT
-<paths>` with `rebase '<branch>' onto <target>, then call queue_enqueue
-again`, failure reasons), its gates (`test PASS 12.4s`, `lint CACHED`), and a
+<paths>` with `rebase '<branch>' onto <target>, run `verify`, then call
+queue_retry with job_id <id>`, failure reasons and, for a `failed` job, `fix
+and commit on '<branch>', run `verify`, then call queue_retry with job_id
+<id>`), its gates (`test PASS 12.4s`, `lint CACHED`), and a
 state line: `ready; a human approves with `sluice queue approve <id>``,
 `approved; the daemon is pushing`, `landed <sha7>`, `push outcome unknown; a
 human runs `sluice queue reconcile``; jobs outside any train follow. Conflict
@@ -249,8 +256,10 @@ Inputs: `working_directory`, `train_id`.
    answers `not-allowed` if the flag is off (the daemon's copy of the user
    config); a changed train gives `stale-plan`.
 4. On `queue-approved` with the train `approved`/`pushing`, it polls
-   `queue-status` every second, up to 10 minutes (the default
-   `[queue] push_timeout`), until the train is `landed`, `needs_reconcile`
+   `queue-status` every second, up to the train's `push_timeout_ms` plus
+   its `network_timeout_ms` (pre-push checks), two user-config `[queue]
+   tick`s and 30 s (defaults 10 min and 60 s when the daemon does not report
+   them; `approve_wait`), until the train is `landed`, `needs_reconcile`
    or disappears/`dissolved`; it sends a progress notification every
    `[mcp] progress_interval` when the request has a progress token.
    Cancelling the call stops the wait, never the push.
@@ -260,6 +269,26 @@ Text: `landed <sha7> on <remote>/<target> (train <id>)`, or
 is still …`. `is_error` is set unless it landed. `structured_content`
 (`ApproveReport`): `{train_id, state, landed, train}` with the last known
 train view.
+
+### `queue_retry`
+
+Inputs: `working_directory`, `job_id`. Fetches `queue-status` for the
+repository (`not-found` when the job is not one of its jobs), re-reads
+`refs/heads/<job branch>^{commit}` in that repository like `sluice queue
+retry` (`unknown-branch` when the branch is gone) and sends `queue-retry
+{job_id, head_sha, via: mcp}`. The daemon accepts only `conflict` and
+`failed` jobs (`conflict-state` otherwise) and re-queues the job at the back
+with the new head. Text: `requeued <branch> (job <id>) at <sha7> for
+<target>, position N` and a line telling the agent to stop.
+`structured_content`: the job view.
+
+### `queue_cancel`
+
+Inputs: `working_directory`, `job_id`. Checks that the job belongs to the
+repository (`not-found`), then sends `queue-cancel {job_id, via: mcp}`.
+Text: `<branch> (job <id>) is <state>`, or `cancel requested for …` when the
+job is `pushing`/`needs_reconcile` (only recorded; honoured once nothing
+landed is proven). `structured_content`: the job view.
 
 ## Agent policy integration (G7)
 

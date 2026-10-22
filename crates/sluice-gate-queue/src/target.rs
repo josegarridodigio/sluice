@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
-use sluice_gate_core::config::{QueueConfig, REPO_CONFIG_FILE, RepoConfig};
+use sluice_gate_core::config::{QueueConfig, REPO_CONFIG_FILE, RepoConfig, invalid_remote_name};
 
 use crate::git::Git;
 
@@ -36,8 +36,9 @@ impl Target {
 }
 
 /// Why a base was refused. `code` is the machine-readable token placed
-/// first in the error message (`invalid_base`, `tag`, `sha`, `head`,
-/// `own_branch`, `target_checked_out`, `unknown_base`, `no_default_target`).
+/// first in the error message (`invalid_base`, `invalid_remote`, `tag`,
+/// `sha`, `head`, `own_branch`, `target_checked_out`, `unknown_base`,
+/// `no_default_target`).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{code}: {message}")]
 pub struct TargetError {
@@ -83,34 +84,48 @@ fn remotes(git: &Git, common: &Path) -> Vec<String> {
 }
 
 /// True when `remote` has the branch: a remote-tracking ref exists, or
-/// `ls-remote` lists it.
+/// `ls-remote` of its push URL lists it.
 fn remote_has_branch(git: &Git, common: &Path, remote: &str, branch: &str) -> bool {
     let tracking = format!("refs/remotes/{remote}/{branch}");
     if git.ref_sha(common, &tracking).ok().flatten().is_some() {
         return true;
     }
     let head = format!("refs/heads/{branch}");
-    git.ls_remote(common, remote, &[&head])
+    git.push_url(common, remote)
+        .and_then(|url| git.ls_remote(common, &url, &[&head]))
         .is_ok_and(|m| m.contains_key(&head))
 }
 
 /// The remote's HEAD branch: `refs/remotes/<remote>/HEAD`, else
-/// `ls-remote --symref <remote> HEAD`.
+/// `ls-remote --symref <push url> HEAD`.
 fn remote_head_branch(git: &Git, common: &Path, remote: &str) -> Option<String> {
     let sym = format!("refs/remotes/{remote}/HEAD");
-    if let Ok(full) = git.repo(common, &["symbolic-ref", "--quiet", &sym]) {
+    if let Ok(full) = git.repo(common, &["symbolic-ref", "--quiet", "--", &sym]) {
         let prefix = format!("refs/remotes/{remote}/");
         if let Some(b) = full.strip_prefix(&prefix) {
             return Some(b.to_owned());
         }
     }
-    let out = git
-        .repo(common, &["ls-remote", "--symref", remote, "HEAD"])
-        .ok()?;
-    out.lines().find_map(|l| {
-        let rest = l.strip_prefix("ref: refs/heads/")?;
-        Some(rest.split('\t').next()?.trim().to_owned())
-    })
+    let url = git.push_url(common, remote).ok()?;
+    git.remote_head(common, &url).ok().flatten()
+}
+
+/// Refuses a remote that git would read as an option, or that is not a
+/// configured remote of the repository (`invalid_remote`).
+fn check_remote(git: &Git, common: &Path, remote: &str) -> Result<(), TargetError> {
+    if let Some(why) = invalid_remote_name(remote) {
+        return Err(TargetError::new(
+            "invalid_remote",
+            format!("the remote name '{remote}' {why}"),
+        ));
+    }
+    if !remotes(git, common).iter().any(|r| r == remote) {
+        return Err(TargetError::new(
+            "invalid_remote",
+            format!("'{remote}' is not a configured remote of this repository"),
+        ));
+    }
+    Ok(())
 }
 
 fn looks_like_sha(s: &str) -> bool {
@@ -140,6 +155,7 @@ pub fn resolve(
     let target = match base.map(str::trim).filter(|s| !s.is_empty()) {
         None => {
             let remote = defaults.remote.clone();
+            check_remote(git, common, &remote)?;
             let branch = match &defaults.target {
                 Some(t) => t.clone(),
                 None => remote_head_branch(git, common, &remote).ok_or_else(|| {
@@ -284,19 +300,35 @@ pub fn strip_userinfo(url: &str) -> String {
     format!("{scheme}://{host}{path}")
 }
 
-/// Endpoint binding: `sha256(git ls-remote --get-url <remote>)` with the
-/// userinfo stripped; for a local target, `sha256("local:" + common dir)`.
+/// The endpoint of a target: `(push URL, endpoint hash)`. Endpoint
+/// binding: `sha256(git remote get-url --push <remote>)` with the userinfo
+/// stripped (the URL `git push <remote>` uses, `pushurl` and
+/// `pushInsteadOf` included); for a local target `("",
+/// sha256("local:" + common dir))`.
 ///
 /// # Errors
 ///
-/// Git failure.
+/// An invalid or unknown remote, or several push URLs ([`Git::push_url`]).
+pub fn endpoint(git: &Git, common: &Path, remote: &str) -> anyhow::Result<(String, String)> {
+    if remote.is_empty() {
+        let material = format!("local:{}", common.display());
+        return Ok((
+            String::new(),
+            hex::encode(Sha256::digest(material.as_bytes())),
+        ));
+    }
+    let url = git.push_url(common, remote)?;
+    let hash = hex::encode(Sha256::digest(strip_userinfo(&url).as_bytes()));
+    Ok((url, hash))
+}
+
+/// The endpoint hash alone (see [`endpoint`]).
+///
+/// # Errors
+///
+/// As [`endpoint`].
 pub fn endpoint_hash(git: &Git, common: &Path, remote: &str) -> anyhow::Result<String> {
-    let material = if remote.is_empty() {
-        format!("local:{}", common.display())
-    } else {
-        strip_userinfo(&git.repo(common, &["ls-remote", "--get-url", remote])?)
-    };
-    Ok(hex::encode(Sha256::digest(material.as_bytes())))
+    endpoint(git, common, remote).map(|(_, h)| h)
 }
 
 #[cfg(test)]

@@ -259,6 +259,15 @@ pub struct Daemon {
 }
 
 pub fn daemon_config(state: &Path, user: UserConfig, base_env: EnvMap) -> DaemonConfig {
+    daemon_config_with(state, user, base_env, None)
+}
+
+pub fn daemon_config_with(
+    state: &Path,
+    user: UserConfig,
+    base_env: EnvMap,
+    push_program: Option<PathBuf>,
+) -> DaemonConfig {
     DaemonConfig {
         socket_path: state.join("d.sock"),
         lock_path: state.join("daemon.lock"),
@@ -282,6 +291,7 @@ pub fn daemon_config(state: &Path, user: UserConfig, base_env: EnvMap) -> Daemon
         user,
         extensions: vec![Arc::new(QueueExtension::new(QueueOptions {
             base_env: Some(base_env),
+            push_program,
         }))],
     }
 }
@@ -295,9 +305,14 @@ pub fn user_config(allow_agent_approval: bool) -> UserConfig {
 
 impl Daemon {
     pub async fn start(fx: &Fixture, user: UserConfig) -> Self {
+        Self::start_with(fx, user, None).await
+    }
+
+    /// Like [`Daemon::start`]; `push_program` replaces `git` for the push.
+    pub async fn start_with(fx: &Fixture, user: UserConfig, push_program: Option<PathBuf>) -> Self {
         let state = fx.root.join("state");
         std::fs::create_dir_all(&state).unwrap();
-        let cfg = daemon_config(&state, user, fx.queue_env());
+        let cfg = daemon_config_with(&state, user, fx.queue_env(), push_program);
         let socket = cfg.socket_path.clone();
         let _ = std::fs::remove_file(&socket);
         let (tx, rx) = oneshot::channel::<()>();
@@ -357,6 +372,7 @@ impl Daemon {
                 caller: Caller::Agent,
                 session: Some("s1".into()),
                 env: fx.client_env(),
+                via: None,
             },
         })
         .await
@@ -407,6 +423,17 @@ impl Daemon {
         self.ask(&ClientMessage::QueueCancel {
             id: 4,
             job_id: job.into(),
+            via: None,
+        })
+        .await
+    }
+
+    pub async fn retry(&self, job: &str, head_sha: &str) -> ServerMessage {
+        self.ask(&ClientMessage::QueueRetry {
+            id: 6,
+            job_id: job.into(),
+            head_sha: head_sha.into(),
+            via: None,
         })
         .await
     }

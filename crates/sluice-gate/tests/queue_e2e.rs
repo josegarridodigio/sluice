@@ -743,6 +743,146 @@ async fn acceptance_6_mcp_approval_refused_by_default_then_allowed() {
     client.cancel().await.expect("shutdown");
 }
 
+/// Calls an MCP tool with `args`.
+async fn mcp_call(client: &McpClient, name: &'static str, args: Value) -> CallToolResult {
+    let Value::Object(args) = args else {
+        unreachable!()
+    };
+    client
+        .call_tool(CallToolRequestParams::new(name).with_arguments(args))
+        .await
+        .expect(name)
+}
+
+/// After a conflict the agent is not stuck: `queue_enqueue` answers
+/// `duplicate-branch` (the job keeps the branch), `queue_status` names
+/// `queue_retry`, which re-reads the rebased branch head and re-queues the
+/// job; `queue_cancel` withdraws it. Every MCP request is audited as `mcp`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines, reason = "one scenario, step by step")]
+async fn mcp_retry_and_cancel_after_a_conflict() {
+    let q = Q::new(GATE);
+    let (wa, _a) = q.worktree("feat/a", &[("a.txt", "from A\n")]);
+    let (wb, _b) = q.worktree("feat/b", &[("a.txt", "from B\n")]);
+    let ja = q.enqueue(&wa, &[]);
+    q.wait_ready("A ready", |t| members(t) == vec![ja.clone()]);
+    let client = mcp(&q.sb).await;
+    let wb_dir = wb.display().to_string();
+    // A lands first; B, enqueued over MCP, then conflicts with the new main.
+    let out = q.approve(&q.wait_ready("A", |_| true));
+    assert!(out.status.success(), "{}", show(&out));
+    let r = mcp_call(
+        &client,
+        "queue_enqueue",
+        json!({"working_directory": wb_dir}),
+    )
+    .await;
+    assert_ne!(r.is_error, Some(true), "{}", tool_text(&r));
+    let jb = structured_job_id(&r);
+    q.wait("B conflicts", |v| job_is(v, &jb, "conflict"));
+    let r = mcp_call(
+        &client,
+        "queue_status",
+        json!({"working_directory": wb_dir}),
+    )
+    .await;
+    let status = tool_text(&r);
+    evidence("mcp status after conflict", &status);
+    assert!(
+        status.contains(&format!("call queue_retry with job_id {jb}")),
+        "{status}"
+    );
+    let r = mcp_call(
+        &client,
+        "queue_enqueue",
+        json!({"working_directory": wb_dir}),
+    )
+    .await;
+    assert!(
+        tool_text(&r).starts_with("duplicate-branch: "),
+        "{}",
+        tool_text(&r)
+    );
+    // Rebase B onto the landed main with a non-conflicting change.
+    q.sb.git_in(&wb, &["fetch", "-q", "origin"]);
+    q.sb.git_in(&wb, &["reset", "-q", "--hard", "origin/main"]);
+    fs::write(wb.join("b.txt"), "b\n").expect("write");
+    q.sb.git_in(&wb, &["add", "-A"]);
+    q.sb.git_in(
+        &wb,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "b again",
+        ],
+    );
+    let head = q.sb.git_in(&wb, &["rev-parse", "HEAD"]);
+    let r = mcp_call(
+        &client,
+        "queue_retry",
+        json!({"working_directory": wb_dir, "job_id": jb}),
+    )
+    .await;
+    evidence("mcp retry", &tool_text(&r));
+    assert_ne!(r.is_error, Some(true), "{}", tool_text(&r));
+    assert!(
+        tool_text(&r).starts_with("requeued feat/b"),
+        "{}",
+        tool_text(&r)
+    );
+    let st = q.status();
+    assert_eq!(job(&st, &jb)["head_sha"], head.as_str());
+    // A second retry of a job that is no longer conflict/failed is refused.
+    let r = mcp_call(
+        &client,
+        "queue_retry",
+        json!({"working_directory": wb_dir, "job_id": jb}),
+    )
+    .await;
+    assert!(
+        tool_text(&r).starts_with("conflict-state: "),
+        "{}",
+        tool_text(&r)
+    );
+    let t = q.wait_ready("B ready", |t| members(t) == vec![jb.clone()]);
+    let r = mcp_call(
+        &client,
+        "queue_cancel",
+        json!({"working_directory": wb_dir, "job_id": jb}),
+    )
+    .await;
+    evidence("mcp cancel", &tool_text(&r));
+    assert_ne!(r.is_error, Some(true), "{}", tool_text(&r));
+    let st = q.wait("B cancelled", |v| job_is(v, &jb, "cancelled"));
+    assert_eq!(train(&st, train_id(&t))["state"], "dissolved");
+    let db = rusqlite::Connection::open(q.sb.home.join("state/sluice/sluice.db")).expect("db");
+    db.busy_timeout(Duration::from_secs(5)).unwrap();
+    let actors: Vec<String> = db
+        .prepare(
+            "SELECT actor FROM queue_events WHERE job_id = ?1 AND \
+             (from_state IS NULL OR note IN ('retry', 'cancel')) ORDER BY rowid",
+        )
+        .unwrap()
+        .query_map([&jb], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(actors, ["mcp", "mcp", "mcp"], "enqueue, retry, cancel");
+    client.cancel().await.expect("shutdown");
+}
+
+/// The job id in a `queue_enqueue` result's structured content.
+fn structured_job_id(r: &CallToolResult) -> String {
+    r.structured_content
+        .as_ref()
+        .and_then(|v| v["job_id"].as_str())
+        .unwrap_or_else(|| panic!("no job id: {}", tool_text(r)))
+        .to_owned()
+}
+
 // ------------------------------------------------------------------ test 7
 
 /// `git remote set-url` after `ready`: the approved train is dissolved with

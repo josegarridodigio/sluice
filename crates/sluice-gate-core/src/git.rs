@@ -5,9 +5,12 @@
 //! (`GIT_DIR`, `GIT_INDEX_FILE`, ...) are handled on purpose.
 
 use std::collections::BTreeMap;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::tree::TreeHash;
@@ -80,8 +83,93 @@ pub fn run_output(args: &[&str], cwd: &Path, env: &EnvMap) -> Result<Output> {
     output(args, cwd, env, false)
 }
 
+/// Grace period between SIGTERM and SIGKILL when a deadline expires.
+const DEADLINE_GRACE: Duration = Duration::from_secs(2);
+/// Polling period while waiting for a process with a deadline.
+const DEADLINE_POLL: Duration = Duration::from_millis(20);
+
+/// Reads a pipe to the end on a helper thread; the result arrives on the
+/// returned channel (never, when a stray grandchild keeps the pipe open).
+fn drain(mut pipe: impl std::io::Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
+/// Sends `signal` to the process group `pgid` (best effort).
+fn signal_group(pgid: u32, signal: nix::sys::signal::Signal) {
+    if let Ok(raw) = i32::try_from(pgid)
+        && raw > 1
+    {
+        let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(raw), signal);
+    }
+}
+
+/// Like [`run_output`], for git calls that may hang on the network (the
+/// merge queue's `fetch` and `ls-remote`): git runs in its own process group
+/// and, when it has not exited after `timeout`, the whole group (git, its
+/// transport helper, ssh, ...) gets SIGTERM, then SIGKILL after 2 s, and is
+/// reaped.
+///
+/// # Errors
+///
+/// [`Error::GitMissing`] when git cannot be spawned, [`Error::GitTimeout`]
+/// when the deadline expired.
+pub fn run_output_deadline(
+    args: &[&str],
+    cwd: &Path,
+    env: &EnvMap,
+    timeout: Duration,
+) -> Result<Output> {
+    let mut cmd = command(args, cwd, env);
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = cmd.spawn().map_err(Error::GitMissing)?;
+    let out_rx = child.stdout.take().map(drain);
+    let err_rx = child.stderr.take().map(drain);
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(DEADLINE_POLL),
+            Ok(None) | Err(_) => break None,
+        }
+    };
+    let Some(status) = status else {
+        let pgid = child.id();
+        signal_group(pgid, nix::sys::signal::Signal::SIGTERM);
+        let grace = Instant::now() + DEADLINE_GRACE;
+        while Instant::now() < grace && matches!(child.try_wait(), Ok(None)) {
+            std::thread::sleep(DEADLINE_POLL);
+        }
+        // Whatever is left of the group (helpers that ignored SIGTERM).
+        signal_group(pgid, nix::sys::signal::Signal::SIGKILL);
+        let _ = child.wait();
+        return Err(Error::GitTimeout {
+            args: args.iter().map(|a| (*a).to_owned()).collect(),
+            timeout,
+        });
+    };
+    // A helper that outlived git may hold the pipes: collect what is there.
+    let collect = |rx: Option<mpsc::Receiver<Vec<u8>>>| {
+        rx.and_then(|rx| rx.recv_timeout(DEADLINE_GRACE).ok())
+            .unwrap_or_default()
+    };
+    Ok(Output {
+        status,
+        stdout: collect(out_rx),
+        stderr: collect(err_rx),
+    })
+}
+
 /// Converts a failed [`Output`] into [`Error::GitCommand`].
-pub(crate) fn command_error(args: &[&str], out: &Output) -> Error {
+#[must_use]
+pub fn command_error(args: &[&str], out: &Output) -> Error {
     let stderr = String::from_utf8_lossy(&out.stderr);
     let lines: Vec<&str> = stderr
         .lines()
@@ -511,6 +599,50 @@ mod tests {
         let err = run(&["no-such-subcommand"], tmp.path(), &base_env(), true).unwrap_err();
         assert!(matches!(err, Error::GitCommand { .. }), "{err:?}");
         assert!(version().unwrap().starts_with("git version"));
+    }
+
+    #[test]
+    fn deadline_kills_a_stalled_transport_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        init_repo(&root);
+        // The transport helper (`ssh` replaced by a shell that sleeps) runs in
+        // git's process group; the deadline must kill both.
+        let pid_file = root.join("helper.pid");
+        let mut env = base_env();
+        env.insert(
+            "GIT_SSH_COMMAND".into(),
+            format!("echo $$ > '{}'; sleep 600 #", pid_file.display()),
+        );
+        let started = Instant::now();
+        let err = run_output_deadline(
+            &["ls-remote", "--", "ssh://stall.invalid/r.git"],
+            &root,
+            &env,
+            Duration::from_millis(500),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::GitTimeout { .. }), "{err:?}");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let gone = (0..100).any(|_| {
+            let dead = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err();
+            if !dead {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            dead
+        });
+        assert!(gone, "the helper {pid} survived the deadline");
+        // A quick command finishes normally.
+        let out = run_output_deadline(&["rev-parse", "HEAD"], &root, &env, Duration::from_secs(30))
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout.len(), 41);
     }
 
     #[test]

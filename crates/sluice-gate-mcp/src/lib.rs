@@ -40,8 +40,8 @@ use sluice_gate_core::tree::{self, Snapshot};
 use sluice_gate_core::{SLUICE_VERSION, dirs};
 use sluice_gate_proto::client::{self, ClientError};
 use sluice_gate_proto::{
-    self as proto, ClientMessage, GateSpec, OutcomeStatus, QueueTrainState, RepoInfo, RunRequest,
-    STATUS_SCHEMA_VERSION, ServerMessage,
+    self as proto, ClientMessage, GateSpec, OutcomeStatus, QueueTrainState, QueueTrainView,
+    RepoInfo, RunRequest, STATUS_SCHEMA_VERSION, ServerMessage,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -69,9 +69,10 @@ call `queue_enqueue` with your absolute working directory, and stop. Tell the hu
 (and the train id from `queue_status`): a human approves the train with `sluice queue approve`. \
 Never approve a train yourself and never call `queue_approve` unless the user told you to; it \
 is refused unless the user enabled agent approval. Never push to the target branch yourself. \
-`queue_status` shows trains, conflicts and what is ready. When it reports a conflict for your \
-branch, rebase the branch onto the target, run `verify` again, and call `queue_enqueue` again \
-(the daemon's `retry` exists only in the CLI for now). Errors start with a code: \
+`queue_status` shows trains, conflicts and what is ready. When it reports a conflict (or a \
+failed gate) for your branch, rebase or fix the branch, commit, run `verify` again, and call \
+`queue_retry` with the job id: the job keeps the branch, so `queue_enqueue` would answer \
+`duplicate-branch`. `queue_cancel` withdraws a job. Errors start with a code: \
 `conflict-state`, `stale-plan`, `duplicate-branch`, `not-allowed`, `not-supported`.";
 
 /// Runs the MCP server on stdin/stdout until the client disconnects.
@@ -165,6 +166,15 @@ struct QueueEnqueueParams {
 struct QueueStatusParams {
     /// Absolute path inside the repository (worktree).
     working_directory: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct QueueJobParams {
+    /// Absolute path inside the repository (worktree) the job belongs to.
+    working_directory: String,
+    /// Merge-queue job id, as returned by `queue_enqueue` or shown by
+    /// `queue_status`.
+    job_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1072,9 +1082,10 @@ impl Server {
     /// branch of the worktree). Call it only after `verify` passed on the
     /// committed branch; refuses a detached HEAD and tracked uncommitted
     /// changes. Returns the job; then stop and tell the human, who approves the
-    /// train with `sluice queue approve`. After a conflict, rebase and call it
-    /// again. Errors start with their code (`duplicate-branch`, `not-supported`,
-    /// ...).
+    /// train with `sluice queue approve`. After a conflict or a failure, fix
+    /// the branch and call `queue_retry` with the job id (the job keeps the
+    /// branch). Errors start with their code (`duplicate-branch`,
+    /// `not-supported`, ...).
     #[tool(output_schema = schema_for_output::<JobSchema>())]
     async fn queue_enqueue(
         &self,
@@ -1095,6 +1106,48 @@ impl Server {
                 "internal",
                 format!("unexpected reply to queue-enqueue: {other:?}"),
             ))),
+            Err(why) => Ok(tool_error(why)),
+        }
+    }
+
+    /// Re-queue a merge-queue job that ended `conflict` or `failed`, with the
+    /// current head of its branch (re-read in the repository, like `sluice
+    /// queue retry`). Rebase or fix the branch, commit and `verify` first.
+    /// Errors start with their code (`conflict-state` for a job in another
+    /// state, `not-found`, ...).
+    #[tool(output_schema = schema_for_output::<JobSchema>())]
+    async fn queue_retry(
+        &self,
+        Parameters(params): Parameters<QueueJobParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let dir = workdir(&params.working_directory)?;
+        if !valid_job_id(&params.job_id) {
+            return Err(invalid(format!("invalid job_id '{}'", params.job_id)));
+        }
+        let env = Arc::clone(&self.env);
+        let reply = blocking(move || queue::send_retry(&env, &dir, &params.job_id)).await?;
+        match reply {
+            Ok(job) => result(queue::retry_text(&job), &job, false),
+            Err(why) => Ok(tool_error(why)),
+        }
+    }
+
+    /// Cancel a merge-queue job of this repository. A job that is pushing or
+    /// waiting for reconcile only records the request (it is cancelled once
+    /// nothing landed is proven). Errors start with their code.
+    #[tool(output_schema = schema_for_output::<JobSchema>())]
+    async fn queue_cancel(
+        &self,
+        Parameters(params): Parameters<QueueJobParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let dir = workdir(&params.working_directory)?;
+        if !valid_job_id(&params.job_id) {
+            return Err(invalid(format!("invalid job_id '{}'", params.job_id)));
+        }
+        let env = Arc::clone(&self.env);
+        let reply = blocking(move || queue::send_cancel(&env, &dir, &params.job_id)).await?;
+        match reply {
+            Ok(job) => result(queue::cancel_text(&job), &job, false),
             Err(why) => Ok(tool_error(why)),
         }
     }
@@ -1126,8 +1179,9 @@ impl Server {
     /// `not-allowed` unless the user enabled `[queue] allow_agent_approval =
     /// true` in the user config. Do not call it unless the user told you to.
     /// When allowed, it waits until the train landed, failed or needs a human
-    /// to reconcile (up to 10 minutes), sending progress notifications when the
-    /// request carries a progressToken.
+    /// to reconcile (up to the base's `push_timeout` plus its
+    /// `network_timeout` and a margin), sending progress notifications when
+    /// the request carries a progressToken.
     #[tool(output_schema = schema_for_output::<ApproveReport>())]
     async fn queue_approve(
         &self,
@@ -1154,8 +1208,15 @@ impl Server {
     }
 }
 
-/// How long `queue_approve` waits for the push (the default `push_timeout`).
-const APPROVE_WAIT: Duration = Duration::from_secs(600);
+/// How long `queue_approve` waits for the landing: the base's
+/// `push_timeout` plus one `network_timeout` (pre-push checks), two runner
+/// ticks and a 30 s margin (defaults 10 min and 60 s for a daemon that does
+/// not report them), like `sluice queue approve`.
+fn approve_wait(train: &QueueTrainView, tick: Duration) -> Duration {
+    let push = Duration::from_millis(train.push_timeout_ms.unwrap_or(600_000));
+    let network = Duration::from_millis(train.network_timeout_ms.unwrap_or(60_000));
+    push + network + tick * 2 + Duration::from_secs(30)
+}
 /// Poll period of `queue_approve`.
 const APPROVE_POLL: Duration = Duration::from_secs(1);
 
@@ -1194,11 +1255,12 @@ impl Server {
         let started = Instant::now();
         let mut last_progress = Instant::now();
         let mut timed_out = false;
+        let wait = approve_wait(&train, user.queue.tick);
         while matches!(
             train.state,
             QueueTrainState::Approved | QueueTrainState::Pushing | QueueTrainState::Ready
         ) {
-            if started.elapsed() >= APPROVE_WAIT {
+            if started.elapsed() >= wait {
                 timed_out = true;
                 break;
             }
@@ -1513,6 +1575,8 @@ mod schema_tests {
             "detail",
             "position",
             "session",
+            "push_timeout_ms",
+            "network_timeout_ms",
         ] {
             assert!(
                 !required.iter().any(|r| r == skipped),
@@ -1530,7 +1594,13 @@ mod schema_tests {
     #[test]
     fn queue_tools_are_listed_with_descriptions_and_output_schemas() {
         let tools = Server::new(EnvMap::new()).tool_router.list_all();
-        for name in ["queue_enqueue", "queue_status", "queue_approve"] {
+        for name in [
+            "queue_enqueue",
+            "queue_status",
+            "queue_approve",
+            "queue_retry",
+            "queue_cancel",
+        ] {
             let tool = tools
                 .iter()
                 .find(|t| t.name == name)
@@ -1550,9 +1620,29 @@ mod schema_tests {
             "and stop",
             "Never approve",
             "conflict",
-            "only in the CLI",
+            "queue_retry",
+            "queue_cancel",
+            "duplicate-branch",
         ] {
             assert!(INSTRUCTIONS.contains(needle), "missing '{needle}'");
         }
+        assert!(!INSTRUCTIONS.contains("only in the CLI"));
+    }
+
+    #[test]
+    fn approve_wait_follows_the_base_timeouts() {
+        let t = QueueTrainView {
+            push_timeout_ms: Some(120_000),
+            network_timeout_ms: Some(2_000),
+            ..QueueTrainView::default()
+        };
+        assert_eq!(
+            approve_wait(&t, Duration::from_secs(5)),
+            Duration::from_secs(120 + 2 + 10 + 30)
+        );
+        assert_eq!(
+            approve_wait(&QueueTrainView::default(), Duration::from_secs(5)),
+            Duration::from_secs(600 + 60 + 10 + 30)
+        );
     }
 }

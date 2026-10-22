@@ -160,6 +160,12 @@ pub(crate) struct TrainSchema {
     /// Free-form note.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// `[queue] push_timeout` of the base, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_timeout_ms: Option<u64>,
+    /// `[queue] network_timeout` of the base, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_timeout_ms: Option<u64>,
 }
 
 /// `queue_status` result (`sluice queue status --json`).
@@ -342,7 +348,127 @@ pub(crate) fn enqueue_facts(
             .filter(|s| !s.is_empty())
             .cloned(),
         env: allowlisted_env(env),
+        via: Some(ApproveVia::Mcp),
     })
+}
+
+/// A job of the repository of `dir`, from `queue-status`.
+fn find_job(env: &EnvMap, paths: &RepoPaths, job_id: &str) -> Result<QueueJobView, String> {
+    fetch_status(env, Some(paths.common_dir.clone()))?
+        .jobs
+        .into_iter()
+        .find(|j| j.job_id == job_id)
+        .ok_or_else(|| {
+            failure(
+                "not-found",
+                format!("no job '{job_id}' in this repository (see `queue_status`)"),
+            )
+        })
+}
+
+/// `queue_retry`: re-reads the job's branch head in the repository of `dir`
+/// (like `sluice queue retry`) and sends `queue-retry {via: mcp}`.
+/// Blocking.
+pub(crate) fn send_retry(env: &EnvMap, dir: &Path, job_id: &str) -> Result<QueueJobView, String> {
+    let paths = discover(env, dir)?;
+    let job = find_job(env, &paths, job_id)?;
+    let probe = git::probe_env(env, Some(&paths));
+    let reference = format!("refs/heads/{}^{{commit}}", job.branch);
+    let head_sha = git::run(
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &reference,
+        ],
+        &paths.toplevel,
+        &probe,
+        true,
+    )
+    .ok()
+    .filter(|s| !s.is_empty())
+    .ok_or_else(|| {
+        failure(
+            "unknown-branch",
+            format!(
+                "branch '{}' of job {job_id} does not exist here",
+                job.branch
+            ),
+        )
+    })?;
+    let msg = ClientMessage::QueueRetry {
+        id: 1,
+        job_id: job_id.to_owned(),
+        head_sha,
+        via: Some(ApproveVia::Mcp),
+    };
+    match request(env, &msg)? {
+        ServerMessage::QueueJob { job, .. } => Ok(job),
+        other => Err(failure(
+            "internal",
+            format!("unexpected reply to queue-retry: {other:?}"),
+        )),
+    }
+}
+
+/// `queue_cancel`: sends `queue-cancel {via: mcp}` for a job of the
+/// repository of `dir`. Blocking.
+pub(crate) fn send_cancel(env: &EnvMap, dir: &Path, job_id: &str) -> Result<QueueJobView, String> {
+    let paths = discover(env, dir)?;
+    find_job(env, &paths, job_id)?;
+    let msg = ClientMessage::QueueCancel {
+        id: 1,
+        job_id: job_id.to_owned(),
+        via: Some(ApproveVia::Mcp),
+    };
+    match request(env, &msg)? {
+        ServerMessage::QueueJob { job, .. } => Ok(job),
+        other => Err(failure(
+            "internal",
+            format!("unexpected reply to queue-cancel: {other:?}"),
+        )),
+    }
+}
+
+/// Text of a successful `queue_retry`.
+pub(crate) fn retry_text(job: &QueueJobView) -> String {
+    let mut out = format!(
+        "requeued {} (job {}) at {} for {}",
+        job.branch,
+        job.job_id,
+        short(&job.head_sha),
+        target_name(&job.remote, &job.target)
+    );
+    if let Some(p) = job.position {
+        let _ = write!(out, ", position {p}");
+    }
+    out.push_str("\nStop here and tell the human; a human approves the new train.\n");
+    out
+}
+
+/// Text of a successful `queue_cancel`.
+pub(crate) fn cancel_text(job: &QueueJobView) -> String {
+    if job.cancel_requested
+        && matches!(
+            job.state,
+            QueueJobState::Pushing | QueueJobState::NeedsReconcile
+        )
+    {
+        format!(
+            "cancel requested for {} (job {}); it is {} and is cancelled only if nothing landed\n",
+            job.branch,
+            job.job_id,
+            job_state_name(job.state)
+        )
+    } else {
+        format!(
+            "{} (job {}) is {}\n",
+            job.branch,
+            job.job_id,
+            job_state_name(job.state)
+        )
+    }
 }
 
 /// `remote/target`, or just `target` for a local target.
@@ -454,8 +580,8 @@ fn job_line(job: &QueueJobView, target: &str, out: &mut String) {
             }
             let _ = write!(
                 out,
-                "\n    rebase '{}' onto {target}, then call queue_enqueue again",
-                job.branch
+                "\n    rebase '{}' onto {target}, run `verify`, then call queue_retry with job_id {}",
+                job.branch, job.job_id
             );
         }
         QueueJobState::Failed | QueueJobState::NeedsReconcile => {
@@ -464,6 +590,13 @@ fn job_line(job: &QueueJobView, target: &str, out: &mut String) {
             }
             if let Some(e) = detail_error(job) {
                 let _ = write!(out, "  {e}");
+            }
+            if job.state == QueueJobState::Failed {
+                let _ = write!(
+                    out,
+                    "\n    fix and commit on '{}', run `verify`, then call queue_retry with job_id {}",
+                    job.branch, job.job_id
+                );
             }
         }
         // A queued job that cannot be built yet (base unavailable, base
@@ -647,7 +780,8 @@ mod tests {
             "{t}"
         );
         assert!(t.contains("CONFLICT src/app.ts"), "{t}");
-        assert!(t.contains("call queue_enqueue again"), "{t}");
+        assert!(t.contains("then call queue_retry with job_id j2"), "{t}");
+        assert!(!t.contains("queue_enqueue again"), "{t}");
         assert!(t.contains("gates: test CACHED"), "{t}");
         assert!(
             t.contains("ready; a human approves with `sluice queue approve t-1`"),
@@ -669,6 +803,31 @@ mod tests {
         let t = render_status(&report);
         assert!(t.contains("waiting: base_unavailable: fatal: gone"), "{t}");
         assert!(!t.contains("hint"), "{t}");
+    }
+
+    #[test]
+    fn retry_and_cancel_texts() {
+        let mut j = job(QueueJobState::Queued);
+        j.head_sha = "abcdef0123".into();
+        assert_eq!(
+            retry_text(&j).lines().next().unwrap(),
+            "requeued feat/a (job j1) at abcdef0 for origin/main, position 2"
+        );
+        let mut c = job(QueueJobState::Pushing);
+        c.cancel_requested = true;
+        assert!(cancel_text(&c).starts_with("cancel requested for feat/a (job j1)"));
+        assert_eq!(
+            cancel_text(&job(QueueJobState::Cancelled)),
+            "feat/a (job j1) is cancelled\n"
+        );
+        let mut f = job(QueueJobState::Failed);
+        f.reason = Some("gate_failed".into());
+        let report = QueueStatusReport {
+            schema: 1,
+            trains: vec![],
+            jobs: vec![f],
+        };
+        assert!(render_status(&report).contains("call queue_retry with job_id j1"));
     }
 
     #[test]

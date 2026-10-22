@@ -440,7 +440,13 @@ async fn queue_tools_are_listed_with_descriptions_and_instructions() {
     let sb = Sandbox::standard();
     let client = connect(&sb, Counter::default()).await;
     let tools = client.list_all_tools().await.expect("tools/list");
-    for name in ["queue_enqueue", "queue_status", "queue_approve"] {
+    for name in [
+        "queue_enqueue",
+        "queue_status",
+        "queue_approve",
+        "queue_retry",
+        "queue_cancel",
+    ] {
         let tool = tools
             .iter()
             .find(|t| t.name == name)
@@ -455,7 +461,12 @@ async fn queue_tools_are_listed_with_descriptions_and_instructions() {
         .peer_info()
         .and_then(|i| i.instructions.clone())
         .unwrap_or_default();
-    for needle in ["queue_enqueue", "Never approve", "only in the CLI"] {
+    for needle in [
+        "queue_enqueue",
+        "Never approve",
+        "queue_retry",
+        "queue_cancel",
+    ] {
         assert!(instructions.contains(needle), "{instructions}");
     }
     client.cancel().await.expect("shutdown");

@@ -97,6 +97,11 @@ pub struct QueueConfig {
     /// Time limit for the push, including the repository's `pre-push` hook.
     #[serde(with = "humantime_serde")]
     pub push_timeout: Duration,
+    /// Time limit of every network call of the queue other than the push
+    /// (`fetch` of the base, `ls-remote` checks); on expiry git's process
+    /// group is killed and the call counts as failed.
+    #[serde(with = "humantime_serde")]
+    pub network_timeout: Duration,
 }
 
 impl Default for QueueConfig {
@@ -108,7 +113,27 @@ impl Default for QueueConfig {
             max_train: 4,
             audit_ref: true,
             push_timeout: Duration::from_secs(600),
+            network_timeout: DEFAULT_NETWORK_TIMEOUT,
         }
+    }
+}
+
+/// Default `[queue] network_timeout`.
+pub const DEFAULT_NETWORK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Why `remote` cannot be a `[queue] remote`: empty, starting with `-` (git
+/// would read it as an option) or containing whitespace or control
+/// characters. `None` when it is acceptable.
+#[must_use]
+pub fn invalid_remote_name(remote: &str) -> Option<&'static str> {
+    if remote.is_empty() {
+        Some("must not be empty")
+    } else if remote.starts_with('-') {
+        Some("must not start with '-'")
+    } else if remote.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        Some("must not contain whitespace or control characters")
+    } else {
+        None
     }
 }
 
@@ -253,8 +278,11 @@ impl RepoConfig {
         if self.queue.max_train < 1 {
             return Err(config_err(path, "queue.max_train must be >= 1"));
         }
-        if self.queue.remote.trim().is_empty() {
-            return Err(config_err(path, "queue.remote must not be empty"));
+        if let Some(why) = invalid_remote_name(&self.queue.remote) {
+            return Err(config_err(path, format!("queue.remote {why}")));
+        }
+        if self.queue.network_timeout.is_zero() {
+            return Err(config_err(path, "queue.network_timeout must be > 0"));
         }
         if let Some(gates) = &self.queue.gates {
             for gate in gates {
@@ -420,6 +448,11 @@ pub struct UserQueueConfig {
     /// Period of the runner's housekeeping tick.
     #[serde(with = "humantime_serde")]
     pub tick: Duration,
+    /// Finished queue rows (landed or cancelled jobs, landed or dissolved
+    /// trains, their markers and audit events) older than this are pruned at
+    /// daemon start and once per hour.
+    #[serde(with = "humantime_serde")]
+    pub retention: Duration,
 }
 
 impl Default for UserQueueConfig {
@@ -428,6 +461,7 @@ impl Default for UserQueueConfig {
             enabled: true,
             allow_agent_approval: false,
             tick: Duration::from_secs(5),
+            retention: Duration::from_hours(30 * 24),
         }
     }
 }
@@ -852,18 +886,26 @@ depends_on = ["lint"]
         assert_eq!(c.queue.max_train, 4);
         assert!(c.queue.audit_ref);
         assert_eq!(c.queue.push_timeout, Duration::from_secs(600));
+        assert_eq!(c.queue.network_timeout, Duration::from_secs(60));
         assert!(c.queue.target.is_none() && c.queue.gates.is_none());
         let text = format!(
             "{}\n[queue]\nremote = \"up\"\ntarget = \"dev\"\ngates = [\"g\"]\nmax_train = 1\n\
-             audit_ref = false\npush_timeout = \"2m\"",
+             audit_ref = false\npush_timeout = \"2m\"\nnetwork_timeout = \"2s\"",
             gate_with("cmd = \"x\"")
         );
         let c = parse(&text).unwrap();
         assert_eq!(c.queue.target.as_deref(), Some("dev"));
         assert_eq!(c.queue.gates.as_deref(), Some(&["g".to_owned()][..]));
         assert_eq!(c.queue.push_timeout, Duration::from_secs(120));
+        assert_eq!(c.queue.network_timeout, Duration::from_secs(2));
         assert!(msg("version = 1\n[queue]\nmax_train = 0").contains("max_train"));
         assert!(msg("version = 1\n[queue]\nremote = \" \"").contains("remote"));
+        assert!(msg("version = 1\n[queue]\nnetwork_timeout = \"0s\"").contains("network_timeout"));
+        // A remote reaches git as an argument: never an option, never split.
+        let m = msg("version = 1\n[queue]\nremote = \"--upload-pack=touch /tmp/x #\"");
+        assert!(m.contains("queue.remote must not start with '-'"), "{m}");
+        let m = msg("version = 1\n[queue]\nremote = \"up stream\"");
+        assert!(m.contains("whitespace"), "{m}");
         assert!(msg("version = 1\n[queue]\ngates = [\"nope\"]").contains("nope"));
         assert!(msg("version = 1\n[queue]\nbogus = 1").contains("bogus"));
     }
@@ -873,13 +915,16 @@ depends_on = ["lint"]
         let c = UserConfig::parse("version = 1", Path::new("u.toml")).unwrap();
         assert!(c.queue.enabled && !c.queue.allow_agent_approval);
         assert_eq!(c.queue.tick, Duration::from_secs(5));
+        assert_eq!(c.queue.retention, Duration::from_hours(30 * 24));
         let c = UserConfig::parse(
-            "version = 1\n[queue]\nenabled = false\nallow_agent_approval = true\ntick = \"1s\"",
+            "version = 1\n[queue]\nenabled = false\nallow_agent_approval = true\ntick = \"1s\"\n\
+             retention = \"7d\"",
             Path::new("u.toml"),
         )
         .unwrap();
         assert!(!c.queue.enabled && c.queue.allow_agent_approval);
         assert_eq!(c.queue.tick, Duration::from_secs(1));
+        assert_eq!(c.queue.retention, Duration::from_hours(7 * 24));
     }
 
     #[test]

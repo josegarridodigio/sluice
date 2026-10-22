@@ -187,11 +187,11 @@ Timestamps in the views are RFC 3339; paths are absolute.
 
 | Client request | Fields | Reply |
 |---|---|---|
-| `queue-enqueue` | `id`, `repo` (git common dir), `worktree`, `branch`, `head_sha`, `base` (as typed, optional), `caller` (`agent`/`human`), `session` (optional), `env` (map, default `{}`) | `queue-job` |
+| `queue-enqueue` | `id`, `repo` (git common dir), `worktree`, `branch`, `head_sha`, `base` (as typed, optional), `caller` (`agent`/`human`), `session` (optional), `env` (map, default `{}`), `via` (`cli`/`mcp`, optional) | `queue-job` |
 | `queue-status` | `id`, `repo` (common dir, optional = all) | `queue-status` |
 | `queue-approve` | `id`, `train_id`, `train_hash`, `via` (`cli`/`mcp`), `env` (map, default `{}`) | `queue-approved` |
-| `queue-retry` | `id`, `job_id`, `head_sha` | `queue-job` |
-| `queue-cancel` | `id`, `job_id` | `queue-job` |
+| `queue-retry` | `id`, `job_id`, `head_sha`, `via` (`cli`/`mcp`, optional) | `queue-job` |
+| `queue-cancel` | `id`, `job_id`, `via` (`cli`/`mcp`, optional) | `queue-job` |
 | `queue-reconcile` | `id`, `repo` (common dir, optional = all) | `queue-reconcile` |
 
 Server replies:
@@ -214,8 +214,14 @@ Server replies:
   in merge order), `merge_sha?`, `gates: [{gate, key?, job_id?, status,
   duration_ms?}]` (`status`: `pending`, `running`, `pass`, `cached`,
   `fail`, `timeout`, `killed`, `error`), `train_hash?`, `approved_via?`,
-  `approved_at?`, `created_at`, `updated_at`, `landed_at?`, `note?`.
+  `approved_at?`, `created_at`, `updated_at`, `landed_at?`, `note?`,
+  `push_timeout_ms?`, `network_timeout_ms?` (the base's `[queue]` limits
+  stored with the train; clients bound their wait for a landing with them).
   Fields marked `?` are omitted when absent.
+- The optional `via` of `queue-enqueue`, `queue-retry` and `queue-cancel`
+  (same spelling as `queue-approve`'s required `via`) names the surface for
+  the audit trail (`queue_events.actor`): `mcp` from the MCP tools; absent
+  (older clients) or `cli` is recorded as `cli`. It is omitted when absent.
 - Unknown job/train states and reconcile decisions from a newer daemon
   parse as `Unknown` (`#[serde(other)]`).
 
@@ -257,7 +263,9 @@ panics on malformed input.
   and server ignore unknown fields (`#[serde(default)]`, no
   `deny_unknown_fields` on the wire types).
 - The merge-queue additions (`queue-*` messages, `welcome.features`,
-  `status.queue`, the new error codes) keep `protocol` at 1: old clients
+  `status.queue`, the new error codes, the optional `via` of
+  `queue-enqueue`/`queue-retry`/`queue-cancel` and the optional train
+  timeouts) keep `protocol` at 1: old clients
   never send `queue-*`, and the new fields are optional and omitted when
   empty.
 - `sluice-gate-proto` exposes `PROTOCOL_VERSION` and the typed enums

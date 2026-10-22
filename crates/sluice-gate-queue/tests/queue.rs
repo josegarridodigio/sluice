@@ -526,3 +526,397 @@ async fn disabled_queue_answers_not_supported() {
     assert_eq!(error_code(&r), ErrorCode::NotSupported);
     d.shutdown().await;
 }
+
+// ---------------------------------------------------------------- review fixes
+
+/// Opens the daemon's database next to the running daemon.
+fn db(d: &Daemon) -> rusqlite::Connection {
+    let db = rusqlite::Connection::open(d.state.join("sluice.db")).unwrap();
+    db.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+    db
+}
+
+async fn enqueue_via_mcp(
+    d: &Daemon,
+    fx: &Fixture,
+    wt: &std::path::Path,
+    branch: &str,
+    sha: &str,
+) -> sluice_gate_proto::QueueJobView {
+    let msg = sluice_gate_proto::ClientMessage::QueueEnqueue {
+        id: 1,
+        request: sluice_gate_proto::EnqueueRequest {
+            repo: fx.common.clone(),
+            worktree: wt.to_path_buf(),
+            branch: branch.into(),
+            head_sha: sha.into(),
+            base: None,
+            caller: sluice_gate_proto::Caller::Agent,
+            session: None,
+            env: fx.client_env(),
+            via: Some(ApproveVia::Mcp),
+        },
+    };
+    match d.ask(&msg).await {
+        ServerMessage::QueueJob { job, .. } => job,
+        other => panic!("enqueue failed: {other:?}"),
+    }
+}
+
+/// Findings 5, 10, 11, 13, 15: B conflicts and is cancelled while A is
+/// ready → A stays ready and its approval lands; a gate's untracked output
+/// does not dissolve the approved train; `FETCH_HEAD` is untouched; the MCP
+/// enqueue is audited as `mcp`; credentials are dropped once rows finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_a_conflict_keeps_the_ready_train() {
+    let toml =
+        "version = 1\n[gates.test]\ncmd = \"touch gate-output.txt\"\nhooks = [\"pre-push\"]\n";
+    let fx = Fixture::new(toml);
+    let fetch_head = fx.common.join("FETCH_HEAD");
+    std::fs::write(&fetch_head, "sentinel\n").unwrap();
+    let (wa, a) = fx.branch("feat/a", "main", &[("a.txt", "from A\n")]);
+    let (wb, b) = fx.branch("feat/b", "main", &[("a.txt", "from B\n")]);
+    let d = Daemon::start(&fx, user_config(false)).await;
+    let ja = d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    let jb = enqueue_via_mcp(&d, &fx, &wb, "feat/b", &b).await;
+    let t = d
+        .wait_train("ready pair", |t| {
+            ready(t) && t.members == vec![ja.job_id.clone(), jb.job_id.clone()]
+        })
+        .await;
+    let vb = d.wait_job(&jb.job_id, J::Conflict).await;
+    assert_eq!(vb.train_id, None, "a conflicting job leaves its train");
+    assert!(matches!(
+        d.cancel(&jb.job_id).await,
+        ServerMessage::QueueJob { .. }
+    ));
+    // Many ticks: the ready train is not dissolved by B's cancel.
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    let st = d.status().await;
+    let same = st.trains.iter().find(|x| x.train_id == t.train_id).unwrap();
+    assert_eq!(same.state, T::Ready, "{same:?}");
+    assert_eq!(same.train_hash, t.train_hash);
+    let r = d
+        .approve(
+            &fx,
+            &t.train_id,
+            t.train_hash.as_deref().unwrap(),
+            ApproveVia::Cli,
+        )
+        .await;
+    assert!(matches!(r, ServerMessage::QueueApproved { .. }), "{r:?}");
+    let landed = d
+        .wait_train("landed", |x| {
+            x.train_id == t.train_id && x.state == T::Landed
+        })
+        .await;
+    assert_eq!(
+        fx.bare_ref("refs/heads/main"),
+        landed.merge_sha,
+        "the gate's untracked output did not dissolve the train"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&fetch_head).unwrap(),
+        "sentinel\n",
+        "the queue's fetches never write FETCH_HEAD"
+    );
+    let db = db(&d);
+    let actor: String = db
+        .query_row(
+            "SELECT actor FROM queue_events WHERE job_id = ?1 AND from_state IS NULL",
+            [&jb.job_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(actor, "mcp");
+    let cancel_actor: String = db
+        .query_row(
+            "SELECT actor FROM queue_events WHERE job_id = ?1 AND to_state = 'cancelled'",
+            [&jb.job_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cancel_actor, "cli");
+    let push_env: Option<String> = db
+        .query_row(
+            "SELECT push_env FROM queue_trains WHERE id = ?1",
+            [&t.train_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(push_env, None, "push_env cleared on landed");
+    for j in [&ja.job_id, &jb.job_id] {
+        let env: Option<String> = db
+            .query_row("SELECT env FROM queue_jobs WHERE id = ?1", [j], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(env, None, "job env cleared once {j} finished");
+    }
+    d.shutdown().await;
+}
+
+/// Finding 1: a remote whose transport stalls is cut by `[queue]
+/// network_timeout` (its group is killed) and never blocks another
+/// repository's train nor its push.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_remote_times_out_without_blocking_other_repositories() {
+    let stalled = Fixture::new(&format!("{GATE_TRUE}[queue]\nnetwork_timeout = \"10s\"\n"));
+    let (ws, s) = stalled.branch("feat/s", "main", &[("s.txt", "s\n")]);
+    // Every transport call of this repository hangs (`ssh` that sleeps).
+    stalled.git(&["remote", "set-url", "origin", "ssh://stall.invalid/r.git"]);
+    stalled.git(&["config", "core.sshCommand", "sleep 600 #"]);
+    let fx = Fixture::new(GATE_TRUE);
+    let (wa, a) = fx.branch("feat/a", "main", &[("n.txt", "n\n")]);
+    let d = Daemon::start(&fx, user_config(false)).await;
+    // `origin/main` is known locally: the enqueue needs no network.
+    let js = d
+        .enqueue_ok(&stalled, &ws, "feat/s", &s, Some("origin/main"))
+        .await;
+    let ja = d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    let t = d.wait_train("other repo ready", ready).await;
+    let r = d
+        .approve(
+            &fx,
+            &t.train_id,
+            t.train_hash.as_deref().unwrap(),
+            ApproveVia::Cli,
+        )
+        .await;
+    assert!(matches!(r, ServerMessage::QueueApproved { .. }), "{r:?}");
+    d.wait_job(&ja.job_id, J::Landed).await;
+    // The stalled fetch is still running: nothing recorded yet.
+    let st = d.status().await;
+    let vs = st.jobs.iter().find(|j| j.job_id == js.job_id).unwrap();
+    assert_eq!(vs.state, J::Queued);
+    assert_eq!(vs.reason, None, "landed while the other fetch stalled");
+    let vs = d
+        .wait_for("timed-out fetch recorded", |s| {
+            s.jobs
+                .iter()
+                .any(|j| j.job_id == js.job_id && j.reason.is_some())
+        })
+        .await
+        .jobs
+        .into_iter()
+        .find(|j| j.job_id == js.job_id)
+        .unwrap();
+    assert_eq!(vs.reason.as_deref(), Some("base_unavailable"));
+    let err = vs.detail.unwrap()["error"].as_str().unwrap().to_owned();
+    assert!(err.contains("timed out after 10s"), "{err}");
+    d.shutdown().await;
+}
+
+/// Finding 3: fetch from A, push to B (triangular) lands on B without
+/// looping; a push URL changed after `ready` dissolves the approved train
+/// with `endpoint_changed` and pushes to neither URL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines, reason = "two scenarios on one fixture")]
+async fn the_push_url_is_the_endpoint() {
+    let fx = Fixture::new(GATE_TRUE);
+    let a_main = fx.bare_ref("refs/heads/main").unwrap();
+    // B: a copy of A with one more commit on main.
+    let b = fx.root.join("b.git");
+    let bare = fx.bare.display().to_string();
+    common::git_in(
+        &fx.root,
+        &fx.env,
+        &["clone", "-q", "--bare", &bare, b.to_str().unwrap()],
+    );
+    let scratch = fx.root.join("b-work");
+    common::git_in(
+        &fx.root,
+        &fx.env,
+        &[
+            "clone",
+            "-q",
+            b.to_str().unwrap(),
+            scratch.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(scratch.join("b-only.txt"), "b\n").unwrap();
+    common::git_in(&scratch, &fx.env, &["add", "-A"]);
+    common::git_in(&scratch, &fx.env, &["commit", "-q", "-m", "b only"]);
+    common::git_in(&scratch, &fx.env, &["push", "-q", "origin", "HEAD:main"]);
+    let b_ref = |r: &str| {
+        common::git_in(
+            &fx.root,
+            &fx.env,
+            &["--git-dir", b.to_str().unwrap(), "rev-parse", r],
+        )
+    };
+    let b_main = b_ref("refs/heads/main");
+    fx.git(&["remote", "set-url", "--push", "origin", b.to_str().unwrap()]);
+
+    let (wa, a) = fx.branch("feat/a", "main", &[("n.txt", "n\n")]);
+    let d = Daemon::start(&fx, user_config(false)).await;
+    let ja = d
+        .enqueue_ok(&fx, &wa, "feat/a", &a, Some("origin/main"))
+        .await;
+    let t = d.wait_train("ready on B", ready).await;
+    assert_eq!(t.base_sha, b_main, "the base comes from the push URL");
+    d.approve(
+        &fx,
+        &t.train_id,
+        t.train_hash.as_deref().unwrap(),
+        ApproveVia::Cli,
+    )
+    .await;
+    let landed = d
+        .wait_train("landed on B", |x| {
+            x.train_id == t.train_id && x.state == T::Landed
+        })
+        .await;
+    assert_eq!(Some(b_ref("refs/heads/main")), landed.merge_sha);
+    assert_eq!(
+        fx.bare_ref("refs/heads/main").unwrap(),
+        a_main,
+        "A untouched"
+    );
+    assert_eq!(d.wait_job(&ja.job_id, J::Landed).await.state, J::Landed);
+    let trains = d.status().await.trains;
+    assert_eq!(trains.len(), 1, "no loop: {trains:?}");
+
+    // Push URL changed after ready: never pushed to B nor to C.
+    let b_now = b_ref("refs/heads/main");
+    let c = fx.root.join("c.git");
+    common::git_in(
+        &fx.root,
+        &fx.env,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            b.to_str().unwrap(),
+            c.to_str().unwrap(),
+        ],
+    );
+    let (wb, bsha) = fx.branch("feat/b", "main", &[("m.txt", "m\n")]);
+    d.enqueue_ok(&fx, &wb, "feat/b", &bsha, Some("origin/main"))
+        .await;
+    let t2 = d
+        .wait_train("second ready", |x| x.train_id != t.train_id && ready(x))
+        .await;
+    fx.git(&["remote", "set-url", "--push", "origin", c.to_str().unwrap()]);
+    let r = d
+        .approve(
+            &fx,
+            &t2.train_id,
+            t2.train_hash.as_deref().unwrap(),
+            ApproveVia::Cli,
+        )
+        .await;
+    assert!(matches!(r, ServerMessage::QueueApproved { .. }), "{r:?}");
+    let gone = d
+        .wait_train("dissolved", |x| {
+            x.train_id == t2.train_id && x.state == T::Dissolved
+        })
+        .await;
+    assert_eq!(gone.note.as_deref(), Some("endpoint_changed"));
+    d.wait_train("rebuilt against C", |x| {
+        x.train_id != t2.train_id && x.train_id != t.train_id && ready(x)
+    })
+    .await;
+    assert_eq!(b_ref("refs/heads/main"), b_now, "nothing pushed to B");
+    let c_main = common::git_in(
+        &fx.root,
+        &fx.env,
+        &[
+            "--git-dir",
+            c.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/main",
+        ],
+    );
+    assert_eq!(c_main, b_now, "nothing pushed to C");
+    d.shutdown().await;
+}
+
+/// Finding 2: an option-shaped `[queue] remote` or `--base` never reaches
+/// git as an option (the witness file is never created).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn option_shaped_remotes_never_run() {
+    let fx = Fixture::new(GATE_TRUE);
+    let witness = fx.root.join("witness");
+    let evil = format!(
+        "{GATE_TRUE}[queue]\nremote = \"--upload-pack=touch {} #\"\n",
+        witness.display()
+    );
+    let (wa, a) = fx.branch("feat/a", "main", &[(".sluice.toml", &evil)]);
+    let d = Daemon::start(&fx, user_config(false)).await;
+    let base = format!("--upload-pack=touch {} #/main", witness.display());
+    let r = d.enqueue(&fx, &wa, "feat/a", &a, Some(&base)).await;
+    assert_eq!(error_code(&r), ErrorCode::BadRequest, "{r:?}");
+    // The head's `.sluice.toml` is invalid (the remote starts with '-'):
+    // the built-in defaults pick `origin`, and the train is built on it.
+    let j = d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    assert_eq!(j.remote, "origin");
+    d.wait_train("ready", ready).await;
+    assert!(!witness.exists(), "the injected command ran");
+    d.shutdown().await;
+}
+
+/// Findings 4 and 6: a push that cannot be spawned after the marker parks
+/// the train as `needs_reconcile`; a reconcile whose decision cannot be
+/// recorded keeps the pin ref and the worktree; the next one succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_push_spawn_failure_parks_the_train_and_reconcile_cleans_up_only_on_success() {
+    let fx = Fixture::new(GATE_TRUE);
+    let base = fx.bare_ref("refs/heads/main").unwrap();
+    let (wa, a) = fx.branch("feat/a", "main", &[("n.txt", "n\n")]);
+    let d = Daemon::start_with(
+        &fx,
+        user_config(false),
+        Some(fx.root.join("no-such-git-binary")),
+    )
+    .await;
+    d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    let t = d.wait_train("ready", ready).await;
+    d.approve(
+        &fx,
+        &t.train_id,
+        t.train_hash.as_deref().unwrap(),
+        ApproveVia::Cli,
+    )
+    .await;
+    let parked = d
+        .wait_train("needs_reconcile", |x| {
+            x.train_id == t.train_id && x.state == T::NeedsReconcile
+        })
+        .await;
+    let note = parked.note.unwrap_or_default();
+    assert!(note.starts_with("push_spawn_failed"), "{note}");
+    let pin = format!("refs/sluice/pending/{}", t.train_id);
+    let wt = d.state.join("merge").join(&t.train_id);
+    assert!(fx.local_ref(&pin).is_some());
+    assert!(wt.exists());
+
+    // The decision write is refused (the row's token changed under it).
+    let db = db(&d);
+    let token: String = db
+        .query_row(
+            "SELECT claim_token FROM queue_trains WHERE id = ?1",
+            [&t.train_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    db.execute(
+        "UPDATE queue_trains SET claim_token = 'someone-else' WHERE id = ?1",
+        [&t.train_id],
+    )
+    .unwrap();
+    let res = d.reconcile().await;
+    assert_eq!(res[0].decision, ReconcileDecision::Refused, "{res:?}");
+    assert!(fx.local_ref(&pin).is_some(), "pin ref kept");
+    assert!(wt.exists(), "worktree kept");
+    db.execute(
+        "UPDATE queue_trains SET claim_token = ?2 WHERE id = ?1",
+        [&t.train_id, &token],
+    )
+    .unwrap();
+    let res = d.reconcile().await;
+    assert_eq!(res[0].decision, ReconcileDecision::Ready, "{res:?}");
+    assert!(fx.local_ref(&pin).is_none());
+    assert_eq!(fx.bare_ref("refs/heads/main").unwrap(), base);
+    d.shutdown().await;
+}

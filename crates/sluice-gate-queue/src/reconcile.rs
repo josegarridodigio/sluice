@@ -1,12 +1,13 @@
 //! `queue reconcile`: the decision table of design section 6 as a pure
 //! function ([`decide`]) over facts gathered by [`gather`]. Reconcile only
-//! reads the remote (`ls-remote`, `fetch` into Sluice's own ref); it never
+//! reads the remote (`ls-remote`, `fetch` into Sluice's own ref, both at the
+//! push URL the train is bound to and with its network deadline); it never
 //! pushes.
 
 use std::path::Path;
 
 use crate::git::Git;
-use crate::target::endpoint_hash;
+use crate::target::endpoint;
 
 /// Facts about one `needs_reconcile` train.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -144,12 +145,14 @@ pub fn gather(git: &Git, f: &TrainFacts<'_>) -> ReconcileInput {
         if input.push_alive {
             return input;
         }
-        input.endpoint_matches =
-            endpoint_hash(git, f.repo, f.remote).is_ok_and(|h| h == f.endpoint_hash);
-        if !input.endpoint_matches {
-            return input;
-        }
-        match git.ls_remote(f.repo, f.remote, &[&head, &audit]) {
+        let url = match endpoint(git, f.repo, f.remote) {
+            Ok((url, h)) if h == f.endpoint_hash => url,
+            _ => {
+                input.endpoint_matches = false;
+                return input;
+            }
+        };
+        match git.ls_remote(f.repo, &url, &[&head, &audit]) {
             Ok(refs) => {
                 input.reachable = true;
                 input.target = refs.get(&head).cloned();
@@ -183,8 +186,8 @@ fn ancestry(git: &Git, f: &TrainFacts<'_>, target_sha: &str) -> Option<bool> {
                 t = f.target,
                 r = f.remote
             );
-            git.repo(f.repo, &["fetch", "--no-tags", "--quiet", f.remote, &spec])
-                .ok()?;
+            let (url, _) = endpoint(git, f.repo, f.remote).ok()?;
+            git.fetch(f.repo, &url, &spec).ok()?;
         }
     }
     git.is_ancestor(f.repo, f.merge_sha, target_sha)

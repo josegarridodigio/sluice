@@ -58,12 +58,13 @@ Field reference:
 | `gates.<name>.hooks` | list | `[]` | Hook names this gate is meant for. Free-form, but `pre-commit` and `pre-push` are recognised by `sluice hook print`. |
 | `gates.<name>.key_inputs` | list of commands | `[]` | Each command's stdout (via `sh -c` in the worktree root, stderr discarded) is part of the key. Keep them fast; they run on every invocation that consults the cache, including hits. A failing command makes the run uncached (notice on stderr), never a gate failure. |
 | `gates.<name>.key_files` | list of paths | `[]` | Relative to repo root. Content hash is part of the key. For files git ignores. Missing file hashes as "absent". |
-| `queue.remote` | string | `origin` | Remote of the default merge-queue target (Phase 6, [[sluice/design/merge-queue.md]]). |
+| `queue.remote` | string | `origin` | Remote of the default merge-queue target (Phase 6, [[sluice/design/merge-queue.md]]). Must not be empty, start with `-` or contain whitespace/control characters (it reaches git as an argument); at enqueue it must also be a configured remote of the repository (`invalid_remote`). |
 | `queue.target` | string | the remote's HEAD branch | Default target branch for `sluice queue enqueue`. |
 | `queue.gates` | list | gates with a `pre-push` hook, else every gate | Gates a train must pass; each must exist. |
 | `queue.max_train` | int ≥ 1 | 4 | Jobs combined into one train; 1 disables batching. |
 | `queue.audit_ref` | bool | `true` | Push `refs/sluice/landed/<sha>` atomically with the target. |
 | `queue.push_timeout` | duration | `10m` | Limit for the push, including the repository's `pre-push` hook. |
+| `queue.network_timeout` | duration > 0 | `60s` | Limit of every other network call of the queue (`fetch` of the base, `ls-remote` checks at enqueue, in the ready watch, before the push, in reconcile); on expiry git's process group is killed and the call fails. For the base fetch it is read from Sluice's last fetched base (else the remote-tracking branch) of the target, never from a member. |
 
 | `gates.<name>.env` | table | `{}` | Added to the gate's environment and to the key. |
 | `gates.<name>.depends_on` | list | `[]` | Gate names; validated (must exist, no self-reference) but not scheduled in v1. |
@@ -107,6 +108,7 @@ last_subscriber_gone = "cancel"   # cancel | finish
 enabled = true             # user-level kill switch for the merge queue runner
 allow_agent_approval = false   # let the MCP queue_approve tool approve trains
 tick = "5s"                # runner housekeeping period
+retention = "30d"          # finished queue rows (landed/cancelled jobs, landed/dissolved trains, markers, events) older than this are pruned at daemon start and hourly
 
 [admission]
 psi_enabled = true

@@ -46,7 +46,7 @@ claude mcp add sluice -- sluice mcp
 form above follows the documented `claude mcp add <name> <command> [args]`
 syntax; check `claude mcp list` afterwards.
 
-The server exposes seven tools (the last three are the merge queue, see
+The server exposes nine tools (the last five are the merge queue, see
 section 3):
 
 | Tool | Purpose |
@@ -58,6 +58,8 @@ section 3):
 | `queue_enqueue` | Put the committed branch (default: the current one) in the local merge queue. Refuses a detached HEAD and tracked uncommitted changes. |
 | `queue_status` | Trains, members and their state, conflicts with paths, and which trains are ready for a human to approve. |
 | `queue_approve` | Approve a ready train. Refused with `not-allowed` unless the user config has `[queue] allow_agent_approval = true`. |
+| `queue_retry` | Re-queue a `conflict` or `failed` job with the current head of its branch (after rebasing or fixing it). |
+| `queue_cancel` | Withdraw a job (only recorded while it is pushing; honoured once nothing landed is proven). |
 
 `verify` takes `working_directory` (absolute path inside the repository or
 worktree, required) and optionally `gates`, `timeout_seconds` and
@@ -104,9 +106,10 @@ file is read first:
   human approves the train with `sluice queue approve <train id>`.
 - Never approve a train, never call `queue_approve` unless the user told you
   to, and never push to the target branch yourself.
-- If `queue_status` reports a conflict for your branch, rebase it onto the
-  target, call `verify` again, and call `queue_enqueue` again. (`sluice queue
-  retry` exists only in the CLI for now.)
+- If `queue_status` reports a conflict (or a failed gate) for your branch,
+  rebase or fix it, commit, call `verify` again, and call `queue_retry` with
+  the job id. The job keeps the branch, so `queue_enqueue` would answer
+  `duplicate-branch`. `queue_cancel` withdraws a job you no longer want.
 - Errors start with a code: `conflict-state`, `stale-plan`,
   `duplicate-branch`, `not-allowed`, `not-supported`. Report them; do not work
   around them.

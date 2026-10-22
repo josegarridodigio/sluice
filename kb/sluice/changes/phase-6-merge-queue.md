@@ -155,8 +155,50 @@ and were retried silently every tick, forever. Now:
   `allow_agent_approval` needs `sluice daemon stop` (the MCP server reads it
   on every call, so until the restart the MCP check passes and the daemon
   refuses).
-- `queue status` keeps every train of the repository, dissolved and landed
+- ~~`queue status` keeps every train of the repository, dissolved and landed
   ones included, and renders their members with their *current* state next
-  to that train's gates (a member that landed later shows `landed  gates:
-  test FAIL` under the dissolved train it was split from). Cosmetic; a
-  history filter is left for later.
+  to that train's gates.~~ Fixed in "Review fixes" (superseded dissolved
+  trains are hidden in the human view).
+
+## Review fixes (2026-10-22)
+
+Findings of the adversarial review of the merge queue, each with its fix
+and regression test. Design updated in [[sluice/design/merge-queue.md]]
+(sections 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 15),
+[[sluice/design/config-format.md]], [[sluice/design/protocol.md]],
+[[sluice/design/mcp-tools.md]], `docs/merge-queue.md`, `docs/agents.md`.
+Verified with `sluice run fmt`, `sluice run clippy`, `sluice run test`
+(all PASS).
+
+| # | Finding | Fix (files, symbols) | Test |
+|---|---|---|---|
+| 1 | No network timeout; prepare/watch awaited inline in `step` | `sluice-gate-core` `git::run_output_deadline` (own process group, SIGTERM then SIGKILL after 2 s, reaped; `Error::GitTimeout`); queue `Git::net`, `Git::fetch`, `Git::ls_remote`, `Git::remote_head` with `Git::with_network_timeout`; `[queue] network_timeout` (`QueueConfig.network_timeout`, `DEFAULT_NETWORK_TIMEOUT` 60 s) stored in `TrainSettings.network_timeout_ms`; the base fetch's deadline comes from a trusted commit of the target (`runner::trusted_network_timeout`); `runner::claim_next` spawns one task per group (`prepare_and_claim` + `build`, busy key `group:…`), `step` spawns ready watches (at most once per tick, `Core::due_for_watch`) and pushes as tasks; enqueue resolution uses the head's `network_timeout` | core `git::tests::deadline_kills_a_stalled_transport_group`; queue `a_stalled_remote_times_out_without_blocking_other_repositories` (`core.sshCommand = "sleep 600 #"`, another repository's train is approved and lands meanwhile); config `queue_section_defaults_and_validation` |
+| 2 | `[queue] remote` reached git as an option | `config::invalid_remote_name` in `RepoConfig::validate` (no empty, leading `-`, whitespace/control); `target::check_remote` (`invalid_remote`: must be a configured remote) on the default path; `Git::push_url` re-checks; `--` before remote/URL in `fetch`, `ls-remote`, `remote get-url`, `push`; `--end-of-options` in `rev-parse` | `tests/target.rs` `an_option_shaped_remote_is_refused_and_never_runs`; queue `option_shaped_remotes_never_run` (witness file absent); config test above |
+| 3 | Endpoint bound to the fetch URL | `Git::push_url` (`git remote get-url --push --all`, several URLs refused); `target::endpoint` (URL + hash) used by `prepare` (fetch from the push URL), `watch_ready` (`bound_url`, `target_at`; a changed endpoint is left to the pre-push check), `pre_push_checks`, `reconcile::gather`/`ancestry` | `tests/target.rs` `endpoint_is_the_push_url` (pushurl, pushInsteadOf, two push URLs); queue `the_push_url_is_the_endpoint` (triangular A/B lands on B with one train; push URL changed after ready → `endpoint_changed`, nothing pushed to B or C) |
+| 4 | Reconcile cleaned up after a failed apply | `extension::reconcile`: pin ref and worktree removed only when `apply_decision` committed | queue `a_push_spawn_failure_parks_the_train_and_reconcile_cleans_up_only_on_success` (claim token changed under the train → `refused`, pin ref and worktree kept; then `ready`) |
+| 5 | Conflict members kept `train_id` | `Writer::job_to` clears `train_id` on `conflict`/`failed` (audit row keeps the old train) | store `a_conflicting_member_leaves_its_train`; queue `cancelling_a_conflict_keeps_the_ready_train` (cancel B, A stays ready, same hash approves and lands) |
+| 6 | Push spawn failure left the train `pushing` | `push_train`: a `push::spawn` error is `PushVerdict::Ambiguous("push_spawn_failed: …")` → `needs_reconcile`; injection point `QueueOptions.push_program` / `Core::with_push_program` / `push::spawn(program, …)` (tests only) | queue `a_push_spawn_failure_parks_the_train_and_reconcile_cleans_up_only_on_success` |
+| 7 | MCP dead end after a conflict | MCP tools `queue_retry` (`queue::send_retry` re-reads the branch head) and `queue_cancel` (`queue::send_cancel`), `QueueJobParams`, texts `retry_text`/`cancel_text`; conflict/failed lines name `queue_retry`; `INSTRUCTIONS` updated | MCP units `retry_and_cancel_texts`, `status_text_covers_ready_conflict_and_hint`, `instructions_carry_the_queue_guidance`, `queue_tools_are_listed_with_descriptions_and_output_schemas`, `skipped_fields_are_never_required`; `tests/mcp.rs` `queue_tools_are_listed_with_descriptions_and_instructions`; e2e `queue_e2e.rs` `mcp_retry_and_cancel_after_a_conflict` |
+| 8 | CLI `approve` waited forever | `QueueTrainView.push_timeout_ms`/`network_timeout_ms` (optional); CLI `landing_deadline` + `wait_expired_text` (exit 1, hint `sluice queue status`); MCP `approve_wait` replaces the fixed 10 min | CLI unit `landing_wait_is_bounded_by_the_base_timeouts`; MCP unit `approve_wait_follows_the_base_timeouts` |
+| 9 | Cancel between the read and the Ready write → `internal` failures | `runner::finish_train` decides step 7 inside the write transaction | runner units `a_cancel_before_the_outcome_requeues_the_others`, `passing_gates_make_the_train_ready_with_a_hash` |
+| 10 | `push_env`/job `env` kept forever | `Writer::train_to` clears `push_env` on `landed`/`dissolved`; `Writer::job_to` clears `env` on `landed`/`cancelled` (not on `conflict`/`failed`: `retry` still fetches with it) | store `credentials_are_dropped_when_rows_finish`; queue `cancelling_a_conflict_keeps_the_ready_train` (reads the rows) |
+| 11 | `fetch` overwrote `FETCH_HEAD` | `Git::fetch` passes `--no-write-fetch-head` (git ≥ 2.29; Sluice needs 2.31) | queue `cancelling_a_conflict_keeps_the_ready_train` (`FETCH_HEAD` sentinel unchanged) |
+| 12 | Every exit-1 without `fatal:` was `pre_push_hook` | `push::classify`: hook-declined only with no git `error:` line besides `failed to push some refs`; `error: src refspec`/`dst refspec`/`unable to push to unqualified destination` → `Rejected` (definitive); other `error:` lines → `Ambiguous` | push units `hook_declined_needs_no_git_error_besides_the_summary`, `a_refused_refspec_is_definitive`, `pre_push_hook_declined` |
+| 13 | Untracked gate output dissolved approved trains | `pre_push_checks`: `status --porcelain --untracked-files=no` | queue `cancelling_a_conflict_keeps_the_ready_train` (gate `touch gate-output.txt`, the train lands) |
+| 14 | No retention; `step` scanned every train | user `[queue] retention` (default `30d`, `UserQueueConfig.retention`); `Writer::prune` + `store::Pruned`; `runner::maintenance` (prune + `sweep_merge_dir`) at daemon start and every `MAINTENANCE_PERIOD` (1 h); `store::live_trains`, `store::finished_trains_since` (housekeeping window 1 h) | store `retention_prunes_only_finished_rows`; config `user_queue_section` |
+| 15 | MCP enqueues audited as `cli` | optional `via` on `EnqueueRequest`, `QueueRetry`, `QueueCancel` (protocol stays 1); `extension::actor_of` | proto `client_round_trip`, `queue_spellings`; queue `cancelling_a_conflict_keeps_the_ready_train`; e2e `mcp_retry_and_cancel_after_a_conflict` (enqueue, retry, cancel all `mcp`) |
+| — | `queue status` showed dissolved trains with current member states | CLI `visible_trains`: a dissolved train is hidden once a newer train exists for the same (repo, remote, target); `--json` unchanged | CLI unit `superseded_dissolved_trains_are_hidden` |
+
+Notes:
+
+- The push itself still goes to the remote **name** (`git push … --
+  <remote>`), so the repository's `pre-push` hook keeps receiving the remote
+  name; the pre-push check verified just before that the name resolves to
+  the bound push URL. Fetches and `ls-remote` go to the URL, so remote
+  settings keyed by name (`remote.<r>.uploadpack`, `remote.<r>.proxy`) do
+  not apply to them.
+- A head `.sluice.toml` whose `[queue] remote` is invalid is ignored as a
+  whole (built-in defaults, documented behaviour of `defaults_at`), so the
+  injection is refused at the config layer; `invalid_remote` is the refusal
+  for a valid-looking name that is not a configured remote (or a direct
+  caller of `target::resolve`).

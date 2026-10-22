@@ -155,6 +155,9 @@ pub enum ClientMessage {
         job_id: String,
         /// Branch head re-read by the client.
         head_sha: String,
+        /// Surface the request came from (audit trail); `None` = CLI.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<ApproveVia>,
     },
     /// Merge queue: cancel a job. Reply: `queue-job`.
     QueueCancel {
@@ -163,6 +166,9 @@ pub enum ClientMessage {
         id: u64,
         /// Job to cancel.
         job_id: String,
+        /// Surface the request came from (audit trail); `None` = CLI.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<ApproveVia>,
     },
     /// Merge queue: evaluate `needs_reconcile` trains. Reply: `queue-reconcile`.
     QueueReconcile {
@@ -199,15 +205,20 @@ pub struct EnqueueRequest {
     /// Allowlisted environment of the enqueuing client (credentials for fetches).
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Surface the request came from (audit trail); `None` = CLI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<ApproveVia>,
 }
 
-/// Surface an approval came from.
+/// Surface a queue request came from: `queue-approve` (required) and,
+/// optionally, `queue-enqueue`, `queue-retry`, `queue-cancel`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ApproveVia {
-    /// `sluice queue approve`.
+    /// The `sluice queue` CLI.
     Cli,
-    /// The MCP tool `queue_approve`.
+    /// The MCP tools (`queue_approve`, `queue_enqueue`, `queue_retry`,
+    /// `queue_cancel`).
     Mcp,
 }
 
@@ -871,6 +882,13 @@ pub struct QueueTrainView {
     /// Free-form note (e.g. `rewritten_after_landing`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// `[queue] push_timeout` of the base, in milliseconds (bounds a
+    /// client's wait for the landing).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub push_timeout_ms: Option<u64>,
+    /// `[queue] network_timeout` of the base, in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_timeout_ms: Option<u64>,
 }
 
 /// Decision taken by `queue-reconcile` for one train.
@@ -1092,6 +1110,8 @@ mod tests {
             updated_at: "t".into(),
             landed_at: None,
             note: None,
+            push_timeout_ms: Some(600_000),
+            network_timeout_ms: Some(60_000),
         }
     }
 
@@ -1139,6 +1159,7 @@ mod tests {
                     caller: Caller::Agent,
                     session: Some("s1".into()),
                     env: BTreeMap::from([("SSH_AUTH_SOCK".into(), "/a".into())]),
+                    via: Some(ApproveVia::Mcp),
                 },
             },
             ClientMessage::QueueStatus {
@@ -1157,10 +1178,23 @@ mod tests {
                 id: 8,
                 job_id: "j".into(),
                 head_sha: TREE.into(),
+                via: None,
+            },
+            ClientMessage::QueueRetry {
+                id: 8,
+                job_id: "j".into(),
+                head_sha: TREE.into(),
+                via: Some(ApproveVia::Mcp),
             },
             ClientMessage::QueueCancel {
                 id: 9,
                 job_id: "j".into(),
+                via: None,
+            },
+            ClientMessage::QueueCancel {
+                id: 9,
+                job_id: "j".into(),
+                via: Some(ApproveVia::Mcp),
             },
             ClientMessage::QueueReconcile { id: 10, repo: None },
         ];
@@ -1502,6 +1536,18 @@ mod tests {
         };
         assert_eq!(request.base, None);
         assert!(request.env.is_empty());
+        // `via` is optional (old clients never send it) and omitted when unset.
+        assert_eq!(request.via, None);
+        let line = encode(&ClientMessage::QueueEnqueue { id: 1, request }).unwrap();
+        assert!(!line.contains("via"), "{line}");
+        let m = decode_client(r#"{"type":"queue-cancel","job_id":"j","via":"mcp"}"#).unwrap();
+        assert!(matches!(
+            m,
+            ClientMessage::QueueCancel {
+                via: Some(ApproveVia::Mcp),
+                ..
+            }
+        ));
         let m = decode_client(
             r#"{"type":"queue-approve","train_id":"t","train_hash":"h","via":"cli"}"#,
         )

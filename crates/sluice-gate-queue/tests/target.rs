@@ -134,3 +134,58 @@ fn endpoint_hash_tracks_the_url() {
     let l = target::endpoint_hash(&git, &fx.common, "").unwrap();
     assert_eq!(l.len(), 64);
 }
+
+#[test]
+fn endpoint_is_the_push_url() {
+    let fx = Fixture::new("version = 1\n");
+    let git = Git::new(&fx.queue_env());
+    let fetch_only = target::endpoint(&git, &fx.common, "origin").unwrap();
+    assert_eq!(fetch_only.0, fx.bare.display().to_string());
+    // A push URL replaces the fetch URL for the binding and every query.
+    fx.git(&["remote", "set-url", "--push", "origin", "/push/here.git"]);
+    let (url, hash) = target::endpoint(&git, &fx.common, "origin").unwrap();
+    assert_eq!(url, "/push/here.git");
+    assert_ne!(hash, fetch_only.1);
+    // pushInsteadOf rewrites the URL git push uses (no explicit pushurl).
+    fx.git(&["config", "--unset", "remote.origin.pushurl"]);
+    fx.git(&["config", "url./rewritten/.pushInsteadOf", "/"]);
+    let (url, _) = target::endpoint(&git, &fx.common, "origin").unwrap();
+    assert!(url.starts_with("/rewritten/"), "{url}");
+    // Two push URLs: `git push` would go to both; refused.
+    fx.git(&["config", "--unset", "url./rewritten/.pushInsteadOf"]);
+    fx.git(&["remote", "set-url", "--add", "--push", "origin", "/a.git"]);
+    fx.git(&["remote", "set-url", "--add", "--push", "origin", "/b.git"]);
+    let e = target::endpoint(&git, &fx.common, "origin").unwrap_err();
+    assert!(format!("{e:#}").contains("2 push URLs"), "{e:#}");
+}
+
+#[test]
+fn an_option_shaped_remote_is_refused_and_never_runs() {
+    let fx = Fixture::new("version = 1\n");
+    let git = Git::new(&fx.queue_env());
+    let witness = fx.root.join("witness");
+    let injected = QueueConfig {
+        remote: format!("--upload-pack=touch {} #", witness.display()),
+        target: None,
+        ..QueueConfig::default()
+    };
+    let e = target::resolve(&git, &fx.common, "feature", None, &injected).unwrap_err();
+    assert_eq!(e.code, "invalid_remote", "{e}");
+    assert!(e.message.contains("must not start with '-'"), "{e}");
+    // Also through an explicit target branch and the endpoint/fetch path.
+    let explicit = QueueConfig {
+        target: Some("main".into()),
+        ..injected.clone()
+    };
+    let e = target::resolve(&git, &fx.common, "feature", None, &explicit).unwrap_err();
+    assert_eq!(e.code, "invalid_remote", "{e}");
+    assert!(target::endpoint(&git, &fx.common, &injected.remote).is_err());
+    // A remote that is not configured is refused the same way.
+    let unknown = QueueConfig {
+        remote: "upstream".into(),
+        ..QueueConfig::default()
+    };
+    let e = target::resolve(&git, &fx.common, "feature", None, &unknown).unwrap_err();
+    assert_eq!(e.code, "invalid_remote", "{e}");
+    assert!(!witness.exists(), "the injected command ran");
+}

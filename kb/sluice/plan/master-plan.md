@@ -184,6 +184,15 @@ referenced here.
 - [x] Acceptance tests 1–8 of the design (local bare remote, kill during push): [[sluice/changes/phase-6-acceptance.md]] (2026-10-22).
 - [ ] Docs (`docs/agents.md`, README), change note, acceptance note, reconciliation report.
 
+## Debugging and observability (after Phase 6, before the final report)
+
+- [ ] `[debug] level` in the user config and `sluice daemon restart [--debug]`; `SLUICE_LOG` keeps precedence.
+- [ ] Persistent logs for `sluice mcp` (`<state>/logs/mcp-<pid>.log`) and for the CLI (`<state>/logs/client.log`, one line per invocation: gate, tree, decision, exit code, duration), under the same retention as job logs.
+- [ ] Size-based rotation of `<state>/daemon.log`.
+- [ ] `sluice doctor` (git version, PSI, socket, lease, daemon vs installed binary version, config validity) and `sluice doctor --bundle` (a `.tar.gz` with version, configs, `status --json`, `queue status --json`, recent daemon/client/MCP logs and the last failed job logs, with secrets and home paths redacted) for bug reports; CONTRIBUTING points to it.
+
+Why: today the log level is fixed at daemon start, the MCP server and the hook client leave no persistent trace, `daemon.log` grows without bound and a bug report needs manual collection.
+
 ## Agent integration package (after Phase 6, before the final report)
 
 - [ ] Claude Code plugin in this repository, the repository doubling as its marketplace: registers the `sluice mcp` server, ships a `sluice` skill (verify → commit → `queue_enqueue` → stop; exit code 3; reading `status`/`logs`; queue conflicts), and an optional `PreToolUse` hook that redirects raw test commands run through Bash to `verify` and denies `sluice queue approve` to agents.

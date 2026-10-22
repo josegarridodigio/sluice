@@ -27,6 +27,9 @@ pub struct QueueOptions {
     /// call and gate process of the queue (tests isolate the user's git
     /// config this way). `None` in production.
     pub base_env: Option<EnvMap>,
+    /// Program spawned for the push instead of `git` (tests inject a spawn
+    /// failure). `None` in production.
+    pub push_program: Option<PathBuf>,
 }
 
 /// The merge queue as a daemon extension.
@@ -120,6 +123,10 @@ fn train_view(t: &TrainRow) -> QueueTrainView {
         updated_at: rfc3339(t.updated_at),
         landed_at: t.landed_at.map(rfc3339),
         note: t.note.clone(),
+        push_timeout_ms: Some(t.settings.push_timeout_ms),
+        network_timeout_ms: Some(
+            u64::try_from(t.settings.network_timeout().as_millis()).unwrap_or(u64::MAX),
+        ),
     }
 }
 
@@ -131,6 +138,14 @@ fn job_reply(core: &Core, id: u64, job_id: &str) -> ServerMessage {
         Ok(Some(job)) => ServerMessage::QueueJob { id, job },
         Ok(None) => err(id, ErrorCode::NotFound, format!("no queue job {job_id}")),
         Err(e) => store_err(id, &e),
+    }
+}
+
+/// The audit actor of a request from `via` (`None`: an older client, the CLI).
+fn actor_of(via: Option<ApproveVia>) -> Actor {
+    match via {
+        Some(ApproveVia::Mcp) => Actor::Mcp,
+        Some(ApproveVia::Cli) | None => Actor::Cli,
     }
 }
 
@@ -148,12 +163,18 @@ impl Extension for QueueExtension {
             handle
                 .store_tx(store::init)
                 .map_err(|e| anyhow!(store_msg(&e)))?;
-            let core = Arc::new(Core::new(handle.clone(), self.options.base_env.clone())?);
+            let core = Arc::new(Core::with_push_program(
+                handle.clone(),
+                self.options.base_env.clone(),
+                self.options.push_program.clone(),
+            )?);
             start_recovery(&core).context("parking interrupted trains")?;
+            // Retention prune and sweep of `<state>/merge/` leftovers (then
+            // once per hour from the runner).
             let c2 = Arc::clone(&core);
-            tokio::task::spawn_blocking(move || sweep_merge_dir(&c2))
+            tokio::task::spawn_blocking(move || runner::maintenance(&c2))
                 .await
-                .map_err(|e| anyhow!("sweep failed: {e}"))?;
+                .map_err(|e| anyhow!("maintenance failed: {e}"))?;
             let _ = self.core.set(core);
             Ok(())
         })
@@ -213,8 +234,11 @@ impl Extension for QueueExtension {
                     id,
                     job_id,
                     head_sha,
-                } => retry(core, id, &job_id, &head_sha).await,
-                ClientMessage::QueueCancel { id, job_id } => cancel(core, id, &job_id),
+                    via,
+                } => retry(core, id, &job_id, &head_sha, actor_of(via)).await,
+                ClientMessage::QueueCancel { id, job_id, via } => {
+                    cancel(core, id, &job_id, actor_of(via))
+                }
                 ClientMessage::QueueReconcile { id, repo } => {
                     reconcile(core, id, repo.as_deref()).await
                 }
@@ -302,25 +326,6 @@ fn start_recovery(core: &Core) -> anyhow::Result<()> {
     .map_err(|e| anyhow!(store_msg(&e)))
 }
 
-/// Removes `<state>/merge/*` leftovers not owned by a live train.
-fn sweep_merge_dir(core: &Core) {
-    let Ok(entries) = std::fs::read_dir(&core.merge_dir) else {
-        return;
-    };
-    let trains = core.read(|tx| store::trains(tx, None)).unwrap_or_default();
-    for e in entries.flatten() {
-        let path = e.path();
-        let owner = trains.iter().find(|t| t.worktree == path);
-        match owner {
-            Some(t) if crate::model::train_is_active(t.state) => {}
-            Some(t) => core.git.remove_worktree(&t.repo, &path),
-            None => {
-                let _ = std::fs::remove_dir_all(&path);
-            }
-        }
-    }
-}
-
 async fn enqueue(core: &Arc<Core>, id: u64, req: EnqueueRequest) -> ServerMessage {
     let repo = canonical(&req.repo);
     let git = core.git_for(&req.env);
@@ -351,6 +356,9 @@ async fn enqueue(core: &Arc<Core>, id: u64, req: EnqueueRequest) -> ServerMessag
             ));
         };
         let defaults = target::defaults_at(&g2, &r2, &full);
+        // Remote queries of the resolution (`ls-remote`) are bounded by the
+        // head's `[queue] network_timeout`: a stall only delays this request.
+        let g2 = g2.with_network_timeout(defaults.network_timeout);
         match target::resolve(&g2, &r2, &branch, base.as_deref(), &defaults) {
             Ok(t) => Ok((full, t)),
             Err(e) => Err((
@@ -381,7 +389,7 @@ async fn enqueue(core: &Arc<Core>, id: u64, req: EnqueueRequest) -> ServerMessag
         session: req.session.clone(),
         env: allowlisted(&req.env),
     };
-    let actor = Actor::Cli;
+    let actor = actor_of(req.via);
     match core.write(actor, |w| {
         let j = w.insert_job(&new)?;
         job_view(w.tx(), &j)
@@ -483,7 +491,13 @@ fn approve(
     }
 }
 
-async fn retry(core: &Arc<Core>, id: u64, job_id: &str, head_sha: &str) -> ServerMessage {
+async fn retry(
+    core: &Arc<Core>,
+    id: u64,
+    job_id: &str,
+    head_sha: &str,
+    actor: Actor,
+) -> ServerMessage {
     let Ok(Some(j)) = core.read(|tx| store::job(tx, job_id)) else {
         return err(id, ErrorCode::NotFound, format!("no queue job {job_id}"));
     };
@@ -499,7 +513,7 @@ async fn retry(core: &Arc<Core>, id: u64, job_id: &str, head_sha: &str) -> Serve
             format!("{head_sha} is not a commit"),
         );
     };
-    let r = core.write(Actor::Cli, |w| {
+    let r = core.write(actor, |w| {
         let Some(j) = store::job(w.tx(), job_id)? else {
             return Err(store::refuse(Refusal::NotFound(format!(
                 "no queue job {job_id}"
@@ -534,8 +548,8 @@ async fn retry(core: &Arc<Core>, id: u64, job_id: &str, head_sha: &str) -> Serve
     }
 }
 
-fn cancel(core: &Core, id: u64, job_id: &str) -> ServerMessage {
-    let r = core.write(Actor::Cli, |w| {
+fn cancel(core: &Core, id: u64, job_id: &str, actor: Actor) -> ServerMessage {
+    let r = core.write(actor, |w| {
         let Some(j) = store::job(w.tx(), job_id)? else {
             return Err(store::refuse(Refusal::NotFound(format!(
                 "no queue job {job_id}"
@@ -595,7 +609,9 @@ async fn reconcile(core: &Arc<Core>, id: u64, repo: Option<&Path>) -> ServerMess
     let mut results = Vec::new();
     for (t, jobs, m) in trains {
         let env = t.push_env.clone().unwrap_or_default();
-        let git = core.git_for(&env);
+        let git = core
+            .git_for(&env)
+            .with_network_timeout(t.settings.network_timeout());
         let t2 = t.clone();
         let push = m
             .as_ref()
@@ -629,6 +645,10 @@ async fn reconcile(core: &Arc<Core>, id: u64, repo: Option<&Path>) -> ServerMess
         let decision = decide(&input);
         tracing::info!(train = %t.id, ?input, ?decision, "reconcile");
         let applied = apply_decision(core, &t, &decision);
+        // Pin ref and worktree go only once the decision is recorded: a
+        // refused write leaves the train `needs_reconcile`, and the next
+        // reconcile needs both.
+        let cleanup = applied.is_ok() && !matches!(decision, Decision::Refuse(_));
         let (dec, reason) = match (&decision, applied) {
             (_, Err(e)) => (ReconcileDecision::Refused, Some(store_msg(&e))),
             (Decision::Refuse(r), Ok(())) => (ReconcileDecision::Refused, Some((*r).to_owned())),
@@ -637,7 +657,7 @@ async fn reconcile(core: &Arc<Core>, id: u64, repo: Option<&Path>) -> ServerMess
             (Decision::Queued, Ok(())) => (ReconcileDecision::Queued, None),
             (Decision::Cancelled, Ok(())) => (ReconcileDecision::Cancelled, None),
         };
-        if !matches!(decision, Decision::Refuse(_)) {
+        if cleanup {
             let (git, repo, wt, tid) = (
                 core.git.clone(),
                 t.repo.clone(),

@@ -244,6 +244,7 @@ fn do_enqueue(branch: Option<&str>, base: Option<&str>) -> Outcome {
             .filter(|s| !s.is_empty())
             .cloned(),
         env: filter_env(&env),
+        via: None,
     };
     match send(&env, &ClientMessage::QueueEnqueue { id: 1, request }, true)? {
         ServerMessage::QueueJob { job, .. } => {
@@ -465,16 +466,34 @@ fn render_train(train: &QueueTrainView, jobs: &[QueueJobView]) -> String {
     out
 }
 
+/// Trains worth showing to a human: a dissolved train is hidden once a
+/// newer train exists for the same (repository, remote, target); its
+/// members are then shown by the newer train or on their own (`--json`
+/// keeps everything).
+fn visible_trains(report: &QueueStatusReport) -> Vec<&QueueTrainView> {
+    let superseded = |t: &QueueTrainView| {
+        t.state == QueueTrainState::Dissolved
+            && report.trains.iter().any(|n| {
+                n.repo == t.repo
+                    && n.remote == t.remote
+                    && n.target == t.target
+                    && (n.created_at.as_str(), n.train_id.as_str())
+                        > (t.created_at.as_str(), t.train_id.as_str())
+            })
+    };
+    report.trains.iter().filter(|t| !superseded(t)).collect()
+}
+
 /// Renders the human form of a `queue-status` report.
 fn render_status(report: &QueueStatusReport) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
-    for train in &report.trains {
+    let trains = visible_trains(report);
+    for train in &trains {
         out.push_str(&render_train(train, &report.jobs));
     }
     let in_train = |j: &QueueJobView| {
-        report
-            .trains
+        trains
             .iter()
             .any(|t| t.members.iter().any(|m| m == &j.job_id))
     };
@@ -578,10 +597,20 @@ fn do_approve(train_id: &str, yes: bool) -> Outcome {
     match after.state {
         QueueTrainState::Approved | QueueTrainState::Pushing => {
             println!("sluice: approved; pushing\u{2026}");
-            wait_for_landing(&env, &after)
+            let user = UserConfig::load(&env).unwrap_or_default();
+            wait_for_landing(&env, &after, landing_deadline(&after, user.queue.tick))
         }
         _ => report_final(&after, &report.jobs),
     }
+}
+
+/// How long `approve` waits for the landing: the base's `push_timeout`
+/// plus one `network_timeout` (the pre-push checks), two runner ticks and a
+/// 30 s margin. Defaults (10 min, 60 s) for a daemon that does not report them.
+fn landing_deadline(train: &QueueTrainView, tick: Duration) -> Duration {
+    let push = Duration::from_millis(train.push_timeout_ms.unwrap_or(600_000));
+    let network = Duration::from_millis(train.network_timeout_ms.unwrap_or(60_000));
+    push + network + tick * 2 + Duration::from_secs(30)
 }
 
 fn render_plan(train: &QueueTrainView, jobs: &[QueueJobView]) -> String {
@@ -656,8 +685,10 @@ fn report_final(train: &QueueTrainView, jobs: &[QueueJobView]) -> Outcome {
     }
 }
 
-/// Polls `queue-status` until the train is no longer approved or pushing.
-fn wait_for_landing(env: &EnvMap, train: &QueueTrainView) -> Outcome {
+/// Polls `queue-status` until the train is no longer approved or pushing,
+/// or `deadline` expired (exit 1 with the current state).
+fn wait_for_landing(env: &EnvMap, train: &QueueTrainView, deadline: Duration) -> Outcome {
+    let started = std::time::Instant::now();
     loop {
         thread::sleep(POLL_PERIOD);
         let report = fetch_status(env, None)?;
@@ -666,7 +697,12 @@ fn wait_for_landing(env: &EnvMap, train: &QueueTrainView) -> Outcome {
                 if matches!(
                     t.state,
                     QueueTrainState::Approved | QueueTrainState::Pushing
-                ) => {}
+                ) =>
+            {
+                if started.elapsed() >= deadline {
+                    return Err(Failure::error(wait_expired_text(t, deadline)));
+                }
+            }
             Some(t) => return report_final(t, &report.jobs),
             None => {
                 // The train left the report: judge by its members.
@@ -683,6 +719,16 @@ fn wait_for_landing(env: &EnvMap, train: &QueueTrainView) -> Outcome {
             }
         }
     }
+}
+
+/// The message of an `approve` that stopped waiting.
+fn wait_expired_text(train: &QueueTrainView, waited: Duration) -> String {
+    format!(
+        "stopped waiting after {}: train {} is still {}; the daemon goes on (check 'sluice queue status')",
+        humantime::format_duration(Duration::from_secs(waited.as_secs())),
+        train.train_id,
+        train_state_label(train.state)
+    )
 }
 
 // ------------------------------------------------- retry, cancel, reconcile
@@ -712,6 +758,7 @@ fn do_retry(job_id: &str) -> Outcome {
         id: 1,
         job_id: job_id.to_owned(),
         head_sha,
+        via: None,
     };
     match send(&env, &msg, false)? {
         ServerMessage::QueueJob { job, .. } => {
@@ -740,6 +787,7 @@ fn do_cancel(job_id: &str) -> Outcome {
     let msg = ClientMessage::QueueCancel {
         id: 1,
         job_id: job_id.to_owned(),
+        via: None,
     };
     match send(&env, &msg, false)? {
         ServerMessage::QueueJob { job, .. } => {
@@ -954,6 +1002,57 @@ mod tests {
             text.contains("FAILED base_config_invalid TOML parse error"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn superseded_dissolved_trains_are_hidden() {
+        let mut old = train("t-1-aaaaaa", QueueTrainState::Dissolved, &["j1", "j2"]);
+        old.created_at = "2026-10-22T10:00:00Z".into();
+        old.gates = vec![gate("test", "fail", Some(1000))];
+        let mut new = train("t-2-bbbbbb", QueueTrainState::Ready, &["j1"]);
+        new.created_at = "2026-10-22T10:05:00Z".into();
+        let mut other = train("t-0-cccccc", QueueTrainState::Dissolved, &["j9"]);
+        other.target = "release".into();
+        other.created_at = "2026-10-22T09:00:00Z".into();
+        let report = QueueStatusReport {
+            schema: 1,
+            trains: vec![old, new, other],
+            jobs: vec![
+                job("j1", "feat/a", QueueJobState::Ready),
+                job("j2", "feat/b", QueueJobState::Queued),
+            ],
+        };
+        let text = render_status(&report);
+        assert!(!text.contains("t-1-aaaaaa"), "{text}");
+        assert!(!text.contains("FAIL"), "{text}");
+        assert!(text.contains("t-2-bbbbbb"), "{text}");
+        // The newest train of another target stays, even dissolved.
+        assert!(text.contains("t-0-cccccc"), "{text}");
+        // The hidden train's other member is listed on its own.
+        assert!(text.contains("queued:\n  feat/b  job j2"), "{text}");
+    }
+
+    #[test]
+    fn landing_wait_is_bounded_by_the_base_timeouts() {
+        let mut t = train("t-1", QueueTrainState::Approved, &["j1"]);
+        t.push_timeout_ms = Some(120_000);
+        t.network_timeout_ms = Some(2_000);
+        assert_eq!(
+            landing_deadline(&t, Duration::from_secs(5)),
+            Duration::from_secs(120 + 2 + 10 + 30)
+        );
+        t.push_timeout_ms = None;
+        t.network_timeout_ms = None;
+        assert_eq!(
+            landing_deadline(&t, Duration::from_secs(5)),
+            Duration::from_secs(600 + 60 + 10 + 30)
+        );
+        let text = wait_expired_text(&t, Duration::from_millis(700_500));
+        assert!(
+            text.starts_with("stopped waiting after 11m 40s: train t-1 is still APPROVED"),
+            "{text}"
+        );
+        assert!(text.contains("sluice queue status"), "{text}");
     }
 
     #[test]

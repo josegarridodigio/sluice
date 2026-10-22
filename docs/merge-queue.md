@@ -44,7 +44,16 @@ the branch are not part of the job; run `retry` to pick them up.
 | (omitted) | `[queue] remote` and `target` |
 
 Tags, raw SHAs, `HEAD`, the job's own branch and a local branch that is checked
-out somewhere are refused.
+out somewhere are refused, and so is a `[queue] remote` that is not a configured
+remote of the repository or starts with `-` (`invalid_remote`).
+
+Everything the queue asks a remote (the fetch of the target, the checks before the
+push, `reconcile`) goes to the URL `git push <remote>` would use: the remote's
+`pushurl` (or its `url`, with `insteadOf`/`pushInsteadOf` applied). With a fetch URL A
+and a push URL B, trains are built on B's branch and land on B. A remote with several
+push URLs is refused. Each of these calls is limited by `[queue] network_timeout`
+(default `60s`): a remote that hangs makes the jobs wait with `base_unavailable` (and
+`failed` after 3 attempts) without holding up other repositories or approved trains.
 
 ### status
 
@@ -59,7 +68,9 @@ queued:
 ```
 
 One block per train with its members, the gates and, for conflicts, the paths
-and the retry hint. Jobs that are not in a train are listed as `queued` with their
+and the retry hint. A dissolved train is hidden once a newer train exists for the
+same target (its members show up in the newer train or on their own; `--json`
+keeps every train). Jobs that are not in a train are listed as `queued` with their
 position. When no train can be built because the target cannot be fetched or the
 base commit's `.sluice.toml` is invalid, the queued line says why
 (`waiting: base_unavailable <git error>` or `waiting: base_config_invalid <error>`);
@@ -81,7 +92,10 @@ sends the train hash it displayed, so if the train changed in between (the targe
 moved, a member was cancelled or retried) the daemon refuses with `stale-plan`:
 look at `status` again and approve the new plan. On success it prints
 `sluice: landed <sha> on <target> (train <id>)`. If the push is still running it
-prints `approved; pushing...` and waits until the train lands or fails.
+prints `approved; pushing...` and waits until the train lands or fails, at most the
+base's `push_timeout` plus its `network_timeout`, two ticks and 30 s; then it prints
+the train's current state and exits 1 (the daemon carries on; check
+`sluice queue status`).
 
 ### retry, cancel, reconcile
 
@@ -92,12 +106,14 @@ prints `approved; pushing...` and waits until the train lands or fails.
   that contains it is rebuilt without it. A job that is already pushing is only
   cancelled if `reconcile` proves nothing landed.
 - `sluice queue reconcile`: if a push was interrupted (daemon killed, network cut,
-  timeout) the train is parked as `needs_reconcile`. `reconcile` reads the remote
+  timeout, or the push could not be started) the train is parked as
+  `needs_reconcile`. `reconcile` reads the remote
   (it never pushes) and prints one line per train: `train <id>: <decision> (<reason>)`
   with the decision `landed`, `ready` (approval voided, approve again), `queued`
   (the target moved, the train will be rebuilt), `cancelled` or `refused` (for example
   `push_in_progress`, `endpoint_changed`, `remote_unreachable`; nothing changed).
-  It only runs when you ask for it.
+  It only runs when you ask for it. If the decision cannot be recorded, the train
+  stays `needs_reconcile` with its pin ref and worktree, so `reconcile` can run again.
 
 ## Exit codes
 
@@ -116,7 +132,9 @@ Messages start with `sluice: `. If the running daemon predates the queue, run
 The push is a regular `git push --atomic` from the merge worktree, so the repository's
 `pre-push` hook **runs**. A Sluice-based hook (`sluice run --hook pre-push test`) answers
 from the markers the train just produced and does not run anything again. A hook that
-declines fails the train (`pre_push_hook`) instead of being bypassed. The push is
+declines fails the train (`pre_push_hook`) instead of being bypassed. Untracked or
+ignored files that gates leave in the merge worktree do not matter (they are not part of
+the commit); a modified tracked file dissolves the train. The push is
 protected by `--force-with-lease` on the target, and by default a `refs/sluice/landed/<sha>`
 audit ref is pushed with it.
 
@@ -132,6 +150,7 @@ gates = ["test", "lint"]   # default: gates whose hooks contain pre-push, else e
 max_train = 4              # 1 disables batching
 audit_ref = true           # push refs/sluice/landed/<sha> atomically with the target
 push_timeout = "10m"       # covers the pre-push hook and the transfer
+network_timeout = "60s"    # every other network call (fetch, ls-remote); the process group is killed on expiry
 ```
 
 User, `~/.config/sluice/config.toml`:
@@ -141,6 +160,7 @@ User, `~/.config/sluice/config.toml`:
 enabled = true                 # user-level kill switch for the merge queue runner
 allow_agent_approval = false   # let the MCP queue_approve tool approve trains
 tick = "5s"                    # runner housekeeping period
+retention = "30d"              # finished jobs, trains and their history are pruned after this
 ```
 
 `allow_agent_approval` only exists in the user config. Putting it in `.sluice.toml`
@@ -150,7 +170,8 @@ never grant approval rights.
 ## Agent policy
 
 Agents enqueue; humans approve. The MCP server tells agents to enqueue after `verify`
-passes and then stop. `queue_approve` over MCP is refused unless the user config sets
+passes and then stop; after a conflict or a failure they fix the branch and call
+`queue_retry` (`queue_cancel` withdraws a job). `queue_approve` over MCP is refused unless the user config sets
 `allow_agent_approval = true`. The daemon cannot tell a human from an agent on its socket,
 so also deny the command in the agent's permissions, for example in Claude Code's
 `.claude/settings.json`:

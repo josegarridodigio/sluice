@@ -71,7 +71,7 @@ impl Extension for FakeQueue {
                         ..QueueStatusReport::default()
                     },
                 }),
-                ClientMessage::QueueCancel { id, job_id } => Some(ServerMessage::Error {
+                ClientMessage::QueueCancel { id, job_id, .. } => Some(ServerMessage::Error {
                     id,
                     code: ErrorCode::ConflictState,
                     message: format!(
@@ -273,6 +273,7 @@ async fn queue_requests_are_routed_to_the_extension() {
     let cancel = ClientMessage::QueueCancel {
         id: 12,
         job_id: "j1".into(),
+        via: None,
     };
     match d.ask(&cancel).await {
         ServerMessage::Error { id, code, message } => {

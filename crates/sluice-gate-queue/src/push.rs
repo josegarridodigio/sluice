@@ -21,10 +21,12 @@ pub enum PushVerdict {
     /// the train is dissolved and its members re-queued.
     Moved(String),
     /// Definitive rejection by policy (`[remote rejected]`, permission
-    /// denied): nothing landed, members `failed`.
+    /// denied) or a refspec git refused locally (`error: src refspec`):
+    /// nothing landed, members `failed`.
     Rejected(String),
     /// The repository's `pre-push` hook declined (exit 1, no ref line, no
-    /// `fatal:`): nothing was sent; members `failed` with `pre_push_hook`.
+    /// `fatal:` and no git `error:` line besides `failed to push some
+    /// refs`): nothing was sent; members `failed` with `pre_push_hook`.
     HookDeclined(String),
     /// Anything else: signal, timeout, network error, truncated or
     /// unparsable output → `needs_reconcile`.
@@ -93,7 +95,28 @@ pub fn classify(exit: Option<i32>, stdout: &str, stderr: &str, target_ref: &str)
             return PushVerdict::Rejected(format!("permission denied: {}", tail(stderr, 3)));
         }
         let fatal = stderr.lines().any(|l| l.trim_start().starts_with("fatal:"));
-        if code == 1 && !fatal && stderr.contains("failed to push some refs") {
+        // git's own `error:` lines other than the final summary.
+        let git_errors: Vec<&str> = stderr
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| l.starts_with("error:") && !l.contains("failed to push some refs"))
+            .collect();
+        // A refspec git refused locally: nothing was sent.
+        if git_errors.iter().any(|l| {
+            l.starts_with("error: src refspec")
+                || l.starts_with("error: dst refspec")
+                || l.starts_with("error: unable to push to unqualified destination")
+        }) {
+            return PushVerdict::Rejected(format!("refspec refused: {}", tail(stderr, 3)));
+        }
+        // The `pre-push` hook declined: exit 1, nothing but the hook's own
+        // output and git's summary line. Any other git `error:` line makes
+        // the end ambiguous rather than a hook's verdict.
+        if code == 1
+            && !fatal
+            && git_errors.is_empty()
+            && stderr.contains("failed to push some refs")
+        {
             let out: Vec<&str> = stderr
                 .lines()
                 .filter(|l| !l.contains("failed to push some refs"))
@@ -155,6 +178,7 @@ pub fn push_args(remote: &str, target: &str, base_sha: &str, s: &str, audit: boo
     if audit {
         v.push(format!("--force-with-lease=refs/sluice/landed/{s}:"));
     }
+    v.push("--".to_owned());
     v.push(remote.to_owned());
     v.push(format!("{s}:refs/heads/{target}"));
     if audit {
@@ -192,15 +216,32 @@ pub struct PushProcess {
 }
 
 /// Spawns `git <args>` in `cwd` (the merge worktree) in its own process
-/// group, hooks **enabled** (the repository's `pre-push` runs).
+/// group, hooks **enabled** (the repository's `pre-push` runs). `program`
+/// replaces `git` (tests only: an injected spawn failure).
 ///
 /// # Errors
 ///
 /// Spawn failure.
-pub fn spawn(git: &Git, cwd: &Path, args: &[String]) -> Result<PushProcess> {
+pub fn spawn(
+    program: Option<&Path>,
+    git: &Git,
+    cwd: &Path,
+    args: &[String],
+) -> Result<PushProcess> {
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let mut cmd =
-        tokio::process::Command::from(sluice_gate_core::git::command(&refs, cwd, git.env()));
+    let std_cmd = match program {
+        None => sluice_gate_core::git::command(&refs, cwd, git.env()),
+        Some(p) => {
+            let mut c = std::process::Command::new(p);
+            c.args(&refs)
+                .current_dir(cwd)
+                .env_clear()
+                .envs(git.env())
+                .stdin(Stdio::null());
+            c
+        }
+    };
+    let mut cmd = tokio::process::Command::from(std_cmd);
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
@@ -362,6 +403,41 @@ mod tests {
     }
 
     #[test]
+    fn hook_declined_needs_no_git_error_besides_the_summary() {
+        // A hook that prints a ref-shaped `error:` line itself still declines
+        // only when git added nothing of its own: here git did.
+        let err =
+            "error: RPC failed; curl 56 recv failure\nerror: failed to push some refs to 'h'\n";
+        assert!(matches!(
+            classify(Some(1), "", err, T),
+            PushVerdict::Ambiguous(_)
+        ));
+        let err = "hook output\nerror: some other git complaint\nerror: failed to push some refs to 'h'\n";
+        assert!(matches!(
+            classify(Some(1), "", err, T),
+            PushVerdict::Ambiguous(_)
+        ));
+        // Exit 1 without the summary line is not a hook's verdict either.
+        assert!(matches!(
+            classify(Some(1), "", "something odd\n", T),
+            PushVerdict::Ambiguous(_)
+        ));
+    }
+
+    #[test]
+    fn a_refused_refspec_is_definitive() {
+        let err = "error: src refspec deadbeef does not match any\nerror: failed to push some refs to '../r.git'\n";
+        assert!(
+            matches!(classify(Some(1), "", err, T), PushVerdict::Rejected(s) if s.starts_with("refspec refused"))
+        );
+        let err = "error: dst refspec refs/heads/x matches more than one\nerror: failed to push some refs to 'r'\n";
+        assert!(matches!(
+            classify(Some(1), "", err, T),
+            PushVerdict::Rejected(_)
+        ));
+    }
+
+    #[test]
     fn network_failure_is_ambiguous() {
         let err = "fatal: unable to access 'https://h/r.git/': Could not resolve host: h\n";
         assert!(matches!(
@@ -409,13 +485,14 @@ mod tests {
                 "--recurse-submodules=no",
                 "--force-with-lease=refs/heads/main:B",
                 "--force-with-lease=refs/sluice/landed/S:",
+                "--",
                 "origin",
                 "S:refs/heads/main",
                 "S:refs/sluice/landed/S",
             ]
         );
         let a = push_args("origin", "main", "B", "S", false);
-        assert_eq!(a.len(), 8);
+        assert_eq!(a.len(), 9);
         assert!(!a.iter().any(|x| x.contains("landed")));
     }
 }

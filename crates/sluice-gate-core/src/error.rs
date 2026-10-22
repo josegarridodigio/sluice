@@ -24,6 +24,16 @@ pub enum Error {
         stderr: String,
     },
 
+    /// A git command with a deadline (network calls of the merge queue) did
+    /// not finish in time; its process group was terminated.
+    #[error("git {} timed out after {}; its process group was killed", args.join(" "), humantime::format_duration(*timeout))]
+    GitTimeout {
+        /// Arguments passed to git.
+        args: Vec<String>,
+        /// The deadline that expired.
+        timeout: std::time::Duration,
+    },
+
     /// The current directory is not inside a git repository.
     #[error("not a git repository: {0}")]
     NotARepository(PathBuf),

@@ -6,12 +6,20 @@
 //! `GIT_TERMINAL_PROMPT=0` (the daemon has no terminal), plus the
 //! allowlisted credentials variables of the client a call acts for.
 //! Merge and ref operations add `-c core.hooksPath=/dev/null`.
+//!
+//! Network calls (`fetch`, `ls-remote`) go to the remote's **push URL**
+//! (`git remote get-url --push`, design section 2 "Endpoint binding") and
+//! have a deadline (`[queue] network_timeout`): git runs in its own process
+//! group, killed on expiry. User-derived positional arguments follow `--`
+//! (or `--end-of-options` for `rev-parse`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Output;
+use std::time::Duration;
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
+use sluice_gate_core::config::{DEFAULT_NETWORK_TIMEOUT, invalid_remote_name};
 use sluice_gate_core::git as core_git;
 
 /// Environment map.
@@ -41,10 +49,11 @@ pub fn allowlisted(env: &EnvMap) -> EnvMap {
 /// Hooks disabled for merge and ref operations.
 const NO_HOOKS: [&str; 2] = ["-c", "core.hooksPath=/dev/null"];
 
-/// A git runner bound to an environment.
+/// A git runner bound to an environment and a network deadline.
 #[derive(Debug, Clone)]
 pub struct Git {
     env: EnvMap,
+    network_timeout: Duration,
 }
 
 impl Git {
@@ -59,7 +68,10 @@ impl Git {
             .collect();
         env.insert("LC_ALL".into(), "C".into());
         env.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
-        Self { env }
+        Self {
+            env,
+            network_timeout: DEFAULT_NETWORK_TIMEOUT,
+        }
     }
 
     /// The same runner with a client's allowlisted variables on top.
@@ -67,7 +79,25 @@ impl Git {
     pub fn with_client_env(&self, client: &EnvMap) -> Self {
         let mut env = self.env.clone();
         env.extend(allowlisted(client));
-        Self { env }
+        Self {
+            env,
+            network_timeout: self.network_timeout,
+        }
+    }
+
+    /// The same runner with another deadline for network calls.
+    #[must_use]
+    pub fn with_network_timeout(&self, timeout: Duration) -> Self {
+        Self {
+            env: self.env.clone(),
+            network_timeout: timeout.max(Duration::from_millis(1)),
+        }
+    }
+
+    /// Deadline of network calls.
+    #[must_use]
+    pub fn network_timeout(&self) -> Duration {
+        self.network_timeout
     }
 
     /// The environment used for git.
@@ -133,6 +163,82 @@ impl Git {
         core_git::run_output(&all, wt, &self.env).context("spawning git")
     }
 
+    /// Runs a network call `git --git-dir=<common> <args>` (hooks disabled)
+    /// with the deadline; trimmed stdout.
+    ///
+    /// # Errors
+    ///
+    /// Spawn failure, non-zero exit or the deadline.
+    fn net(&self, common: &Path, args: &[&str]) -> Result<String> {
+        let c = common.to_string_lossy();
+        let all = Self::repo_args(&c, args, false);
+        let out = core_git::run_output_deadline(&all, common, &self.env, self.network_timeout)?;
+        if !out.status.success() {
+            return Err(core_git::command_error(&all, &out).into());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    }
+
+    /// The push URL of `remote` (`git remote get-url --push`: `pushurl`, else
+    /// `url`, with `insteadOf`/`pushInsteadOf` applied): where `git push
+    /// <remote>` goes, hence the endpoint every network query of a train
+    /// uses. Local (no network).
+    ///
+    /// # Errors
+    ///
+    /// An unacceptable name (leading `-`, whitespace), a remote that is not
+    /// configured, or a remote with several push URLs (a train lands on
+    /// exactly one endpoint).
+    pub fn push_url(&self, common: &Path, remote: &str) -> Result<String> {
+        if let Some(why) = invalid_remote_name(remote) {
+            bail!("invalid remote name '{remote}': it {why}");
+        }
+        let out = self.repo_out(
+            common,
+            &["remote", "get-url", "--push", "--all", "--", remote],
+        )?;
+        if !out.status.success() {
+            bail!("'{remote}' is not a configured remote of this repository");
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let urls: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        match urls.as_slice() {
+            [url] => Ok((*url).to_owned()),
+            [] => bail!("remote '{remote}' has no URL"),
+            _ => bail!(
+                "remote '{remote}' has {} push URLs; the merge queue pushes to exactly one",
+                urls.len()
+            ),
+        }
+    }
+
+    /// `git fetch --no-tags --no-write-fetch-head <url> <refspec>` with the
+    /// deadline. `FETCH_HEAD` of the repository is never touched.
+    ///
+    /// # Errors
+    ///
+    /// The fetch failed or timed out.
+    pub fn fetch(&self, common: &Path, url: &str, refspec: &str) -> Result<()> {
+        self.net(
+            common,
+            &[
+                "fetch",
+                "--no-tags",
+                "--quiet",
+                "--no-write-fetch-head",
+                "--",
+                url,
+                refspec,
+            ],
+        )
+        .with_context(|| format!("git fetch {url} {refspec}"))?;
+        Ok(())
+    }
+
     /// Full SHA of `rev` (`rev-parse --verify --quiet <rev>^{commit}` for
     /// commits); `None` when it does not resolve.
     ///
@@ -141,7 +247,16 @@ impl Git {
     /// Spawn failure.
     pub fn resolve_commit(&self, common: &Path, rev: &str) -> Result<Option<String>> {
         let spec = format!("{rev}^{{commit}}");
-        let out = self.repo_out(common, &["rev-parse", "--verify", "--quiet", &spec])?;
+        let out = self.repo_out(
+            common,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &spec,
+            ],
+        )?;
         Ok(out
             .status
             .success()
@@ -154,7 +269,16 @@ impl Git {
     ///
     /// Spawn failure.
     pub fn ref_sha(&self, common: &Path, refname: &str) -> Result<Option<String>> {
-        let out = self.repo_out(common, &["rev-parse", "--verify", "--quiet", refname])?;
+        let out = self.repo_out(
+            common,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                refname,
+            ],
+        )?;
         Ok(out
             .status
             .success()
@@ -176,20 +300,23 @@ impl Git {
         })
     }
 
-    /// `git ls-remote <remote> <refs…>`: map of ref name to SHA.
+    /// `git ls-remote -- <url> <refs…>` with the deadline: map of ref name
+    /// to SHA. `url` is the push URL ([`Git::push_url`]).
     ///
     /// # Errors
     ///
-    /// The remote cannot be reached or git fails.
+    /// The remote cannot be reached, git fails or the deadline expired.
     pub fn ls_remote(
         &self,
         common: &Path,
-        remote: &str,
+        url: &str,
         refs: &[&str],
     ) -> Result<BTreeMap<String, String>> {
-        let mut args = vec!["ls-remote", remote];
+        let mut args = vec!["ls-remote", "--", url];
         args.extend(refs);
-        let out = self.repo(common, &args)?;
+        let out = self
+            .net(common, &args)
+            .with_context(|| format!("git ls-remote {url}"))?;
         Ok(out
             .lines()
             .filter_map(|l| {
@@ -197,6 +324,20 @@ impl Git {
                 Some((name.trim().to_owned(), sha.trim().to_owned()))
             })
             .collect())
+    }
+
+    /// The branch `HEAD` points to on `url` (`ls-remote --symref`, with the
+    /// deadline); `None` when the remote does not say.
+    ///
+    /// # Errors
+    ///
+    /// The remote cannot be reached, git fails or the deadline expired.
+    pub fn remote_head(&self, common: &Path, url: &str) -> Result<Option<String>> {
+        let out = self.net(common, &["ls-remote", "--symref", "--", url, "HEAD"])?;
+        Ok(out.lines().find_map(|l| {
+            let rest = l.strip_prefix("ref: refs/heads/")?;
+            Some(rest.split('\t').next()?.trim().to_owned())
+        }))
     }
 
     /// Branches checked out in any worktree of the repository (short names).

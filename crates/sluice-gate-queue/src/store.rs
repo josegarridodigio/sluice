@@ -139,6 +139,23 @@ pub struct TrainSettings {
     pub push_timeout_ms: u64,
     /// `[queue] audit_ref`.
     pub audit_ref: bool,
+    /// `[queue] network_timeout` in milliseconds; `0` (rows written before
+    /// the setting existed) means the default.
+    #[serde(default)]
+    pub network_timeout_ms: u64,
+}
+
+impl TrainSettings {
+    /// Deadline of the train's network calls (watch, pre-push checks,
+    /// reconcile).
+    #[must_use]
+    pub fn network_timeout(&self) -> std::time::Duration {
+        if self.network_timeout_ms == 0 {
+            sluice_gate_core::config::DEFAULT_NETWORK_TIMEOUT
+        } else {
+            std::time::Duration::from_millis(self.network_timeout_ms)
+        }
+    }
 }
 
 /// One `queue_jobs` row.
@@ -515,6 +532,48 @@ pub fn trains(tx: &Transaction<'_>, repo: Option<&Path>) -> rusqlite::Result<Vec
         .collect()
 }
 
+/// Trains that are not finished (neither `landed` nor `dissolved`),
+/// oldest first, optionally restricted to one repository.
+///
+/// # Errors
+///
+/// SQLite errors.
+pub fn live_trains(tx: &Transaction<'_>, repo: Option<&Path>) -> rusqlite::Result<Vec<TrainRow>> {
+    let mut stmt = tx.prepare(&format!(
+        "SELECT {TRAIN_COLS} FROM queue_trains WHERE state NOT IN ('landed','dissolved') \
+         AND (?1 IS NULL OR repo = ?1) ORDER BY created_at, id"
+    ))?;
+    stmt.query_map([repo.map(path_str)], train_from_row)?
+        .collect()
+}
+
+/// Finished (`landed`/`dissolved`) trains changed at or after `since`
+/// (unix ms): the ones whose merge worktree may still need removing.
+///
+/// # Errors
+///
+/// SQLite errors.
+pub fn finished_trains_since(tx: &Transaction<'_>, since: u64) -> rusqlite::Result<Vec<TrainRow>> {
+    let mut stmt = tx.prepare(&format!(
+        "SELECT {TRAIN_COLS} FROM queue_trains WHERE state IN ('landed','dissolved') \
+         AND updated_at >= ?1 ORDER BY created_at, id"
+    ))?;
+    stmt.query_map([i(since)], train_from_row)?.collect()
+}
+
+/// Rows removed by [`Writer::prune`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Pruned {
+    /// `landed`/`cancelled` jobs.
+    pub jobs: usize,
+    /// `landed`/`dissolved` trains.
+    pub trains: usize,
+    /// Push markers of finished trains.
+    pub markers: usize,
+    /// Audit rows.
+    pub events: usize,
+}
+
 /// Trains in one of `states`, oldest first.
 ///
 /// # Errors
@@ -795,8 +854,15 @@ impl<'a, 'c> Writer<'a, 'c> {
         if let Some(d) = &edit.detail {
             push("detail", Box::new(d.as_ref().map(json)));
         }
+        // The train of the job before this change, for the audit row.
+        let train_before: Option<String> = job(self.tx, id)?.and_then(|j| j.train_id);
         if let Some(t) = &edit.train_id {
             push("train_id", Box::new(t.clone()));
+        } else if matches!(to, QueueJobState::Conflict | QueueJobState::Failed) {
+            // A conflicting or failed job leaves its train: the train goes on
+            // with the other members, and nothing done to this job later
+            // (cancel, retry) may touch that train.
+            push("train_id", Box::new(Option::<String>::None));
         }
         if let Some(h) = &edit.head_sha {
             push("head_sha", Box::new(h.clone()));
@@ -812,6 +878,8 @@ impl<'a, 'c> Writer<'a, 'c> {
         }
         if crate::model::job_is_terminal(to) {
             push("finished_at", Box::new(i(self.now)));
+            // The credentials allowlist is not needed any more.
+            push("env", Box::new(Option::<String>::None));
         } else {
             push("finished_at", Box::new(Option::<i64>::None));
         }
@@ -840,7 +908,7 @@ impl<'a, 'c> Writer<'a, 'c> {
                 ))),
             });
         }
-        let train: Option<String> = job(self.tx, id)?.and_then(|j| j.train_id);
+        let train: Option<String> = job(self.tx, id)?.and_then(|j| j.train_id).or(train_before);
         self.event(
             Some(id),
             train.as_deref(),
@@ -996,6 +1064,12 @@ impl<'a, 'c> Writer<'a, 'c> {
         if to == QueueTrainState::Landed {
             push("landed_at", Box::new(i(self.now)));
         }
+        if matches!(to, QueueTrainState::Landed | QueueTrainState::Dissolved)
+            && edit.approve.is_none()
+        {
+            // Terminal: the approver's credentials allowlist is dropped.
+            sets.push("push_env = NULL".to_owned());
+        }
         if edit.void_approval {
             sets.push(
                 "approved_at = NULL, approved_via = NULL, approved_hash = NULL, push_env = NULL"
@@ -1038,6 +1112,43 @@ impl<'a, 'c> Writer<'a, 'c> {
             )?;
         }
         Ok(())
+    }
+
+    /// Retention (user config `[queue] retention`): deletes what finished
+    /// before `cutoff` (unix ms): `landed`/`cancelled` jobs, `landed`/
+    /// `dissolved` trains no job still points to, the markers of finished
+    /// trains, and audit rows. Live rows are never touched.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn prune(&self, cutoff: u64) -> rusqlite::Result<Pruned> {
+        let c = i(cutoff);
+        let jobs = self.tx.execute(
+            "DELETE FROM queue_jobs WHERE state IN ('landed','cancelled') \
+             AND coalesce(finished_at, updated_at) < ?1",
+            [c],
+        )?;
+        let markers = self.tx.execute(
+            "DELETE FROM queue_push_markers WHERE written_at < ?1 AND train_id IN \
+             (SELECT id FROM queue_trains WHERE state IN ('landed','dissolved'))",
+            [c],
+        )?;
+        let trains = self.tx.execute(
+            "DELETE FROM queue_trains WHERE state IN ('landed','dissolved') AND updated_at < ?1 \
+             AND id NOT IN (SELECT train_id FROM queue_jobs WHERE train_id IS NOT NULL) \
+             AND id NOT IN (SELECT train_id FROM queue_push_markers)",
+            [c],
+        )?;
+        let events = self
+            .tx
+            .execute("DELETE FROM queue_events WHERE at < ?1", [c])?;
+        Ok(Pruned {
+            jobs,
+            trains,
+            markers,
+            events,
+        })
     }
 
     /// Re-stamps every non-terminal train with this daemon's token
@@ -1251,7 +1362,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn with<R>(
+    pub(crate) fn with<R>(
         c: &mut Connection,
         f: impl FnOnce(&Transaction<'_>) -> rusqlite::Result<R>,
     ) -> rusqlite::Result<R> {
@@ -1261,7 +1372,7 @@ pub(crate) mod tests {
         Ok(r)
     }
 
-    fn new_job(id: &str, branch: &str) -> NewJob {
+    pub(crate) fn new_job(id: &str, branch: &str) -> NewJob {
         NewJob {
             id: id.into(),
             repo: "/r/.git".into(),
@@ -1517,6 +1628,211 @@ pub(crate) mod tests {
         let t = with(&mut c, |tx| train(tx, "t1")).unwrap().unwrap();
         assert_eq!(t.approved_via, Some(ApproveVia::Cli));
         assert_eq!(t.approved_hash.as_deref(), Some("h"));
+    }
+
+    /// `j1`, `j2` claimed into train `t1` (state `building`, jobs `merging`).
+    pub(crate) fn two_member_train(c: &mut Connection, f: &LeaseFence) {
+        with(c, init).unwrap();
+        with(c, |tx| {
+            let w = Writer::new(tx, f, Actor::Runner)?;
+            let mut j1 = new_job("j1", "a");
+            j1.env = EnvMap::from([("HOME".to_owned(), "/h".to_owned())]);
+            w.insert_job(&j1)?;
+            w.insert_job(&new_job("j2", "b"))?;
+            w.insert_train(&NewTrain {
+                id: "t1".into(),
+                repo: "/r/.git".into(),
+                remote: "origin".into(),
+                target: "main".into(),
+                endpoint_hash: "e".into(),
+                base_sha: "b".into(),
+                worktree: "/s/merge/t1".into(),
+                members: vec!["j1".into(), "j2".into()],
+                settings: TrainSettings::default(),
+            })?;
+            for j in ["j1", "j2"] {
+                w.job_to(
+                    j,
+                    QueueJobState::Queued,
+                    QueueJobState::Merging,
+                    &JobEdit {
+                        train_id: Some(Some("t1".into())),
+                        ..JobEdit::default()
+                    },
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn env_column(c: &mut Connection, table: &str, col: &str, id: &str) -> Option<String> {
+        with(c, |tx| {
+            tx.query_row(
+                &format!("SELECT {col} FROM {table} WHERE id = ?1"),
+                [id],
+                |r| r.get(0),
+            )
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_conflicting_member_leaves_its_train() {
+        let mut c = conn();
+        let f = fence("tok");
+        two_member_train(&mut c, &f);
+        with(&mut c, |tx| {
+            Writer::new(tx, &f, Actor::Runner)?.job_to(
+                "j2",
+                QueueJobState::Merging,
+                QueueJobState::Conflict,
+                &JobEdit::default(),
+            )
+        })
+        .unwrap();
+        let (j2, t, ev) = with(&mut c, |tx| {
+            Ok((
+                job(tx, "j2")?.unwrap(),
+                train(tx, "t1")?.unwrap(),
+                events(tx, "j2")?,
+            ))
+        })
+        .unwrap();
+        assert_eq!(j2.train_id, None);
+        // The train still lists every claimed member, but only j1 is attached.
+        assert_eq!(t.members, ["j1", "j2"]);
+        let attached = with(&mut c, |tx| train_jobs(tx, &t)).unwrap();
+        assert_eq!(attached.len(), 1);
+        assert_eq!(attached[0].id, "j1");
+        // The audit row still names the train the job left.
+        let last = ev.last().unwrap();
+        assert_eq!(last.1, "conflict");
+        let tid: Option<String> = with(&mut c, |tx| {
+            tx.query_row(
+                "SELECT train_id FROM queue_events WHERE job_id = 'j2' AND to_state = 'conflict'",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+        assert_eq!(tid.as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn credentials_are_dropped_when_rows_finish() {
+        let mut c = conn();
+        let f = fence("tok");
+        two_member_train(&mut c, &f);
+        assert!(env_column(&mut c, "queue_jobs", "env", "j1").is_some());
+        // Approve, then land: the train's push_env and the jobs' env go.
+        with(&mut c, |tx| {
+            let w = Writer::new(tx, &f, Actor::Runner)?;
+            for (from, to) in [
+                (QueueJobState::Merging, QueueJobState::Verifying),
+                (QueueJobState::Verifying, QueueJobState::Ready),
+                (QueueJobState::Ready, QueueJobState::Approved),
+                (QueueJobState::Approved, QueueJobState::Pushing),
+                (QueueJobState::Pushing, QueueJobState::Landed),
+            ] {
+                w.job_to("j1", from, to, &JobEdit::default())?;
+            }
+            for (from, to) in [
+                (QueueTrainState::Building, QueueTrainState::Verifying),
+                (QueueTrainState::Verifying, QueueTrainState::Ready),
+            ] {
+                w.train_to("t1", from, to, &TrainEdit::default())?;
+            }
+            w.train_to(
+                "t1",
+                QueueTrainState::Ready,
+                QueueTrainState::Approved,
+                &TrainEdit {
+                    approve: Some((
+                        ApproveVia::Cli,
+                        "h".into(),
+                        EnvMap::from([("SSH_AUTH_SOCK".to_owned(), "/s".to_owned())]),
+                    )),
+                    ..TrainEdit::default()
+                },
+            )?;
+            w.train_to(
+                "t1",
+                QueueTrainState::Approved,
+                QueueTrainState::Pushing,
+                &TrainEdit::default(),
+            )
+        })
+        .unwrap();
+        assert!(env_column(&mut c, "queue_trains", "push_env", "t1").is_some());
+        with(&mut c, |tx| {
+            let w = Writer::new(tx, &f, Actor::Runner)?;
+            w.train_to(
+                "t1",
+                QueueTrainState::Pushing,
+                QueueTrainState::Landed,
+                &TrainEdit::default(),
+            )?;
+            w.job_to(
+                "j2",
+                QueueJobState::Merging,
+                QueueJobState::Cancelled,
+                &JobEdit::default(),
+            )
+        })
+        .unwrap();
+        assert_eq!(env_column(&mut c, "queue_trains", "push_env", "t1"), None);
+        assert_eq!(env_column(&mut c, "queue_jobs", "env", "j1"), None);
+        assert_eq!(env_column(&mut c, "queue_jobs", "env", "j2"), None);
+        let t = with(&mut c, |tx| train(tx, "t1")).unwrap().unwrap();
+        assert!(t.landed_at.is_some());
+        assert_eq!(t.approved_hash.as_deref(), Some("h"), "history kept");
+    }
+
+    #[test]
+    fn retention_prunes_only_finished_rows() {
+        let mut c = conn();
+        let f = fence("tok");
+        two_member_train(&mut c, &f);
+        // j1 cancelled, train t1 dissolved with j2 back in the queue.
+        with(&mut c, |tx| {
+            let w = Writer::new(tx, &f, Actor::Runner)?;
+            w.job_to(
+                "j1",
+                QueueJobState::Merging,
+                QueueJobState::Cancelled,
+                &JobEdit::default(),
+            )?;
+            let t = train(tx, "t1")?.unwrap();
+            w.dissolve(&t, QueueTrainState::Building, "test", false)
+        })
+        .unwrap();
+        // Nothing is older than the cutoff yet.
+        let now = sluice_gate_core::dirs::now_ms();
+        let p = with(&mut c, |tx| {
+            Writer::new(tx, &f, Actor::Runner)?.prune(now.saturating_sub(60_000))
+        })
+        .unwrap();
+        assert_eq!(p, Pruned::default());
+        let p = with(&mut c, |tx| {
+            Writer::new(tx, &f, Actor::Runner)?.prune(now + 60_000)
+        })
+        .unwrap();
+        assert_eq!(p.jobs, 1, "the cancelled job");
+        assert_eq!(p.trains, 1, "the dissolved train");
+        assert!(p.events > 0);
+        let (j1, j2, t1, live) = with(&mut c, |tx| {
+            Ok((
+                job(tx, "j1")?,
+                job(tx, "j2")?,
+                train(tx, "t1")?,
+                live_trains(tx, None)?,
+            ))
+        })
+        .unwrap();
+        assert!(j1.is_none() && t1.is_none());
+        assert_eq!(j2.unwrap().state, QueueJobState::Queued, "live rows stay");
+        assert_eq!(live.len(), 0);
     }
 
     #[test]
