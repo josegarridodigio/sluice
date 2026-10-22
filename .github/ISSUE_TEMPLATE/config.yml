@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Debugging guide
+    url: https://github.com/josegarridodigio/sluice/blob/main/docs/debugging.md
+    about: Where Sluice logs, how to turn on debug logging and how to collect a diagnostic bundle. Read this before filing a bug.
+  - name: README and known limitations
+    url: https://github.com/josegarridodigio/sluice#known-limitations
+    about: What Sluice does, how to configure it and what it deliberately does not do yet.

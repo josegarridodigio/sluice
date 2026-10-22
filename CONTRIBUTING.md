@@ -57,6 +57,35 @@ multi-worktree benchmark that produces the before/after numbers.
   `docs:`). Keep the subject under 72 characters and explain the why in the
   body.
 
+## Changelog
+
+`CHANGELOG.md` follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+Every user-visible change adds one line under `## [Unreleased]`, in the
+right group (`Added`, `Changed`, `Fixed`), in the same commit as the
+change. Documentation-only or internal-only changes need no entry.
+
+## Releasing
+
+Maintainers only:
+
+```sh
+scripts/release.sh X.Y.Z
+```
+
+The script refuses to run with a dirty tree, off `main`, or when
+`[Unreleased]` is empty. It moves the `[Unreleased]` entries into
+`## [X.Y.Z] - <today>` (`scripts/changelog-release.py`), updates the
+compare links, bumps the versions, runs the gates through Sluice, commits
+`chore(release): vX.Y.Z` and tags `vX.Y.Z`. It never pushes. Review the
+commit, then the human pushes:
+
+```sh
+git push origin main vX.Y.Z
+```
+
+The release workflow refuses a tag that does not match the workspace
+version and uses the matching CHANGELOG section as the release notes.
+
 ## Knowledge base
 
 `kb/` is a Pando knowledge base versioned with the code. Each change gets a

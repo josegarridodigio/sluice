@@ -1,0 +1,33 @@
+name: Feature request
+description: Suggest an improvement or a new capability.
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check the [README](https://github.com/josegarridodigio/sluice#known-limitations) and the [roadmap](https://github.com/josegarridodigio/sluice#roadmap) first; the idea may already be planned.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like Sluice to do? Include the commands or configuration you imagine.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you use now, or other tools you tried.
+  - type: textarea
+    id: context
+    attributes:
+      label: Your setup
+      description: Project type, hook manager, whether agents are involved, number of parallel worktrees.

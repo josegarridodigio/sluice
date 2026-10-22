@@ -1,0 +1,114 @@
+# Changelog
+
+All notable changes to Sluice are documented in this file.
+
+The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+
+- `docs/gates-cookbook.md`: per-stack `.sluice.toml` examples (Node,
+  Python, Rust, Go, Docker, monorepos) and guidance on per-worktree caches,
+  verdicts versus build artifacts and choosing hooks.
+- A compatibility CI matrix: Ubuntu 22.04/24.04, Debian 12, Fedora,
+  Alpine (musl), git 2.31.0 built from source and native aarch64, on main,
+  tags, weekly and on demand.
+- Issue templates that ask for `sluice doctor --bundle`, this changelog,
+  release notes taken from it, and a "Known limitations" README section.
+
+### Changed
+
+### Fixed
+
+## [0.2.0] - 2026-10-22
+
+### Added
+
+- Local merge queue inside the daemon (`sluice-gate-queue`): trains of up
+  to four branches, no-ff merges in a disposable worktree, gates run
+  through the scheduler, approval bound to a train hash, a write-ahead
+  marker and pin ref before an atomic push, deterministic reconcile after a
+  crash, and local-branch targets (failing multi-job trains split into
+  single-job trains). CLI `sluice queue ...` and MCP
+  `queue_*` tools. Humans approve; agents cannot unless a user-config key
+  allows it.
+- Debugging tools: `[debug] level` in the user config, `sluice daemon
+  restart --debug`, persistent `sluice mcp` and `sluice run` logs
+  (`logs/mcp-<pid>.log`, `logs/client.log`), `daemon.log` rotation, and
+  `sluice doctor [--json] [--bundle]` with a redacted `.tar.gz` bundle.
+  See [docs/debugging.md](docs/debugging.md).
+- `sluice update [--check] [--version vX.Y.Z]`: replaces the binary with a
+  verified release (SHA-256 checked) and restarts an idle daemon.
+- Claude Code plugin and marketplace in this repository: MCP registration,
+  the `sluice` skill and a `PreToolUse` guard hook that denies the raw
+  commands your gates run.
+- `scripts/release.sh`, and a release workflow step that refuses a tag that
+  does not match the workspace version.
+- Daemon extension point and protocol messages for the merge queue.
+
+### Changed
+
+- The merge queue was hardened after an adversarial review: network calls
+  have deadlines and run off the runner's main loop, the `[queue] remote`
+  must be a configured remote, reconcile cleans up only after its decision
+  commits, approve waits are bounded, credentials are dropped when rows
+  finish, and untracked gate output no longer dissolves a train. MCP gained
+  `queue_retry` and `queue_cancel`.
+- `sluice status` shows the log level and path; the status reply gained an
+  optional `daemon.log_level` (status JSON schema stays 1).
+- `docs/agents.md` recommends the plugin and keeps the `CLAUDE.md` or
+  `AGENTS.md` block as the fallback for other agents.
+
+### Fixed
+
+- A daemon killed with SIGKILL kept its lease for 90 s and blocked every
+  restart; the new daemon frees a lease whose owner is gone. Queued jobs
+  whose base cannot be prepared now fail after three attempts with the
+  reason, and approve says why a train was dissolved.
+- `sluice update`: retry the exec of the fresh binary copy on `ETXTBSY`.
+- Review findings in the merge queue, the debugging tools and the
+  knowledge-base documents (final reconciliation, no open discrepancy).
+
+## [0.1.0] - 2026-10-22
+
+### Added
+
+- Phase 0: workspace of `sluice-gate-*` crates, research of four reference
+  projects and the first architecture decision records (MIT license,
+  Linux only).
+- Phase 1, cache only: `sluice run <gate>` with tree hashing from a private
+  index and object directory (the user's index and working tree are never
+  touched), cache keys with `key_inputs` and `key_files`, markers and miss
+  records with a TTL shared by every worktree, agent detection, a flock
+  semaphore, `sluice cache`, `sluice init` and `sluice hook print`
+  (husky, lefthook, pre-commit, plain). Cache-hit latency 29 ms on a
+  5 000-file repository.
+- Phase 2, daemon: per-user daemon with socket protocol v1, a fenced SQLite
+  lease, a weighted budget scheduler with backfill and head-of-line
+  reservation, coalescing of identical requests, an executor with process
+  groups and timeouts, orphan reconciliation, `sluice daemon`,
+  `sluice status` and `sluice logs`.
+- Phase 3, MCP server: `sluice mcp` with `verify` (blocking, with progress
+  notifications so agent idle timeouts do not fire), `status`, `gate_list`
+  and `logs`; a hook policy that fails fast for agents (exit 3).
+- Phase 4, load awareness: admission by Linux PSI with hysteresis and a
+  starvation guard; status JSON schema 1 pinned by a fixture.
+- Phase 5, packaging: tag-triggered release workflow (static musl binaries
+  for x86_64 and aarch64, `SHA256SUMS`), POSIX installer
+  `scripts/install.sh`, a multi-worktree benchmark and the README demo.
+- Sluice verifies its own repository through `.sluice.toml` and plain hooks
+  under `.githooks/`.
+
+### Fixed
+
+- MCP `verify`: extra arguments join the cache key, per-gate errors keep the
+  other results, and structured results validate against their output
+  schema.
+- PSI thresholds must be percentages (rejected at config load otherwise).
+- Findings of the Phase 1, 2, 3 and 4 reconciliation passes.
+
+[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/josegarridodigio/sluice/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/josegarridodigio/sluice/releases/tag/v0.1.0

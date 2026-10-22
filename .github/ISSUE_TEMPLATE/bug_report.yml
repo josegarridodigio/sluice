@@ -1,0 +1,90 @@
+name: Bug report
+description: Something Sluice did, or failed to do, that you did not expect.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Before you start, read [docs/debugging.md](https://github.com/josegarridodigio/sluice/blob/main/docs/debugging.md).
+        If the problem is reproducible, run `sluice daemon restart --debug`, reproduce it, and then run `sluice doctor --bundle`.
+  - type: input
+    id: version
+    attributes:
+      label: Sluice version
+      description: Output of `sluice --version`.
+      placeholder: "sluice 0.2.0"
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Linux distribution and kernel
+      description: For example the `PRETTY_NAME` in `/etc/os-release` and the output of `uname -r`.
+      placeholder: "Ubuntu 24.04, 6.8.0-45-generic"
+    validations:
+      required: true
+  - type: input
+    id: git-version
+    attributes:
+      label: Git version
+      description: Output of `git --version`.
+      placeholder: "git version 2.43.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: hook-manager
+    attributes:
+      label: Hook manager
+      description: What installs the git hooks that call Sluice.
+      options:
+        - husky
+        - lefthook
+        - pre-commit
+        - plain
+        - other
+    validations:
+      required: true
+  - type: dropdown
+    id: invoked-by
+    attributes:
+      label: Invoked by
+      description: Who or what ran the command or hook that went wrong.
+      options:
+        - A human
+        - A coding agent
+        - Both, or I am not sure
+    validations:
+      required: true
+  - type: textarea
+    id: gate
+    attributes:
+      label: Gate definition
+      description: The relevant gate from `.sluice.toml` (and your user config if it matters).
+      render: toml
+      placeholder: |
+        [gates.test]
+        cmd = "cargo test --workspace"
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Exact commands, output and exit codes. Say which job or tree hash if you know it.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: checkboxes
+    id: bundle
+    attributes:
+      label: Diagnostic bundle
+      description: "`sluice doctor --bundle` redacts home paths, secret-looking values and URL credentials, but logs can still name projects and commands."
+      options:
+        - label: I attached the output of `sluice doctor --bundle` after reviewing it for secrets.
+          required: true

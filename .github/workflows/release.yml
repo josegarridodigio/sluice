@@ -54,15 +54,19 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      - name: Release notes from CHANGELOG.md
+        run: python3 scripts/changelog-release.py extract "${GITHUB_REF_NAME#v}" > release-notes.md
       - name: Checksums
         working-directory: dist
         run: sha256sum sluice-*.tar.gz > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
+          body_path: release-notes.md
           files: |
             dist/sluice-*.tar.gz
             dist/SHA256SUMS

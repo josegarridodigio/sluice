@@ -299,6 +299,38 @@ in `PATH`.
   raw commands your gates run; for other agents, tell them to verify through
   Sluice ([docs/agents.md](docs/agents.md) has a ready-to-paste section).
 
+Recipes for common stacks (Node, Python, Rust, Go, Docker, monorepos):
+[docs/gates-cookbook.md](docs/gates-cookbook.md).
+
+## Known limitations
+
+Sluice is pre-alpha. These are the gaps you will hit first; the full list
+is in the [final report](kb/sluice/changes/final-report.md) and the
+[alpha plan](kb/sluice/plan/alpha-plan.md).
+
+- **Linux only** (git 2.31 or newer). Other platforms are not planned for v1.
+- **Verdicts, not artifacts.** A cache hit says a gate passed on this tree;
+  it does not restore build outputs, so a hit on a build command produces
+  no files.
+- **Only declared gates are controlled.** Raw commands that are not gates
+  (`docker build`, `make`, anything inside `sh -c` or a script) bypass the
+  queue until command control lands. The agent plugin's guard hook and your
+  forge's branch protection are the enforcement, not the daemon.
+- **Per-worktree caches.** Tools that keep state inside the checkout, such
+  as `node_modules/.cache`, break when worktrees share one `node_modules`.
+  Give each worktree its own caches; Sluice cannot fix this.
+- **git reports every failing hook as exit 1.** Sluice's fail-fast exit 3
+  for agents is only visible in the hook's message, so agent instructions
+  must key on the message.
+- **Socket path limit.** The daemon refuses to start when its socket path
+  is longer than 108 bytes (a deep `XDG_RUNTIME_DIR`), and clients then fall
+  back to in-process runs without queue or coalescing. Until the automatic
+  fallback ships, point `SLUICE_SOCKET` at a short path.
+- A documentation-only change re-runs every gate, because the cache key is
+  the whole tree.
+
+See the [CHANGELOG](CHANGELOG.md) for what changed in each release.
+
 ## Prior art
 
 Sluice reimplements ideas from three projects and tries to combine what
@@ -319,7 +351,9 @@ See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Contributing
 
-Issues and discussions are open. The quality bar is in
+Issues and discussions are open; use the issue forms (a bug report asks for
+`sluice doctor --bundle`). Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+The quality bar is in
 [CONTRIBUTING.md](CONTRIBUTING.md): `cargo fmt`, `cargo clippy -D warnings`,
 `cargo test`, and a knowledge-base note for every change.
 
