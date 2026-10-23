@@ -1,0 +1,9 @@
+{
+  "name": "node-pnpm-app",
+  "version": "1.0.0",
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  }
+}

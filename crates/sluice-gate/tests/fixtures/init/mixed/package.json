@@ -1,0 +1,7 @@
+{
+  "name": "mixed-app",
+  "version": "1.0.0",
+  "scripts": {
+    "lint": "ng lint"
+  }
+}

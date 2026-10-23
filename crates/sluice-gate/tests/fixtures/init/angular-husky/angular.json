@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "projects": {
+    "app": {
+      "projectType": "application",
+      "root": "",
+      "architect": {
+        "build": { "builder": "@angular-devkit/build-angular:application" },
+        "lint": { "builder": "@angular-eslint/builder:lint" },
+        "test": { "builder": "@angular-devkit/build-angular:karma" }
+      }
+    }
+  }
+}

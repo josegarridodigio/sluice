@@ -20,7 +20,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the ceiling.
 - `sluice status` shows configured and effective weights (`weight auto→5`);
   its JSON gains the optional `weight_effective` and `weight_auto` (schema 1).
-
 - The built-in heavy list knows the Angular CLI, Nx, Turborepo, Playwright,
   Cypress, react-scripts, Astro, Nuxt, .NET, Bazel, Ninja and `cmake --build`,
   so the guard and the shims catch them with no user config. Dev servers and
@@ -32,8 +31,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A shim call that is exactly a gate command inside a repository with a
   `.sluice.toml` now runs `sluice run <gate> -v` (cache and coalescing)
   instead of `sluice exec`.
+- `sluice init` detects the stack and the existing hooks. It takes gates from
+  the heavy commands of husky, lefthook, pre-commit framework and plain hooks,
+  fills the rest from Angular, Node (npm/pnpm/yarn/bun), Rust, Python and Go
+  projects, picks weights (`"auto"` for test runners) and timeouts, and
+  rewires the hooks in place to `sluice run --hook <hook> <gate>` (comments,
+  mode and CRLF kept; formatters and fixers untouched). With no hook manager
+  it creates `.githooks/` and sets `core.hooksPath` locally. `--dry-run`
+  prints the gates, the files and the diff and writes nothing; `--force` is
+  idempotent.
 
 ### Changed
+
+- `sluice init` outside a git repository is now an error, and writes at the
+  repository root instead of the current directory.
 
 ### Fixed
 

@@ -1,5 +1,10 @@
 # Gates cookbook
 
+`sluice init` writes most of this for you: it detects the stack and the
+commands your hooks already run, picks weights and timeouts like the ones
+below and rewires the hooks (see [`sluice init`](cli.md#sluice-init)). Run
+`sluice init --dry-run` first, then adjust the result with this page.
+
 Ready-to-adapt `.sluice.toml` files per stack. Every example uses only fields
 that exist today (see [docs/configuration.md](configuration.md)): `cmd`,
 `weight`, `timeout`, `hooks`, `key_inputs`, `key_files`, `env`, `cache`,
@@ -70,8 +75,8 @@ Notes:
 
 ### husky and lefthook
 
-Both managers just need to call Sluice. Print the snippet and paste it into
-the manager's file:
+`sluice init` edits husky and lefthook files for you. To do it by hand, print
+the snippet and paste it into the manager's file:
 
 ```sh
 sluice hook print pre-commit    # use in .husky/pre-commit or lefthook.yml

@@ -616,7 +616,10 @@ hooks = ["pre-commit"]
 
 [gates.test]
 cmd = "npm test"
-weight = 4
+# A number is a ceiling in budget units (roughly the CPU threads the gate
+# uses); "auto" starts at half the daemon budget and learns a lower weight
+# from measured runs (needs Sluice 0.4.0). An omitted weight means 1.
+weight = "auto"
 timeout = "20m"
 hooks = ["pre-commit", "pre-push"]
 # Stdout of each command is folded into the cache key.
@@ -1581,7 +1584,7 @@ cmd = \"x\"
         assert_eq!(lint.weight, Weight::Fixed(1));
         assert_eq!(lint.hooks, ["pre-commit"]);
         let test = c.gate("test").unwrap();
-        assert_eq!(test.weight, Weight::Fixed(4));
+        assert_eq!(test.weight, Weight::Auto);
         assert_eq!(test.timeout, Duration::from_mins(20));
         assert_eq!(test.hooks, ["pre-commit", "pre-push"]);
     }

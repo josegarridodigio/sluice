@@ -1,0 +1,8 @@
+#!/bin/sh
+. "$(dirname -- "$0")/_/husky.sh"
+
+# lint first
+ng lint || exit 1
+npx commitlint --edit
+CI=true npx jest --ci
+ng test --watch=false

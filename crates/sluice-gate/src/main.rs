@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use sluice_gate_core::config::{REPO_CONFIG_FILE, RepoConfig, starter_repo_config};
+use sluice_gate_core::config::{REPO_CONFIG_FILE, RepoConfig};
 
 mod budget;
 mod cache;
@@ -19,6 +19,7 @@ mod dirs;
 mod doctor;
 mod exec;
 mod guard;
+mod init;
 mod logging;
 mod logs;
 mod queue;
@@ -205,11 +206,19 @@ enum Command {
         #[command(subcommand)]
         command: CacheCommand,
     },
-    /// Write a starter `.sluice.toml` and print hook snippets.
+    /// Write a `.sluice.toml` that fits the repository and wire its git hooks.
+    ///
+    /// Detects the stack at the repository root and the commands the existing
+    /// hooks (husky, lefthook, pre-commit, plain) already run, writes the gates
+    /// and rewrites those hook lines to `sluice run --hook <hook> <gate>`.
+    /// Nothing is staged or committed.
     Init {
         /// Overwrite an existing `.sluice.toml`.
         #[arg(long)]
         force: bool,
+        /// Print the gates, the files and the diff of the hook edits; write nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Print hook integration snippets.
     Hook {
@@ -479,7 +488,7 @@ fn main() -> ExitCode {
         Command::Cache {
             command: CacheCommand::Clear { gate },
         } => cache::clear(gate.as_deref()),
-        Command::Init { force } => init(force),
+        Command::Init { force, dry_run } => init::run(force, dry_run),
         Command::Hook {
             command: HookCommand::Print { manager },
         } => hook_print(manager),
@@ -606,22 +615,6 @@ fn hook_print(manager: HookManager) -> ExitCode {
         ),
     };
     print!("{preface}{}", snippet(manager, &gates.0, &gates.1));
-    ExitCode::SUCCESS
-}
-
-fn init(force: bool) -> ExitCode {
-    if Path::new(REPO_CONFIG_FILE).exists() && !force {
-        eprintln!("sluice: {REPO_CONFIG_FILE} already exists; not overwriting (use --force)");
-        return ExitCode::from(run::EXIT_ERROR);
-    }
-    if let Err(err) = fs::write(REPO_CONFIG_FILE, starter_repo_config()) {
-        eprintln!("sluice: cannot write {REPO_CONFIG_FILE}: {err}");
-        return ExitCode::from(run::EXIT_ERROR);
-    }
-    println!("sluice: wrote {REPO_CONFIG_FILE}");
-    println!();
-    let (pre_commit, pre_push) = starter_gates();
-    print!("{}", snippet(HookManager::Plain, &pre_commit, &pre_push));
     ExitCode::SUCCESS
 }
 

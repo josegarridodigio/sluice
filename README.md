@@ -85,7 +85,7 @@ is `sluice`. For Claude Code, install the agent plugin (with `sluice` in your
 ## Quick start
 
 ```sh
-sluice init                  # writes .sluice.toml, prints the hook snippet
+sluice init                  # detects the stack, writes .sluice.toml, rewires your hooks
 sluice hook print husky      # or lefthook | pre-commit | plain
 git commit -m "my change"    # the hook runs `sluice run` on a cache miss
 sluice status                # daemon, budget, queue and totals

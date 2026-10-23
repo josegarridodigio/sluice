@@ -15,7 +15,7 @@ authoritative.
 | [`sluice daemon`](#sluice-daemon) | Start the per-user daemon, or stop or restart it. |
 | [`sluice status`](#sluice-status) | Show the daemon, budget, system pressure, jobs and totals. |
 | [`sluice cache`](#sluice-cache) | Inspect or clear cache markers for the current repository. |
-| [`sluice init`](#sluice-init) | Write a starter `.sluice.toml` and print hook snippets. |
+| [`sluice init`](#sluice-init) | Detect the stack and the existing hooks, write `.sluice.toml` and rewire the hooks. |
 | [`sluice hook print`](#sluice-hook) | Print the snippet for a hook manager. |
 | [`sluice logs`](#sluice-logs) | Show the log of a job. |
 | [`sluice queue`](#sluice-queue) | Local merge queue: enqueue, approve, retry, cancel, reconcile. |
@@ -59,7 +59,7 @@ Commands:
   doctor  Check the installation (git, PSI, daemon, lease, configs, hooks) and optionally collect a redacted diagnostics bundle for bug reports
   status  Show the daemon, budget, system pressure (PSI), running and queued jobs, and totals
   cache   Inspect or clear cache markers for the current repository
-  init    Write a starter `.sluice.toml` and print hook snippets
+  init    Write a `.sluice.toml` that fits the repository and wire its git hooks
   hook    Print hook integration snippets
   logs    Show the log of a job
   queue   Local merge queue: enqueue committed branches, approve trains, land them
@@ -447,19 +447,90 @@ Options:
 
 ### `sluice init`
 
-Write a starter `.sluice.toml` and print hook snippets.
+Write a `.sluice.toml` that fits the repository and wire its git hooks, in one
+command.
+
+```sh
+sluice init --dry-run    # show the gates, the files and the diff; write nothing
+sluice init              # do it
+sluice init --force      # redo it over an existing .sluice.toml (idempotent)
+```
+
+`init` is the one command that writes your working tree, and only because you
+ran it ([ADR-0016](../kb/sluice/design/adr/0016-init-detection-and-hooks.md)). It
+writes at the repository root (`git rev-parse --show-toplevel`, so a
+subdirectory is fine; outside a repository it exits 1), and it never stages or
+commits: `git diff` shows everything it changed.
+
+**Gates come first from the hooks you already have.** `init` reads husky
+(`.husky/pre-commit`, `.husky/pre-push`), lefthook (`lefthook.yml`,
+`.lefthook.yml`), the pre-commit framework (`repo: local` hooks of
+`.pre-commit-config.yaml`) and plain hooks (`core.hooksPath` or `.git/hooks`,
+samples ignored). Each line that runs one heavy, non-mutating command (a test
+runner, `ng lint`, `cargo clippy`, an npm script that runs one) becomes a gate
+named from its words (`ng test` is `test`, `npm run typecheck` is `typecheck`,
+repeated names get `-2`), tagged with the hook it was found in. Formatters and
+fixers (`--fix`, `--write`, `pretty-quick`, `lint-staged`), commitlint and your
+own scripts are left alone.
+
+**Then the stack at the root fills what is missing:**
+
+| Found | Gates |
+|---|---|
+| `angular.json` with `lint`/`test` targets | `npx ng lint`, `npx ng test --watch=false` (the package manager's launcher for pnpm/yarn/bun) |
+| `package.json` | `lint`, `typecheck` (or `type-check`) and `test` scripts, run with the package manager of the lockfile (`pnpm-lock.yaml`, `yarn.lock`, `bun.lock[b]`, else npm); `test` gets `env = { CI = "1" }` |
+| `Cargo.toml` | `cargo fmt --check`, `cargo clippy ...`, `cargo test --workspace`, with `CARGO_BUILD_JOBS = "4"` |
+| `pyproject.toml`, `setup.cfg`, `requirements*.txt` | `ruff` and `mypy` when configured, `pytest -q`; `.venv/bin/` prefix when a `.venv` exists |
+| `go.mod` | `go vet ./...`, `go test -p 4 ./...` |
+| nothing | the commented starter template |
+
+Projects below the root are not configured; they are listed in a comment.
+
+**Weights and timeouts.** Lint, vet and type checks get `weight = 2`, a
+formatter 1, test runners and multi-threaded builds `weight = "auto"` (half the
+daemon budget at first, lowered by learning; see
+[configuration](configuration.md); it needs Sluice 0.4.0). Timeouts are 10m for
+lint-like gates and 30m for tests. `key_inputs` carry the tool versions.
+
+**Hooks are rewired, always.** Every line that became a gate is replaced in
+place by `sluice run --hook <hook> <gate>`. Comments, other lines, the file
+mode, CRLF line endings and the trailing-newline state are kept. lefthook and
+pre-commit YAML are edited line by line (no re-serialisation, comments
+survive); a local pre-commit hook also gets `pass_filenames: false`. A line
+that cannot be matched safely (a symlink that leaves the repository, a pre-commit
+hook with `args` or a non-`system` language) is left alone and its snippet is
+printed. With no hook at all, `init` creates executable `.githooks/pre-commit`
+and `.githooks/pre-push` and sets `core.hooksPath` locally; if `.git/hooks`
+already has hooks of its own, or `core.hooksPath` points elsewhere, it prints
+the snippet and says why instead. Gates that no hook calls keep `hooks = []`.
+
+It is safe to run twice: lines that already call `sluice run` are recognised
+and `init --force` changes no hook.
+
+**Output.** A table of the gates (name, command, weight, hooks, source: hook or
+detected), the files written, and a unified diff of the hook edits. `--dry-run`
+prints the same and writes nothing. Exit 0 on success, 1 on error (not a
+repository, `.sluice.toml` exists without `--force`), 2 on a usage error.
 
 <details>
 <summary>Full help</summary>
 
 ```text
-Write a starter `.sluice.toml` and print hook snippets
+Write a `.sluice.toml` that fits the repository and wire its git hooks.
+
+Detects the stack at the repository root and the commands the existing hooks (husky, lefthook, pre-commit, plain) already run, writes the gates and rewrites those hook lines to `sluice run --hook <hook> <gate>`. Nothing is staged or committed.
 
 Usage: sluice init [OPTIONS]
 
 Options:
-      --force  Overwrite an existing `.sluice.toml`
-  -h, --help   Print help
+      --force
+          Overwrite an existing `.sluice.toml`
+
+      --dry-run
+          Print the gates, the files and the diff of the hook edits; write nothing
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 </details>
