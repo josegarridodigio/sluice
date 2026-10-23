@@ -157,6 +157,77 @@ impl Fx {
 
 const BYPASS: Option<&str> = Some("bypassPermissions");
 
+/// The zero-config classification of the Angular incident: no user config,
+/// a `package.json` whose scripts run heavy and light commands.
+#[test]
+fn angular_and_package_scripts_are_classified_without_config() {
+    let fx = Fx::new();
+    fx.write(
+        "plain/package.json",
+        r#"{"scripts":{"test":"ng test","axe":"npm run axe:a","axe:a":"playwright test",
+            "start":"ng serve","lint":"eslint ."}}"#,
+    );
+    for cwd in ["plain", "plain/web"] {
+        for (cmd, want) in [
+            (
+                "npx ng test --watch=false",
+                "sluice exec --label ng-test -- npx ng test --watch=false",
+            ),
+            (
+                "npx ng build -c x",
+                "sluice exec --label ng-build -- npx ng build -c x",
+            ),
+            ("npm run axe", "sluice exec --label run-axe -- npm run axe"),
+            ("npm test", "sluice exec --label run-test -- npm test"),
+            (
+                "pnpm exec playwright test",
+                "sluice exec --label playwright-test -- pnpm exec playwright test",
+            ),
+            (
+                "cd web && npm run axe | tail -3",
+                "cd web && sluice exec --label run-axe -- npm run axe | tail -3",
+            ),
+        ] {
+            if cwd == "plain/web" && cmd.starts_with("cd web") {
+                continue;
+            }
+            fx.check("zero config", cwd, cmd, BYPASS, &[], Want::Allow(want));
+        }
+        for cmd in [
+            "npm start",
+            "npx ng serve",
+            "ng test --watch",
+            "npm run lint",
+            "npm run missing",
+            "npm install",
+        ] {
+            fx.check("not heavy", cwd, cmd, BYPASS, &[], Want::Silent);
+        }
+    }
+    // The script is read from the directory the command runs in.
+    fx.write(
+        "plain/web/package.json",
+        r#"{"scripts":{"test":"echo ok"}}"#,
+    );
+    fx.check(
+        "nearest",
+        "plain/web",
+        "npm test",
+        BYPASS,
+        &[],
+        Want::Silent,
+    );
+    fx.write("plain/web/package.json", "{ not json");
+    fx.check(
+        "invalid",
+        "plain/web",
+        "npm test",
+        BYPASS,
+        &[],
+        Want::Silent,
+    );
+}
+
 /// Rewrites of heavy commands (no `.sluice.toml` applies).
 #[test]
 fn heavy_rewrites() {

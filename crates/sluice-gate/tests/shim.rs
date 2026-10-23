@@ -701,3 +701,86 @@ fn a_non_utf8_environment_still_runs_the_real_binary() {
         assert_eq!(stdout(&out), "real make hello\n", "{env:?}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Zero-config classification and gate routing
+// ---------------------------------------------------------------------------
+
+/// The package manager and runner shims, as fake real binaries that say
+/// whether they ran inside a Sluice job.
+fn fake_node_tools(s: &Shims) {
+    for tool in ["npm", "npx", "pnpm", "ng"] {
+        exe(
+            &s.bin.join(tool),
+            r#"echo "real $(basename "$0") $* job=${SLUICE_JOB:-none}""#,
+        );
+    }
+}
+
+#[test]
+fn package_scripts_and_angular_commands_are_queued_without_config() {
+    let s = setup(4, "");
+    fake_node_tools(&s);
+    fs::write(
+        s.sb.repo.join("package.json"),
+        r#"{"scripts":{"test":"ng test","axe":"npm run axe:a","axe:a":"playwright test",
+            "start":"ng serve","lint":"eslint ."}}"#,
+    )
+    .unwrap();
+    let path = s.default_path();
+    let queued = |name: &str, args: &[&str]| {
+        let out = s.run(&path, AGENT, name, args);
+        assert!(out.status.success(), "{name} {args:?}: {out:?}");
+        let text = stdout(&out);
+        assert!(
+            text.starts_with("real ") && !text.contains("job=none"),
+            "{name} {args:?} should be queued: {text}"
+        );
+    };
+    let direct = |name: &str, args: &[&str]| {
+        let out = s.run(&path, AGENT, name, args);
+        assert!(out.status.success(), "{name} {args:?}: {out:?}");
+        assert!(
+            stdout(&out).ends_with("job=none\n"),
+            "{name} {args:?} should run directly: {}",
+            stdout(&out)
+        );
+    };
+    queued("npx", &["ng", "test", "--watch=false"]);
+    queued("npx", &["ng", "build", "-c", "x"]);
+    queued("npm", &["run", "axe"]);
+    queued("npm", &["test"]);
+    queued("pnpm", &["exec", "playwright", "test"]);
+    queued("ng", &["build"]);
+    direct("npm", &["start"]);
+    direct("npx", &["ng", "serve"]);
+    direct("ng", &["test", "--watch"]);
+    direct("npm", &["run", "lint"]);
+    direct("npm", &["install"]);
+}
+
+#[test]
+fn a_shim_call_equal_to_a_gate_command_runs_sluice_run() {
+    let s = setup(4, "");
+    s.sb.write_config("[gates.gated]\ncmd = \"make gated\"\n");
+    let path = s.default_path();
+    assert_eq!(s.sb.marker_count(), 0);
+    let out = s.run(&path, AGENT, "make", &["gated"]);
+    assert!(out.status.success(), "{out:?}");
+    // `sluice run` streamed the gate and stored its result ...
+    assert!(stderr(&out).contains("real make gated"), "{out:?}");
+    assert_eq!(s.sb.marker_count(), 1, "{out:?}");
+    // ... so the same call is answered from the cache, without running make.
+    let again = s.run(&path, AGENT, "make", &["gated"]);
+    assert!(again.status.success(), "{again:?}");
+    assert!(!stderr(&again).contains("real make gated"), "{again:?}");
+    assert_eq!(s.sb.marker_count(), 1);
+    // Another argument list is a plain queued command, not the gate.
+    let other = s.run(&path, AGENT, "make", &["gated", "extra"]);
+    assert!(other.status.success(), "{other:?}");
+    assert_eq!(stdout(&other), "real make gated extra\n");
+    assert_eq!(s.sb.marker_count(), 1);
+    // Human sessions are untouched.
+    let human = s.run(&path, &[], "make", &["gated"]);
+    assert_eq!(stdout(&human), "real make gated\n", "{human:?}");
+}

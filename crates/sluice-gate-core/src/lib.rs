@@ -18,6 +18,7 @@
 //! - [`dirs`]: state, runtime and socket paths, job ids.
 //! - [`which`]: `PATH` resolution that skips Sluice's own shims.
 //! - [`heavy`]: the heavy-command list and package-manager equivalences.
+//! - [`pkgscripts`]: `package.json` scripts as heavy-command sources.
 
 pub mod agent;
 pub mod config;
@@ -31,6 +32,7 @@ pub mod logfile;
 pub mod lookup;
 pub mod marker;
 pub mod mode;
+pub mod pkgscripts;
 pub mod scope;
 pub mod semaphore;
 pub mod tree;
