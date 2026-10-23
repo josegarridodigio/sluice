@@ -195,16 +195,21 @@ fn a_sigkilled_daemon_takes_its_gates_and_their_children_with_it() {
 
 /// Regression (CI flake of the test above): the daemon used to register a
 /// gate with its reaper only after `renice` and `ionice` had run on it, and
-/// a daemon killed while those helpers ran left the gate behind. A slow
-/// `ionice` shim holds the daemon in that window; the gate, already
-/// running, must still be reaped.
+/// a daemon killed while those helpers ran left the gate behind. Gates now
+/// start through `ionice` (which `exec`s the real command: same PID, same
+/// group), so a slow `ionice` shim holds the gate in that wrapper; the
+/// group, already registered, must still be reaped, shim included.
 #[test]
 fn a_daemon_killed_while_it_sets_gate_priorities_still_reaps_the_gate() {
     let sb = forking_gate("316.2");
     let shims = sb.root.path().join("slow-ionice-bin");
     fs::create_dir_all(&shims).unwrap();
     let shim = shims.join("ionice");
-    fs::write(&shim, "#!/bin/sh\n# slow-ionice-316\nsleep 3\n").unwrap();
+    fs::write(
+        &shim,
+        "#!/bin/sh\n# slow-ionice-316\nsleep 3\nwhile [ \"$1\" = -c ] || [ \"$1\" = -n ]; do shift 2; done\nexec \"$@\"\n",
+    )
+    .unwrap();
     fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
     let path = format!(
         "{}:{}",
@@ -214,9 +219,8 @@ fn a_daemon_killed_while_it_sets_gate_priorities_still_reaps_the_gate() {
     let client = spawn_run(&sb, "long", Some(&path));
     let shim_cmd = shim.display().to_string();
     assert!(
-        wait_for(LIMIT, || live("sleep 316.2").len() == 3
-            && !live(&shim_cmd).is_empty()),
-        "the gate never started next to the slow ionice: {}",
+        wait_for(LIMIT, || !live(&shim_cmd).is_empty()),
+        "the gate never reached the slow ionice wrapper: {}",
         client.stderr()
     );
     let daemon = daemon_pid(&sb);

@@ -273,8 +273,10 @@ pub struct Running {
     log_path: PathBuf,
     started: Instant,
     timeout: Duration,
-    nice: u8,
-    ionice: Option<IoPriority>,
+    /// Priority halves the wrapper could not apply (tool missing); applied
+    /// to the leader from `wait`, as before the wrapper existed.
+    fallback_nice: u8,
+    fallback_ionice: Option<IoPriority>,
 }
 
 impl Running {
@@ -304,11 +306,19 @@ impl Running {
     /// returns the result.
     pub async fn wait(mut self) -> Finished {
         let pgid = self.info.pgid;
-        // Priorities are applied here, not in `spawn`: the caller registers
-        // the group with the gate reaper between the two, and the helper
-        // processes take long enough on a loaded machine that a daemon
-        // killed meanwhile would leave an unregistered gate behind.
-        tokio::spawn(apply_priority(self.info.pid, self.nice, self.ionice));
+        // Priorities normally come from the `nice`/`ionice` wrappers the job
+        // was started through. Only a half whose tool is missing is applied
+        // here, not in `spawn`: the caller registers the group with the gate
+        // reaper between the two, and the helper processes take long enough
+        // on a loaded machine that a daemon killed meanwhile would leave an
+        // unregistered gate behind.
+        if self.fallback_nice > 0 || self.fallback_ionice.is_some() {
+            tokio::spawn(apply_priority(
+                self.info.pid,
+                self.fallback_nice,
+                self.fallback_ionice,
+            ));
+        }
         let deadline = tokio::time::Instant::from_std(self.started + self.timeout);
         let cancel = Arc::clone(&self.handle.cancel);
 
@@ -403,9 +413,13 @@ async fn join_all(tasks: Vec<JoinHandle<()>>) {
 /// `spec.log_path`: behind the Phase 1 header for [`Sink::Log`], as framed
 /// records for [`Sink::Spool`].
 ///
-/// Priorities are applied when [`Running::wait`] starts, through the
-/// `renice` and `ionice` binaries when they are in `PATH` (failures are
-/// ignored); `spawn` returns as soon as the process exists, so the caller
+/// Priorities are set from the first instruction: the job is started
+/// through `nice -n <N>` and `ionice -c <class> [-n <level>]` (absolute
+/// paths resolved once), which set their own priority and `exec` the real
+/// program, so every descendant inherits it and the PID and process group
+/// are unchanged. When a tool is missing, that half falls back to
+/// `renice`/`ionice -p` when [`Running::wait`] starts (failures are
+/// ignored). `spawn` returns as soon as the process exists, so the caller
 /// can register its group (gate reaper, store) before anything slow runs.
 ///
 /// A gate's log that cannot be created (read-only `logs/` or state
@@ -440,7 +454,7 @@ pub async fn spawn(spec: ExecSpec) -> Result<Running> {
     }
     let log = Arc::new(Mutex::new(log));
     let bytes = Arc::new(AtomicU64::new(0));
-    let mut command = command(&spec, &log, &bytes);
+    let (mut command, fallback_nice, fallback_ionice) = command(&spec, &log, &bytes);
     let mut child = command
         .current_dir(&spec.cwd)
         .env_clear()
@@ -507,14 +521,45 @@ pub async fn spawn(spec: ExecSpec) -> Result<Running> {
         log_path: spec.log_path,
         started,
         timeout: spec.timeout,
-        nice: spec.nice,
-        ionice: spec.ionice,
+        fallback_nice,
+        fallback_ionice,
     })
 }
 
-/// The command to spawn; writes the log header (gates) or the spool magic.
-fn command(spec: &ExecSpec, log: &Mutex<JobLog>, bytes: &AtomicU64) -> Command {
-    let command = match &spec.launch {
+/// Absolute paths of the priority wrappers, resolved once per process.
+struct PriorityTools {
+    nice: Option<PathBuf>,
+    ionice: Option<PathBuf>,
+}
+
+fn priority_tools() -> &'static PriorityTools {
+    static TOOLS: std::sync::OnceLock<PriorityTools> = std::sync::OnceLock::new();
+    TOOLS.get_or_init(|| PriorityTools {
+        nice: find_in_path("nice"),
+        ionice: find_in_path("ionice"),
+    })
+}
+
+/// The `ionice` arguments selecting `prio` (the idle class takes no level).
+fn ionice_args(prio: IoPriority) -> Vec<String> {
+    let mut args = vec!["-c".to_owned(), prio.class.number().to_string()];
+    if prio.class != IoClass::Idle {
+        args.push("-n".to_owned());
+        args.push(prio.level.to_string());
+    }
+    args
+}
+
+/// The command to spawn, wrapped in `nice`/`ionice` when configured and
+/// available; writes the log header (gates) or the spool magic. Also returns
+/// the priority halves left to apply after the spawn (tool missing).
+fn command(
+    spec: &ExecSpec,
+    log: &Mutex<JobLog>,
+    bytes: &AtomicU64,
+) -> (Command, u8, Option<IoPriority>) {
+    let mut argv: Vec<std::ffi::OsString> = Vec::new();
+    match &spec.launch {
         Launch::Shell { cmd, extra } => {
             let header = format!(
                 "# sluice job {}: gate '{}' in {}\n# command: {}\n\n",
@@ -525,27 +570,50 @@ fn command(spec: &ExecSpec, log: &Mutex<JobLog>, bytes: &AtomicU64) -> Command {
             );
             write_log(log, bytes, header.as_bytes());
             // `"$@"` is appended only when extra arguments exist: a compound
-            // command (`for … done`) followed by `"$@"` would be a shell
+            // command (`for ... done`) followed by `"$@"` would be a shell
             // syntax error.
             let script = if extra.is_empty() {
                 cmd.trim().to_owned()
             } else {
                 format!("{} \"$@\"", cmd.trim())
             };
-            let mut c = Command::new("sh");
-            c.arg("-c").arg(script).arg("sh").args(extra);
-            c
+            argv.extend(["sh".into(), "-c".into(), script.into(), "sh".into()]);
+            argv.extend(extra.iter().map(Into::into));
         }
         Launch::Argv { program, args } => {
-            let mut c = Command::new(program);
-            c.args(args);
-            c
+            argv.push(program.into());
+            argv.extend(args.iter().map(Into::into));
         }
-    };
+    }
     if spec.sink == Sink::Spool {
         write_log(log, bytes, spool::MAGIC);
     }
-    command
+
+    let tools = priority_tools();
+    let mut prefix: Vec<std::ffi::OsString> = Vec::new();
+    let mut fallback_nice = 0;
+    let mut fallback_ionice = None;
+    if spec.nice > 0 {
+        if let Some(nice) = &tools.nice {
+            prefix.extend([nice.into(), "-n".into(), spec.nice.to_string().into()]);
+        } else {
+            tracing::debug!("nice not found; the gate is reniced after it starts");
+            fallback_nice = spec.nice;
+        }
+    }
+    if let Some(prio) = spec.ionice {
+        if let Some(ionice) = &tools.ionice {
+            prefix.push(ionice.into());
+            prefix.extend(ionice_args(prio).into_iter().map(Into::into));
+        } else {
+            tracing::debug!("ionice not found; the gate keeps the default I/O class");
+            fallback_ionice = Some(prio);
+        }
+    }
+    prefix.extend(argv);
+    let mut c = Command::new(&prefix[0]);
+    c.args(&prefix[1..]);
+    (c, fallback_nice, fallback_ionice)
 }
 
 /// Lowers the CPU and I/O priority of `pid` with the `renice` and `ionice`
@@ -566,14 +634,11 @@ async fn apply_priority(pid: u32, nice: u8, ionice: Option<IoPriority>) {
     }
     if let Some(prio) = ionice {
         if let Some(ionice) = find_in_path("ionice") {
-            run_quietly(Command::new(ionice).args([
-                "-c",
-                &prio.class.number().to_string(),
-                "-n",
-                &prio.level.to_string(),
-                "-p",
-                &pid.to_string(),
-            ]))
+            run_quietly(
+                Command::new(ionice)
+                    .args(ionice_args(prio))
+                    .args(["-p", &pid.to_string()]),
+            )
             .await;
         } else {
             tracing::debug!("ionice not found; gate {pid} keeps the default I/O class");
