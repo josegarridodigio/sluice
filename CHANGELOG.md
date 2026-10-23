@@ -14,7 +14,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `sluice run` prints `sluice: cache off for this tree: <reason>` once on
+  stderr (without `-v`, hooks included) when the tree cannot be hashed, and
+  `client.log` lines carry `reason=<code>` after `tree=-`.
+
 ### Fixed
+
+- `npm exec X`, `npm x X`, `npm exec -- X`, `npm exec -y X`, `npx -- X`,
+  `pnpm dlx X` and `yarn dlx X` are classified as `X`, so the guard and the
+  shims queue `npm exec playwright test` and `pnpm dlx vitest run`.
+- `sluice doctor` reads the scripts a husky v9 runner executes
+  (`.husky/<hook>`) instead of warning that no hook calls sluice.
+- `sluice doctor` has a `cache` check that warns about skip-worktree and
+  assume-unchanged index entries, which silently disable the cache.
 
 ## [0.4.0] - 2026-10-23
 

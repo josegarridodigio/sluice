@@ -67,3 +67,61 @@ fn doctor_suggests_init_in_a_repository_without_config() {
     );
     assert!(find(&all, "weights").is_empty(), "{all:?}");
 }
+
+#[test]
+fn doctor_warns_when_index_entries_disable_the_cache() {
+    let sb = Sandbox::standard();
+    let all = checks(&sb);
+    assert_eq!(find(&all, "cache")[0]["status"], "ok", "{all:?}");
+
+    sb.git(&["update-index", "--skip-worktree", "a.txt"]);
+    let all = checks(&sb);
+    let cache = find(&all, "cache");
+    assert_eq!(cache.len(), 1, "{all:?}");
+    assert_eq!(cache[0]["status"], "warn", "{cache:?}");
+    let detail = cache[0]["detail"].as_str().unwrap();
+    assert!(detail.contains("a.txt"), "{detail}");
+    assert!(detail.contains("cache is disabled"), "{detail}");
+    assert!(detail.contains("--no-skip-worktree"), "{detail}");
+    assert!(detail.contains("--no-assume-unchanged"), "{detail}");
+
+    sb.git(&["update-index", "--no-skip-worktree", "a.txt"]);
+    sb.git(&["update-index", "--assume-unchanged", "a.txt"]);
+    let all = checks(&sb);
+    assert_eq!(find(&all, "cache")[0]["status"], "warn", "{all:?}");
+    sb.git(&["update-index", "--no-assume-unchanged", "a.txt"]);
+    let all = checks(&sb);
+    assert_eq!(find(&all, "cache")[0]["status"], "ok", "{all:?}");
+}
+
+fn husky_v9(sb: &Sandbox, hook_body: &str) {
+    let husky = sb.repo.join(".husky");
+    fs::create_dir_all(husky.join("_")).unwrap();
+    fs::write(
+        husky.join("_/h"),
+        "#!/usr/bin/env sh\nsh -e \"$(dirname \"$(dirname \"$0\")\")/$(basename \"$0\")\"\n",
+    )
+    .unwrap();
+    fs::write(
+        husky.join("_/pre-commit"),
+        "#!/usr/bin/env sh\n. \"$(dirname \"$0\")/h\"\n",
+    )
+    .unwrap();
+    fs::write(husky.join("pre-commit"), hook_body).unwrap();
+    sb.git(&["config", "core.hooksPath", ".husky/_"]);
+}
+
+#[test]
+fn doctor_reads_the_scripts_a_husky_v9_runner_executes() {
+    let sb = Sandbox::standard();
+    husky_v9(&sb, "sluice run --hook pre-commit lint\n");
+    let all = checks(&sb);
+    let hooks = find(&all, "hooks");
+    assert_eq!(hooks[0]["status"], "ok", "{hooks:?}");
+
+    let sb = Sandbox::standard();
+    husky_v9(&sb, "npm run lint\n");
+    let all = checks(&sb);
+    let hooks = find(&all, "hooks");
+    assert_eq!(hooks[0]["status"], "warn", "{hooks:?}");
+}

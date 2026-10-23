@@ -171,12 +171,19 @@ pub enum Lookup {
         /// Line a terminal front-end shows (without the `sluice: ` prefix);
         /// `None` when the condition is silent (`cache = false`).
         notice: Option<String>,
+        /// Short machine-friendly code of the reason (`skip-worktree`,
+        /// `disabled`, ...), recorded in `client.log`.
+        code: &'static str,
     },
 }
 
 impl Lookup {
-    fn off(reason: String, notice: Option<String>) -> Self {
-        Self::Off { reason, notice }
+    fn off(reason: String, notice: Option<String>, code: &'static str) -> Self {
+        Self::Off {
+            reason,
+            notice,
+            code,
+        }
     }
 }
 
@@ -187,31 +194,42 @@ impl Lookup {
 pub fn lookup(r: &Resolved, mode: &CacheMode, extra: &[String]) -> Lookup {
     match mode {
         CacheMode::Disabled { reason } => {
-            return Lookup::off(reason.clone(), Some(format!("cache disabled ({reason})")));
+            return Lookup::off(
+                reason.clone(),
+                Some(format!("cache disabled ({reason})")),
+                "disabled",
+            );
         }
         CacheMode::Bypass => {
             return Lookup::off(
                 "SLUICE_DISABLE is set".to_owned(),
                 Some("cache disabled (SLUICE_DISABLE is set)".to_owned()),
+                "disabled",
             );
         }
         CacheMode::Enabled => {}
     }
     if !r.gate.cache {
-        return Lookup::off(format!("gate '{}' has cache = false", r.gate_name), None);
+        return Lookup::off(
+            format!("gate '{}' has cache = false", r.gate_name),
+            None,
+            "gate-cache-off",
+        );
     }
     let (tree, entries) = match tree::snapshot_entries(&r.paths, &r.probe_env, &r.scratch) {
         Ok(SnapshotFull::Known { root, entries }) => (root, entries),
         Ok(SnapshotFull::Unknown { reason }) => {
             return Lookup::off(
                 format!("tree unknown: {reason}"),
-                Some(format!("tree unknown ({reason}); running uncached")),
+                Some(format!("cache off for this tree: {reason}")),
+                tree::unknown_code(&reason),
             );
         }
         Err(e) => {
             return Lookup::off(
                 format!("snapshot failed: {e}"),
                 Some(format!("cannot snapshot the tree ({e}); running uncached")),
+                "snapshot-failed",
             );
         }
     };
@@ -223,6 +241,7 @@ pub fn lookup(r: &Resolved, mode: &CacheMode, extra: &[String]) -> Lookup {
                 Some(format!(
                     "cannot derive the cache key ({e}); running uncached"
                 )),
+                "key-failed",
             );
         }
     };
@@ -237,6 +256,7 @@ pub fn lookup(r: &Resolved, mode: &CacheMode, extra: &[String]) -> Lookup {
         Err(e) => Lookup::off(
             format!("cache read failed: {e}"),
             Some(format!("cannot read the cache ({e}); running uncached")),
+            "cache-read-failed",
         ),
     }
 }
@@ -515,7 +535,7 @@ mod tests {
         let disabled = CacheMode::Disabled {
             reason: "CI is set".into(),
         };
-        let Lookup::Off { reason, notice } = lookup(&r, &disabled, &[]) else {
+        let Lookup::Off { reason, notice, .. } = lookup(&r, &disabled, &[]) else {
             panic!("expected off");
         };
         assert_eq!(reason, "CI is set");

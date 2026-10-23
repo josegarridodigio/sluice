@@ -648,3 +648,30 @@ fn the_state_and_logs_dirs_are_private() {
         assert_eq!(mode, 0o700, "{}", dir.display());
     }
 }
+
+#[test]
+fn a_tree_that_cannot_be_hashed_says_so_on_stderr_without_verbose() {
+    let sb = Sandbox::standard();
+    sb.git(&["update-index", "--skip-worktree", "a.txt"]);
+    for args in [
+        &["run", "test"][..],
+        &["run", "--hook", "pre-commit", "test"],
+    ] {
+        let out = sb.sluice().args(args).output().expect("run");
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let lines: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.contains("cache off for this tree"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{args:?}: {stderr}");
+        assert!(
+            lines[0].starts_with(
+                "sluice: cache off for this tree: skip-worktree or assume-unchanged entry: a.txt"
+            ),
+            "{}",
+            lines[0]
+        );
+    }
+    assert_eq!(sb.marker_count(), 0);
+}

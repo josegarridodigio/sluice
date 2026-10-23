@@ -747,3 +747,29 @@ async fn parallel_verify_keeps_a_sibling_another_client_waits_for() {
     );
     client.cancel().await.expect("shutdown");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_says_when_the_tree_cannot_be_hashed() {
+    let sb = Sandbox::new(EXTRA);
+    sb.git(&["update-index", "--skip-worktree", "a.txt"]);
+    let client = connect(&sb, Counter::default()).await;
+    let dir = repo_arg(&sb);
+    let r = call(
+        &client,
+        "verify",
+        &json!({"working_directory": dir, "gates": ["counted"]}),
+    )
+    .await;
+    assert_eq!(r.is_error, Some(false), "{}", text(&r));
+    let body = text(&r);
+    assert!(
+        body.contains("not cached: tree unknown: skip-worktree or assume-unchanged entry: a.txt"),
+        "{body}"
+    );
+    assert!(
+        structured(&r)["results"][0]["not_cached_reason"]
+            .as_str()
+            .is_some_and(|s| s.contains("skip-worktree"))
+    );
+    client.cancel().await.expect("shutdown");
+}

@@ -823,6 +823,8 @@ Besides the basics, the zero-config checks are:
 | `shims` | The shims are installed in the stable directory and current (`warn` when missing or stale). First in `PATH` for this shell: in an agent shell `warn` when it is not; in a human shell `ok`, with a note that the agent plugin puts them in `PATH` for agent sessions. |
 | `plugin` | Version of the installed agent plugin (read from `installed_plugins.json` under `$CLAUDE_CONFIG_DIR` or `~/.claude`) against the binary: `warn` when they differ, `ok` when equal, missing or unreadable. Never fails. |
 | `weights` | For each gate that declares a number, `warn` when the weight the runs actually need (learned, without the ceiling) exceeds the declared ceiling by more than 50 %: raise it or use `weight = "auto"`. |
+| `hooks` | A hook in the hooks directory (`core.hooksPath` or `.git/hooks`) calls sluice. When `core.hooksPath` is a husky v9 runner (`.husky/_`, with an `h` file), the scripts it executes (`.husky/<hook>`) are inspected instead of the runner stubs. |
+| `cache` | In a repository: `warn` when the index has skip-worktree or assume-unchanged entries (it names up to 5 paths): the tree cannot be hashed, so the cache is disabled for this worktree. The detail gives `git update-index --no-skip-worktree <path>` / `--no-assume-unchanged <path>`. `ok` otherwise. |
 | `init` | In a git repository without `.sluice.toml`: `ok`, with the hint `run 'sluice init --dry-run'`. |
 
 ```text

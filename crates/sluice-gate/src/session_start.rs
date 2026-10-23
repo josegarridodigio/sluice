@@ -211,6 +211,7 @@ pub fn respond(input: &str, env: &EnvMap) -> Option<String> {
             hook: Some("session-start"),
             gate: "-",
             tree: None,
+            reason: None,
             decision,
             exit: 0,
             duration_ms: start.elapsed().as_millis(),

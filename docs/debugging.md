@@ -24,6 +24,41 @@ All paths are under the state directory, `$XDG_STATE_HOME/sluice` or
 caller started), `in-process` (ran without the daemon), `disabled`
 (`SLUICE_DISABLE`) or `error`. Writing the line never fails the command.
 
+When the cache was off for the run, `reason=<code>` follows `tree=-`:
+
+```
+2026-10-22T10:00:00Z pid=4242 caller=agent hook=- gate=test tree=- reason=skip-worktree decision=miss-run exit=0 ms=9100 cwd=/home/u/repo
+```
+
+The codes are `skip-worktree` (a skip-worktree or assume-unchanged index
+entry), `unmerged`, `submodules`, `git-error` (git failed while hashing the
+tree), `snapshot-failed`, `key-failed`, `cache-read-failed`, `disabled`
+(`cache = false` in the user config, `CI` set, `SLUICE_DISABLE`) and
+`queue-only`. The field is absent when the cache was used.
+
+## The cache is off for this tree
+
+A tree Sluice cannot hash is never cached: every run executes the gate again.
+The usual cause is an index entry flagged `skip-worktree` or `assume-unchanged`
+(sparse checkouts, or `git update-index` to silence a local change). `sluice
+run` says so once on stderr, with or without `-v`, in hooks too:
+
+```
+sluice: cache off for this tree: skip-worktree or assume-unchanged entry: web/config.local.ts
+```
+
+The `verify` MCP tool puts the same reason on the gate's line (`PASS 12.3s (job
+...) (not cached: tree unknown: skip-worktree or assume-unchanged entry: ...)`)
+and in `not_cached_reason`. `sluice doctor` has a `cache` check that lists up
+to 5 flagged paths (`warn`) and the way out:
+
+```
+[warn] cache          1 index entry flagged skip-worktree or assume-unchanged (web/config.local.ts): the cache is disabled for this worktree and every gate runs uncached; clear the flag with 'git update-index --no-skip-worktree <path>' or 'git update-index --no-assume-unchanged <path>'
+```
+
+`git ls-files -v` shows the flags: `S` is skip-worktree, a lowercase letter is
+assume-unchanged.
+
 ## What the session hook decided
 
 The agent plugin's `SessionStart` hook never shows anything to you, so to see
@@ -118,7 +153,10 @@ cannot open it does not start, and every gate then runs in-process; move
 the file aside and the next daemon creates a fresh one, losing the job
 history); the user config parses; inside a repository, `.sluice.toml`
 parses, a hook in the hooks directory (`core.hooksPath` or `.git/hooks`)
-calls sluice, `queue-only-hooks`: a warning when a `mode = "queue-only"`
+calls sluice (with husky v9, where `core.hooksPath` is `.husky/_`, the scripts
+that runner executes, `.husky/<hook>`, are the ones read), `cache`: a warning
+naming up to 5 skip-worktree or assume-unchanged index entries, which disable
+the cache for the worktree (see above), `queue-only-hooks`: a warning when a `mode = "queue-only"`
 gate lists hooks, `scoped-gates`: one line per path-scoped gate, a warning
 when `paths` matches no file or a well-known build input (`Cargo.toml`,
 `package.json`, lockfiles, `Makefile`, `Dockerfile`, ...) or a symlink target

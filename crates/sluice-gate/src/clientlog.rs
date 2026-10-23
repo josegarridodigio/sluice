@@ -7,7 +7,10 @@
 //! 2026-10-22T10:00:00Z pid=4242 caller=agent hook=pre-commit gate=test tree=0123456789ab decision=hit exit=0 ms=12 cwd=/home/u/repo
 //! ```
 //!
-//! `hook` and `tree` are `-` when there is none. `decision` is one of
+//! `hook` and `tree` are `-` when there is none. When the cache was off for
+//! the invocation, ` reason=<code>` follows `tree` (`skip-worktree`,
+//! `unmerged`, `submodules`, `git-error`, `disabled`, ...); it is absent
+//! otherwise. `decision` is one of
 //! `hit`, `miss-run`, `miss-fail-fast`, `coalesced`, `in-process`, `nested`,
 //! `disabled`, `error`. The file is appended with one `O_APPEND` write per
 //! line, so concurrent invocations never interleave inside a line; above
@@ -41,6 +44,8 @@ pub struct Entry<'a> {
     pub gate: &'a str,
     /// Working-tree hash, when known (shortened here).
     pub tree: Option<&'a str>,
+    /// Short code of why the cache was off (`skip-worktree`, ...), if it was.
+    pub reason: Option<&'a str>,
     /// Decision keyword.
     pub decision: &'a str,
     /// Exit code of the invocation.
@@ -58,8 +63,11 @@ pub fn format_line(timestamp: &str, e: &Entry<'_>) -> String {
     let tree = e
         .tree
         .map_or_else(|| "-".to_owned(), |t| t.chars().take(12).collect());
+    let reason = e
+        .reason
+        .map_or_else(String::new, |r| format!(" reason={}", clean(r)));
     format!(
-        "{timestamp} pid={} caller={} hook={} gate={} tree={tree} decision={} exit={} ms={} cwd={}",
+        "{timestamp} pid={} caller={} hook={} gate={} tree={tree}{reason} decision={} exit={} ms={} cwd={}",
         e.pid,
         e.caller,
         e.hook.map_or_else(|| "-".to_owned(), clean),
@@ -102,6 +110,7 @@ mod tests {
             hook: Some("pre-commit"),
             gate: "test",
             tree: Some("0123456789abcdef0123"),
+            reason: None,
             decision: "hit",
             exit: 0,
             duration_ms: 12,
@@ -116,6 +125,15 @@ mod tests {
             tree: None,
             ..e
         };
-        assert!(format_line("T", &e).contains("hook=- gate=test tree=-"));
+        assert!(!format_line("T", &e).contains("reason="));
+        assert!(format_line("T", &e).contains("hook=- gate=test tree=- decision=hit"));
+        let e = Entry {
+            reason: Some("skip-worktree"),
+            ..e
+        };
+        assert!(
+            format_line("T", &e)
+                .contains("hook=- gate=test tree=- reason=skip-worktree decision=hit")
+        );
     }
 }

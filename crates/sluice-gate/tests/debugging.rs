@@ -444,3 +444,20 @@ fn collect_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
         }
     }
 }
+
+#[test]
+fn client_log_records_the_reason_when_the_cache_is_off() {
+    let sb = Sandbox::standard();
+    sb.sluice().args(["run", "test"]).assert().success();
+    sb.git(&["update-index", "--assume-unchanged", "a.txt"]);
+    sb.sluice().args(["run", "test"]).assert().success();
+    let lines = client_log(&sb);
+    assert_eq!(lines.len(), 2, "{lines:#?}");
+    assert!(!lines[0].contains("reason="), "{}", lines[0]);
+    assert_eq!(field(&lines[1], "reason"), "skip-worktree", "{}", lines[1]);
+    assert!(
+        lines[1].contains(" tree=- reason=skip-worktree decision="),
+        "{}",
+        lines[1]
+    );
+}

@@ -567,6 +567,7 @@ fn check_repo(env: &EnvMap, paths: &RepoPaths) -> Vec<Check> {
     }
     out.push(check_hooks(env, paths));
     out.push(check_markers(paths));
+    out.push(check_cache(env, paths));
     match &config {
         Ok(cfg) => {
             out.extend(check_scoped_gates(env, paths, cfg));
@@ -974,6 +975,28 @@ fn symlink_target(link: &str, target: &Path) -> Option<String> {
     Some(parts.join("/"))
 }
 
+/// Husky v9 keeps a runner in `<dir>/_` (`h` plus one stub per hook that only
+/// sources `h`) and the real scripts one level up (`<dir>/<hook>`). When
+/// `dir` is such a runner, whether a script it executes mentions sluice.
+fn husky_scripts_call_sluice(dir: &Path) -> bool {
+    if !dir.join("h").is_file() {
+        return false;
+    }
+    let Some(scripts) = dir.parent() else {
+        return false;
+    };
+    fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name != "h"
+                && !name.starts_with('.')
+                && fs::read_to_string(scripts.join(&*name))
+                    .is_ok_and(|text| text.contains("sluice"))
+        })
+    })
+}
+
 fn check_hooks(env: &EnvMap, paths: &RepoPaths) -> Check {
     let probe = git::probe_env(env, Some(paths));
     let dir = git::run(
@@ -1001,7 +1024,7 @@ fn check_hooks(env: &EnvMap, paths: &RepoPaths) -> Check {
             !name.to_string_lossy().ends_with(".sample")
                 && fs::read_to_string(e.path()).is_ok_and(|text| text.contains("sluice"))
         })
-    });
+    }) || husky_scripts_call_sluice(&dir);
     if calls_sluice {
         check(
             "hooks",
@@ -1017,6 +1040,61 @@ fn check_hooks(env: &EnvMap, paths: &RepoPaths) -> Check {
                 dir.display()
             ),
         )
+    }
+}
+
+/// Paths of index entries marked skip-worktree (`S`) or assume-unchanged
+/// (lowercase tag), from `git ls-files -v -z`.
+fn hidden_index_entries(env: &EnvMap, paths: &RepoPaths) -> Result<Vec<String>, String> {
+    let probe = git::probe_env(env, Some(paths));
+    let out =
+        git::run(&["ls-files", "-v"], &paths.toplevel, &probe, true).map_err(|e| e.to_string())?;
+    Ok(out
+        .lines()
+        .filter_map(|line| {
+            let (tag, path) = line.split_once(' ')?;
+            (tag == "S" || tag.bytes().any(|b| b.is_ascii_lowercase())).then(|| path.to_owned())
+        })
+        .collect())
+}
+
+/// `cache`: skip-worktree or assume-unchanged index entries make the tree
+/// unknown, so no gate is cached in this worktree.
+fn check_cache(env: &EnvMap, paths: &RepoPaths) -> Check {
+    const NAME: &str = "cache";
+    match hidden_index_entries(env, paths) {
+        Err(e) => check(
+            NAME,
+            Status::Warn,
+            format!("could not list the index ({e}); the cache state is unknown"),
+        ),
+        Ok(hidden) if hidden.is_empty() => check(
+            NAME,
+            Status::Ok,
+            "no skip-worktree or assume-unchanged entries; the cache can key this worktree",
+        ),
+        Ok(hidden) => {
+            let shown: Vec<&str> = hidden.iter().take(5).map(String::as_str).collect();
+            let more = hidden.len().saturating_sub(shown.len());
+            let more = if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            };
+            check(
+                NAME,
+                Status::Warn,
+                format!(
+                    "{} index entr{} flagged skip-worktree or assume-unchanged ({}{more}): the \
+                     cache is disabled for this worktree and every gate runs uncached; clear the \
+                     flag with 'git update-index --no-skip-worktree <path>' or \
+                     'git update-index --no-assume-unchanged <path>'",
+                    hidden.len(),
+                    if hidden.len() == 1 { "y" } else { "ies" },
+                    shown.join(", ")
+                ),
+            )
+        }
     }
 }
 

@@ -116,6 +116,8 @@ struct Trace {
     caller: Option<&'static str>,
     /// Working-tree hash, when it was computed.
     tree: Option<String>,
+    /// Short code of why the cache was off, when it was (`skip-worktree`).
+    reason: Option<&'static str>,
     /// Decision keyword (see [`crate::clientlog`]); `None` until decided.
     decision: Option<&'static str>,
 }
@@ -141,6 +143,7 @@ pub fn run(args: &RunArgs) -> ExitCode {
             hook: args.hook.as_deref(),
             gate: &args.gate,
             tree: trace.tree.as_deref(),
+            reason: trace.reason,
             decision,
             exit,
             duration_ms: started.elapsed().as_millis(),
@@ -207,6 +210,7 @@ fn run_traced(args: &RunArgs, trace: &mut Trace) -> ExitCode {
         CacheState::Off {
             reason: "queue-only gate".to_owned(),
             notice: None,
+            code: "queue-only",
         }
     } else {
         lookup::lookup(&ctx, &mode, &args.extra)
@@ -233,16 +237,9 @@ fn run_traced(args: &RunArgs, trace: &mut Trace) -> ExitCode {
             }
             return ExitCode::SUCCESS;
         }
-        CacheState::Off {
-            reason,
-            notice: Some(notice),
-        } => {
-            eprintln!("sluice: {notice}");
-            CacheState::Off {
-                reason,
-                notice: None,
-            }
-        }
+        state @ CacheState::Off {
+            notice: Some(_), ..
+        } => announce_cache_off(state, trace),
         state => state,
     };
 
@@ -273,6 +270,28 @@ fn run_traced(args: &RunArgs, trace: &mut Trace) -> ExitCode {
         return execute(&ctx, args, state);
     }
     run_queued(&ctx, args, &caller, state, queue_only.flatten(), trace)
+}
+
+/// Prints the one-line reason the cache is off on stderr (with or without
+/// `-v`, hooks included: a cache that is off must never go unnoticed), records
+/// its code for `client.log` and returns the state with the notice consumed.
+fn announce_cache_off(state: CacheState, trace: &mut Trace) -> CacheState {
+    match state {
+        CacheState::Off {
+            reason,
+            notice: Some(notice),
+            code,
+        } => {
+            eprintln!("sluice: {notice}");
+            trace.reason = Some(code);
+            CacheState::Off {
+                reason,
+                notice: None,
+                code,
+            }
+        }
+        other => other,
+    }
 }
 
 /// Policy `wait`: the daemon, else the in-process run under the semaphore.

@@ -426,15 +426,34 @@ fn hidden_entry_reason(paths: &RepoPaths, env: &EnvMap) -> Result<Option<String>
         let tag = &record[..space];
         let path = String::from_utf8_lossy(&record[space + 1..]);
         if tag.eq_ignore_ascii_case(b"M") {
-            return Ok(Some(format!("unmerged index: {path}")));
+            return Ok(Some(format!("{UNMERGED_REASON}: {path}")));
         }
         if tag == b"S" || tag.iter().any(u8::is_ascii_lowercase) {
-            return Ok(Some(format!(
-                "skip-worktree or assume-unchanged entry: {path}"
-            )));
+            return Ok(Some(format!("{HIDDEN_REASON}: {path}")));
         }
     }
     Ok(None)
+}
+
+/// Prefix of the reason for an unmerged index.
+const UNMERGED_REASON: &str = "unmerged index";
+/// Prefix of the reason for skip-worktree or assume-unchanged entries.
+const HIDDEN_REASON: &str = "skip-worktree or assume-unchanged entry";
+/// Prefix of the reason for submodules.
+const SUBMODULE_REASON: &str = "submodules are not supported yet";
+
+/// Short code of an `Unknown` reason, for `client.log` (`reason=<code>`).
+#[must_use]
+pub fn unknown_code(reason: &str) -> &'static str {
+    if reason.starts_with(HIDDEN_REASON) {
+        "skip-worktree"
+    } else if reason.starts_with(UNMERGED_REASON) {
+        "unmerged"
+    } else if reason.starts_with(SUBMODULE_REASON) {
+        "submodules"
+    } else {
+        "git-error"
+    }
 }
 
 /// Returns the first gitlink path in `ls-files -s -z` output.
@@ -485,7 +504,7 @@ pub fn snapshot_entries(
         Ok(out) => {
             if let Some(path) = first_gitlink(&out) {
                 return Ok(SnapshotFull::Unknown {
-                    reason: format!("submodules are not supported yet: {path}"),
+                    reason: format!("{SUBMODULE_REASON}: {path}"),
                 });
             }
             out
