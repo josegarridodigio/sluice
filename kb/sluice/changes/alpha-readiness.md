@@ -252,3 +252,33 @@ Every target is met in every variant. Low-core idle-while-waiting fell from
 close to the p95 limit (1.18x; E2 with the default 1.5x cap had 0.89x), so
 round 3 measures the code defaults (`overcommit = 1.5`, interval 5 s) with
 the round-2 code to choose the shipped defaults.
+
+## L3 round 3 — shipped defaults (`overcommit = 1.5`, interval 5 s) with the round-2 code
+
+No configuration override; the binary at ca35df7 with its defaults.
+
+| Variant | Wall vs baseline | p95 vs baseline | Idle while waiting | Peak load sluice / baseline | Checks |
+|---|---|---|---|---|---|
+| normal | 42.8 / 66.8 s = 0.64x | 15.7 / 13.7 s = 1.14x | 5.0 % | 10.3 / 14.5 | 14/14 |
+| low-core | 49.6 / 88.3 s = 0.56x | 22.6 / 24.1 s = 0.94x | 5.5 % | 5.2 / 14.4 | 14/14 |
+| overload | 79.2 / 137.5 s = 0.58x | 39.3 / 35.8 s = 1.10x | 7.8 % | 16.6 / 63.3 | 14/14 |
+
+Every target is met in every variant with the shipped defaults, so the
+defaults stay at 1.5x / 5 s: they need no configuration and keep the
+normal variant further from the p95 limit (1.14x) than round 2's 2.0x / 2 s
+(1.18x). The round-1 settings stay documented as a tuning option for
+machines where idle-while-waiting is the priority.
+
+## Tuning loop summary
+
+| Round | Change | Targets met |
+|---|---|---|
+| E2 (start) | scheduler work of B1/L1 | 13 of 15 (idle-while-waiting in overload and low-core, p95 in low-core missed) |
+| 1 | overcommit 2.0, interval 2 s (config) | 14 of 15 (low-core idle-while-waiting 11.3 %) |
+| 2 | learned weight resolved at admission (code) + round-1 config | 15 of 15 |
+| 3 | round-2 code with the shipped defaults | 15 of 15 (shipped) |
+
+Against the measurement that started the plan (overload, 0.2.0 scheduler):
+wall 162.5 s vs 147.3 s baseline (1.10x) → 79.2 s vs 137.5 s (0.58x);
+p95 79.6 s vs 37.5 s (2.12x) → 39.3 s vs 35.8 s (1.10x); suites 25 of 48
+in both; peak load 31 vs 74 → 16.6 vs 63.3.
