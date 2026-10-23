@@ -241,6 +241,13 @@ With no `[agent]` section at all, the guard and the shims already know these
 | Angular, Nx, Turborepo | `ng build\|test\|lint\|e2e`, `nx run\|run-many\|affected\|build\|test\|lint\|e2e`, `turbo run\|build\|test\|lint` |
 | Browser test runners | `playwright test`, `cypress run` |
 
+**Launchers.** `npx X`, `bunx X`, `pnpm exec X`, `pnpm dlx X`, `yarn exec X`,
+`yarn dlx X`, `npm exec X` and `npm x X` are classified as `X` (so `npm exec
+playwright test --config=x` and `pnpm dlx vitest run` are heavy). `-y`,
+`--yes` and a `--` before `X` are skipped; any other option before `X` (for
+example `npm exec -p pkg X`, `npm exec --help`) stops the unwrap and the
+command is not heavy. At most 4 launchers are unwrapped.
+
 **Never heavy.** Dev servers and watch modes never end, so queueing them would
 hold a slot forever: `ng serve`, `nx serve`, `next dev`, `astro dev|preview`,
 `nuxt dev|preview`, `react-scripts start`, `vite` alone or with only options

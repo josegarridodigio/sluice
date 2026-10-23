@@ -143,6 +143,8 @@ fn rewrites_angular_and_package_scripts_with_an_empty_config() {
         ("npm run axe", "run-axe"),
         ("npm test", "run-test"),
         ("pnpm exec playwright test", "playwright-test"),
+        ("npm exec playwright test --config=x", "playwright-test"),
+        ("pnpm dlx vitest run", "vitest-run"),
     ] {
         assert_eq!(
             rewritten(command).as_deref(),
@@ -155,6 +157,8 @@ fn rewrites_angular_and_package_scripts_with_an_empty_config() {
         "npx ng serve",
         "ng test --watch",
         "npm run lint",
+        "npm exec --help",
+        "npm install",
     ] {
         assert_eq!(rewritten(command), None, "{command}");
     }

@@ -153,7 +153,8 @@ const PM_DIR_OPTIONS: &[&str] = &["-C", "--dir", "--prefix", "--cwd"];
 /// Equivalences: `npm run X`, `npm run-script X`, `pnpm run X`, `yarn run X`,
 /// `bun run X` → `run X`; `npm test|start|stop|restart` → `run <that>`;
 /// `pnpm X` / `yarn X` → `run X` unless X is a package-manager builtin;
-/// `npx [-y|--yes] X`, `pnpm exec X`, `yarn exec X`, `bunx X` → `X`;
+/// `npx [-y|--yes] [--] X`, `npm exec|x [-y|--yes] [--] X`, `pnpm exec|dlx X`,
+/// `yarn exec|dlx X`, `bunx X` → `X`;
 /// `pnpm -C d|--dir d`, `npm --prefix d`, `yarn --cwd d` are skipped when
 /// finding the subcommand; `python -m pytest`, `python3 -m pytest` →
 /// `pytest`; `./gradlew` → `gradle`, `./mvnw` → `mvn`; `docker-compose` →
@@ -218,22 +219,41 @@ fn subcommand_index(tail: &[&str]) -> Option<usize> {
     None
 }
 
-/// `npx X`, `bunx X`, `pnpm exec X`, `yarn exec X` → the words of `X`.
+/// The command after `-y`/`--yes` options and an optional `--`; `None` when
+/// nothing follows or another option comes first.
+fn exec_inner<'a>(args: &[&'a str]) -> Option<Vec<&'a str>> {
+    let skip = args
+        .iter()
+        .take_while(|w| matches!(**w, "-y" | "--yes"))
+        .count();
+    let mut inner = &args[skip..];
+    if inner.first() == Some(&"--") {
+        inner = &inner[1..];
+    }
+    (!inner.is_empty() && !inner[0].starts_with('-')).then(|| inner.to_vec())
+}
+
+/// `npx X`, `bunx X`, `npm exec X`, `npm x X`, `pnpm exec|dlx X`,
+/// `yarn exec|dlx X` -> the words of `X` (`-y`/`--yes` and `--` skipped).
 fn unwrap_launcher<'a>(words: &[&'a str]) -> Option<Vec<&'a str>> {
     let (&first, tail) = words.split_first()?;
     match first {
-        "npx" | "bunx" => {
-            let skip = tail
-                .iter()
-                .take_while(|w| matches!(**w, "-y" | "--yes"))
-                .count();
-            let inner = &tail[skip..];
-            (!inner.is_empty() && !inner[0].starts_with('-')).then(|| inner.to_vec())
+        "npx" | "bunx" => exec_inner(tail),
+        "npm" => {
+            let i = subcommand_index(tail)?;
+            if matches!(tail[i], "exec" | "x") {
+                exec_inner(&tail[i + 1..])
+            } else {
+                None
+            }
         }
         "pnpm" | "yarn" => {
             let i = subcommand_index(tail)?;
-            (tail[i] == "exec" && tail.len() > i + 1 && !tail[i + 1].starts_with('-'))
-                .then(|| tail[i + 1..].to_vec())
+            if !matches!(tail[i], "exec" | "dlx") {
+                return None;
+            }
+            let after = &tail[i + 1..];
+            (!after.is_empty() && !after[0].starts_with('-')).then(|| after.to_vec())
         }
         _ => None,
     }
@@ -551,6 +571,18 @@ mod tests {
             ("npx -y vitest run", "vitest run"),
             ("npx --yes jest", "jest"),
             ("bunx tsc", "tsc"),
+            (
+                "npm exec playwright test --config=x",
+                "playwright test --config=x",
+            ),
+            ("npm x tsc --noEmit", "tsc --noEmit"),
+            ("npm exec -- vitest run", "vitest run"),
+            ("npm exec -y vitest run", "vitest run"),
+            ("npm exec --yes -- vitest run", "vitest run"),
+            ("npx -- tsc", "tsc"),
+            ("pnpm dlx vitest run", "vitest run"),
+            ("yarn dlx vitest run", "vitest run"),
+            ("npm --prefix web exec tsc", "tsc"),
             ("pnpm exec tsc", "tsc"),
             ("yarn exec tsc", "tsc"),
             ("pnpm -C web build", "run build"),
@@ -581,6 +613,11 @@ mod tests {
             "npm --silent run build",
             "npx",
             "npx -p x",
+            "npm exec --help",
+            "npm exec",
+            "npm exec -p x y",
+            "npm x",
+            "pnpm dlx",
             "python -m http.server",
             "bun build",
             "cargo build",
@@ -626,6 +663,25 @@ mod tests {
 
     fn words(cmd: &str) -> Vec<String> {
         canonical_words(&cmd.split_whitespace().collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn npm_exec_family_is_heavy_like_npx() {
+        let m = HeavyMatcher::default();
+        for yes in [
+            "npm exec playwright test --config=x",
+            "npm x playwright test",
+            "npm exec -- vitest run",
+            "npm exec -y vitest run",
+            "npx -- vitest run",
+            "pnpm dlx vitest run",
+            "yarn dlx vitest run",
+        ] {
+            assert!(m.matches(&words(yes)), "{yes}");
+        }
+        for no in ["npm exec --help", "npm install", "npm exec", "pnpm dlx"] {
+            assert!(!m.matches(&words(no)), "{no}");
+        }
     }
 
     #[test]

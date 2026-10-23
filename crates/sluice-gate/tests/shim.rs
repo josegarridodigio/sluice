@@ -753,12 +753,15 @@ fn package_scripts_and_angular_commands_are_queued_without_config() {
     queued("npm", &["run", "axe"]);
     queued("npm", &["test"]);
     queued("pnpm", &["exec", "playwright", "test"]);
+    queued("npm", &["exec", "playwright", "test", "--config=x"]);
+    queued("pnpm", &["dlx", "vitest", "run"]);
     queued("ng", &["build"]);
     direct("npm", &["start"]);
     direct("npx", &["ng", "serve"]);
     direct("ng", &["test", "--watch"]);
     direct("npm", &["run", "lint"]);
     direct("npm", &["install"]);
+    direct("npm", &["exec", "--help"]);
 }
 
 #[test]
