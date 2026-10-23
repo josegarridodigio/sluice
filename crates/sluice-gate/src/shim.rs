@@ -217,6 +217,89 @@ fn prune(dir: &Path, names: &[String]) -> Vec<String> {
     pruned
 }
 
+/// What [`install_into`] did.
+#[derive(Debug, Default)]
+pub struct Installed {
+    /// Canonical shim directory.
+    pub dir: PathBuf,
+    /// Shims written for the first time.
+    pub created: usize,
+    /// Sluice shims rewritten because they were stale.
+    pub updated: usize,
+    /// Shims already current.
+    pub unchanged: usize,
+    /// Foreign files replaced (only with `force`).
+    pub replaced: usize,
+    /// Names whose file Sluice did not write and was left alone.
+    pub refused: Vec<String>,
+    /// Sluice shims removed because their command left the heavy list.
+    pub pruned: Vec<String>,
+}
+
+/// Creates or refreshes one shim per name of `names` in `dir`, pointing at
+/// the `sluice` binary, and prunes Sluice shims of commands no longer listed.
+/// Idempotent: a current shim is not rewritten. Files Sluice did not write
+/// are never touched unless `force`.
+///
+/// # Errors
+///
+/// A message when the directory cannot be created or a shim cannot be
+/// written.
+pub fn install_into(
+    dir: &Path,
+    sluice: &Path,
+    names: &[String],
+    force: bool,
+) -> Result<Installed, String> {
+    let dir = prepare_dir(dir)?;
+    let mut done = Installed::default();
+    for name in names {
+        let path = dir.join(name);
+        let content = script(&dir, sluice, name);
+        let exists = fs::symlink_metadata(&path).is_ok();
+        if exists && !is_our_shim(&path) {
+            if !force {
+                done.refused.push(name.clone());
+                continue;
+            }
+            if path.is_dir() {
+                return Err(format!("{} is a directory", path.display()));
+            }
+            done.replaced += 1;
+        } else if exists {
+            if fs::read_to_string(&path).is_ok_and(|c| c == content) {
+                done.unchanged += 1;
+                continue;
+            }
+            done.updated += 1;
+        } else {
+            done.created += 1;
+        }
+        write_atomic(&dir, &path, &content)
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    }
+    done.pruned = prune(&dir, names);
+    done.dir = dir;
+    Ok(done)
+}
+
+/// The directory `sluice shim install` and the session hook use when none is
+/// given: `$SLUICE_SHIM_DIR`, else `$XDG_DATA_HOME/sluice/shims` or
+/// `~/.local/share/sluice/shims`.
+pub fn default_dir(env: &EnvMap, cwd: &Path) -> Result<PathBuf, String> {
+    shim_dir(None, env, cwd)
+}
+
+/// Shell-quoted `text` (`'...'`), for lines written into shell files.
+pub fn quote(text: &str) -> String {
+    sh_quote(text)
+}
+
+/// The running `sluice` binary, canonical.
+pub fn current_binary() -> Result<PathBuf, String> {
+    sluice_binary()
+}
+
 /// `sluice shim install [--dir DIR] [--force]`.
 pub fn install(dir: Option<&Path>, force: bool) -> ExitCode {
     let env = env_map();
@@ -233,40 +316,20 @@ pub fn install(dir: Option<&Path>, force: bool) -> ExitCode {
         Ok(p) => p,
         Err(e) => return error(&e),
     };
-    let dir = match prepare_dir(&dir) {
+    let names = HeavyMatcher::from_config(&user.agent).shim_names();
+    let done = match install_into(&dir, &sluice, &names, force) {
         Ok(d) => d,
         Err(e) => return error(&e),
     };
-    let names = HeavyMatcher::from_config(&user.agent).shim_names();
-    let (mut created, mut updated, mut unchanged, mut replaced) = (0, 0, 0, 0);
-    let mut refused = Vec::new();
-    for name in &names {
-        let path = dir.join(name);
-        let content = script(&dir, &sluice, name);
-        let exists = fs::symlink_metadata(&path).is_ok();
-        if exists && !is_our_shim(&path) {
-            if !force {
-                refused.push(name.clone());
-                continue;
-            }
-            if path.is_dir() {
-                return error(&format!("{} is a directory", path.display()));
-            }
-            replaced += 1;
-        } else if exists {
-            if fs::read_to_string(&path).is_ok_and(|c| c == content) {
-                unchanged += 1;
-                continue;
-            }
-            updated += 1;
-        } else {
-            created += 1;
-        }
-        if let Err(e) = write_atomic(&dir, &path, &content) {
-            return error(&format!("cannot write {}: {e}", path.display()));
-        }
-    }
-    let pruned = prune(&dir, &names);
+    let Installed {
+        dir,
+        created,
+        updated,
+        unchanged,
+        replaced,
+        refused,
+        pruned,
+    } = done;
     println!(
         "sluice: shim: {} shims in {} ({created} new, {updated} updated, {unchanged} unchanged{})",
         names.len() - refused.len(),

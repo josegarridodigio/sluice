@@ -22,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A shim call that is exactly a gate command inside a repository with a
   `.sluice.toml` now runs `sluice run <gate> -v` (cache and coalescing)
   instead of `sluice exec`.
+- The agent plugin sets itself up when a session starts (`SessionStart` hook,
+  `sluice agent session-start`, hidden): it installs the shell shims, puts
+  them first in the session's `PATH` through `CLAUDE_ENV_FILE` (once, also on
+  resume) and gives the agent the rules as context: verify before commits,
+  no subshell or script around builds, no parallel dev servers during gates,
+  never approve merge trains. In a git repository without `.sluice.toml` the
+  agent proposes `sluice init` to the user once. A missing or older `sluice`
+  binary is reported to the agent, which asks the user before installing or
+  updating. Users no longer edit `PATH` or their `CLAUDE.md`.
 
 ### Changed
 

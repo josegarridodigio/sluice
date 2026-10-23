@@ -9,6 +9,31 @@ A repository with a `.sluice.toml` runs its tests, linters and type checks
 through Sluice: one queue and one cache shared by every agent on the machine.
 A tree that already passed is answered from the cache in milliseconds.
 
+## Automatic setup in agent sessions
+
+The plugin's session hook does the setup; there is nothing for the user to
+install, edit or export beyond the `sluice` binary itself:
+
+- Shell shims are on automatically in every repository: heavy commands
+  (builds, test runners, `ng`, `playwright`, package scripts, `make`, ...)
+  are queued under the machine's shared budget even when they run inside a
+  subshell, `$(...)`, `sh -c` or a script. You do not prefix anything.
+- Never retry a queued command without Sluice. Do not wrap builds or tests
+  in subshells, `$(...)` or scripts to capture their output; redirect with
+  `>` or `2>&1`. Do not start several dev servers or watchers while gates
+  run. `SLUICE_SHIMS=0` turns the shims off only if the human asks for it.
+- The session start prints these rules and the gate names as context.
+
+If the session context says the repository has no `.sluice.toml`: propose
+Sluice to the user once. Run `sluice init --dry-run`, show its output to the
+user and run `sluice init` only after the user agrees. If they decline, do
+not bring it up again.
+
+If the session context says the `sluice` binary is missing or older than the
+plugin: tell the user, and only with their consent run the install command
+(or `sluice update`) given in that context, then ask them to restart the
+session. Never install or update on your own.
+
 ## Verify
 
 - Call the `verify` MCP tool (`mcp__plugin_sluice_sluice__verify` when loaded from the plugin) with `working_directory`
@@ -71,7 +96,8 @@ a code (`conflict-state`, `stale-plan`, `duplicate-branch`, `not-allowed`,
 
 If the sluice MCP tools (`verify`, `status`, ...) are not available, or `verify` reports that the daemon is
 unreachable, do not fall back to running the gates in the shell. Tell the
-human: Sluice is not installed or not in the `PATH` Claude Code sees. Install:
+human: Sluice is not installed or not in the `PATH` Claude Code sees. With
+their consent, install:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/josegarridodigio/sluice/main/scripts/install.sh | sh
