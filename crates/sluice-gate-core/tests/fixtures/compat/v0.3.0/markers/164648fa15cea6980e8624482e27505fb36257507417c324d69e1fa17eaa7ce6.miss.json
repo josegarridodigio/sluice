@@ -1,0 +1,10 @@
+{
+  "format": 1,
+  "key": "164648fa15cea6980e8624482e27505fb36257507417c324d69e1fa17eaa7ce6",
+  "gate": "fail",
+  "exit_code": 1,
+  "reason": "gate failed",
+  "job_id": "1792726397282-561755-ddbe56",
+  "log_path": "/tmp/sa-compat.nMHyA8/v0.3.0/home/.state/sluice/logs/1792726397282-561755-ddbe56.log",
+  "recorded_at": "2026-10-23T03:33:17Z"
+}

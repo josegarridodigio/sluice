@@ -5,8 +5,8 @@ tags: [sluice, plan, alpha]
 
 # Plan: from pre-alpha to alpha (v0.3.0)
 
-Status: approved for execution by the user on 2026-10-22; to be driven by a
-`/goal` that implements every task below and cuts release `v0.3.0`.
+Status: done (2026-10-23). Approved by the user on 2026-10-22 and driven by a
+`/goal`; every task below is implemented and release `v0.3.0` is published.
 Parent: [[sluice/plan/master-plan.md]] ("Alpha readiness" block). Evidence
 so far: [[sluice/changes/alpha-readiness.md]].
 
@@ -143,9 +143,9 @@ change notes named in the last column.
 | L2, L3 latency policies and tuning | done | [[sluice/changes/alpha-readiness.md]] |
 | R1 adversarial review | done | [[sluice/changes/alpha-review.md]] |
 | R2 review fixes | done | [[sluice/changes/alpha-review-fixes.md]], [[sluice/changes/ci-flakes.md]] |
-| E5 full harness run | in progress | |
-| R3 reconciliation | in progress | [[sluice/changes/alpha-reconciliation.md]] |
-| R4 release v0.3.0 | pending | |
+| E5 full harness run | done | 320/320 checks ([[sluice/changes/alpha-readiness.md]]) |
+| R3 reconciliation | done | [[sluice/changes/alpha-reconciliation.md]], open discrepancies: none |
+| R4 release v0.3.0 | done | alpha badge, `v0.3.0` published, `sluice update` on the user install, s6 v0.2.0 → v0.3.0 46/46, v0.3.0 golden files |
 
 ## 5. Tasks
 

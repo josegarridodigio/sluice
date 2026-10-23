@@ -1,0 +1,27 @@
+# Sluice repository configuration.
+version = 1
+
+[defaults]
+# Behaviour when a hook invoked by an agent misses the cache.
+agent_hook_policy = "fail-fast"   # fail-fast | wait | run-unqueued
+# Behaviour when a hook invoked by a human misses the cache.
+human_hook_policy = "wait"        # wait | run-unqueued
+# Lines of log shown on failure.
+tail_lines = 40
+
+[gates.lint]
+cmd = "npm run lint"
+weight = 1
+hooks = ["pre-commit"]
+
+[gates.test]
+cmd = "npm test"
+weight = 4
+timeout = "20m"
+hooks = ["pre-commit", "pre-push"]
+# Stdout of each command is folded into the cache key.
+# key_inputs = ["node --version"]
+# Ignored/untracked files whose content must invalidate the cache.
+# key_files = [".env.test"]
+# Extra environment for the gate (also part of the key).
+# env = { NODE_ENV = "test" }

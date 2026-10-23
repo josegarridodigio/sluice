@@ -19,7 +19,7 @@ use sluice_gate_core::key::{self, CacheKey, KeyMaterial};
 use sluice_gate_core::marker::{Lookup, MarkerStore};
 use sluice_gate_core::tree::TreeHash;
 
-const RELEASES: [&str; 2] = ["v0.1.0", "v0.2.0"];
+const RELEASES: [&str; 3] = ["v0.1.0", "v0.2.0", "v0.3.0"];
 
 /// Longer than any marker can be old.
 const CENTURY: Duration = Duration::from_hours(100 * 365 * 24);
@@ -171,6 +171,20 @@ fn user_value(cfg: &UserConfig, key: &str) -> Value {
         "scheduler.head_reserve_after_secs" => secs(cfg.scheduler.head_reserve_after),
         "agent_detection.env_any_set" => json!(cfg.agent_detection.env_any_set),
         "agent_detection.env_any_equals" => json!(cfg.agent_detection.env_any_equals),
+        // Since v0.3.0 (the generator records these as written in the file).
+        "admission.cpu_some_avg10_low" => json!(cfg.admission.cpu_some_avg10_low),
+        "admission.memory_some_avg10_low" => json!(cfg.admission.memory_some_avg10_low),
+        "admission.overcommit" => json!(cfg.admission.overcommit),
+        "admission.overcommit_interval" => {
+            json!(format!("{}s", cfg.admission.overcommit_interval.as_secs()))
+        }
+        "agent.exec_weight" => json!(cfg.agent.exec_weight),
+        "agent.heavy_commands_extra" => json!(cfg.agent.heavy_commands_extra),
+        "mcp.verify_parallel" => json!(cfg.mcp.verify_parallel),
+        "scheduler.fairness" => serde_json::to_value(cfg.scheduler.fairness).unwrap(),
+        "scheduler.human_first" => json!(cfg.scheduler.human_first),
+        "scheduler.learned_weights" => json!(cfg.scheduler.learned_weights),
+        "scheduler.order" => serde_json::to_value(cfg.scheduler.order).unwrap(),
         other => panic!("fixture key {other} has no reader in compat.rs: add it"),
     }
 }

@@ -167,6 +167,15 @@ class Upgrade:
         fail = self.lookup(self.wt_fail, "f")
         rep.check(f"{step}: the failure record is still reported (never a pass)", fail.startswith("MISS") and "exit 1" in fail, fail)
         st = sb.status_json(self.repo)
+        if not st.get("daemon"):
+            # A hit never needs the daemon, and `update` stopped the idle one:
+            # start the new daemon explicitly so status shows its history
+            # (0.3.0 reports `daemon: null` instead of starting one).
+            sb.run(["sluice", "daemon"], self.repo)
+            # `sluice daemon` returns once it has forked, before the new daemon
+            # opens its socket: wait until it answers.
+            wait_until(lambda: bool(sb.status_json(self.repo).get("daemon")), 10)
+            st = sb.status_json(self.repo)
         d = self.db()
         old_jobs = self.baseline["jobs"]
         logs_ok = True
@@ -174,8 +183,8 @@ class Upgrade:
             cpl = sb.run(["sluice", "logs", job], self.repo)
             logs_ok &= cpl.returncode == 0 and "# sluice job" in cpl.stdout
         rep.check(f"{step}: status answers and the job history is intact (rows and logs of the first runs)",
-                  st.get("schema") == 1 and old_jobs <= d["jobs"] and logs_ok and (d["schema"] or [0])[0] >= (self.baseline["schema"] or [0])[0],
-                  f"daemon {st.get('daemon', {}).get('version')}, {len(old_jobs)} early jobs of {len(d['jobs'])} rows, logs readable {logs_ok}, "
+                  st.get("schema") == 1 and bool(st.get("daemon")) and old_jobs <= d["jobs"] and logs_ok and (d["schema"] or [0])[0] >= (self.baseline["schema"] or [0])[0],
+                  f"daemon {(st.get('daemon') or {}).get('version')}, {len(old_jobs)} early jobs of {len(d['jobs'])} rows, logs readable {logs_ok}, "
                   f"schema {d['schema']}, totals {st.get('totals', {}).get('runs')} runs since {st.get('totals', {}).get('since')}")
         if queue_absent is not None:
             queue_tables = [t for t in d["tables"] if "queue" in t]

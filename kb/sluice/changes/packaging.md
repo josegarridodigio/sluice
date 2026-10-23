@@ -179,3 +179,14 @@ and that publishing the five internal crates is acceptable; publish with
 `--allow-dirty` flag was only needed here); crates.io versions are
 immutable, so a bad release can only be yanked; decide whether
 `scripts/release.sh` should also publish.
+
+## Third release: `v0.3.0` (alpha, 2026-10-23)
+
+`scripts/release.sh 0.3.0` (now also moving the changelog's Unreleased
+section) after CI and the full matrix were green on the candidate; `main`
+and the tag pushed with the user's approval. Release workflow green on the
+first run: tag guard, tests, both `cross` builds, release with notes from
+the changelog section. Assets: x86_64 5.2 MB, aarch64 4.7 MB, `SHA256SUMS`.
+`sluice update --yes` moved the user's install from 0.2.0 to 0.3.0; the
+upgrade scenario reran v0.2.0 → v0.3.0 at 46/46. Not published to
+crates.io.

@@ -315,3 +315,30 @@ Total: 320 of 320 checks pass across the seven scenarios. s2 here is its
 default size (8 agents x 2 iterations); the three sized variants are the
 L3 rounds above. s7's numbers: raw 10 concurrent loads in 2.1 s, guarded
 or shimmed 2 concurrent in 8.6–8.9 s (sandbox budget 8, exec weight 4).
+
+## R4 — release v0.3.0 and the upgrade rerun (2026-10-23)
+
+- CI and the full compatibility matrix (Ubuntu 22.04/24.04, Debian 12,
+  Fedora, Alpine, git 2.31.0, native aarch64) green on the release
+  candidate `51beab8`; `scripts/release.sh 0.3.0` bumped every version,
+  moved the changelog's Unreleased section into `[0.3.0]`, verified through
+  Sluice and tagged; `main` and `v0.3.0` pushed (the first push attempt was
+  refused by this repository's own pre-push hook because the shell lacked
+  `cargo` in `PATH` — the gate failed as it should; the retry hit the
+  cache). The release workflow, the matrix on the tag and CI on `main`
+  passed; assets: x86_64 5.2 MB, aarch64 4.7 MB, `SHA256SUMS`, notes taken
+  from the changelog.
+- `sluice update --yes` on the user's install: 0.2.0 → 0.3.0 (static
+  release binary), idle daemon stopped, `doctor` clean, the real database
+  already migrated with its backup.
+- `s6_upgrade.py` with `ALPHA_TAGS=v0.2.0,v0.3.0` and the published 0.3.0
+  as the binary under test: 46/46. Markers and failure records written by
+  0.2.0 survive, the history is intact, the 0.2.0 daemon is stopped by
+  `update` and 0.3.0 starts, and downgrading to 0.2.0 still opens the
+  migrated database. The first run of the rerun exposed two harness
+  assumptions, fixed in the scenario: 0.3.0's `status --json` reports
+  `daemon: null` instead of starting a daemon, and `sluice daemon` returns
+  once it has forked, before the new daemon answers (a product nit noted
+  for beta).
+- Golden files recorded from the published 0.3.0 binary (58 files) are read
+  by the compatibility tests of every crate next to 0.1.0 and 0.2.0.

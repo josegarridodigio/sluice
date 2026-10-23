@@ -1,9 +1,9 @@
 ---
-title: "Final report: Sluice through Phase 6"
+title: "Final report: Sluice through v0.3.0 (alpha)"
 tags: [sluice, report, final]
 ---
 
-# Final report (2026-10-22)
+# Final report (2026-10-22, updated for v0.3.0 on 2026-10-23)
 
 Sluice is a verification queue and result cache for parallel coding agents
 on Linux: git hooks and agents ask for a gate (tests, linters), a per-user
@@ -16,6 +16,50 @@ is done with an acceptance document; release `v0.1.0` is published; the
 full suite (401 tests) passes through Sluice itself; the final
 reconciliation lists no open discrepancies
 ([[sluice/changes/final-reconciliation.md]]).
+
+## v0.3.0: alpha (2026-10-23)
+
+The alpha plan ([[sluice/plan/alpha-plan.md]]) is done and `v0.3.0` is
+released. Built in this release: `sluice exec` and queue-only gates, a
+guard that rewrites agent commands into the queue instead of denying them,
+shell shims for agents without hook support, opt-in path-scoped cache keys,
+a scheduler that uses the whole machine (budget = CPUs, learned weights,
+bounded over-admission, parallel `verify` with an early verdict, fairness,
+a per-job timeline), a reaper so gates die with the daemon, a socket path
+fallback, authenticated merge-queue remotes, database migrations with
+backups, a written compatibility promise with golden files from every
+release, a CI matrix down to git 2.31 and on aarch64, issue templates and a
+changelog. Two adversarial reviews and a stress pass found and fixed real
+defects (gates surviving a daemon SIGKILL, a reaper race, the queue needing
+git 2.33, credential leaks in remote URLs, guard bypasses of the approval
+rule, stale over-admission, failures teaching low weights).
+
+Evidence without AI sessions (simulated agents over the CLI and MCP, public
+Node and Python projects): 320 of 320 harness checks
+([[sluice/changes/alpha-readiness.md]]).
+
+| Overload run (12 agents, 8-thread suites, 20 CPUs) | Before (0.2.0 scheduler) | After (0.3.0) |
+|---|---|---|
+| Wall time vs running everything directly | 162.5 s vs 147.3 s (1.10x, slower) | 79.2 s vs 137.5 s (0.58x) |
+| p95 `verify` latency vs directly | 79.6 s vs 37.5 s (2.12x) | 39.3 s vs 35.8 s (1.10x) |
+| Heavy suites executed | 25 of 48 | 25 of 48 |
+| Peak load (1 min) | 31 vs 74 | 16.6 vs 63.3 |
+
+Normal load (8 agents): 0.64x the wall time; six CPUs: 0.56x; all five
+alpha targets met in the three variants with the shipped defaults.
+
+### What remains for beta
+
+- Use by several people on their own projects over weeks; the alpha
+  evidence comes from public test beds and dogfooding.
+- Product nits found while closing: `sluice daemon` returns before the new
+  daemon answers; the default `sluice exec` weight (half the budget) is
+  conservative for single-threaded commands (learned weights do not apply
+  to exec); `queue status` retry after a dropped connection is not
+  reproduced locally; the reaper's fork-to-registration window.
+- Command control for agents other than the plugin's host relies on shell
+  shims and `SLUICE_SHIMS=1`; no native integration.
+- crates.io publication (readiness proven by a dry run; a user decision).
 
 ## Per phase
 
@@ -59,9 +103,9 @@ behaviour.
 - Agents can still run raw commands or push directly when their
   permissions allow it; the plugin's guard hook and forge branch
   protection are the enforcement, not the daemon.
-- The guard hook splits compound commands without parsing quotes, so it
-  can deny more than necessary, and it does not see commands wrapped in
-  `sh -c`.
+- The guard rewrites only what it can parse with certainty: pipelines,
+  substitutions, heredocs, `sh -c` and wrappers are left alone (and
+  approval commands are denied when unsure).
 - Merge queue: bisection of a failing train is not implemented (failing
   multi-job trains split into single-job trains); the daemon reads the
   user config only at start; reconcile rows 5 and 6 and a lease lost in
