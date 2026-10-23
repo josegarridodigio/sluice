@@ -10,6 +10,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use sluice_gate_core::heavy::{HeavyMatcher, canonical_words};
+use sluice_gate_core::pkgscripts::{NoScripts, ScriptSource};
 
 use super::lex::{self, Op, Segment};
 
@@ -43,6 +44,11 @@ pub trait World {
     /// The config found walking up from `dir`; `Err` when one exists but
     /// cannot be read or parsed.
     fn gates_from(&self, dir: &Path) -> Result<Option<Gates>, ()>;
+    /// Where `package.json` scripts are read from (to classify
+    /// `npm run <script>`). No scripts by default.
+    fn scripts(&self) -> &dyn ScriptSource {
+        &NoScripts
+    }
 }
 
 /// One change to the original string.
@@ -385,7 +391,7 @@ fn plan_segment(
     {
         return Ok(Some(edit));
     }
-    if heavy.matches(&canonical) {
+    if heavy.classify(&canonical, dir, world.scripts()).is_some() {
         return Ok(Some(Edit::Heavy {
             at: first.start,
             label: label(&canonical),
@@ -428,18 +434,49 @@ fn gate_edit(
         }));
     }
     // Another spelling of the same command, without arguments.
-    if has_dir_option(values) || !words.iter().all(literal_word) {
+    if !words.iter().all(literal_word) {
         return Ok(None);
     }
-    Ok(gates
+    Ok(same_command(&gates, values, canonical).map(|g| Edit::Gate {
+        start: words[0].start,
+        end: words[words.len() - 1].end,
+        gate: g.name.clone(),
+        rest: false,
+    }))
+}
+
+/// The gate whose command is `canonical` (another spelling of it, no
+/// arguments, no directory option in `values`).
+fn same_command<'a>(
+    gates: &'a [GateWords],
+    values: &[String],
+    canonical: &[String],
+) -> Option<&'a GateWords> {
+    if has_dir_option(values) || canonical.is_empty() {
+        return None;
+    }
+    gates.iter().find(|g| g.canonical == canonical)
+}
+
+/// The name of the gate that `values` (a command as an executable and its
+/// arguments, already unquoted) runs exactly, when `dir` is the directory of
+/// the `.sluice.toml` of `gates`: the same canonical-equality rule the guard
+/// uses to replace a command with `sluice run <gate>`. Used by the shims.
+pub fn exact_gate(
+    gates: &Gates,
+    dir: &Path,
+    values: &[String],
+    canonical: &[String],
+) -> Option<String> {
+    if gates.dir != dir {
+        return None;
+    }
+    let parsed: Vec<GateWords> = gates
+        .gates
         .iter()
-        .find(|g| !canonical.is_empty() && g.canonical == canonical)
-        .map(|g| Edit::Gate {
-            start: words[0].start,
-            end: words[words.len() - 1].end,
-            gate: g.name.clone(),
-            rest: false,
-        }))
+        .filter_map(|(name, cmd)| gate_words(name, cmd))
+        .collect();
+    same_command(&parsed, values, canonical).map(|g| g.name.clone())
 }
 
 // ---------------------------------------------------------------------------

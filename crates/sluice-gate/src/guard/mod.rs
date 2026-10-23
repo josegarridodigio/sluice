@@ -24,6 +24,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use sluice_gate_core::config::{EnvMap, REPO_CONFIG_FILE, RepoConfig, UserConfig};
 use sluice_gate_core::heavy::HeavyMatcher;
+use sluice_gate_core::pkgscripts::{FsScripts, ScriptSource};
 
 use matcher::{Gates, NoPlan, World};
 use rules::Decision;
@@ -72,6 +73,10 @@ impl Mode {
 pub struct Fs;
 
 impl World for Fs {
+    fn scripts(&self) -> &dyn ScriptSource {
+        &FsScripts
+    }
+
     fn resolve_dir(&self, path: &Path) -> Option<PathBuf> {
         let canonical = std::fs::canonicalize(path).ok()?;
         canonical.is_dir().then_some(canonical)

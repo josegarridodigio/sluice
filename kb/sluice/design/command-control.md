@@ -358,12 +358,38 @@ exec_weight = 0                            # 0 = ceil(budget / 2)
 Default (`DEFAULT_HEAVY_COMMANDS`, canonical words): `docker build`, `docker buildx build`, `docker
 compose build`, `run build` (npm/pnpm/yarn/bun build scripts), `cargo build`, `cargo test`, `cargo
 clippy`, `cargo nextest`, `go build`, `go test`, `make`, `gradle`, `mvn`, `tsc`, `vite build`,
-`webpack`, `next build`, `pytest`, `jest`, `vitest`. Entries are validated by the config parser
+`webpack`, `next build`, `pytest`, `jest`, `vitest`, plus (zero-config, v0.4.0) `ng build|test|lint|e2e`,
+`nx run|run-many|affected|build|test|lint|e2e`, `turbo run|build|test|lint`, `playwright test`,
+`cypress run`, `react-scripts build|test`, `astro build`, `nuxt build`, `dotnet build|test`,
+`bazel build|test`, `ninja`, `cmake --build`. Entries are validated by the config parser
 (not empty, no control characters, at most 8 words; at most 256 entries across both lists) and
 canonicalised before matching, so `pnpm build` and `run build` are the same entry. The guard reads
 the config through the normal strict parser (re-read per call, as the client does); a parse error means "no rewrites" and a stderr
 note that only the debug log shows. Old binaries reading a user config with `[agent]` fail loudly;
 the user config is per machine and upgrades with the binary, so this is accepted.
+
+#### 4.4.1 Never heavy, and package scripts (zero-config, T1)
+
+`heavy::is_never_heavy(canonical)` is checked before the list, so a dev server or a watcher stays
+direct (it never ends and would hold a queue slot forever): `ng serve|s`, `nx serve`, `next dev`,
+`astro|nuxt dev|preview`, `react-scripts start`, `vite` alone or with options only (and `vite
+dev|serve|preview`), and any word `--watch`, `--watch=true`, `--watchAll`, `--watchAll=true`
+(`--watch=false` is not a watch); `-w` counts only for `tsc jest vitest webpack vite`, where it
+means `--watch`. `HeavyMatcher::matches` (words only) applies this rule too.
+
+`HeavyMatcher::classify(canonical, dir, scripts: &dyn ScriptSource) -> Option<Match>` adds package
+scripts (`crates/sluice-gate-core/src/pkgscripts.rs`). Words are matched first (no I/O). Otherwise,
+for canonical `run <name> ...` (so `npm test` is `run test`), the nearest `package.json` from `dir`
+upwards (stopping after the git root, or at `/`; the nearest file wins even without that script;
+at most 1 MiB; unreadable or invalid means not heavy) supplies `scripts.<name>`. The body is split
+on `&&`, `||`, `;`, `|`, `&` and newlines outside quotes, leading `NAME=value`, `env` and
+`cross-env` words are dropped, and each piece is canonicalised and classified with the same rules,
+recursively for `npm run x` / `pnpm x` pieces in the same package (depth at most 4, a script
+already on the stack ends the walk). Heavy when any piece is. `pre`/`post` scripts are ignored.
+`Match { entry, script }` says why. The rewrite label stays the canonical words the agent typed
+(`run-axe`). `-C/--dir/--prefix/--cwd` options are not followed: the script is read from `dir`.
+The guard gets scripts through `World::scripts()` (the real `Fs` returns `FsScripts`; fake worlds
+default to none); the shims use `FsScripts` directly.
 
 ### 4.5 Fail-open rules
 
@@ -472,8 +498,13 @@ exec make "$@"
    `<name>: Permission denied`, 126).
 2. Pass-through (`CommandExt::exec(real, args)`, argv[0] kept) when `SLUICE_JOB` is set (inside
    `sluice exec`, a gate, or a rewritten command: no double wrapping), when `SLUICE_SHIMS` is falsy,
-   when neither `SLUICE_SHIMS` is truthy nor `agent::detect` says agent, when the canonical words of
-   `name args` do not match the heavy list (`docker ps`, `npm install`), or when an argument is `-`.
+   when neither `SLUICE_SHIMS` is truthy nor `agent::detect` says agent, when an argument is `-`,
+   or when `HeavyMatcher::classify` (4.4.1: list plus package scripts, in the cwd) says the
+   canonical words of `name args` are not heavy (`docker ps`, `npm install`, `npm run lint`).
+   Before the heavy check: when the cwd is the directory of a `.sluice.toml` and the canonical
+   words of `name args` equal a gate's canonical command (same rule as `gate_edit`: exact, no extra
+   arguments, no directory option; `matcher::exact_gate`), the route is `Route::Gate`: `sluice run
+   <gate> -v` in this process (cache, coalescing, queue). Config errors there fail open.
 3. Otherwise run the exec client in-process (no extra `sluice` spawn) with argv `[real, args...]`,
    label = the first two canonical words joined with a space.
 

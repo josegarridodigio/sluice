@@ -15,6 +15,9 @@
 //!   subcommand that is not heavy (`docker ps`, `npm install`) or with a `-`
 //!   argument (reads stdin): replaces itself with the real binary, so the
 //!   command sees exactly the caller's stdin, stdout, stderr and terminal;
+//! - when the command is exactly a gate of the repository's `.sluice.toml`
+//!   (the same canonical-equality rule the guard uses), runs `sluice run
+//!   <gate> -v` in this process: cache, coalescing and the queue;
 //! - otherwise runs it as `sluice exec --label <words> -- <real> <args>`
 //!   (in this process, no extra spawn): queued under the budget, output and
 //!   exit code replayed byte for byte, stdin `/dev/null`.
@@ -32,6 +35,9 @@ use sluice_gate_core::agent::{self, Caller};
 use sluice_gate_core::config::{EnvMap, UserConfig};
 use sluice_gate_core::heavy::{HeavyMatcher, is_shim_name, shim_canonical_words};
 use sluice_gate_core::which::{self, NotRunnable, SHIM_DIR_VAR, SHIM_MARKER};
+
+use crate::guard::Fs;
+use crate::guard::matcher::{World, exact_gate};
 
 /// Variable that forces shims on (`1`) or off (`0`) regardless of agent
 /// detection.
@@ -577,11 +583,20 @@ enum Route {
     Direct(String),
     /// `sluice exec --label <label> -- <real> <args>`.
     Queue { label: String },
+    /// `sluice run <gate> -v`: the command is exactly that gate's command.
+    Gate { gate: String },
 }
 
-/// Chooses the route of `name args` (design section 5, step 2). The user
-/// config is not read inside a job or with `SLUICE_SHIMS=0`.
-fn route(env: &EnvMap, user: impl FnOnce() -> UserConfig, name: &str, args: &[String]) -> Route {
+/// Chooses the route of `name args` run in `dir` (design section 5, step
+/// 2). The user config is not read inside a job or with `SLUICE_SHIMS=0`.
+fn route(
+    env: &EnvMap,
+    user: impl FnOnce() -> UserConfig,
+    world: &dyn World,
+    dir: &Path,
+    name: &str,
+    args: &[String],
+) -> Route {
     if env.get(JOB_ENV_VAR).is_some_and(|v| !v.is_empty()) {
         return Route::Direct(format!("inside a Sluice job ({JOB_ENV_VAR})"));
     }
@@ -594,11 +609,24 @@ fn route(env: &EnvMap, user: impl FnOnce() -> UserConfig, name: &str, args: &[St
         return Route::Direct(why);
     }
     let words = shim_canonical_words(name, args);
-    if !HeavyMatcher::from_config(&user.agent).matches(&words) {
-        return Route::Direct("not a heavy command".to_owned());
-    }
     if args.iter().any(|a| a == "-") {
         return Route::Direct("reads stdin ('-' argument)".to_owned());
+    }
+    // A command that is exactly a gate goes through `sluice run`, before
+    // the heavy check: the gate's cache and coalescing apply to it.
+    if let Ok(Some(gates)) = world.gates_from(dir) {
+        let values: Vec<String> = std::iter::once(name.to_owned())
+            .chain(args.iter().cloned())
+            .collect();
+        if let Some(gate) = exact_gate(&gates, dir, &values, &words) {
+            return Route::Gate { gate };
+        }
+    }
+    if HeavyMatcher::from_config(&user.agent)
+        .classify(&words, dir, world.scripts())
+        .is_none()
+    {
+        return Route::Direct("not a heavy command".to_owned());
     }
     let label = words.iter().take(2).cloned().collect::<Vec<_>>().join(" ");
     Route::Queue { label }
@@ -624,12 +652,22 @@ pub fn exec(name: &str, args: &[String]) -> ExitCode {
             return ExitCode::from(e.exit_code());
         }
     };
-    match route(&env, || load_user(&env, false), name, args) {
+    match route(&env, || load_user(&env, false), &Fs, &cwd, name, args) {
         Route::Direct(why) => {
             tracing::debug!(%name, %why, "shim: direct");
             let err = Command::new(&real).arg0(name).args(args).exec();
             eprintln!("{name}: {err}");
             ExitCode::from(126)
+        }
+        Route::Gate { gate } => {
+            tracing::debug!(%name, %gate, "shim: gate");
+            crate::run::run(&crate::run::RunArgs {
+                gate,
+                extra: Vec::new(),
+                hook: None,
+                verbose: true,
+                explain: false,
+            })
         }
         Route::Queue { label } => crate::exec::exec(&crate::exec::ExecArgs {
             weight: None,
@@ -659,6 +697,112 @@ mod tests {
         a.iter().map(|s| (*s).to_owned()).collect()
     }
 
+    /// A world with a repository at `/r` (gates `test` = `npm test`, `web`
+    /// = `cargo test`) whose `package.json` has a heavy and a light script.
+    struct TestWorld;
+
+    impl World for TestWorld {
+        fn resolve_dir(&self, path: &Path) -> Option<PathBuf> {
+            Some(path.to_path_buf())
+        }
+
+        fn gates_from(&self, dir: &Path) -> Result<Option<crate::guard::matcher::Gates>, ()> {
+            Ok(dir.starts_with("/r").then(|| crate::guard::matcher::Gates {
+                dir: PathBuf::from("/r"),
+                gates: vec![
+                    ("test".into(), "npm test".into()),
+                    ("rs".into(), "cargo   test --workspace".into()),
+                ],
+            }))
+        }
+
+        fn scripts(&self) -> &dyn sluice_gate_core::pkgscripts::ScriptSource {
+            &Scripts
+        }
+    }
+
+    struct Scripts;
+
+    impl sluice_gate_core::pkgscripts::ScriptSource for Scripts {
+        fn package_json(&self, dir: &Path) -> Option<String> {
+            (dir == Path::new("/r") || dir == Path::new("/p")).then(|| {
+                r#"{"scripts":{"test":"ng test","axe":"npm run axe:a","axe:a":"playwright test",
+                   "start":"ng serve","lint":"eslint ."}}"#
+                    .to_owned()
+            })
+        }
+
+        fn is_repo_root(&self, dir: &Path) -> bool {
+            dir == Path::new("/r") || dir == Path::new("/p")
+        }
+    }
+
+    fn rt_in(
+        dir: &str,
+        env: &EnvMap,
+        user: impl FnOnce() -> UserConfig,
+        name: &str,
+        args: &[String],
+    ) -> Route {
+        route(env, user, &TestWorld, Path::new(dir), name, args)
+    }
+
+    fn rt(env: &EnvMap, user: impl FnOnce() -> UserConfig, name: &str, args: &[String]) -> Route {
+        rt_in("/x", env, user, name, args)
+    }
+
+    #[test]
+    fn package_scripts_and_gates_route() {
+        let user = UserConfig::default;
+        let agent = env(&[("CLAUDECODE", "1")]);
+        // In a directory with a package.json but no gates (`/p`).
+        let go = |name: &str, a: &[&str]| rt_in("/p", &agent, user, name, &args(a));
+        assert_eq!(go("npm", &["test"]), queue("run test"));
+        assert_eq!(go("npm", &["run", "axe"]), queue("run axe"));
+        assert_eq!(
+            go("pnpm", &["exec", "playwright", "test"]),
+            queue("playwright test")
+        );
+        assert_eq!(
+            go("npx", &["ng", "test", "--watch=false"]),
+            queue("ng test")
+        );
+        assert_eq!(go("npx", &["ng", "build", "-c", "x"]), queue("ng build"));
+        for (name, a) in [
+            ("npm", &["start"][..]),
+            ("npx", &["ng", "serve"]),
+            ("ng", &["test", "--watch"]),
+            ("npm", &["run", "lint"]),
+        ] {
+            assert!(direct(&go(name, a)), "{name} {a:?}");
+        }
+        // Exactly a gate command, at the repository root: `sluice run`.
+        let at_root = |name: &str, a: &[&str]| rt_in("/r", &agent, user, name, &args(a));
+        assert_eq!(
+            at_root("npm", &["test"]),
+            Route::Gate {
+                gate: "test".into()
+            }
+        );
+        assert_eq!(
+            at_root("cargo", &["test", "--workspace"]),
+            Route::Gate { gate: "rs".into() }
+        );
+        // Extra arguments, another directory and human sessions are not.
+        assert_eq!(at_root("cargo", &["test", "-p", "x"]), queue("cargo test"));
+        assert_eq!(
+            rt_in("/r/sub", &agent, user, "npm", &args(&["test"])),
+            queue("run test")
+        );
+        assert!(direct(&rt_in(
+            "/r",
+            &env(&[]),
+            user,
+            "npm",
+            &args(&["test"])
+        )));
+    }
+
     fn queue(label: &str) -> Route {
         Route::Queue {
             label: label.to_owned(),
@@ -673,35 +817,32 @@ mod tests {
     fn routes() {
         let user = UserConfig::default;
         let agent = env(&[("CLAUDECODE", "1")]);
+        assert_eq!(rt(&agent, user, "make", &args(&["all"])), queue("make all"));
         assert_eq!(
-            route(&agent, user, "make", &args(&["all"])),
-            queue("make all")
-        );
-        assert_eq!(
-            route(&agent, user, "pnpm", &args(&["build"])),
+            rt(&agent, user, "pnpm", &args(&["build"])),
             queue("run build")
         );
         assert_eq!(
-            route(&agent, user, "cargo", &args(&["build", "--release"])),
+            rt(&agent, user, "cargo", &args(&["build", "--release"])),
             queue("cargo build")
         );
         assert_eq!(
-            route(&agent, user, "gradlew", &args(&["build"])),
+            rt(&agent, user, "gradlew", &args(&["build"])),
             queue("gradle build")
         );
-        assert!(direct(&route(&agent, user, "docker", &args(&["ps"]))));
-        assert!(direct(&route(&agent, user, "npm", &args(&["install"]))));
-        assert!(direct(&route(&agent, user, "make", &args(&["-f", "-"]))));
-        assert!(direct(&route(&env(&[]), user, "make", &[])));
+        assert!(direct(&rt(&agent, user, "docker", &args(&["ps"]))));
+        assert!(direct(&rt(&agent, user, "npm", &args(&["install"]))));
+        assert!(direct(&rt(&agent, user, "make", &args(&["-f", "-"]))));
+        assert!(direct(&rt(&env(&[]), user, "make", &[])));
         let never = || -> UserConfig { panic!("the config must not be read") };
         let off = env(&[("SLUICE_SHIMS", "0"), ("CLAUDECODE", "1")]);
-        assert!(direct(&route(&off, never, "make", &[])));
+        assert!(direct(&rt(&off, never, "make", &[])));
         let job = env(&[("SLUICE_JOB", "j1"), ("SLUICE_SHIMS", "1")]);
-        assert!(direct(&route(&job, never, "make", &[])));
+        assert!(direct(&rt(&job, never, "make", &[])));
         let human = env(&[("SLUICE_AGENT", "0"), ("CLAUDECODE", "1")]);
-        assert!(direct(&route(&human, user, "make", &[])));
+        assert!(direct(&rt(&human, user, "make", &[])));
         assert_eq!(
-            route(&env(&[("SLUICE_SHIMS", "yes")]), user, "make", &[]),
+            rt(&env(&[("SLUICE_SHIMS", "yes")]), user, "make", &[]),
             queue("make")
         );
     }

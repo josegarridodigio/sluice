@@ -117,6 +117,50 @@ fn rewrites_a_heavy_command_with_allow_in_bypass_mode() {
 }
 
 #[test]
+fn rewrites_angular_and_package_scripts_with_an_empty_config() {
+    let env = Env::new();
+    fs::write(
+        env.path("repo/package.json"),
+        r#"{"scripts":{"test":"ng test","axe":"npm run axe:a","axe:a":"playwright test",
+            "start":"ng serve","lint":"eslint ."}}"#,
+    )
+    .unwrap();
+    let rewritten = |command: &str| {
+        env.answer(
+            &Env::hook(&env.path("repo/sub"), command, "bypassPermissions"),
+            &[],
+        )
+        .map(|v| {
+            v["hookSpecificOutput"]["updatedInput"]["command"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+    };
+    for (command, label) in [
+        ("npx ng test --watch=false", "ng-test"),
+        ("npx ng build -c x", "ng-build"),
+        ("npm run axe", "run-axe"),
+        ("npm test", "run-test"),
+        ("pnpm exec playwright test", "playwright-test"),
+    ] {
+        assert_eq!(
+            rewritten(command).as_deref(),
+            Some(format!("sluice exec --label {label} -- {command}").as_str()),
+            "{command}"
+        );
+    }
+    for command in [
+        "npm start",
+        "npx ng serve",
+        "ng test --watch",
+        "npm run lint",
+    ] {
+        assert_eq!(rewritten(command), None, "{command}");
+    }
+}
+
+#[test]
 fn rewrites_a_gate_with_ask_in_default_mode() {
     let env = Env::new();
     let v = env
