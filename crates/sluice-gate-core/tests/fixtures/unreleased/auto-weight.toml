@@ -1,0 +1,16 @@
+# Written for 0.4.0 (ADR-0015): `weight = "auto"` next to integers and an
+# omitted weight. Not a recording of a released binary; 0.3.0 and older
+# reject this file because they accept only integers.
+version = 1
+
+[gates.lint]
+cmd = "npm run lint"
+
+[gates.test]
+cmd = "npm test"
+weight = "auto"
+timeout = "20m"
+
+[gates.build]
+cmd = "npm run build"
+weight = 8

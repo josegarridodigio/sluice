@@ -114,8 +114,9 @@ and drifts toward the peak under contention, the safe direction. Without
 kept only when `cpu some avg10 < 10` at both ends of the run. Known
 undercount: processes that leave the group (`setsid`, `dockerd`/buildkit)
 and short-lived ones exiting between ticks (the leader's `cutime` recovers
-those waited for). Hence learning applies to **gates only**; `sluice exec`
-jobs (A1) keep their declared weight.
+those waited for). This first restricted learning to gates, with `sluice exec`
+jobs (A1) keeping their declared weight. ADR-0015 lifts that: `exec` jobs
+learn too (see "Automatic weights" below).
 
 **Use.** Stats key `(repo identity, gate, cmd_hash)`: repo identity is the
 main worktree path (as for the repo cap); `cmd_hash` = 16 hex of SHA-256
@@ -354,8 +355,8 @@ new string field, because a new enum variant breaks old clients.
 | `queued` event | `weight_cfg`, `expected_ms` |
 | `done.outcome` | `queue_wait_ms` (this subscriber: `started_at − attached_at`, 0 if it joined a running job), `wait_reason` (dominant), `admission`, `killed_by` |
 | `status.budget` | `cap`, `cpus`, `idle_cpus` |
-| `status.running[]` | `weight_cfg`, `waited_ms`, `admission`, `demand` |
-| `status.queued[]` | `lane`, `rank`, `expected_ms`, `weight_cfg`, `wait_detail` (`outranked`, `lane`, `human-first`) |
+| `status.running[]` | `weight_cfg`, `waited_ms`, `admission`, `demand`, `weight_effective`, `weight_auto` (0.4.0) |
+| `status.queued[]` | `lane`, `rank`, `expected_ms`, `weight_cfg`, `wait_detail` (`outranked`, `lane`, `human-first`), `weight_effective`, `weight_auto` (0.4.0) |
 | `status.totals` | `idle_while_waiting_ms`, `waiting_wall_ms`, `over_admissions` (per instance) |
 | MCP `verify` | `GateResult.queue_wait_ms`, `GateResult.wait_reason`, `VerifyReport.wall_ms` |
 
@@ -599,3 +600,23 @@ under overload and on six CPUs, while serial `verify` has the lower p95
 when the machine has room; lane fairness, humans-first, SJF and
 over-admission are neutral in those scenarios (all agent jobs of similar
 length) and stay at their defaults for the cases they protect.
+
+## Automatic weights (0.4.0, ADR-0015)
+
+- `weight = "auto"` is a ceiling like any declared number: the client sends
+  the integer `ceil(budget / 2)` it computes from its own budget plus the
+  optional `weight_auto: true` of the `GateSpec`; the admitting daemon
+  replaces the integer with `ceil(budget / 2)` of its own budget. An older
+  daemon ignores the flag and uses the integer. Learning lowers the ceiling
+  through the existing clamp (floor `ceil(ceiling / 4)`): on a budget of 20 a
+  gate is admitted at 10 and, once three runs measured about 4 CPUs, at 4.
+- `sluice exec` jobs carry a stats key `(repo identity, "exec:<label>", "")`;
+  the repository identity is the repository root, or the canonical cwd
+  outside one. Their ceiling is `--weight`, else `[agent] exec_weight`, else
+  `ceil(budget / 2)`, resolved by the client. Same window
+  (`LEARN_WINDOW`), warm-up (`LEARN_AFTER`), passing-runs-only rule and
+  pruning as gates, in the same `gate_stats` table.
+- `status` shows `weight auto→5` or `weight 10→3` (configured, then
+  effective); the JSON adds the optional `weight_effective` and `weight_auto`.
+- `Store::unbounded_learned(repo, gate)` returns the learned weight without
+  the clamp, the input of the `sluice doctor` weights check.

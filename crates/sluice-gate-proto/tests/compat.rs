@@ -322,3 +322,24 @@ fn wire_enums_have_an_unknown_fallback() {
         "unknown variants break decoding: {broken:#?}"
     );
 }
+
+/// ADR-0015: `weight_auto` is an optional additive field of the gate spec.
+/// An older daemon ignores it and still reads the integer `weight`; a newer
+/// daemon reading an older client's spec sees `false`.
+#[test]
+fn gate_spec_weight_auto_is_additive() {
+    let old: sluice_gate_proto::GateSpec =
+        serde_json::from_value(json!({"name":"g","cmd":"x","weight":4,"timeout_ms":1})).unwrap();
+    assert!(!old.weight_auto);
+    assert_eq!(
+        serde_json::to_value(&old).unwrap().get("weight_auto"),
+        None,
+        "false is never serialised, so old transcripts stay byte-identical"
+    );
+    let new: sluice_gate_proto::GateSpec = serde_json::from_value(
+        json!({"name":"g","cmd":"x","weight":4,"weight_auto":true,"timeout_ms":1}),
+    )
+    .unwrap();
+    assert!(new.weight_auto);
+    assert_eq!(serde_json::to_value(&new).unwrap()["weight"], 4);
+}

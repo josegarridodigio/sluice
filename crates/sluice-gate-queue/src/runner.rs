@@ -981,7 +981,11 @@ async fn build_inner(core: &Arc<Core>, train: &TrainRow, config: Option<RepoConf
                 gate: GateSpec {
                     name: name.clone(),
                     cmd: gate.cmd.clone(),
-                    weight: gate.weight,
+                    // The daemon resolves "auto" against its own budget.
+                    weight: gate
+                        .weight
+                        .ceiling(sluice_gate_core::cpus::default_budget()),
+                    weight_auto: gate.weight.is_auto(),
                     timeout_ms: u64::try_from(gate.timeout.as_millis()).unwrap_or(u64::MAX),
                     env: gate.env.clone(),
                     cache: gate.cache,

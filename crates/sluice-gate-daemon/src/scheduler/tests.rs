@@ -1034,3 +1034,80 @@ fn over_admission_waits_for_a_sample_taken_after_the_latest_start() {
         [("s3".to_owned(), Admission::Over)]
     );
 }
+
+// ---------------------------------------------------------------- ADR-0015
+
+/// An `auto` gate job as the daemon registers it: the ceiling is
+/// `ceil(budget / 2)` and `weight_auto` marks it for `status`.
+fn auto_job(id: &str, budget: u32, queued_at: u64) -> JobSpec {
+    let mut j = gate_job(
+        id,
+        sluice_gate_core::config::auto_ceiling(budget),
+        queued_at,
+    );
+    j.weight_auto = true;
+    j
+}
+
+#[test]
+fn auto_is_admitted_at_half_the_budget_and_drops_to_the_measured_demand() {
+    let mut s = learning(20);
+    s.enqueue(auto_job("t0", 20, 0));
+    assert_eq!(s.spec("t0").unwrap().weight, 10, "nothing learned yet");
+    assert_eq!(s.admit(10, false), vec!["t0"]);
+    assert_eq!(s.used(), 10);
+    let (running, _) = s.snapshot(11, false);
+    assert!(running[0].weight_auto, "status can show `auto`");
+    assert!(s.finish("t0").is_some());
+    // Three runs measured about 4 CPUs: the next one holds 4, not 10.
+    s.set_learned(lk("test"), &[3_900, 4_100, 4_000]);
+    s.enqueue(auto_job("t1", 20, 20));
+    let (_, queued) = s.snapshot(21, false);
+    assert_eq!((queued[0].weight, queued[0].weight_cfg), (4, 10));
+    assert!(queued[0].weight_auto);
+    // Never below a quarter of the ceiling: ceil(10 / 4) = 3.
+    s.set_learned(lk("test"), &[200, 300, 100]);
+    let (_, queued) = s.snapshot(22, false);
+    assert_eq!(queued[0].weight, 3);
+}
+
+#[test]
+fn a_declared_weight_is_a_ceiling_that_learning_never_raises() {
+    let mut s = learning(20);
+    s.enqueue(gate_job("t0", 8, 0));
+    s.set_learned(lk("test"), &[15_000, 14_000, 16_000]);
+    let (_, queued) = s.snapshot(1, false);
+    assert_eq!(queued[0].weight, 8, "declared 8 never exceeds 8");
+    assert!(!queued[0].weight_auto);
+    s.set_learned(lk("test"), &[5_000, 5_200, 4_900]);
+    let (_, queued) = s.snapshot(2, false);
+    assert_eq!((queued[0].weight, queued[0].weight_cfg), (5, 8));
+}
+
+#[test]
+fn exec_jobs_learn_from_their_label_and_repository() {
+    let mut s = learning(20);
+    let exec_key = |label: &str| (PathBuf::from("/r"), format!("exec:{label}"), String::new());
+    let exec_job = |id: &str, label: &str, at: u64| {
+        let mut j = spec(id, None, "/r", 10, at);
+        j.gate = format!("exec:{label}");
+        j.learn_key = Some(exec_key(label));
+        j
+    };
+    s.enqueue(exec_job("e0", "ng-lint", 0));
+    assert_eq!(
+        s.spec("e0").unwrap().weight,
+        10,
+        "first runs hold the ceiling"
+    );
+    assert_eq!(s.admit(10, false), vec!["e0"]);
+    assert!(s.finish("e0").is_some());
+    // Three runs at about one CPU: the fourth is admitted at the floor, 3.
+    s.set_learned(exec_key("ng-lint"), &[1_000, 1_100, 900]);
+    s.enqueue(exec_job("e1", "ng-lint", 20));
+    s.enqueue(exec_job("other", "ng-build", 21));
+    let (_, queued) = s.snapshot(22, false);
+    let weight = |id: &str| queued.iter().find(|v| v.id == id).unwrap().weight;
+    assert!(weight("e1") <= 3, "learned: {}", weight("e1"));
+    assert_eq!(weight("other"), 10, "another label keeps its own history");
+}

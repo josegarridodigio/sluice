@@ -1019,6 +1019,35 @@ impl Store {
         Ok(out)
     }
 
+    /// The unbounded learned weight of one gate in one repository
+    /// (ADR-0015, for `sluice doctor`): `round_half_up(P75(demand))` over the
+    /// newest [`crate::scheduler::LEARN_WINDOW`] passing runs of the gate
+    /// (all its command hashes together), without the clamp to the declared
+    /// ceiling. `None` before [`crate::scheduler::LEARN_AFTER`] samples.
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn unbounded_learned(&self, repo: &Path, gate: &str) -> Result<Option<u32>> {
+        if self.sched < 1 {
+            return Ok(None);
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT demand_milli FROM gate_stats WHERE repo = ?1 AND gate = ?2 \
+                 AND outcome = 'pass' ORDER BY finished_at DESC, rowid DESC LIMIT ?3",
+            )
+            .map_err(db)?;
+        let limit = i64::try_from(crate::scheduler::LEARN_WINDOW).unwrap_or(i64::MAX);
+        let mut demands = stmt
+            .query_map(params![path_str(repo), gate, limit], |r| r.get::<_, u32>(0))
+            .map_err(db)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db)?;
+        demands.reverse();
+        Ok(crate::scheduler::learned_weight(&demands))
+    }
+
     /// Deletes the statistics of keys with no run since `unseen_since_ms`;
     /// returns the rows deleted.
     ///
@@ -1618,6 +1647,49 @@ mod tests {
                 .iter()
                 .all(|g| g.cmd_hash == "aaaa")
         );
+    }
+
+    #[test]
+    fn unbounded_learned_weight_is_the_p75_demand_without_a_clamp() {
+        let (_d, p) = tmp();
+        let s = Store::open(&p).unwrap();
+        let stat = |n: u64, gate: &str, demand: u32, outcome: &str| GateStat {
+            repo: PathBuf::from("/r"),
+            gate: gate.into(),
+            cmd_hash: "aaaa".into(),
+            job_id: format!("{gate}{n}"),
+            finished_at: n,
+            outcome: outcome.into(),
+            wall_ms: 1_000,
+            cpu_ms: 500,
+            run_delay_ms: None,
+            demand_milli: demand,
+        };
+        let repo = Path::new("/r");
+        assert_eq!(s.unbounded_learned(repo, "test").unwrap(), None, "no runs");
+        for n in 0..2 {
+            s.insert_gate_stat(&stat(n, "test", 9_000, "pass")).unwrap();
+        }
+        assert_eq!(
+            s.unbounded_learned(repo, "test").unwrap(),
+            None,
+            "warm-up: fewer than three samples"
+        );
+        s.insert_gate_stat(&stat(2, "test", 9_400, "pass")).unwrap();
+        assert_eq!(s.unbounded_learned(repo, "test").unwrap(), Some(9));
+        // Failed runs and other gates or repositories are not samples.
+        s.insert_gate_stat(&stat(3, "test", 100, "fail")).unwrap();
+        s.insert_gate_stat(&stat(4, "lint", 100, "pass")).unwrap();
+        assert_eq!(s.unbounded_learned(repo, "test").unwrap(), Some(9));
+        assert_eq!(
+            s.unbounded_learned(Path::new("/other"), "test").unwrap(),
+            None
+        );
+        // Only the newest window counts: ten quiet runs push the old ones out.
+        for n in 10..20 {
+            s.insert_gate_stat(&stat(n, "test", 1_200, "pass")).unwrap();
+        }
+        assert_eq!(s.unbounded_learned(repo, "test").unwrap(), Some(1));
     }
 
     #[test]

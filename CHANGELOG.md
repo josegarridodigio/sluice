@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Golden files recorded from the 0.3.0 release binary, read by the
   compatibility tests next to 0.1.0 and 0.2.0.
+- `weight = "auto"` for gates: the ceiling is half the daemon's budget and
+  learned weights lower it, so there is no number to guess. A declared number
+  stays a ceiling and an omitted `weight` stays 1. A `.sluice.toml` that uses
+  `"auto"` needs 0.4.0 (older binaries accept only integers).
+- `sluice exec` jobs learn their weight from the measured demand after three
+  runs, per repository and `--label`; `--weight` or `[agent] exec_weight` is
+  the ceiling.
+- `sluice status` shows configured and effective weights (`weight auto→5`);
+  its JSON gains the optional `weight_effective` and `weight_auto` (schema 1).
 
 ### Changed
 

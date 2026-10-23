@@ -218,3 +218,27 @@ fn scheduler_fields_are_additive_optional_fields() {
     let back: StatusReport = serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
     assert_eq!(back, with);
 }
+
+/// ADR-0015: the configured and effective weight fields are optional and
+/// additive; schema 1 is unchanged and old reports still parse.
+#[test]
+fn weight_effective_and_auto_are_additive_optional_fields() {
+    let mut with = report();
+    with.running[0].weight_effective = Some(4);
+    with.running[0].weight_auto = Some(true);
+    with.queued[0].weight_effective = Some(1);
+    with.queued[0].weight_auto = Some(true);
+    let mut actual = serde_json::to_value(&with).unwrap();
+    for list in ["running", "queued"] {
+        let o = actual[list][0].as_object_mut().unwrap();
+        assert_eq!(o.remove("weight_auto"), Some(serde_json::json!(true)));
+        assert!(o.remove("weight_effective").is_some(), "{list}");
+    }
+    let expected: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+    assert_eq!(actual, expected);
+    let back: StatusReport = serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
+    assert_eq!(back, with);
+    let old: StatusReport = serde_json::from_str(FIXTURE).unwrap();
+    assert_eq!(old.running[0].weight_auto, None);
+    assert_eq!(STATUS_SCHEMA_VERSION, 1);
+}

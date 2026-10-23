@@ -66,7 +66,7 @@ use crate::sampler::{self, JobUsage, Utilisation};
 use crate::scheduler::{self as sched, Class, Enqueued, JobSpec, Policy, Pressure, Scheduler};
 use crate::store::{FinishMeta, GateStat, JobRow, JobState, QueuedMeta, RequestRow, Store};
 use crate::{Error, Result};
-use sluice_gate_core::config::{Fairness, QueueOrder};
+use sluice_gate_core::config::{Fairness, QueueOrder, auto_ceiling};
 
 /// Name of the lease row held by the running daemon.
 pub const LEASE_NAME: &str = "daemon";
@@ -280,9 +280,9 @@ struct JobEntry {
     process: Option<ProcessInfo>,
     /// Exec coalescing identity, removed from [`State::exec_inflight`] on finish.
     exec_identity: Option<String>,
-    /// Learned-statistics key (gates only).
+    /// Learned-statistics key (gates and `exec` jobs).
     stats_key: Option<StatsKey>,
-    /// CPU demand sampled while running (gates only).
+    /// CPU demand sampled while running.
     usage: JobUsage,
     /// Why the job was killed, when Sluice killed it.
     killed_by: Option<&'static str>,
@@ -2067,6 +2067,8 @@ fn status_report(shared: &Shared) -> StatusReport {
                     repo: v.repo,
                     gate: v.gate,
                     weight: v.weight,
+                    weight_effective: Some(v.weight),
+                    weight_auto: v.weight_auto.then_some(true),
                     started_at: rfc3339(v.started_at),
                     elapsed_ms,
                     subscribers: v.subscribers,
@@ -2088,6 +2090,8 @@ fn status_report(shared: &Shared) -> StatusReport {
                     repo: v.repo,
                     gate: v.gate,
                     weight: v.weight,
+                    weight_effective: Some(v.weight),
+                    weight_auto: v.weight_auto.then_some(true),
                     queued_at: rfc3339(v.queued_at),
                     waiting_ms: now.saturating_sub(v.queued_at),
                     subscribers: v.subscribers,
@@ -2250,7 +2254,10 @@ struct NewJob {
     /// Fairness lane (the worktree of the request).
     lane: PathBuf,
     weight: u32,
-    /// Learned-statistics key (gates only).
+    /// The configured weight is `"auto"` (ADR-0015); `weight` is already the
+    /// ceiling of this daemon's budget.
+    weight_auto: bool,
+    /// Learned-statistics key (gates and `exec` jobs).
     stats_key: Option<StatsKey>,
     /// Client send time.
     requested_at: Option<u64>,
@@ -2277,6 +2284,13 @@ fn register(
         request.gate.name.clone(),
         cmd_hash(&request.cmd, &request.extra),
     );
+    // `weight = "auto"` resolves against this daemon's budget, not the
+    // client's view of it; an older client sends only the integer.
+    let weight = if request.gate.weight_auto {
+        auto_ceiling(shared.state().sched.budget())
+    } else {
+        request.gate.weight
+    };
     register_job(
         shared,
         NewJob {
@@ -2284,7 +2298,8 @@ fn register(
             exec_identity: None,
             lane: request.repo.toplevel.clone(),
             repo,
-            weight: request.gate.weight,
+            weight,
+            weight_auto: request.gate.weight_auto,
             stats_key: Some(stats_key),
             requested_at: request.requested_at,
             via,
@@ -2342,6 +2357,13 @@ fn shell_quote(argv: &[String]) -> String {
 /// Registers an `exec` request (new job or coalesced), or returns an error message.
 fn register_exec(shared: &Shared, request: ExecRequest) -> std::result::Result<Registered, String> {
     let repo = request.repo.clone().unwrap_or_else(|| request.cwd.clone());
+    // Learned weights of `exec` jobs: the repository (the canonical cwd
+    // outside one) and the label; no command hash (ADR-0015).
+    let stats_repo = request
+        .repo
+        .clone()
+        .unwrap_or_else(|| std::fs::canonicalize(&request.cwd).unwrap_or(request.cwd.clone()));
+    let stats_key = (stats_repo, format!("exec:{}", request.label), String::new());
     register_job(
         shared,
         NewJob {
@@ -2349,10 +2371,11 @@ fn register_exec(shared: &Shared, request: ExecRequest) -> std::result::Result<R
             exec_identity: exec_identity(&request),
             repo: repo.clone(),
             lane: request.cwd.clone(),
+            // The ceiling: `--weight`, `[agent] exec_weight` or half the
+            // budget, all resolved by the client. Learning only lowers it.
             weight: request.weight,
-            // `exec` jobs keep their declared weight: their CPU may escape
-            // the process group (ADR-0011 M2).
-            stats_key: None,
+            weight_auto: false,
+            stats_key: Some(stats_key),
             requested_at: None,
             via: "exec",
             client_pid: Some(request.client_pid).filter(|p| *p != 0),
@@ -2458,6 +2481,7 @@ fn register_job(shared: &Shared, job: NewJob) -> std::result::Result<Registered,
         gate: job.request.name(),
         weight: job.weight,
         weight_cfg: 0,
+        weight_auto: job.weight_auto,
         class: class_of(job.request.caller()),
         queued_at: now,
         expected_ms,

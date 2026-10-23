@@ -305,7 +305,7 @@ fn run_queued(
     let _slots = match crate::budget::acquire(
         &ctx.scratch,
         ctx.user.daemon.budget,
-        ctx.gate.weight,
+        ctx.gate.weight.ceiling(ctx.user.daemon.budget),
         &ctx.gate_name,
         false,
     ) {
@@ -376,6 +376,7 @@ fn run_request(
         .map_err(|e| e.to_string())?;
     Ok(to_request(
         material,
+        ctx.user.daemon.budget,
         match caller {
             Caller::Agent { .. } => proto::Caller::Agent,
             Caller::Human => proto::Caller::Human,
@@ -384,7 +385,7 @@ fn run_request(
 }
 
 /// Converts the shared run material into the protocol request.
-fn to_request(m: RunMaterial, caller: proto::Caller) -> RunRequest {
+fn to_request(m: RunMaterial, budget: u32, caller: proto::Caller) -> RunRequest {
     RunRequest {
         repo: RepoInfo {
             toplevel: m.paths.toplevel,
@@ -394,7 +395,8 @@ fn to_request(m: RunMaterial, caller: proto::Caller) -> RunRequest {
         gate: GateSpec {
             name: m.gate_name,
             cmd: m.gate.cmd,
-            weight: m.gate.weight,
+            weight: m.gate.weight.ceiling(budget),
+            weight_auto: m.gate.weight.is_auto(),
             timeout_ms: m.timeout_ms,
             env: m.gate.env,
             cache: m.gate.cache,

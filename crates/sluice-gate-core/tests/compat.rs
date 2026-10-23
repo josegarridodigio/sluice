@@ -508,3 +508,28 @@ fn compat_fixtures_match_their_checksums() {
     assert!(dirs >= 10, "expected 5 crates x 2 releases, found {dirs}");
     assert!(checked_files >= 90, "only {checked_files} files checked");
 }
+
+// ---------------------------------------------------------------------------
+// Post-release fixtures (not recorded from a release binary)
+// ---------------------------------------------------------------------------
+
+/// ADR-0015: `weight = "auto"` parses next to integers and an omitted weight,
+/// and serialises back to the same spellings.
+#[test]
+fn auto_weight_fixture_parses() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/unreleased/auto-weight.toml");
+    let text = fs::read_to_string(&path).unwrap();
+    let cfg = RepoConfig::parse(&text, &path).unwrap();
+    let weights: BTreeMap<_, _> = cfg
+        .gates
+        .iter()
+        .map(|(name, g)| (name.clone(), serde_json::to_value(g.weight).unwrap()))
+        .collect();
+    assert_eq!(
+        serde_json::to_value(weights).unwrap(),
+        json!({"build": 8, "lint": 1, "test": "auto"})
+    );
+    assert_eq!(cfg.gates["test"].weight.ceiling(20), 10);
+    assert_eq!(cfg.gates["build"].weight.ceiling(20), 8);
+}
