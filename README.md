@@ -10,7 +10,7 @@
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
   <img alt="Rust 2024 edition" src="https://img.shields.io/badge/rust-2024%20edition-orange.svg">
   <img alt="Platform: Linux" src="https://img.shields.io/badge/platform-linux-lightgrey.svg">
-  <img alt="Status: pre-alpha" src="https://img.shields.io/badge/status-pre--alpha-red.svg">
+  <img alt="Status: alpha" src="https://img.shields.io/badge/status-alpha-orange.svg">
 </p>
 
 ![Six requests, one run](docs/assets/demo.gif)
@@ -123,7 +123,7 @@ the cache. Recipes for Node, Python, Rust, Go, Docker and monorepos are in the
 
 ## Status and limitations
 
-Sluice is pre-alpha. The gaps you will hit first:
+Sluice is alpha: complete enough for early adopters, not yet proven by long use. The gaps you will hit first:
 
 - **Linux only**, git 2.31 or newer; other platforms are not planned.
 - **Verdicts, not artifacts.** A hit says a gate passed on this tree; it does

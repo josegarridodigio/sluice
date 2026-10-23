@@ -63,6 +63,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Status moves from pre-alpha to alpha: every scenario of the alpha harness
+  passes on real Node and Python projects (`kb/sluice/changes/alpha-readiness.md`).
 - `sluice queue approve` run from an agent's environment is refused unless
   `[queue] allow_agent_approval = true`.
 - Scheduler throughput (ADR-0011): the default budget is the number of
