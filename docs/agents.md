@@ -106,8 +106,14 @@ section 3):
 | `queue_cancel` | Withdraw a job (only recorded while it is pushing; honoured once nothing landed is proven). |
 
 `verify` takes `working_directory` (absolute path inside the repository or
-worktree, required) and optionally `gates`, `timeout_seconds` and
-`extra_args`. A failing gate is a normal result flagged as an error, so the
+worktree, required) and optionally `gates`, `timeout_seconds`, `extra_args`
+and `fail_fast` (default `true`). It starts every selected gate at once (the
+daemon's budget still bounds what runs; `[mcp] verify_parallel = false` runs
+them one after another instead); with `fail_fast` it returns at the first
+failure, timeout or error and cancels the gates nobody else waits for, and
+with `fail_fast = false` it waits for every gate and reports every failure.
+`queue_enqueue` also accepts `branch` and `base`, and `logs` accepts `job_id`
+and `tail`. A failing gate is a normal result flagged as an error, so the
 model reads the tail. It never runs a gate in the agent's process: if the
 daemon is unreachable it reports an error.
 

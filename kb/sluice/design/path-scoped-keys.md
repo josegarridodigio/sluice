@@ -23,7 +23,7 @@ the tree it depends on; the key then hashes only that part.
 | # | Decision |
 |---|---|
 | 1 | Two new optional gate fields, `paths` and `paths_ignore` (lists of strings). Both absent = unscoped gate, key bytes identical to v0.2. `version = 1` stays. |
-| 2 | Pattern semantics = git `:(glob)` pathspec semantics (as with `git --glob-pathspecs`), root-relative. No magic pathspecs (`:(exclude)`, `:!`, `:/`, `:(icase)`, `:(attr)`, `:(top)`, `:(literal)`): rejected at parse. Exclusion is `paths_ignore`. |
+| 2 | Pattern semantics = git `:(glob)` pathspec semantics (as with `git --glob-pathspecs`), root-relative, evaluated per pattern (the in-process matcher is a port of git's `wildmatch` and `match_pathspec_item`). No magic pathspecs (`:(exclude)`, `:!`, `:/`, `:(icase)`, `:(attr)`, `:(top)`, `:(literal)`): rejected at parse. Exclusion is `paths_ignore`. |
 | 3 | The filtered hash is computed **in process** from the `ls-files -s -z` output the snapshot already produces (spawn 4, the gitlink check). Zero extra git spawns. |
 | 4 | The scoped set always contains `.sluice.toml` (its index entry, or the literal `absent`), regardless of `paths_ignore`. `key_inputs`, `key_files`, `env`, gate name and normalised command stay in the key exactly as today. |
 | 5 | In the key, the tree field becomes `scope-v1:<sha256 hex>` for scoped gates. `KEY_PREFIX` stays `sluice-cache-v1`, `CACHE_FORMAT_VERSION` stays 1. |
@@ -51,7 +51,7 @@ cmd = "pnpm -C web lint"
 paths_ignore = ["crates", "docs/**/*.png"]   # everything except these
 ```
 
-Field reference (rows to add to config-format.md):
+Field reference (these rows are in config-format.md):
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
@@ -78,10 +78,14 @@ Validation (errors at parse, message `invalid configuration in <path>:
 gates.<name>.paths[<i>]: <reason>`):
 
 - `paths = []` → `must not be empty (remove the field to use the whole tree)`.
-- Empty pattern; leading `/`; leading `./`; any `..` component; leading `:`
+- Empty pattern; leading `/`; leading `./`; any `..`, `.` or empty (`a//b`)
+  component (git would normalise them, so the key would depend on the
+  spelling; one trailing `/` is allowed); leading `:`
   (`magic pathspecs are not supported; use paths_ignore`); leading `!`
   (`negation is not supported; use paths_ignore`); a backslash (no escapes
-  in v1); NUL or control characters; more than 64 patterns per list.
+  in v1); NUL or control characters.
+- More than 64 patterns in a list: `gates.<name>.<field>: at most 64
+  patterns are allowed` (no index).
 - `paths`/`paths_ignore` with `cache = false` is accepted and has no effect
   (`doctor` notes it).
 
@@ -108,9 +112,9 @@ The snapshot already runs `ls-files -s -z` on the private index after
 (`<mode> SP <oid> SP <stage> TAB <path> NUL`, stage always 0 because
 unmerged indexes are rejected earlier). Filtering and hashing it in process
 adds no spawn and makes the key independent of the installed git's pathspec
-code. Fidelity to git is enforced by a differential test (section 9). If
-D1 finds a divergence it cannot fix, it switches to the fallback spawn and
-re-measures; the budget still holds (29 + 3 ≈ 32 ms).
+code. Fidelity to git is enforced by a differential test (section 9). D1
+found no divergence, so the fallback spawn was not needed; the measured
+hit path is in section 10.
 
 ### Algorithm
 
@@ -147,7 +151,7 @@ self-describing). The oid width follows the repository's object format
   target's content is not followed. A link inside the scope pointing outside
   it does not invalidate on target changes: put the target in `paths`.
 - **Submodules**: a gitlink anywhere still makes the whole tree unknown
-  (unchanged policy, even outside the scope). See open question Q2.
+  (unchanged policy, even outside the scope; decision Q2 in section 11).
 - **Renames across the boundary**: paths are hashed, so moving a file into
   or out of the scope changes the selected set and misses; renames entirely
   outside the scope hit; renames inside it miss.
@@ -183,12 +187,17 @@ hits** (golden test). New code (names indicative):
   callers do not change.
 - `scope.rs` (new, pure): `PathScope::from_gate(&Gate) -> Option<PathScope>`,
   `matches(&[u8]) -> bool` (wildmatch with `WM_PATHNAME` + literal prefix
-  rule), `hash(&StagedEntries) -> ScopeHash`, `count(&StagedEntries)`.
+  rule), `hash(&StagedEntries) -> ScopeHash`, `count(&StagedEntries)`,
+  `unmatched_paths(&StagedEntries)` (for `doctor`).
 - `config.rs`: the two fields (`Option<Vec<String>>`, `Vec<String>`),
   validation of section 3.
 - `lookup.rs`: one function used by **every** front-end and the queue:
-  `key_tree(gate, &SnapshotFull) -> KeyTree` and
-  `derive_key_at(gate, name, key_tree, extra, root_dir, child_env)`;
+  `key_tree(gate, &root, &entries) -> KeyTree` (an unknown snapshot has no
+  key, so it takes the root tree and the entries rather than a
+  `&SnapshotFull`) and
+  `derive_key_at(gate, name, key_tree, extra, root_dir, child_env)`
+  (`child_env` is a closure, so the `git rev-parse --local-env-vars` spawn
+  still happens only for gates with `key_inputs` or `key_files`);
   `derive_key` and the runner's private `derive_key` both call it (the
   runner's copy is deleted).
 - `Lookup::Hit` carries the current root tree next to the marker
@@ -227,9 +236,10 @@ changes were inside the scope.
 
 **`cache status` / MCP `status`.** One snapshot, then per gate a scope hash
 from the same entries (no extra spawn per gate). Text: the line gets
-` [scoped: <n> of <total> files, <12 hex>]`; JSON (MCP `status`, `status
---json`) gets optional fields `scope: {files, total, hash}`. `--all` is
-unchanged (markers carry no scope).
+` [scoped: <n> of <total> files, <12 hex>]`; MCP `status` gets the optional
+field `scope: {files, total, hash}` per scoped gate. `sluice status --json`
+(the daemon report) is not per gate and does not carry the scope. `--all` is
+unchanged (markers carry no scope). `run --explain` prints a `scope:` line.
 
 **Queue (merge-queue.md section 5, step 5).** The runner already takes
 `tree::snapshot` of the clean merge worktree and fails with `tree_mismatch`
@@ -254,7 +264,9 @@ conservative and identical to how a `cmd` change behaves today.
 | Toolchain/env not in tree | Same as today | `key_inputs`. Unchanged. |
 | Old binary in another worktree | `invalid configuration` | Documented minimum version. |
 
-`doctor` check `scoped-gates` (warning, never a failure): for each scoped
+`doctor` check `scoped-gates` (warning, never a failure; it also warns when
+a scoped gate has `cache = false`, when its scope selects no file, and for an
+in-scope symlink whose target lies outside the scope): for each scoped
 gate, on the current snapshot, list tracked files that exist at the root or
 in an ancestor directory of a matched path and are well-known build inputs
 (`Cargo.toml`, `Cargo.lock`, `rust-toolchain*`, `package.json`,
@@ -281,9 +293,13 @@ Unit (`scope.rs`, pure):
 4. `paths_ignore` alone, `paths` + `paths_ignore`, ignore never removes
    `.sluice.toml`.
 5. Differential: a generated corpus (≥ 500 paths, unicode, spaces, dots,
-   deep nesting) × ≥ 60 patterns; selection equals
-   `git --glob-pathspecs ls-files -z -- <paths> :(exclude)<ignore>…`
-   for every pattern set.
+   deep nesting) × ≥ 60 patterns; selection equals what
+   `git --glob-pathspecs ls-files -z -- <pattern>` selects for every
+   pattern, as `paths` and as `paths_ignore`, and for combined sets equals
+   the paths set minus the ignore set, each asked of git separately. The
+   single `ls-files -- <paths> ':(exclude)<ignore>'` command is not an
+   oracle: git strips the common literal prefix of the positive pathspecs
+   from the exclusions too.
 6. Hash: order independence (shuffled input sorts to same hash), mode
    change, oid change, path change, pattern change all change the hash;
    `absent` config differs from present.
@@ -347,16 +363,18 @@ run scoped` **interleaved** (ABAB, 40 iterations each) so machine load hits
 both equally; then edit a file outside the scope (`src/3/f300.txt`) and
 time 40 scoped hits again (the case that motivates the feature). If
 `SLUICE_BASELINE=<v0.2 binary>` is set, interleave it as well for the
-unscoped gate. Print min/median/p90/max, load average, git version; also
-run once with 20 000 files (informational). Record the results in
+unscoped gate (in a linked worktree whose `.sluice.toml` has no scoped gate,
+since 0.2 rejects `paths`). Print min/median/p90/max; also run once with
+20 000 files (`scripts/bench-hit-path.sh 20000`, informational). Record the results in
 `kb/sluice/changes/hit-path-latency.md`.
 
 Acceptance: scoped median < 35 ms at 5 000 files; scoped minus unscoped
 median ≤ 2 ms; unscoped median within noise (≤ 1 ms) of the baseline
-binary. Estimate: +0.3–1 ms (parse 5 000 records, wildmatch, SHA-256 of
-< 330 KB, no spawn), i.e. about 30 ms against the 29.1 ms baseline.
+binary. Measured (two runs, [[sluice/changes/hit-path-latency.md]]): scoped
+median 23.0 / 26.4 ms, scoped minus unscoped +0.8 / +1.0 ms, unscoped
+versus the 0.2.0 binary +1.1 / 0.0 ms.
 
-## 11. Open questions (with recommended answers)
+## 11. Open questions (decided in D1 as recommended)
 
 - **Q1. Store the scope hash in markers?** Recommended: no for alpha (keeps
   the frozen marker schema readable by v0.2); revisit as an optional

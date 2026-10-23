@@ -29,24 +29,35 @@ Facts relied on: [[sluice/research/claude-code-facts.md]]. Library notes:
   `status`, `logs` and the hit event use the blocking client. It never
   runs a gate in-process (no fallback: an unavailable daemon is an MCP
   error, because the agent's shell is the wrong place to run suites).
-- Logging only to stderr (`tracing_subscriber` with `with_ansi(false)`),
-  never to stdout. `SLUICE_LOG` sets the filter for the MCP process.
+- Logging goes to stderr and, best effort, to `<state>/logs/mcp-<pid>.log`
+  (`tracing_subscriber` with `with_ansi(false)`), never to stdout. The
+  filter is `SLUICE_LOG`, then `[debug] level` of the user config (an
+  unreadable config is ignored here), then `info`.
 - The server declares `instructions` for the model: use `verify` with the
   absolute working directory before committing; do not run test, lint or
   type-check commands through the shell; on `FAIL`, read the tail and fix;
   call `verify` again rather than re-running commands yourself; a passed
   tree is answered from the cache in milliseconds; `status`, `logs` and
-  `gate_list` exist.
+  `gate_list` exist. The merge-queue paragraph: land a finished branch by
+  committing, calling `verify` until it passes, then `queue_enqueue`, and
+  stop and tell the human the job id (and the train id from
+  `queue_status`); never approve a train or call `queue_approve` unless the
+  user said so; never push to the target branch; on a conflict or failed
+  gate rebase or fix, commit, `verify`, then `queue_retry` (the job keeps
+  the branch, so `queue_enqueue` would answer `duplicate-branch`);
+  `queue_cancel` withdraws a job; error codes start the message.
 
 ## Tools
 
 All tools take `working_directory` (absolute path; the agent's cwd is not
-known to the server) and resolve the repository from it. Results carry a
+known to the server; optional for `status`, absent from `logs`) and
+resolve the repository from it. Results carry a
 human-readable text block **and** `structured_content` (JSON); every tool
 builds its `CallToolResult` by hand, with an `output_schema` derived from
 the Rust result types for `verify`, `gate_list` and `logs`. The server
 identifies itself to the daemon as `sluice-gate-mcp <version>`, forwards
-`CLAUDE_CODE_SESSION_ID` as the job's `session`, never sets `hook`, and
+`CLAUDE_CODE_SESSION_ID` as the job's `session`, never sets `hook`, sets
+`requested_at` on every `run`, and
 re-reads the user config on every `verify` (so `[mcp] progress_interval`,
 floored at 1 s, applies without a restart). `sluice mcp` exits 0 when the
 client disconnects and 1 when the transport fails.
@@ -72,7 +83,8 @@ nobody else waits for (`killed_by = early-verdict`), while a job another
 client coalesced into keeps running (under `last_subscriber_gone = finish`
 it completes and caches). Those gates report `cancelled` with message
 `not finished: <gate> failed first` and the text line `CANCELLED (not
-finished: <gate> failed first; job <id>)`; the call itself is not
+finished: <gate> failed first; job <id>)` (without `; job <id>` when the
+gate had not been queued yet); the call itself is not
 `cancelled`. `fail_fast: false` waits for every gate and reports every
 failure. `[mcp] verify_parallel = false` (or a single gate) restores the
 pre-0.3.0 sequential loop: gates in the given order, **all of them run
@@ -93,8 +105,9 @@ tail and progress interval) but the gate still runs through the daemon;
 `CI`, `SLUICE_CACHE=0`, `cache = false`, an unknown tree or a failed key
 make the gate run uncached with `not_cached_reason` on a pass. A hit
 sends the best-effort `hit` event when the daemon socket exists. Progress
-messages: `[i/n] <gate>: submitting to the daemon`, `<gate>: queued,
-position <p> (job <id>)`, `<gate>: running for <elapsed> (job <id>)`, with
+messages, each prefixed `[i/n] `: `<gate>: submitting to the daemon`,
+`<gate>: queued, position <p> (job <id>)`, `<gate>: running for <elapsed>
+(job <id>)`, with
 `progress` = seconds since the call began; the first one is sent one
 interval after the daemon phase begins. Cancellation before `queued` only
 drops the connection; a cancel during the hit check or `ensure_daemon`
@@ -131,7 +144,8 @@ pass has no `duration_ms` (a daemon-side `cached` answer carries the
 `not_cached_reason`, `message` and `tail` (failing, timed-out and killed
 gates) appear when relevant; the text tail is `--- last <n> lines of
 <path> ---` with `n` the real count (`defaults.tail_lines` /
-`cache.tail_lines`); the report carries `cancelled: true` after a
+`cache.tail_lines`); a cancelled gate carries the message `the verification
+was cancelled` unless it is an early-verdict one; the report carries `cancelled: true` after a
 cancellation. A Sluice error on one gate (daemon unavailable, refused
 before `queued`, connection lost) is recorded as that gate's `error`
 result (with `fail_fast` it is the early verdict; otherwise the remaining
@@ -257,7 +271,8 @@ and commit on '<branch>', run `verify`, then call queue_retry with job_id
 state line: `ready; a human approves with `sluice queue approve <id>``,
 `approved; the daemon is pushing`, `landed <sha7>`, `push outcome unknown; a
 human runs `sluice queue reconcile``; jobs outside any train follow under
-`jobs outside a train:`. With no trains and no jobs the text is `the merge
+`jobs outside a train:`; a `queued` job whose build cannot start yet shows
+`waiting: <reason>` (plus the first line of `detail.error`). With no trains and no jobs the text is `the merge
 queue is empty for this repository`. Conflict
 paths are read from `detail.paths` (or a bare array). `structured_content` =
 the `queue-status` payload, `schema: 1`, same as `sluice queue status --json`.

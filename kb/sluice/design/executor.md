@@ -20,7 +20,9 @@ Status: implemented in Phase 2 (`sluice-gate-daemon`, CLI `daemon_cmd`, proto `c
   SQLite (`owner = "<uid>:<pid>"`, random `token`, `heartbeat_at`,
   `expires_at = now + 90 s`, heartbeat every 15 s). Every write to `jobs`
   that matters (state transitions) is fenced with `WHERE daemon_instance = ?`.
-  A lost lease (heartbeat rejected) does not stop the daemon: it keeps
+  At start, a lease left by a dead daemon of the same user (its `uid:pid` owner no longer exists or
+  is a zombie, `server::reclaim_dead_lease`) is released first, so a restart after SIGKILL is not
+  refused for the 90 s TTL; the lease of a live owner is never touched. A lost lease (heartbeat rejected) does not stop the daemon: it keeps
   serving its running jobs and refuses new `run` requests with
   `error{internal}`. The daily log pruning runs from the heartbeat task
   (and once at start).
@@ -80,7 +82,7 @@ start may be hours away.
 
 - The daemon starts one companion process at start-up through a
   short-lived launcher, `sluice daemon reaper --detach` (hidden
-  subcommand; `crate::reaper`, executed through `/proc/self/exe` so it
+  subcommand; `sluice_gate_daemon::reaper`, entry `daemon_cmd::reaper`, executed through `/proc/self/exe` so it
   works after `sluice update` replaced the file; own process group, empty
   environment, cwd `/`, stdin a pipe, stderr the daemon log). The launcher
   starts `sluice daemon reaper --daemon <daemon pid>` with the same stdin,
@@ -113,7 +115,9 @@ start may be hours away.
   registered and the reaper exits at once.
 - Clients waiting on a daemon that died get `sluice: error: the daemon died
   while running <gate>; it was killed` and exit 143 (`while <gate> was
-  queued; it did not run`, exit 1, when it had not started). Nothing is
+  queued; it did not run`, exit 1, when it had not started); `sluice exec`
+  prints `sluice: exec: the daemon died while running exec '<label>'; it was
+  killed` and exits 125. Nothing is
   cached: markers are only written by the daemon after a verdict.
 - If the reaper cannot be started (or dies) the daemon logs a warning and
   keeps working; reconciliation at the next start still applies.
@@ -167,7 +171,9 @@ finding 7).
 
 ## Executor
 
-- Spawn: `sh -c '<cmd> "$@"' sh <extra…>` with `current_dir = request.cwd`,
+- Spawn: `sh -c '<cmd>'`, or `sh -c '<cmd> "$@"' sh <extra…>` only when extra
+  arguments exist (a compound command followed by `"$@"` is a syntax error),
+  with `current_dir = request.cwd`,
   `env_clear().envs(child_env)`, `stdin = null`, stdout and stderr piped,
   `process_group(0)` (new group; the daemon owns the gate, no terminal).
   `ExecSpec` says what and where: `launch: Launch` (`Shell { cmd, extra }`
@@ -178,7 +184,10 @@ finding 7).
 - `sluice exec` jobs ([[sluice/design/command-control.md]] section 2): the
   argv runs directly (no shell) with the caller's environment (plus
   `SLUICE_JOB`) and cwd, same group, priorities, timeout (`timeout_ms`, 0 =
-  none) and kill sequence as gates. Output goes to `<logs>/<job>.exec` in
+  none) and kill sequence as gates. The `jobs` row has `gate = "exec:<label>"`,
+  `key` NULL and `cmd` the shell-quoted argv (`via = exec` in `job_requests`);
+  the declared weight is kept (no learned weight, ADR-0011 M2) and the caller's
+  repository identity (else its cwd) feeds the per-repository cap. Output goes to `<logs>/<job>.exec` in
   the spool format of `executor::spool` (magic `SLUICEX1\n`, records
   `[stream u8][len u32 BE][bytes]`, streams kept apart, no header or
   footer); `done` is sent after both pumps finished. The leader's death by
@@ -296,8 +305,9 @@ versioned by their own one-row table and applied on open by
 `sluice_gate_daemon::migrate`: numbered additive migrations (new tables,
 nullable columns) in one `IMMEDIATE` transaction with the version update;
 before migrating an existing file a consistent copy is written next to it as
-`sluice.db.bak-<version before>` (`VACUUM INTO`; an existing backup is
-kept); a newer version refuses a read-write open (`NewerSchema`) while a
+`sluice.db.bak-<version before>` (`VACUUM INTO` a temporary file, fsync,
+rename, fsync of the directory; an existing backup is kept only when it opens
+read-only and passes `PRAGMA quick_check`, otherwise it is replaced); a newer version refuses a read-write open (`NewerSchema`) while a
 read-only open still reads the known columns. `sched_schema` 1 adds:
 
 ```sql
@@ -312,7 +322,7 @@ CREATE TABLE job_requests (
   requested_at INTEGER, attached_at INTEGER NOT NULL, finished_at INTEGER,
   coalesced INTEGER NOT NULL, detached INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX job_requests_job ON job_requests(job_id);
-CREATE TABLE gate_stats (                              -- newest 20 per key
+CREATE TABLE gate_stats (                              -- newest 20 per key, passing runs only
   repo TEXT NOT NULL, gate TEXT NOT NULL, cmd_hash TEXT NOT NULL,
   job_id TEXT NOT NULL, finished_at INTEGER NOT NULL, outcome TEXT NOT NULL,
   wall_ms INTEGER NOT NULL, cpu_ms INTEGER NOT NULL, run_delay_ms INTEGER,
@@ -323,6 +333,9 @@ CREATE INDEX gate_stats_key ON gate_stats(repo, gate, cmd_hash, finished_at);
 Rows written by a downgraded 0.2.0 daemon (its `INSERT` names its columns)
 have NULL timeline fields, read as unknown (`sluice logs --timeline`).
 Keys of `gate_stats` unseen for 90 days are pruned with the daily log prune.
+Only passing runs teach a demand: failed runs write no `gate_stats` row, and
+rows of failed runs written by earlier releases are ignored on load
+(`WHERE outcome = 'pass'`; alpha review finding 5).
 
 Timestamps are unix milliseconds (integers), never strings. Busy timeouts
 map to a typed retryable error, never to a gate failure. The database is
@@ -336,8 +349,8 @@ with a message naming the file. `totals(since)` filters jobs by `queued_at` and 
 2. On a miss with policy `wait`: connect (autostart if needed), send `run`
    with everything precomputed (`cmd` trimmed but not whitespace-normalised,
    `cwd` = worktree root), print `queued`/`started` lines to stderr for
-   humans (`sluice: test queued (position 2, 5 of 8 units busy[, sharing
-   job <id>])` — the `U of B` part comes from one extra `status` call and
+   humans (`sluice: test queued (position 2, 5 of 8 units busy)[, sharing
+   job <id>]` — the `U of B` part comes from one extra `status` call and
    is omitted if it fails — then `sluice: test running (job <id>)`),
    stream nothing else unless `-v` (then poll the log file every 500 ms),
    print the `done` summary exactly as Phase 1 does, exit with the mapped
@@ -354,7 +367,9 @@ with a message naming the file. `totals(since)` filters jobs by `queued_at` and 
    then the Phase 1 in-process run with the `flock` semaphore. Gates run
    this way, or under `run-unqueued` (which takes no slots at all), do not
    appear in `status`, do not consume the daemon's budget and get no
-   `nice`/`ionice`. A zero `timeout` means no timeout on both paths.
+   `nice`/`ionice`. A zero `timeout` means no timeout on both paths. A socket path that can never work
+   (an over-long `SLUICE_SOCKET`, an unsafe fallback directory) is a configuration
+   error (exit 1), not a reason to fall back.
 4. `run-unqueued` policy never touches the daemon.
 5. On a hit, send the best-effort `hit` event (20 ms budget) when the
    socket file exists.

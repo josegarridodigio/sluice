@@ -20,8 +20,11 @@ sluice run <gate> [--hook <hook>] [-v] [--explain] [-- extra args]   # hooks, te
 sluice cache status [--all] | clear [--gate <gate>]                  # markers of the current repo (Phase 1)
 sluice init [--force]                                                # starter .sluice.toml + plain hook snippet (Phase 1)
 sluice hook print husky|lefthook|pre-commit|plain                    # integration snippets (Phase 1)
-sluice logs [<job-id>] [-n <lines>]                                  # job logs (Phase 1)
-sluice daemon [--foreground] | stop [--force] | restart [--debug] [--force]   # the brain: one per user, Unix socket (Phase 2)
+sluice logs [<job-id>] [-n <lines>] [--timeline [--since <dur>]]     # job logs, or the scheduler timeline (Phase 1)
+sluice exec [--weight N] [--label L] [--coalesce-key K] [--timeout DUR] [-q] -- <cmd>...   # any command under the budget, no cache (alpha)
+sluice guard --hook                                                  # PreToolUse hook of the agent plugin: deny or rewrite into the queue (alpha)
+sluice shim install [--dir D] [--force] | uninstall [--dir D] | status [--dir D] [--json]   # PATH shims for agents without hooks (alpha)
+sluice daemon [--foreground] | stop [--force] | restart [--debug] [--force]   # the brain: one per user, Unix socket (Phase 2; hidden `reaper`)
 sluice status [--json]                                               # queue, in-flight, cache stats, time saved (Phase 2)
 sluice mcp                                                           # MCP stdio server spawned by the agent (Phase 3)
 sluice queue enqueue [<branch>] [--base <base>] | status [--json] | approve <train> [--yes] | retry <job> | cancel <job> | reconcile   # local merge queue (Phase 6)
@@ -34,7 +37,8 @@ Process topology:
 ```
  git hook ──▶ sluice run ──┐                       ┌──▶ gate process group
  terminal ──▶ sluice run ──┼──(Unix socket)──▶ daemon ─┼──▶ gate process group
- Claude   ──▶ sluice mcp ──┘   JSON lines, versioned   └──▶ ... (bounded by budget)
+ Claude   ──▶ sluice mcp ──┤   JSON lines, versioned   └──▶ ... (bounded by budget)
+ any cmd ──▶ sluice exec ──┘   (also through the guard rewrite and the PATH shims)
                  │
                  └── cache-hit fast path: no daemon involved
 ```
@@ -44,9 +48,10 @@ Three invariants:
 1. **The hit path never needs the daemon.** The client computes the key and
    checks the marker file itself (target < 30 ms). Only misses talk to the
    daemon.
-2. **Every expensive run goes through the daemon** (except the explicit
-   `run-unqueued` escape hatch and the in-process fallback when the daemon
-   is unavailable), so budget, coalescing and PSI apply globally.
+2. **Every expensive run goes through the daemon** (gates and `sluice exec`
+   commands; except the explicit `run-unqueued` escape hatch and the
+   in-process fallback when the daemon is unavailable), so budget, coalescing
+   and PSI apply globally.
 3. **Sluice never touches the user's index or working tree.**
 
 ## 2. Crate layout (proposed, see [[sluice/design/adr/0001-rust-edition-and-workspace.md]])
@@ -74,8 +79,10 @@ Crate names on crates.io use the `sluice-gate` prefix
 with weight, timeout, extra key inputs, env. Details and the frozen format
 live in [[sluice/design/config-format.md]].
 
-User-level `~/.config/sluice/config.toml`: global budget, PSI thresholds, log
-retention, nice/ionice, per-repo overrides, agent detection, `[mcp]`, `[queue]`
+User-level `~/.config/sluice/config.toml`: global budget (default: the available
+CPUs), PSI thresholds (`[admission]`), `[scheduler]`, log retention, nice/ionice,
+per-repo overrides, agent detection, `[agent]` (heavy-command list and default
+`sluice exec` weight, [[sluice/design/command-control.md]]), `[mcp]`, `[queue]`
 (merge queue, also readable from the repository file for the keys the format
 allows there) and `[debug]` (log level, `daemon.log` rotation).
 
@@ -102,8 +109,9 @@ Summarised here; authoritative in [[sluice/design/cache-key.md]].
 |---|---|---|
 | Markers and miss records | `<git-common-dir>/sluice/markers/` | shared by all worktrees of a repo |
 | Scratch snapshots, daemon socket, locks, semaphore slots | `$XDG_RUNTIME_DIR/sluice/` (fallback `/tmp/sluice-<uid>/`) | mode `0700`; stale `snap-*` swept after 1 h |
-| Job logs, SQLite database | `$XDG_STATE_HOME/sluice/` (fallback `~/.local/state/sluice/`) | `logs/<job-id>.log`, `sluice.db` (Phase 2; it also holds the `queue_*` tables), `daemon.log` (+ `.1` to `.3`), `logs/mcp-<pid>.log`, `logs/client.log` (+ `.1`), `merge/<train-id>/` (merge-queue worktrees) |
+| Job logs, SQLite database | `$XDG_STATE_HOME/sluice/` (fallback `~/.local/state/sluice/`) | `logs/<job-id>.log` (`logs/<job-id>.exec` for `sluice exec` output spools), `sluice.db` (Phase 2; it also holds the `queue_*` tables; `sluice.db.bak-<version>` before a migration), `daemon.log` (+ `.1` to `.3`), `logs/mcp-<pid>.log`, `logs/client.log` (+ `.1`), `merge/<train-id>/` (merge-queue worktrees) |
 | User config | `$SLUICE_CONFIG` or `$XDG_CONFIG_HOME/sluice/config.toml` (fallback `~/.config/sluice/config.toml`) | optional |
+| Shell shims | `$XDG_DATA_HOME/sluice/shims` (fallback `~/.local/share/sluice/shims`) | `sluice shim install`; mode `0700` |
 
 Job ids are `<unix-ms>-<pid>-<6 hex digits of the sub-second nanoseconds>`;
 they are unique per machine and sort chronologically. `$XDG_STATE_HOME`
@@ -114,8 +122,11 @@ is ignored when empty; with no `HOME` the state dir falls back to
 
 ### 5.1 Lifecycle
 
-- Socket: `$XDG_RUNTIME_DIR/sluice/daemon.sock`; fallback
-  `/tmp/sluice-<uid>/daemon.sock` with mode `0700` on the directory.
+- Socket: `$SLUICE_SOCKET` when set (an over-long value is an error), else
+  `$XDG_RUNTIME_DIR/sluice/daemon.sock`; fallback `/tmp/sluice-<uid>/daemon.sock`
+  (without `XDG_RUNTIME_DIR`, or when the default path is longer than
+  `sun_path`) with mode `0700` on the directory, which must be a real directory
+  owned by the user and not group- or world-writable.
 - Autostart: a client that cannot connect takes an `flock` on
   `<runtime-dir>/start.lock`, re-checks the socket, spawns its own
   executable as `sluice daemon` (which detaches itself with
@@ -145,10 +156,14 @@ For each `Run` request (repo, gate, key, cwd, env snapshot, policy, client kind)
 1. Look for a queued or running job with the same key. If found,
    subscribe to its event channel and stream the outcome when it arrives
    (coalescing, G3).
-2. Otherwise enqueue a **job** with the gate's weight.
-3. The **scheduler** admits jobs when `used + weight <= budget` and PSI is
-   below thresholds. Policy in [[sluice/design/scheduler.md]] (FIFO with
-   backfill and head-of-line reservation, [[sluice/design/adr/0007-scheduler-fairness.md]]).
+2. Otherwise enqueue a **job** with the gate's weight (the learned weight once
+   enough passing runs are known, [[sluice/design/adr/0011-scheduler-throughput.md]]).
+3. The **scheduler** admits jobs when `used + weight <= budget` (the budget
+   defaults to the available CPUs) and PSI is below thresholds, plus bounded
+   over-admission while CPUs sit idle. Policy in [[sluice/design/scheduler.md]]
+   (FIFO with backfill and head-of-line reservation,
+   [[sluice/design/adr/0007-scheduler-fairness.md]], lane fairness, humans first
+   and the throughput rules of ADR-0011).
 4. The **executor** runs the command in the worktree root, in a new
    process group, with `nice`/`ionice` applied through the `renice` and
    `ionice` binaries, stdout+stderr streamed to `<state>/logs/<job-id>.log`,
@@ -157,6 +172,14 @@ For each `Run` request (repo, gate, key, cwd, env snapshot, policy, client kind)
 5. On success with an unchanged tree, the daemon writes the marker. On
    failure it returns the exit code and the log tail.
 6. Outcome is broadcast to all subscribers; the in-flight entry is removed.
+
+An `exec` request (`sluice exec`, [[sluice/design/command-control.md]]) takes
+the same path with no key (it coalesces only with an explicit `--coalesce-key`,
+same command and directory), the caller's cwd and environment, the declared
+weight, and its output framed into `<state>/logs/<job-id>.exec`; it never writes
+a marker. Every process the daemon starts (gates and exec) carries
+`SLUICE_JOB=<job id>`, which turns nested `sluice exec`, `sluice run` and shims
+into direct runs.
 
 ### 5.3 Client disconnects and crashes
 
@@ -173,7 +196,9 @@ For each `Run` request (repo, gate, key, cwd, env snapshot, policy, client kind)
 
 SQLite (`rusqlite`, bundled) at `<state>/sluice.db`: jobs table (id, key,
 repo, gate, state, timestamps from which wait and run times are derived,
-exit code, log path, coalesced count, daemon instance id), plus aggregate
+exit code, log path, coalesced count, daemon instance id; the scheduler timeline,
+`job_requests` and `gate_stats` tables are added by versioned migrations, see
+[[sluice/design/executor.md]]), plus aggregate
 metrics for `sluice status` (hit count, coalesced count, estimated time
 saved = sum of marker durations for hits and run times for coalesced
 subscribers of passed jobs).
@@ -243,8 +268,9 @@ generations), `<state>/logs/mcp-<pid>.log` per `sluice mcp` process,
 logs and `mcp-*.log` files older than `[daemon] log_retention_days`;
 `client.log` is only rotated. `sluice doctor [--json]` runs read-only checks
 (git version, PSI files, state and runtime directories, daemon socket and
-version, lease row, user config, repository config, hooks, marker size, the
-`sluice` first in `PATH`), exits 1 when one fails and never uses the network;
+version, lease row, database, user config, repository config, scoped key
+inputs, queue-only gates with hooks, hooks, marker size, the `sluice` first in
+`PATH`), exits 1 when one fails and never uses the network;
 `--bundle [path]` adds a redacted `.tar.gz` (versions, configs, `status
 --json`, `queue status --json`, recent daemon, client and MCP logs, logs of
 the last failed jobs).
@@ -261,7 +287,8 @@ download to a directory or `file://` URL ([[sluice/changes/self-update.md]]).
 
 Newline-delimited JSON over the Unix socket, with a `protocol` field in
 the hello/welcome handshake. Client messages: `hello`, `run`, `status`,
-`logs`, `event`, `stop`, `cancel`, and the merge-queue requests
+`logs`, `event`, `stop`, `cancel`, `exec` and `signal` (`sluice exec`, announced
+by the welcome feature `exec`), and the merge-queue requests
 `queue-enqueue`, `queue-status`, `queue-approve`, `queue-retry`,
 `queue-cancel`, `queue-reconcile`; server messages: `welcome`, `queued`,
 `started`, `progress`, `done`, `status`, `log`, `stopping`, `error`, and
@@ -300,6 +327,10 @@ invoked the hook:
 | human | `run-unqueued` | run immediately outside the queue |
 | anyone, not in a hook | `wait` | the policies only apply inside hooks (`--hook` given, or `GIT_DIR`/`GIT_INDEX_FILE` present) |
 
+A queue-only gate (`mode = "queue-only"`) never gets `fail-fast`: no `verify`
+could satisfy it, so the hook waits. Inside a Sluice job (`SLUICE_JOB` set) a
+miss runs in-process, unqueued (the parent job already holds the budget).
+
 `sluice run --explain <gate>` prints every decision (repository, git
 version, cache mode, caller and rule, hook, policies, budget, tree, key,
 lookup result) and exits 0 without running anything.
@@ -319,7 +350,11 @@ Agent detection: see [[sluice/design/adr/0004-agent-detection.md]].
   signal (`FAIL exit=signal`), by `daemon stop --force`, by cancellation
   or dropped from the queue by `daemon stop` (`KILLED`); 1 Sluice error (`sluice: error: <message>`
   on stderr: no repository, bad config, unknown gate, spawn or log
-  failure); 2 usage error.
+  failure); 2 usage error. `sluice exec` returns the command's own code, 128+N
+  for a signal, 124 on `--timeout`, 143 when the daemon stopped, 127 / 126 when
+  the command is not found / not executable, 125 for a Sluice error after the
+  request was accepted and 141 when its stdout is a closed pipe; `sluice daemon`
+  exits 75 when another daemon holds the lock.
 - Stderr notices on the way to an uncached run: `sluice: cache disabled
   (<reason>)`, `sluice: tree unknown (<reason>); running uncached`,
   `sluice: cannot snapshot the tree / derive the cache key / read the cache
@@ -369,7 +404,8 @@ and [[sluice/changes/phase-2-daemon.md]].
 - Socket directory `0700`, owned by the user. No network listener in v1.
 - The daemon runs gates in the worktree root with the requester's
   environment snapshot, minus git hook variables and `CLAUDE*`, plus the
-  gate's declared `env` (Q11). The runtime directory is `0700`, the socket
+  gate's declared `env` (Q11) and `SLUICE_JOB`; `sluice exec` jobs run in the
+  caller's directory with the caller's environment unchanged. The runtime directory is `0700`, the socket
   `0600`, the state and logs directories `0700`; files inside follow the
   umask.
 - `SLUICE_DISABLE=1` bypasses everything (runs the gate directly, no cache,

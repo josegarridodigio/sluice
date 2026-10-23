@@ -37,8 +37,9 @@ on CPU or memory, which is exactly "is this machine already saturated".
 ## Rule
 
 Sampled every `admission.psi_poll_interval` (default 1 s) by a daemon
-task (first sample at start, fixed period); the scheduling loop is woken
-only when the blocking verdict changes. Block and resume transitions are
+task (first sample at start, fixed period; the same task also samples CPU
+utilisation and gate demand, see [[sluice/design/scheduler.md]]); the
+scheduling loop is woken only when the blocking verdict changes. Block and resume transitions are
 logged at `info` with the sampled values.
 
 ```
@@ -56,15 +57,21 @@ blocking = psi_enabled
   job burst does not flap. Thresholds are validated as percentages in
   `[0, 100]`; `0` blocks on any pressure.
 - Starvation guard: evaluated on every scheduling pass (wake-ups and the
-  1 s tick); if the queue head has waited strictly more than
+  1 s tick); if the queue head (the first job in the scheduler's priority
+  order) has waited strictly more than
   `admission.psi_max_wait` (default 5 min, measured from its `queued_at`,
   so time spent waiting on the budget counts) while PSI blocks, the head
-  alone is admitted if it fits the budget and its repository cap (no
-  other job is tried); at most one admission per `psi_max_wait`, so a
+  alone is admitted if its effective weight fits the budget and its
+  repository cap (no other job is tried; `admission = guard`); at most one admission per `psi_max_wait`, so a
   backlog does not drain at once (pressure caused by other users' work
   must not stall Sluice forever). Logged at `info` with the job id.
-- Weighted admission under moderate pressure is out of scope for v1
-  (binary gate is enough to stop the "machine unresponsive" failure mode).
+- Blocking stays a binary gate (enough to stop the "machine unresponsive"
+  failure mode). Since ADR-0011 the same PSI values also gate
+  over-admission above the budget: it needs `cpu some avg10 <
+  cpu_some_avg10_low` and `memory some avg10 < memory_some_avg10_low`, both
+  values present, not blocking and at least `overcommit_interval` since
+  the last resume; without PSI (or with `psi_enabled = false`) admission
+  never goes above the budget ([[sluice/design/scheduler.md]]).
 
 ## Configuration additions
 
@@ -75,6 +82,11 @@ cpu_some_avg10_max = 60.0
 memory_some_avg10_max = 20.0
 psi_poll_interval = "1s"
 psi_max_wait = "5m"        # Phase 4 addition
+# ADR-0011 over-admission (validated: overcommit 1.0..=4.0, the others percentages)
+overcommit = 1.5           # 1.0 disables; cap = floor(overcommit * budget)
+cpu_some_avg10_low = 25.0
+memory_some_avg10_low = 5.0
+overcommit_interval = "5s"
 ```
 
 ## Observability

@@ -7,11 +7,11 @@ worktree. The server does not know your cwd.
 
 | Tool | Use |
 |---|---|
-| `verify` | Run gates and block until they finish. `gates` (names, run in order), `timeout_seconds` (per gate, 0 = none), `extra_args` (appended to every gate command and part of the cache key). |
+| `verify` | Run gates and block until they finish. `gates` (names, run in order), `timeout_seconds` (per gate, 0 = none), `extra_args` (appended to every gate command and part of the cache key), `fail_fast` (default true: return at the first failing gate and cancel the pending ones; false waits for every gate). All selected gates start at once unless the user disabled `[mcp] verify_parallel`. |
 | `status` | Queued and running jobs; with `working_directory`, the cache state of that tree per gate (`hit`, `miss`, `uncached`, `error`). Never starts the daemon. |
 | `gate_list` | Gates of `.sluice.toml`: name, command, weight, timeout, hooks, cache flag. |
-| `logs` | Tail of a job log; newest job by default. |
-| `queue_enqueue` | Put the committed branch in the local merge queue. Refuses a detached HEAD and tracked uncommitted changes. |
+| `logs` | Tail of a job log; newest job by default. `job_id`, `tail` (default 100, max 2000). |
+| `queue_enqueue` | Put the committed branch (`branch`, default the current one; `base`, default the configured target) in the local merge queue. Refuses a detached HEAD and tracked uncommitted changes. |
 | `queue_status` | Trains, members, conflicts with paths, trains ready for a human. |
 | `queue_approve` | Human decision. Refused with `not-allowed` unless the user enabled agent approval. |
 | `queue_retry` | Re-queue a `conflict` or `failed` job with the current head of its branch. |
@@ -34,8 +34,10 @@ e2e   FAIL exit=1 12.3s (job 1761...) log=/home/u/.local/state/sluice/logs/1761.
   you waited for and share that result.
 - Status values: `pass`, `fail`, `timeout`, `killed`, `error`, `cancelled`.
   A failing gate is a normal result flagged as an error: read the tail.
-- All selected gates run even after one fails; fix everything the tail shows,
-  then call `verify` again.
+- By default (`fail_fast`) the call returns at the first failing gate and the
+  gates still pending are cancelled (`cancelled`); fix what the tail shows,
+  then call `verify` again. With `fail_fast` false every gate runs and every
+  failure is reported.
 - `not_cached_reason` appears on a pass that could not be cached (for example
   `CI` is set, or the tree is unknown): that pass will run again next time.
 - Use `logs` with the job id for the full log, not another run.

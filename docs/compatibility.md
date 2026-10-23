@@ -36,10 +36,10 @@ status`, `client.log` and `daemon.log` lines, and the wording of errors.
 | Markers and miss records | `format` | 1 |
 | Cache key | prefix `sluice-cache-v1` | v1 |
 | Daemon protocol | `protocol` in `hello` / `welcome` | 1 |
-| Daemon features | `welcome.features` | `["queue"]` |
+| Daemon features | `welcome.features` | `["exec", "queue-only", "queue"]` (0.2.0: `["queue"]`) |
 | Status JSON | `schema` | 1 |
 | Queue status JSON | `schema` | 1 |
-| Database | tables `schema` and `queue_schema` | 1 and 1 |
+| Database | tables `schema`, `queue_schema` and `sched_schema` | 1, 1 and 1 |
 | Exit codes, CLI flags, MCP tools | none | n/a |
 | Plugin | `plugin.json` `version`, follows the release | |
 
@@ -77,7 +77,7 @@ unknown extra field as damaged, so no field is added to markers in 0.3.0; new
 per-marker data goes in separate files. From 0.3.0 on, Sluice itself accepts
 unknown fields in markers and miss records (they are ignored, not deleted), so
 a field added by a later release is safe once 0.3.0 is the oldest binary in
-use. `cache prune` also removes miss records and files of a foreign `format`
+use. The TTL pruning of markers (`[cache] ttl_days`) also removes miss records and files of a foreign `format`
 once they are older than the TTL. If a future release changes the key prefix
 (`sluice-cache-v2`), the first run after the upgrade is a cache miss, the gate
 runs once and a `v2` marker is written. Nothing else happens: no migration and
@@ -121,6 +121,9 @@ queue's state in two independent schemas. Markers are not in it.
 - Additive changes (a new table, a nullable column, an index) are applied when
   the daemon opens the file, do not change the schema version, and so keep
   older binaries working.
+- The scheduler timeline and the learned-weight statistics of 0.3.0 (extra
+  `jobs` columns and the `job_requests` and `gate_stats` tables) are additive
+  and tracked by their own `sched_schema` version; older binaries ignore them.
 - A non-additive change bumps that schema's version and ships a forward
   migration that runs once on open, after copying `sluice.db` to
   `sluice.db.bak-<version>`. One release of warnings comes first.
@@ -178,8 +181,10 @@ appear as `mcp__plugin_sluice_sluice__<tool>`; use those names in permission
 rules. The tools `verify`, `status`, `gate_list`, `logs`, `queue_enqueue`,
 `queue_status`, `queue_approve`, `queue_retry` and `queue_cancel` keep their
 names, arguments and output fields; new tools and optional fields may appear.
-The skill is named `sluice`; the `PreToolUse` guard only denies gate bypasses
-and `sluice queue approve`; the marketplace id is `sluice@sluice`.
+The skill is named `sluice`; the `PreToolUse` guard (`sluice guard`, from 0.3.0)
+rewrites gate and heavy commands to run through Sluice, denies raw gate
+commands it does not rewrite and denies `sluice queue approve` (an older binary
+only denies); the marketplace id is `sluice@sluice`.
 
 The plugin (installed by Claude Code) and the binary (installed by
 `install.sh` or `sluice update`) update independently. Each release's plugin

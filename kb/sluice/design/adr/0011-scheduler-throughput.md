@@ -27,11 +27,16 @@ measure them one at a time:
    and cgroup CPU limits), instead of CPUs − 1.
 2. Learned weights for gates: demand = (CPU time + run-queue wait) / wall
    from the job's tasks (`/proc/*/task/*/schedstat`), P75 of the last 10
-   runs, used after 3 runs, bounded to `[ceil(w_cfg / 4), w_cfg]`; not for
-   `exec` jobs.
+   passing runs, used after 3 runs, bounded to `[max(1, ceil(w_cfg / 4)),
+   w_cfg]`; resolved at every admission pass (a queued job takes the learned
+   weight as soon as it exists); not for `exec` jobs.
 3. PSI-driven over-admission up to 1.5 × budget when CPU `some avg10` < 25,
-   memory < 5, at least `ceil(w / 3)` CPUs idle, and no over-admission in
-   the last 5 s; the existing blocking hysteresis and `psi_max_wait` stay.
+   memory < 5, at least `max(1, ceil(w / 3))` CPUs idle (mean of the last two
+   samples, the newest taken after the latest admission), nothing started
+   nominally in the same pass, and no over-admission in the last 5 s
+   (`admission.overcommit_interval`, also the wait after a PSI resume);
+   `admission.overcommit` is validated to 1.0 (off) to 4.0; the existing
+   blocking hysteresis and `psi_max_wait` stay.
 4. Parallel `verify` with an early verdict: the gates of one `verify`
    start together; the first failure ends the call and cancels sibling
    jobs nobody else waits for.
@@ -42,8 +47,9 @@ measure them one at a time:
    supersede of queued older trees is deferred (no stale queued work under
    the defaults).
 7. Instrumentation (L1): a per-job timeline and requesters, and
-   `idle_while_waiting_ms` (integral of idle CPUs while the queue is not
-   empty) in optional fields of `status --json`, `done` and `verify`.
+   `idle_while_waiting_ms` (integral of the idle CPU fraction while the queue
+   is not empty) in `status.totals`, and per job `queue_wait_ms` and
+   `wait_reason` in `done` and `verify`, all optional fields.
 8. Storage: `schema.version` stays 1 so 0.2.0 binaries still open the
    database; the additions (nullable timeline columns in `jobs`, tables
    `job_requests` and `gate_stats`) are versioned by their own
@@ -58,8 +64,13 @@ load ≤ baseline, in the normal, overload and low-core variants.
 ## Consequences
 
 - Predicted overload result: wall about 95 s, p95 about 43 s, idle while
-  waiting about 4 %. On a 6-CPU machine p95 is predicted at 1.2–1.25 ×
-  baseline, at or just over the target; L3 measures it.
+  waiting about 4 %. On a 6-CPU machine p95 was predicted at 1.2–1.25 ×
+  baseline, at or just over the target.
+- Measured (L3 round 3, shipped defaults 1.5 × / 5 s, learned weights
+  resolved at admission): every target met in every variant. Overload: wall
+  0.58 × the baseline, p95 1.10 ×, idle while waiting 7.8 %; low-core: p95
+  0.94 ×, idle 5.5 %; normal: p95 1.14 ×, idle 5.0 %
+  ([[sluice/changes/alpha-readiness.md]]).
 - Admission decisions become pure functions over a snapshot (unit-tested);
   the scheduler state grows by the learned statistics.
 

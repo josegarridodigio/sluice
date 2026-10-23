@@ -18,11 +18,13 @@ addition is optional.
    separate streams in arrival order; the client replays it to its own fds. Stdin is `/dev/null`, no
    TTY, exit code propagated, signals forwarded.
 3. The caller's environment is passed verbatim (no sanitising); cwd is the caller's.
-4. Default exec weight is `ceil(budget / 2)`; coalescing only with `--coalesce-key`.
+4. Default exec weight is `[agent] exec_weight`, else `ceil(budget / 2)`; exec jobs keep that
+   declared weight (never learned, ADR-0011); coalescing only with `--coalesce-key`.
 5. Queue-only gates use a new optional field `mode = "queue-only"`; `cache` stays a bool.
 6. The guard's logic moves into `sluice guard` (Rust); `guard.sh` is a thin wrapper that keeps
    today's shell deny logic as fallback when the binary lacks `guard`.
-7. Rewrites insert a fixed prefix at a segment start of the untouched original string and are
+7. Rewrites only add fixed words to the untouched original string (`sluice exec --label L -- `
+   before a heavy command word; `sluice run <gate> -v` in place of the typed gate words) and are
    emitted as `allow` only where that cannot widen permissions; `ask` or no rewrite elsewhere (table
    in section 4.6).
 8. Shims are POSIX `sh` wrappers that call `sluice shim exec <name>`; every process Sluice runs
@@ -65,7 +67,7 @@ one `claude -p --model haiku` session and records the transcript excerpt in its 
 ## 2. `sluice exec`
 
 ```
-sluice exec [--weight N] [--label L] [--coalesce-key K] [--timeout DUR] [--quiet] -- <cmd> [args...]
+sluice exec [--weight N] [--label L] [--coalesce-key K] [--timeout DUR] [-q|--quiet] -- <cmd> [args...]
 ```
 
 Module `crates/sluice-gate/src/exec.rs`, `pub fn exec(args: &ExecArgs) -> ExitCode`. `<cmd>` is an
@@ -73,18 +75,24 @@ argv (no shell); `sluice exec -- sh -c '...'` is the way to run a script.
 
 ### 2.1 Client flow
 
-1. If `SLUICE_JOB` is set (we are inside a Sluice job): `CommandExt::exec` the command directly
-   (inherited stdio, no queue). The parent job's weight already covers it.
-2. Resolve `argv[0]` with `sluice_gate_core::which::resolve(name, PATH, cwd, skip_shims=true)`
+1. Resolve `argv[0]` with `sluice_gate_core::which::resolve(name, env, cwd, skip_shims=true)`
    (skips the shim dir and any file starting with the shim marker, section 5). Not found: `sluice:
-   exec: cannot run '<cmd>': command not found`, exit 127; not executable: 126.
-3. Label: `--label` or the first two words of argv (`cargo build`), keeping only letters, digits,
-   space and `._:/-`, max 48 chars. Weight: `--weight` or `[agent] exec_weight` or `ceil(effective_budget / 2)`;
-   clamped by the daemon as for gates.
-4. Repo identity: best-effort `git rev-parse --show-toplevel --git-common-dir` in cwd (one call,
-   failure ignored) so `repos.<path>.budget_share_max` applies; else `null`.
-5. `client::ensure_daemon`, handshake. Daemon without feature `"exec"`, refusal, or any error before
-   `queued` → in-process fallback (2.6).
+   exec: cannot run '<cmd>': command not found`, exit 127; not executable: `... permission denied`,
+   126.
+2. If `SLUICE_JOB` is set (we are inside a Sluice job): `CommandExt::exec` the resolved command
+   directly (argv[0] kept, inherited stdio, no queue). The parent job's weight already covers it.
+3. Label: `--label` or the first two words of argv (the program as its base name, `cargo build`),
+   keeping only letters, digits, space and `._:/-`, max 48 chars (`exec` when nothing is left).
+   Weight: `--weight` or `[agent] exec_weight` or `ceil(effective_budget / 2)` (`[daemon] budget`,
+   at least 1); clamped by the daemon as for gates. A user config that cannot be parsed prints
+   `sluice: warning: <error>; using the default settings` and exec goes on with the defaults.
+4. Repo identity: best-effort repository discovery in cwd (`git::discover`, one call, failure
+   ignored): the main worktree (the parent of a common dir named `.git`) or the common dir, so
+   `repos.<path>.budget_share_max` applies; else `null` (the daemon then uses the cwd as the
+   repository for the cap).
+5. `SLUICE_DISABLE=1`, or a non-UTF-8 environment (2.6): straight to the in-process run.
+   Otherwise `client::ensure_daemon`, handshake. Daemon without feature `"exec"`, refusal, or any
+   error before `queued` → in-process fallback (2.6).
 6. Block SIGINT, SIGTERM, SIGHUP with `SigSet::thread_block` before any thread starts; a thread
    reads them from `nix::sys::signalfd::SignalFd` (safe API, `unsafe_code` stays forbidden) and
    forwards them (2.4).
@@ -119,13 +127,15 @@ argv (no shell); `sluice exec -- sh -c '...'` is the way to run a script.
 
 ### 2.3 Daemon execution and output
 
-`server.rs`: `handle_exec` registers an `Entry` like `register` with `key = None`, `request =
-JobRequest::Exec(Arc<ExecRequest>)`. `start_job` builds the `ExecSpec` with two new fields: `launch:
-Launch` (`Shell { cmd, extra }` for gates, `Argv { program, args }` for exec) and `sink: Sink`
-(`Log` or `Spool`). Everything else is reused: new process group, `renice`/`ionice`, `KILL_GRACE`,
+`server.rs`: `handle_exec` calls `register_exec`, which goes through the same `register_job` as
+gates with `key = None`, `via = "exec"`, `request = JobRequest::Exec(Arc<ExecRequest>)`; the job
+keeps its declared weight (it has no `stats_key`, so no weight is learned, ADR-0011 M2) and its
+lane is the cwd. `start_exec` builds the `ExecSpec` with two new fields: `launch: Launch` (`Shell {
+cmd, extra }` for gates, `Argv { program, args }` for exec) and `sink: Sink` (`Log` or `Spool`). Everything else is reused: new process group, `renice`/`ionice`, `KILL_GRACE`,
 orphan reconciliation, `NO_TIMEOUT` unless `--timeout`. Every job's env gets `SLUICE_JOB=<job id>`
 (gates too). Exec ignores `last_subscriber_gone = finish` (nothing to cache): the last subscriber
-leaving kills it.
+leaving kills it. Unlike a gate log, an unwritable spool is a start error (the client replays the
+file).
 
 Output choice: **separate streams, ordered at chunk granularity, through a spool file.** Agents need
 the real stdout/stderr (tools parse stdout; Claude's Bash tool returns both) and the real exit code.
@@ -154,9 +164,14 @@ Client receives SIGINT/SIGTERM/SIGHUP:
 - request still queued → close the connection (job dropped if it has no other subscriber), print
   `sluice: exec '<label>' interrupted while queued`, exit 128+sig;
 - running → send `signal{sig}`; the daemon does `killpg(sig)` when this is the only subscriber, else
-  only detaches this subscriber; then after `KILL_GRACE` + 5 s with the group alive,
-  `terminate_group`. A second signal at the client, or the client's SIGKILL (Bash tool timeout),
-  closes the connection: the existing cancel path kills the group.
+  only detaches this subscriber; once the leader has exited, the rest of its group is SIGKILLed
+  at once (background children that ignore SIGINT would hold the output pipes); with the leader
+  still alive after `KILL_GRACE` + 5 s the cancel sequence (`terminate_group`) runs. A second
+  signal at the client, or the client's SIGKILL (Bash tool timeout), closes the connection: the
+  existing cancel path kills the group. The exit code is 128+N of the signal that killed the
+  job, or of the signal the client received when the job ended as killed (not 143).
+
+The `interrupted while queued` line is informational and omitted with `--quiet`.
 
 ### 2.5 Exit codes and messages
 
@@ -168,14 +183,20 @@ Client receives SIGINT/SIGTERM/SIGHUP:
 | killed by `daemon stop`/lost lease | 143 | `sluice: exec '<label>' KILLED: the daemon stopped (job <id>)` |
 | not found / not executable | 127 / 126 | `sluice: exec: cannot run '<cmd>': <why>` |
 | Sluice error after `queued` | 125 | `sluice: exec: <message>` |
+| connection lost after `queued` | 125 | `sluice: exec: the daemon died while running exec '<label>'; it was killed` (after `started`) or `sluice: exec: lost the connection to the daemon: <why>` |
+| the client's stdout is a closed pipe | 141 | nothing (the connection is closed, which kills the job) |
+| client received SIGINT/SIGTERM/SIGHUP | 128+N | nothing (`interrupted while queued` when it was still queued) |
 | waited ≥ 1 s in the queue | — | `sluice: exec '<label>' queued (position P, U of B units busy)` then `sluice: exec '<label>' started after 12.4s (job <id>)` |
 | coalesced | — | `sluice: exec '<label>' sharing job <id>` |
 
 ### 2.6 In-process fallback
 
-`sluice: daemon unavailable (<why>); running '<label>' in-process` (one stderr line), then take
-`weight` slots of the `flock` semaphore (`acquire_budget`, moved from `run.rs` to
-`crates/sluice-gate/src/budget.rs` and shared), spawn with inherited stdin/stdout/stderr in the
+`sluice: daemon unavailable (<why>); running '<label>' in-process` (one stderr line, omitted with
+`--quiet`; `SLUICE_DISABLE=1` goes in-process without it), then take
+`weight` slots of the `flock` semaphore (`budget::acquire`, moved from `run.rs` to
+`crates/sluice-gate/src/budget.rs` and shared; it prints `sluice: waiting for N of B budget units
+for '<label>'` once unless `--quiet`, and when the semaphore directory cannot be used the command
+runs unthrottled after `sluice: warning: cannot take budget slots (<why>); running unthrottled`), spawn with inherited stdin/stdout/stderr in the
 command's own process group (`process_group(0)`), set `SLUICE_JOB=inproc-<pid>`, wait, map the
 code. When the client's group is the foreground group of the terminal on stdin, the terminal is
 handed to the command's group (`tcsetpgrp`, SIGTTOU blocked, then SIGCONT in case a read already
@@ -187,8 +208,8 @@ background children of the command never outlive it (alpha review finding 9). No
 
 The environment travels to the daemon as UTF-8 strings. The client reads it with `vars_os`
 (`sluice_gate_core::config::process_env`, which drops non-UTF-8 entries instead of panicking);
-when any entry is not valid UTF-8 (`process_env_is_utf8`), `sluice exec` skips the daemon and runs
-in-process, where the command inherits the raw environment unchanged. Shims and the guard use the
+when any entry is not valid UTF-8 (`process_env_is_utf8`), `sluice exec` skips the daemon (one line:
+`the environment is not valid UTF-8; running '<label>' in-process`) and runs in-process, where the command inherits the raw environment unchanged. Shims and the guard use the
 same reader, so a non-UTF-8 variable never makes them panic (alpha review finding 3).
 
 ### 2.7 Coalescing
@@ -213,10 +234,11 @@ it. `mode` keeps `cache` a bool forever (no type change of a frozen field, see
 [[sluice/design/compatibility.md]]), gives a clear old-binary error (``unknown field `mode` ``
 instead of ``invalid type: string, expected a boolean``), and leaves room for later modes.
 Validation: `mode = "queue-only"` with an explicit `cache = true` → `gates.<name>: mode =
-"queue-only" never caches; remove cache = true`; `cache = false` is accepted (redundant). Docs:
+"queue-only" never caches; remove cache = true`; `cache = false` is accepted (redundant); the parser
+sets `cache = false` on every queue-only gate (`RepoConfig::check_queue_only`). Docs:
 "needs sluice ≥ 0.3.0".
 
-Semantics (`run.rs`, `lookup.rs`, `server.rs`):
+Semantics (`run.rs`, `config.rs`, `server.rs`):
 - Always runs: no marker lookup, no hit path, no `hit` event. The tree is still snapshot to derive
   the normal key K; the request carries `key = sha256("queue-only\0" K)` (own namespace, never
   matches a marker) and `no_marker = true`.
@@ -228,13 +250,16 @@ Semantics (`run.rs`, `lookup.rs`, `server.rs`):
 - Hooks: the agent `fail-fast` policy never applies to a queue-only gate (no `verify` could satisfy
   it, the commit would loop); the hook waits. `sluice hook print` and `doctor` warn when a
   queue-only gate has `hooks`. `verify` runs it every time and reports `pass` (never `cached`); the
-  merge queue may list it in `queue.gates`.
+  merge queue may list it in `queue.gates`. `verify` and the merge-queue runner send it with `key =
+  null` (it always runs and never writes a marker, but is not coalesced there; `sluice run`
+  coalesces).
 
 ## 4. Guard rewrite (agent plugin)
 
 ### 4.1 Shape
 
-`plugin/hooks/guard.sh` becomes: exit 0 if `SLUICE_GUARD=0`; run `sluice guard --hook` with the hook
+`plugin/hooks/guard.sh` becomes: exit 0 if `SLUICE_GUARD=0` (the Rust guard also treats `false`, `no`
+and `off` as off); run `sluice guard --hook` with the hook
 JSON on stdin (no daemon contact, reads files only); if it exits 0, print its stdout when it starts
 with `{"hookSpecificOutput"`; otherwise (binary missing, a pre-0.3 binary without `guard`, crash)
 run the current shell logic unchanged (`legacy_main`: deny gates, deny `sluice queue approve`).
@@ -259,50 +284,64 @@ shims. `guard::run_hook() -> ExitCode` never returns non-zero and never panics o
 ### 4.2 Tokenizer (`lex::split(command) -> Option<Vec<Segment>>`)
 
 A segment is a simple command with byte offsets into the original string: optional leading
-`VAR=value` words, words, redirections, and the operator that ends it (`&&`, `||`, `;`, `|`). Single
-and double quoted words are supported when balanced and on one line; inside double quotes `$`, `` `
-`` and `\` make the whole command unparseable. `None` (never rewritten, never denied by the rewrite
-logic; the legacy deny checks still run on the naive split) for: newlines or `\` continuations,
-heredocs `<<`, input redirection `<`, process substitution, `$(`, backticks, `(`, `)`, `{`, `}`, a
-single `&` (background), `|&`, unbalanced quotes, non-UTF-8, more than 4096 bytes.
+`VAR=value` words, words, a count of output redirections (`>`, `>>`, `2>&1`, `&>`), and the operator
+that ends it (`&&`, `||`, `;`, `|`). Single and double quoted words are supported when balanced and
+on one line; inside double quotes `$`, `` ` `` and `\` make the whole command unparseable. `None`
+(never rewritten, never denied by the rewrite logic; the legacy deny checks still run on the naive
+split) for: newlines and other control characters (tab is fine), any unquoted `\`, heredocs `<<`,
+input redirection `<`, process substitution (`<(`, `>(`), `$(`, `${`, `$[`, `$'...'`, `$"..."`,
+backticks, `(`, `)`, `{`, `}`, a single `&` (background), `|&`, `;;`, `;&`, comments, unbalanced
+quotes, a segment starting with a compound-command keyword (`if`, `for`, `while`, `case`, `!`,
+`[[`, ...), an operator with no command before it, more than 4096 bytes. A trailing `;` is
+accepted. Input that is not valid UTF-8 never reaches the tokenizer (the hook gives no answer).
 
 ### 4.3 Matching
 
 Per segment, after skipping env assignments and an optional leading `time`:
-- **Skip** when the first word is `sluice` (`sluice queue approve` stays a deny), or one of `sudo`,
-  `env`, `nohup`, `nice`, `timeout`, `xargs`, `exec`, `eval`, `sh`, `bash`, `zsh`, `command`,
-  `builtin` (wrappers and `sh -c` are never looked into), and when a leading assignment sets `PATH`
-  (`PATH=... cmd` would also pick which `sluice` runs).
-- **Directory**: a previous segment `cd <word>` joined with `&&` changes the effective directory
-  (no `~` or variables, must exist), else no rewrite at all. The target is resolved lexically on
+- **Skip** when the first word starts with `sluice` (`sluice queue approve` stays a deny), or is one
+  of `sudo`, `doas`, `env`, `nohup`, `nice`, `ionice`, `timeout`, `xargs`, `exec`, `eval`, `sh`,
+  `bash`, `zsh`, `dash`, `ksh`, `fish`, `command`, `builtin`, `source`, `.`, `watch`, `parallel`,
+  `flock`, `setsid`, `stdbuf`, `chrt`, `taskset`, `strace` (wrappers and `sh -c` are never looked
+  into), and when a leading assignment sets `PATH` (`PATH=... cmd` would also pick which `sluice`
+  runs). A bare leading `time` is passed over; `time` with options is skipped. A segment that is
+  downstream in a pipeline, or that has an argument `-`, is never rewritten (it reads stdin).
+- **Directory**: a previous segment `cd <word>` (exactly one plain argument, no assignments or
+  redirections) joined with `&&` changes the effective directory (no `~` or variables, must exist),
+  else no rewrite at all; `pushd`/`popd`, and any `||` or `;` in a command that contains a `cd`,
+  also mean no rewrite at all (the directory of later segments would depend on exit codes). The target is resolved lexically on
   the logical directory (the hook's `cwd`, the shell's `$PWD`): `..` drops the previous component
   as typed, like the shell's default `cd -L`; only the result is canonicalised to find the
   `.sluice.toml`. No rewrite at all when `CDPATH` is set (a relative `cd` may go elsewhere) or when
   a `cd` argument has a `..` component while the logical and canonical current directories differ
   (alpha review finding 1).
-- **Gate**: config found by walking up from the effective directory. A gate matches when the
-  effective directory is the config's directory, the segment has no env assignments, and the
-  canonical words of the segment start with the canonical words of the gate `cmd` (one-line gates
-  only). Rewrite: `sluice run <gate> -v -- <rest>` when the typed words equal the gate words as
-  spelled (rest = the remaining original substring, verbatim), or `sluice run <gate> -v` when only
-  the canonical forms are equal and there is no rest (a different package manager would parse extra
-  args differently). Runner-only matches (`cargo test -p x` for a gate `cargo test --workspace`) are
+- **Gate**: config found by walking up from the effective directory (a `.sluice.toml` that cannot
+  be read or parsed: no output at all). A gate matches when the effective directory is the config's
+  directory, the segment has no env assignments and no redirections and is not in a pipeline (`cargo
+  test --workspace 2>&1 | tail` becomes an exec rewrite: `sluice run -v` prints different bytes), and
+  the segment starts with the gate `cmd` (only gates whose `cmd` is one simple command of unquoted
+  literal words take part; no `$ ~ * ? [ ]`). Rewrite: the typed gate words are replaced by `sluice
+  run <gate> -v -- ` followed by the rest of the original (` --` only when arguments follow; the
+  longest gate wins) when the typed words equal the gate words as spelled, or by `sluice run <gate>
+  -v` when only the canonical forms are equal, there is no rest, every word is literal and no
+  package-manager directory option is present (a different package manager would parse extra args
+  differently). Runner-only matches (`cargo test -p x` for a gate `cargo test --workspace`) are
   not gate matches; they fall through to heavy.
-- **Heavy**: canonical words start with an entry of the heavy list (word boundary). Rewrite: insert
-  `sluice exec --label <L> -- ` before the command word (after env assignments, so they reach exec
-  and then the child). `L` = first two canonical words joined with `-`, filtered to `[a-z0-9._-]`,
-  max 32 chars. Not rewritten when an argument is `-` (reads stdin) or the segment is not the first
-  of a pipeline (it would read stdin). A heavy segment first in a pipeline is fine: exec's stdout is
-  the child's.
+- **Heavy**: canonical words start with an entry of the heavy list (word boundary; the longest
+  entry wins). Rewrite: insert `sluice exec --label <L> -- ` before the command word (after env
+  assignments, so they reach exec and then the child). `L` = up to the first two canonical words,
+  stopping at the first word that starts with `-`, joined with `-`, lowercased, filtered to
+  `[a-z0-9._-]`, max 32 chars (`exec` when nothing is left). A heavy segment first in a pipeline is
+  fine: exec's stdout is the child's.
 
 Canonical words (`canonical_words`), used only for matching, never for output: `npm run X`, `npm
 run-script X`, `pnpm run X`, `yarn run X`, `bun run X` → `run X`; `npm test|start|stop|restart` →
 `run <that>`; `pnpm X` / `yarn X` → `run X` unless X is a package-manager builtin (`add audit bin
 cache check config create dedupe dlx exec import info init install i link list ls outdated pack
 prune publish rebuild remove rm root store unlink up update upgrade why workspace workspaces`); `npx
-[-y|--yes] X`, `pnpm exec X`, `yarn exec X`, `bunx X` → `X`; `pnpm -C d|--dir d`, `npm --prefix d`,
-`yarn --cwd d` are kept as words (they are part of what runs) but skipped when finding the command
-word; `python -m pytest`, `python3 -m pytest` → `pytest`; `./gradlew` → `gradle`, `./mvnw` → `mvn`;
+[-y|--yes] X`, `pnpm exec X`, `yarn exec X`, `bunx X` → `X`; `pnpm -C d|--dir d` (also `--dir=d`),
+`npm --prefix d`, `yarn --cwd d` are skipped when finding the command word and left out of the
+canonical words (which are used only for matching, never to build the command; launchers are
+unwrapped at most four times); `python -m pytest`, `python3 -m pytest` → `pytest`; `./gradlew` → `gradle`, `./mvnw` → `mvn`;
 `docker-compose` → `docker compose`; whitespace collapsed.
 
 ### 4.4 Heavy list and configuration
@@ -319,17 +358,22 @@ exec_weight = 0                            # 0 = ceil(budget / 2)
 Default (`DEFAULT_HEAVY_COMMANDS`, canonical words): `docker build`, `docker buildx build`, `docker
 compose build`, `run build` (npm/pnpm/yarn/bun build scripts), `cargo build`, `cargo test`, `cargo
 clippy`, `cargo nextest`, `go build`, `go test`, `make`, `gradle`, `mvn`, `tsc`, `vite build`,
-`webpack`, `next build`, `pytest`, `jest`, `vitest`. The guard reads the config through the normal
-strict parser (re-read per call, as the client does); a parse error means "no rewrites" and a stderr
+`webpack`, `next build`, `pytest`, `jest`, `vitest`. Entries are validated by the config parser
+(not empty, no control characters, at most 8 words; at most 256 entries across both lists) and
+canonicalised before matching, so `pnpm build` and `run build` are the same entry. The guard reads
+the config through the normal strict parser (re-read per call, as the client does); a parse error means "no rewrites" and a stderr
 note that only the debug log shows. Old binaries reading a user config with `[agent]` fail loudly;
 the user config is per machine and upgrades with the binary, so this is accepted.
 
 ### 4.5 Fail-open rules
 
-Any error (unreadable JSON, missing `tool_input.command`, unparseable command, unreadable config,
-settings that cannot be parsed, a panic) → no output, exit 0, and the original command goes through
-Claude Code's normal flow. The guard never blocks on I/O beyond local files, never contacts the
-daemon, and caps its own run at 500 ms (a watchdog thread exits 0 with no output). `SLUICE_GUARD=0`
+Any error (unreadable JSON, a tool other than `Bash`, missing `tool_input.command`, a `.sluice.toml`
+that cannot be read, a panic) → no output, exit 0, and the original command goes through Claude
+Code's normal flow. An unparseable command, a user config or settings that cannot be parsed, or
+an unknown settings location mean no rewrite, but the legacy deny of a raw gate command (4.3)
+still applies; `sluice queue approve` is denied before any of this. The guard reads at most 1 MiB
+of input, never blocks on I/O beyond local files, never contacts the daemon, and caps its own run
+at 500 ms (a watchdog thread exits 0 with no output). `SLUICE_GUARD=0` (or `false`, `no`, `off`)
 disables everything, `SLUICE_GUARD=deny` selects suggestion mode (4.8).
 
 ### 4.6 Permission safety
@@ -341,22 +385,26 @@ and `/etc/claude-code/managed-settings.json`. Only `Bash` rules matter (`Bash`, 
 
 | Condition (first that applies) | Output |
 |---|---|
-| any deny or ask rule matches any segment of the original, or a bare `Bash` ask/deny rule, or a settings file fails to parse | nothing (normal flow on the original) |
-| `permission_mode` is `plan`, `auto` or `dontAsk` and the original is not covered by allow rules | nothing |
-| `permission_mode = bypassPermissions`, or every segment of the original matches an allow rule | `allow` + `updatedInput` + `additionalContext` |
-| `default` / `acceptEdits` (absent counts as `default`) | `ask` + `updatedInput` + reason (the user would have been prompted for the original anyway; now the prompt shows the rewritten command) |
+| any deny or ask rule matches (liberally: any doubt counts) the whole command or any segment of the original or of the rewrite, or a bare `Bash` or unrecognised `Bash...` ask/deny rule, or a settings file fails to parse, or the settings location is unknown (`CLAUDE_PROJECT_DIR` unset, or neither `CLAUDE_CONFIG_DIR` nor `HOME`) | nothing (normal flow on the original) |
+| `permission_mode` is `plan`, `auto` or `dontAsk` and the original is not covered by allow rules, or the mode is unknown | nothing |
+| `permission_mode = bypassPermissions`, or every segment of the original matches an allow rule (strictly; a segment with a redirection never does) | `allow` + `updatedInput` + `additionalContext` + reason |
+| `default` / `acceptEdits` (absent counts as `default`) | `ask` + `updatedInput` + `additionalContext` + reason (the user would have been prompted for the original anyway; now the prompt shows the rewritten command) |
+
+When the table says "nothing", the legacy deny of a raw gate command still applies, as in 0.2.0.
 
 So a rewrite never runs something the user would not have run, and never hides a deny or ask rule.
 Command-line `--disallowedTools` flags are invisible to hooks; documented.
 
 ### 4.7 Injection argument, output and examples
 
-The rewrite is `original[..o] + PREFIX + original[o..]` for each insertion offset `o` (segment
-command-word starts found by the tokenizer). `PREFIX` is a constant plus the gate name
-(`[a-z0-9_-]`, validated by the config parser) or a label from `[a-z0-9._-]`. Nothing from the
-original is re-quoted, unescaped or moved, and every character of the original keeps its position
-relative to its neighbours, so the shell parses the agent's words exactly as before; only words are
-added in front. The JSON output is built with `serde_json` from the received `tool_input` with
+A heavy rewrite is `original[..o] + PREFIX + original[o..]` for each insertion offset `o` (segment
+command-word starts found by the tokenizer); a gate rewrite replaces the typed gate words
+`original[s..e]` with `sluice run <gate> -v` (plus ` --` when arguments follow). The inserted text
+is a constant plus the gate name (`[a-z0-9_-]`, validated by the config parser) or a label from
+`[a-z0-9._-]`. Nothing else from the original is re-quoted, unescaped or moved, and every character
+of the original keeps its position relative to its neighbours, so the shell parses the agent's
+words exactly as before; only words are added in front (or, for a gate, swapped for the gate
+runner). The JSON output is built with `serde_json` from the received `tool_input` with
 `command` replaced.
 
 | Original (`cwd` = repo root, gate `test` = `cargo test --workspace`) | Rewritten |
@@ -366,7 +414,7 @@ added in front. The JSON output is built with `serde_json` from the received `to
 | `cd web && pnpm build` | `cd web && sluice exec --label run-build -- pnpm build` |
 | `RUSTFLAGS=-Dwarnings cargo clippy` | `RUSTFLAGS=-Dwarnings sluice exec --label cargo-clippy -- cargo clippy` |
 | `npx vitest run` | `sluice exec --label vitest-run -- npx vitest run` |
-| `make && make install` | `sluice exec --label make -- make && sluice exec --label make -- make install` |
+| `make && make install` | `sluice exec --label make -- make && sluice exec --label make-install -- make install` |
 | `docker build -t "my app" .` | `sluice exec --label docker-build -- docker build -t "my app" .` |
 | `sh -c "make"`, `make &`, `cat x \| make`, `docker build - < Dockerfile`, `echo "cargo build"`, `sluice exec -- make`, `bash -c "$(cat run.sh)"` | unchanged |
 
@@ -374,7 +422,7 @@ What the agent sees: the rewritten command's own output and exit code (`sluice r
 gate log on stderr and prints the gate summary; `sluice exec` prints only the command's output plus
 at most two queue lines on stderr), and the `additionalContext`: ``Sluice ran this through its
 shared queue as: `<rewritten>`. Output and exit code are the command's own. Use the `verify` tool
-for gates.`` (gate case: ``... as gate '<gate>' (cached per tree)``).
+for gates.`` (gate case: ``Sluice ran this through its shared queue as gate '<gate>' (cached per tree): `<rewritten>`. The exit code is the gate's; a cached pass skips the run. Use the `verify` tool for gates.``).
 
 ### 4.8 Suggestion mode and missing support
 
@@ -387,35 +435,52 @@ code).`` The legacy shell path never rewrites.
 
 `sluice shim install [--dir DIR] [--force]` writes one file per command word of the heavy list
 (`docker cargo go make gradle gradlew mvn mvnw tsc vite webpack next pytest jest vitest npm pnpm
-yarn bun npx`) into `~/.local/share/sluice/shims` (mode 0755, dir 0700, atomic rename; refuses to
-overwrite a file without the marker unless `--force`):
+yarn bun npx`) into `$XDG_DATA_HOME/sluice/shims` or `~/.local/share/sluice/shims` (mode 0755, dir 0700, atomic
+rename; refuses to overwrite a file without the marker unless `--force`):
 
 ```sh
 #!/bin/sh
 # sluice-shim v1
+# Generated by Sluice (`sluice shim install`); `sluice shim uninstall` removes it.
+# Routes 'make' through the Sluice queue in agent sessions; runs it unchanged otherwise.
 SLUICE_SHIM_DIR='/home/u/.local/share/sluice/shims'; export SLUICE_SHIM_DIR
 if [ -x '/home/u/.local/bin/sluice' ]; then
     exec '/home/u/.local/bin/sluice' shim exec make -- "$@"
 fi
-PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$SLUICE_SHIM_DIR" | paste -sd: -)
+# Sluice is gone: run the real 'make', skipping every Sluice shim in PATH.
+sluice_path=
+set -f
+IFS=:
+for sluice_d in $PATH; do
+    if [ -f "${sluice_d:-.}/make" ] && grep -q '^# sluice-shim v1$' "${sluice_d:-.}/make" 2>/dev/null; then
+        continue
+    fi
+    sluice_path=${sluice_path:+$sluice_path:}$sluice_d
+done
+unset IFS sluice_d
+set +f
+PATH=$sluice_path; export PATH
+unset sluice_path
 exec make "$@"
 ```
 
 `sluice shim exec <name> -- args` (`crates/sluice-gate/src/shim.rs`):
-1. `real = which::resolve(name, PATH, cwd, skip_shims=true)`: walks `PATH`, skips every entry whose
-   canonical path equals the canonical `SLUICE_SHIM_DIR`, and every candidate whose first 64 bytes
-   contain `# sluice-shim v1` or that canonicalises to the running `sluice` binary. Not found:
-   `sluice: shim: no '<name>' in PATH after <dir>`, exit 127.
+1. `real = which::resolve(name, env, cwd, skip_shims=true)`: walks `PATH`, skips every entry whose
+   canonical path equals the canonical `SLUICE_SHIM_DIR` (else the default shim dir), and every
+   candidate whose first 64 bytes contain `# sluice-shim v1` or that canonicalises to the running
+   `sluice` binary. Not found: `<name>: command not found`, exit 127 (not executable:
+   `<name>: Permission denied`, 126).
 2. Pass-through (`CommandExt::exec(real, args)`, argv[0] kept) when `SLUICE_JOB` is set (inside
    `sluice exec`, a gate, or a rewritten command: no double wrapping), when `SLUICE_SHIMS` is falsy,
    when neither `SLUICE_SHIMS` is truthy nor `agent::detect` says agent, when the canonical words of
    `name args` do not match the heavy list (`docker ps`, `npm install`), or when an argument is `-`.
 3. Otherwise run the exec client in-process (no extra `sluice` spawn) with argv `[real, args...]`,
-   label = canonical words.
+   label = the first two canonical words joined with a space.
 
-`sluice shim uninstall` removes only files with the marker; `sluice shim status` lists shims,
-whether the dir is in `PATH` and before the real binaries, and which real binary each resolves to.
-`doctor` reports a shim dir that is in `PATH` while the shims are stale (sluice path changed). Docs
+`sluice shim uninstall` removes only files with the marker (and the directory when it is then
+empty); `sluice shim status` lists shims, whether the dir is in `PATH` and before the real
+binaries, and which real binary each resolves to (a `doctor` check for stale shims does not exist
+yet, see 5.1). Docs
 (`docs/agents.md`): put the dir first in `PATH` only for agent shells
 (`PATH="$HOME/.local/share/sluice/shims:$PATH"` in the agent's environment or launcher), set
 `SLUICE_SHIMS=1` for agents that set no detectable variable, plus a ready-to-paste `AGENTS.md`
@@ -444,8 +509,10 @@ of `SLUICE_JOB` and the resolver skip.
   default directory, is used. `status --json` (`schema: 1`): `dir`, `exists`, `in_path`,
   `path_index`, `sluice`, `this_shell {queue, reason}`, `shims [{name, state, real, active}]`
   (`current | stale | missing | foreign`), `unlisted`.
-- Not done here: the `doctor` check for stale shims (`doctor.rs` belonged to task X1 in the same
-  wave); `sluice shim status` reports `stale` meanwhile. Follow-up.
+- Not done: the `doctor` check for stale shims (`doctor.rs` belonged to task X1 in the same
+  wave); `sluice shim status` reports `stale` instead. Follow-up.
+- `install` fails (exit 1) when the user config cannot be parsed; `status` warns and `shim exec`
+  silently uses the defaults. `--dir` is made absolute against the cwd.
 - Through the queue stdin is `/dev/null` (as `sluice exec`); only a `-` argument passes through.
   `shim exec` uses `sluice exec` without `--quiet`, so a command that waited at least 1 s gets the
   two queue lines on stderr.
@@ -471,6 +538,10 @@ of `SLUICE_JOB` and the resolver skip.
 - **Disk**: spool files grow with output; pruned by `log_retention_days` (open question 3).
 
 ## 7. Test plans
+
+Plans as written at design time. As built (see `kb/sluice/changes/command-control-exec.md`,
+`guard-rewrite.md`, `shell-shims.md`): the large-output test uses 12 MiB instead of 200 MB, and
+`plugin/hooks/test-guard.sh` has 92 checks.
 
 A1 (`crates/sluice-gate/tests/exec.rs`, daemon tests in `sluice-gate-daemon`):
 1. exit codes 0, 1, 42, 255 propagate; child killed by SIGKILL → 137.
@@ -523,18 +594,20 @@ pass-through; human env → pass-through with zero Sluice side effects; `SLUICE_
 wrapper fallback when the recorded `sluice` path is gone; 10 shells calling a shimmed `make` with
 budget 4 and weight 2 → peak 2; install/uninstall never touch files without the marker.
 
-## 8. Open questions (with recommendation)
+## 8. Open questions (decided)
 
-1. Forward the caller's stdin to the daemon child by `SCM_RIGHTS`? Recommended: not in alpha;
-   `/dev/null` plus the guard/shim rules that leave stdin readers alone.
-2. Offer a TTY for humans (`--tty`, in-process with inherited stdio)? Recommended: no;
+1. Forward the caller's stdin to the daemon child by `SCM_RIGHTS`? Decided: no; stdin is
+   `/dev/null`, plus the guard/shim rules that leave stdin readers alone.
+2. Offer a TTY for humans (`--tty`, in-process with inherited stdio)? Decided: no;
    `SLUICE_DISABLE=1` already gives a direct run.
-3. Cap spool size? Recommended: no cap in alpha; measure in E3 and add `[daemon] exec_spool_max_mib`
-   later if builds produce gigabytes.
-4. Allow-rule matching in 4.6 is an approximation of Claude Code's matcher. Recommended: keep it
-   conservative (any doubt → `ask` or no rewrite) and compare with the haiku run.
+3. Cap spool size? Decided: no cap in 0.3.0; `[daemon] exec_spool_max_mib` can be added later if
+   builds produce gigabytes (spools are pruned with the job logs).
+4. Allow-rule matching in 4.6 is an approximation of Claude Code's matcher. Decided: conservative
+   (deny and ask rules match liberally against the original and the rewrite, allow rules strictly;
+   any doubt → `ask` or no rewrite); the haiku run confirmed the hook behaviour (guard-rewrite.md).
 5. `sluice run` invoked with `SLUICE_JOB` set (a gate inside an exec job) can wait for budget the
-   parent holds. Recommended: same pass-through rule as exec (run in-process, unqueued) in A1,
-   logged as decision `nested`.
-6. Default exec weight `ceil(B/2)` vs B0's learned weights. Recommended: ship `ceil(B/2)`; B1 may
-   replace it with the learned weight per label once available.
+   parent holds. Decided: same pass-through rule as exec (run in-process, unqueued), logged as
+   decision `nested`.
+6. Default exec weight `ceil(B/2)` vs B0's learned weights. Decided: `[agent] exec_weight` or
+   `ceil(B/2)`; exec jobs never learn a weight (their CPU may escape the process group, ADR-0011
+   M2).

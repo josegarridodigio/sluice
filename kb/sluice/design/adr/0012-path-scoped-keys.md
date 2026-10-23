@@ -17,9 +17,10 @@ suite).
 ## Decision
 
 - Two optional gate fields, `paths` and `paths_ignore`, with git
-  `:(glob)` pathspec semantics, root-relative; magic pathspecs, `!`, `..`
-  and empty lists are rejected at parse time. Absent fields keep keys
-  byte-identical to 0.2.
+  `:(glob)` pathspec semantics, root-relative; magic pathspecs, `!`,
+  `..`, `.` and empty path components, backslashes, more than 64 patterns
+  per list and an empty `paths` are rejected at parse time. Absent fields
+  keep keys byte-identical to 0.2.
 - The scoped hash is computed in process from the `ls-files -s -z` output
   the snapshot already produces (no extra git spawn), and always includes
   `.sluice.toml`. In the key material the tree field becomes
@@ -31,7 +32,8 @@ suite).
 - Stale-pass mitigation: documentation, a `sluice doctor` heuristic for
   well-known manifests and lockfiles outside a gate's scope, and the scope
   shown in `cache status`.
-- Hit-path budget: median under 35 ms on 5 000 files (measured in D1).
+- Hit-path budget: median under 35 ms on 5 000 files; measured in D1: scoped
+  median 23.0 and 26.4 ms, +0.8 and +1.0 ms over the unscoped gate.
 
 ## Consequences
 

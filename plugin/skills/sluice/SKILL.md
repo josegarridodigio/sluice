@@ -13,7 +13,7 @@ A tree that already passed is answered from the cache in milliseconds.
 
 - Call the `verify` MCP tool (`mcp__plugin_sluice_sluice__verify` when loaded from the plugin) with `working_directory`
   set to your absolute directory inside the repository or worktree. Optional:
-  `gates` (names), `timeout_seconds`, `extra_args`.
+  `gates` (names), `timeout_seconds`, `extra_args`, `fail_fast` (default true).
 - With no `gates`, it runs the gates tagged `pre-commit` (or all of them if
   none is tagged). Use `gate_list` to see the gates and their commands.
 - Never run a gate command through Bash (`cargo test`, `npm test`, `pytest`,

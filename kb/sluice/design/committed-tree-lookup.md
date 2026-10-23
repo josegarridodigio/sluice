@@ -5,7 +5,7 @@ tags: [sluice, design, cache, phase-2]
 
 # Lookup by committed tree (Phase 2)
 
-Status: planned for Phase 2. Context: [[sluice/design/cache-key.md]] "Inside hooks".
+Status: implemented in Phase 2 (evidence note only; no automatic hit). Context: [[sluice/design/cache-key.md]] "Inside hooks".
 
 ## Problem
 

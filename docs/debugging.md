@@ -49,6 +49,23 @@ Without `--force`, restart refuses while gates are running. `sluice status`
 shows the daemon's active level and the log path (`log:  level debug, ...`).
 An MCP server picks up its level when the agent starts it.
 
+## Why did a job wait? `sluice logs --timeline`
+
+```
+sluice logs --timeline [JOB_ID] [--since 10m]
+```
+
+Prints one line per job from the daemon's database (it works without a
+running daemon): `<job> <gate> <repo>: requested +0.0 queued +0.0 admitted
++31.2 (over) started +31.3 done +43.9 pass; waited budget 29.0s,
+order 2.2s; demand 6.1/8; 3 request(s)`. Times are seconds after the job was
+queued; `admitted` carries the kind of admission when it was not within the
+budget (`over`: above it, by over-admission; `guard`: by the PSI starvation
+guard); `waited` splits the queue time by cause (`budget`, `psi`, `repo-cap`,
+`head-reserved`, `order`); `demand 6.1/8` is the measured CPU demand against
+the configured weight. Without a job id it lists the jobs queued within
+`--since` (default `10m`; exit 2 when the duration is invalid).
+
 ## `sluice doctor`
 
 ```
@@ -68,7 +85,11 @@ cannot open it does not start, and every gate then runs in-process; move
 the file aside and the next daemon creates a fresh one, losing the job
 history); the user config parses; inside a repository, `.sluice.toml`
 parses, a hook in the hooks directory (`core.hooksPath` or `.git/hooks`)
-calls sluice, and `markers`: the marker directory size, `fail` when the
+calls sluice, `queue-only-hooks`: a warning when a `mode = "queue-only"`
+gate lists hooks, `scoped-gates`: one line per path-scoped gate, a warning
+when `paths` matches no file or a well-known build input (`Cargo.toml`,
+`package.json`, lockfiles, `Makefile`, `Dockerfile`, ...) or a symlink target
+lies outside the scope, and `markers`: the marker directory size, `fail` when the
 directory is not writable (passes are then never cached), `warn` with the
 count and the first path when marker or miss files are damaged (truncated,
 not valid JSON, or recorded under a key other than their file name; runs

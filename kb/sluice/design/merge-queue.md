@@ -5,7 +5,7 @@ tags: [sluice, design, merge-queue, phase-6]
 
 # Local merge queue (Phase 6)
 
-Status: approved by the user on 2026-10-22 (answers in section 14). Decision record:
+Status: approved by the user on 2026-10-22 (answers in section 14); implemented in Phase 6. Decision record:
 [[sluice/design/adr/0009-merge-queue.md]]. Reference analysis:
 [[sluice/research/references/mergetrain.md]]. Builds on
 [[sluice/design/architecture.md]], [[sluice/design/protocol.md]],
@@ -53,8 +53,8 @@ from bypassing the queue (documented, enforced by the forge, not by Sluice).
   branch name, local or remote), and a local branch checked out in any worktree
   (`target_checked_out`: updating it would desync that worktree, which product code never
   touches). The refusal message starts with a token: `head`, `tag`, `sha`, `unknown_base`,
-  `invalid_remote`, `no_default_target`, `invalid_base` (the worktrees cannot be listed) (error code `bad-request`), `own_branch`,
-  `target_checked_out` (`not-allowed`). The columns `remote`/`target` store `""`/`<branch>` for local targets.
+  `invalid_remote`, `no_default_target`, `invalid_base` (the worktrees cannot be listed), all with error code `bad-request`, and `own_branch`,
+  `target_checked_out`, both `not-allowed`. The columns `remote`/`target` store `""`/`<branch>` for local targets.
 - **Train**: the unit the runner builds, verifies, gets approved and pushes: an ordered list of
   jobs merged onto one `base_sha`. It yields a commit `S` (the landing SHA) and its tree `T`.
 - **Train hash**: `sha256(repo, remote, endpoint_hash, target, base_sha, [(job_id, head_sha)…],
@@ -223,7 +223,11 @@ dissolves an unfinished build and parks an unfinished push).
 3. **Worktree.** `git worktree add --detach <state>/merge/<train-id> <base_sha>`, then
    `git worktree lock --reason "sluice merge queue"` (two steps: `add --lock --reason` needs
    git 2.33, the minimum is 2.31); all git calls with `-c core.hooksPath=/dev/null`, every
-   `GIT_*` variable stripped.
+   `GIT_*` variable stripped (the client's allowlisted `GIT_SSH_COMMAND` and `GIT_ASKPASS` are
+   added back for network calls). Every git process Sluice spawns, the queue's included,
+   also carries `-c maintenance.auto=false -c gc.auto=0`
+   (`sluice_gate_core::git::NO_AUTO_MAINTENANCE`), so a fetch or merge never starts a repack or
+   prune in the user's repository.
 4. **Merge.** For each member in order: if the train has one member and `base_sha` is an
    ancestor of `head_sha`, fast-forward (`git checkout --detach <head_sha>`, `S = head_sha`);
    otherwise `git merge --no-ff --no-edit -m "Merge <branch> (sluice job <id>)" <head_sha>`
@@ -427,7 +431,8 @@ over `ReconcileInput`; `reconcile::gather` collects the facts.
 
 Protocol stays **1**. All additions follow the versioning rules (new message types and optional
 fields); old clients never send them. To avoid relying on `bad-request` from an old daemon,
-`welcome` gains an optional `features: ["queue"]`; a client that does not see it prints
+`welcome` gains an optional `features` array that lists `queue` (a 0.3.0 daemon sends
+`["exec","queue-only","queue"]`); a client that does not see it prints
 `the running daemon does not support the merge queue; run 'sluice daemon stop' and retry`. A bump would
 force every hook client to restart the daemon for a feature most repositories do not use.
 
@@ -471,7 +476,14 @@ it displayed (`stale-plan` if the train changed), then waits for the landing at 
 train's `push_timeout` + `network_timeout` + two ticks + 30 s; on expiry it prints the
 train's state and exits 1 with the hint `sluice queue status`. The human `status` view
 hides a dissolved train once a newer train exists for the same (repo, remote, target);
-`--json` keeps every train. Exit codes: 0 ok, 1 error, 2 usage, 4
+`--json` keeps every train. Jobs outside any train are listed under `queued:` (with
+`waiting: <reason> <error>` when the base cannot be prepared) and `jobs needing attention:`;
+landed and cancelled jobs are not shown, and an empty queue prints `sluice: the merge queue is
+empty`. `reconcile` prints `train <id>: <decision> (<reason>)` per train, or `sluice: no
+train needs reconciling`. `enqueue` sends `caller` from the agent detection of the user config
+and no `via` (recorded as `cli`). Every request except `enqueue`, `approve` and `reconcile`
+has a 60 s reply timeout; a `queue-status` whose connection drops before any reply is sent
+once more after making sure a daemon runs (requests with effects are never retried). Exit codes: 0 ok, 1 error, 2 usage, 4
 refused by state (`conflict-state`, `not-allowed`, `stale-plan`, `duplicate-branch`).
 
 MCP (thin clients of the same messages, `working_directory` required, every request

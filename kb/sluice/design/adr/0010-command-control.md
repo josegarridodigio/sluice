@@ -28,27 +28,31 @@ the cache.
   stderr; stdin is `/dev/null`, no TTY; the exit code is propagated
   (signal deaths as 128+N); SIGINT/SIGTERM are forwarded to the job's
   process group; the caller's environment and cwd are used unchanged.
-  Default weight `ceil(budget / 2)` until learned weights (ADR-0011) apply;
-  coalescing only with an explicit key matched with the exact command and
-  directory.
+  Default weight `[agent] exec_weight`, else `ceil(budget / 2)`; exec jobs
+  never learn a weight (ADR-0011); coalescing only with an explicit key matched
+  with the exact command and directory.
 - Queue-only gates: new optional gate field `mode = "queue-only"`; `cache`
   stays a bool (frozen format, ADR-0013). They always run, never write a
   marker or miss record, coalesce simultaneous identical requests, and the
-  agent fail-fast policy does not apply to them.
+  agent fail-fast policy does not apply to them (`sluice run` coalesces them;
+  `verify` and the merge-queue runner send them without a key).
 - The plugin guard moves its logic into `sluice guard` (Rust); `guard.sh`
   stays a thin wrapper that falls back to the current shell deny logic
-  when the binary lacks the command. A rewrite only inserts a fixed prefix
-  (`sluice run <gate> -v -- ` or `sluice exec --label … -- `) at the start
-  of a segment of the untouched original string; pipelines, `&`, heredocs,
-  redirections from stdin, command substitution, subshells, `sh -c`,
-  wrappers and commands starting with `sluice` are never rewritten.
+  when the binary lacks the command. A rewrite only adds fixed words to the
+  untouched original string: `sluice exec --label … -- ` before a heavy
+  command word, or `sluice run <gate> -v` (plus ` --` when arguments follow)
+  in place of the typed gate words; a segment downstream in a pipeline, `&`,
+  heredocs, redirections from stdin, command substitution, subshells, `sh -c`,
+  wrappers and commands starting with `sluice` are never rewritten. The heavy
+  list is the built-in one, changed by `[agent] heavy_commands` and
+  `heavy_commands_extra` in the user config.
   Verified hook contract (Claude Code docs, 2026-10-22): `updatedInput`
   applies with `allow` and `ask`, replaces the whole input, and permission
   rules apply to the rewritten command. Therefore the guard emits `allow`
   only where it cannot widen permissions (bypass mode or an original that
   is already allowed), `ask` in default/acceptEdits modes, and no rewrite
-  when a deny or ask rule matches the original; it always adds a one-line
-  `additionalContext` note.
+  when a deny or ask rule matches the original or the rewrite; it always adds
+  a one-line `additionalContext` note.
 - Shell shims (`sluice shim install|uninstall|status`) give the same
   control to agents that only have a shell: POSIX wrappers calling
   `sluice shim exec <name>`, active only in agent sessions or with

@@ -117,6 +117,36 @@ store); D1 in parallel with A in a worktree; H3 golden files in parallel
 produced the first numbers; H2 in parallel with L (queue crate and test
 servers only).
 
+## 4a. Progress
+
+Updated by the R3 reconciliation (2026-10-23). Evidence lives in the
+change notes named in the last column.
+
+| Task | State | Evidence |
+|---|---|---|
+| C socket fallback | done | [[sluice/changes/socket-fallback.md]] |
+| F user intake, CHANGELOG | done | [[sluice/changes/user-intake.md]] |
+| G builds and Docker guidance | done | [[sluice/changes/gates-cookbook.md]] |
+| E1 harness s3, s4, s6 | done | [[sluice/changes/alpha-readiness.md]] |
+| X1 fixes from the chaos harness | done | [[sluice/changes/chaos-fixes.md]] |
+| H1 CI matrix | done | [[sluice/changes/ci-matrix.md]] |
+| H4 crates.io dry run | done | [[sluice/changes/packaging.md]] |
+| A0 / B0 / D0 designs, ADR-0010..0012 | done | [[sluice/design/command-control.md]], [[sluice/design/scheduler-throughput.md]], [[sluice/design/path-scoped-keys.md]] |
+| H3 compatibility promise and golden files | done | [[sluice/changes/compat-golden-files.md]], ADR-0013 |
+| A1 `sluice exec`, queue-only gates | done | [[sluice/changes/command-control-exec.md]] |
+| A2 guard rewrite | done | [[sluice/changes/guard-rewrite.md]] |
+| B1 scheduler changes, L1 timeline | done | [[sluice/changes/scheduler-throughput.md]] |
+| D1 path-scoped keys | done | [[sluice/changes/path-scoped-keys.md]] |
+| H5 shell shims | done | [[sluice/changes/shell-shims.md]] |
+| H2 authenticated remotes | done | [[sluice/changes/queue-transports.md]] |
+| E2, E3, E4 harness runs | done | [[sluice/changes/alpha-readiness.md]] |
+| L2, L3 latency policies and tuning | done | [[sluice/changes/alpha-readiness.md]] |
+| R1 adversarial review | done | [[sluice/changes/alpha-review.md]] |
+| R2 review fixes | done | [[sluice/changes/alpha-review-fixes.md]], [[sluice/changes/ci-flakes.md]] |
+| E5 full harness run | in progress | |
+| R3 reconciliation | in progress | [[sluice/changes/alpha-reconciliation.md]] |
+| R4 release v0.3.0 | pending | |
+
 ## 5. Tasks
 
 Each task: goal, files, acceptance, tests, model, depends.
@@ -475,13 +505,13 @@ Waiting is fine while the CPU is full; waiting with idle CPU is waste.
 | Scenario | Script | State |
 |---|---|---|
 | Real stacks and hook managers | `s1_hooks.py` | done, 36/36 |
-| The original problem (normal + overload) | `s2_problem.py` | done; overload target not met (B1) |
-| Correctness invariants | `s3_correctness.py` | E1 |
-| Chaos | `s4_chaos.py` | E1 |
-| Merge queue on a real project | `s5_merge_queue.py` | E4 |
-| Upgrade with live state | `s6_upgrade.py` | E1, rerun at R4 |
-| Command control (exec, guard rewrite, shell shims) | `s7_command_control.py` | done, 64/64 |
-| Merge queue over SSH and smart HTTP | `s5_merge_queue.py --transport ssh|http` | H2 |
+| The original problem (normal + overload) | `s2_problem.py` | done; targets met after B1 and L3 ([[sluice/changes/alpha-readiness.md]]) |
+| Correctness invariants | `s3_correctness.py` | done (E1) |
+| Chaos | `s4_chaos.py` | done (E1, X1) |
+| Merge queue on a real project | `s5_merge_queue.py` | done (E4) |
+| Upgrade with live state | `s6_upgrade.py` | done (E1), rerun at R4 |
+| Command control (exec, guard rewrite, shell shims) | `s7_command_control.py` | done (E3, with the H5 shim variant), 64/64 |
+| Merge queue over SSH and smart HTTP | Rust tests `crates/sluice-gate/tests/queue_transports/` | done (H2); the `s5_merge_queue.py --transport ssh|http` harness variant was not implemented |
 
 Test beds: `sindresorhus/slugify` (Node, xo + ava) and
 `pallets/itsdangerous` (Python, pytest + mypy), cloned into the scratch

@@ -17,14 +17,19 @@ heavy one. Agents issue both kinds constantly.
 
 ## Decision
 
-- Order by arrival (FIFO).
+- Order by arrival (FIFO). With the ADR-0011 defaults the order is the
+  priority order of `scheduler::rank` (humans first, lane fairness), with
+  arrival order as the last tie-break and for every job that waited
+  `head_reserve_after`; "the head" below is the first job of that order.
 - **Backfill:** jobs behind the head may start whenever they fit, as long
   as the head has waited less than `scheduler.head_reserve_after`
   (default 30 s).
 - **Reservation:** after that, the head reserves the budget: no job behind
   it starts until the head fits. Running jobs finish normally.
-- No priorities, no preemption, no dynamic weight resizing in v1 (weights
-  are only clamped at enqueue to the budget and the repository cap).
+- No preemption. As decided in v1 there were no priorities and no dynamic
+  weight resizing; ADR-0011 adds humans-first priority, lane fairness and
+  learned weights (the configured weight is still clamped at enqueue to the
+  budget and the repository cap).
 - The reservation applies only when the head is blocked by the budget; a
   head blocked by its repository cap never stops other repositories.
 
@@ -41,5 +46,7 @@ heavy one. Agents issue both kinds constantly.
 - Strict FIFO: simplest, poor utilisation with mixed weights.
 - Weighted fair queuing per repository: fairer across projects, but more
   state and harder to explain; the per-repo cap covers the practical case.
-- Priorities (humans before agents): tempting, but humans mostly hit the
-  cache and agents are the bulk; revisit if real usage shows starvation.
+- Priorities (humans before agents): rejected here (humans mostly hit the
+  cache and agents are the bulk); adopted in ADR-0011 (`human_first`, on by
+  default) with the ageing bound `head_reserve_after`, so it cannot starve
+  agents.

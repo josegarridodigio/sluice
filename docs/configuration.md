@@ -179,6 +179,11 @@ daemon_log_max_mib = 20
 env_any_set = ["CLAUDECODE"]
 env_any_equals = {}
 
+[agent]
+# heavy_commands = ["make", "cargo build"]   # replaces the built-in list
+heavy_commands_extra = []                    # appended to it
+exec_weight = 0                              # 0 = ceil(budget / 2)
+
 [repos."/path/to/repo"]
 budget_share_max = 4
 ```
@@ -218,6 +223,9 @@ budget_share_max = 4
 | `debug.daemon_log_max_mib` | `20` | Rotate `daemon.log` above this size (0 = never); keeps `daemon.log.1` to `.3`. |
 | `agent_detection.env_any_set` | `["CLAUDECODE"]` | Any of these variables set and non-empty means the caller is an agent (`SLUICE_AGENT` overrides). |
 | `agent_detection.env_any_equals` | `{}` | Variable/value pairs that mean agent, for example `{ CLAUDE_CODE_ENTRYPOINT = "cli" }`. |
+| `agent.heavy_commands` | built-in list | Replaces the list of commands that the plugin guard rewrites to `sluice exec` and that the shell shims route through the queue. Entries are command words (`cargo build`, `docker compose build`), compared after package-manager equivalences (`pnpm build`, `npm run build` and `yarn build` are all `run build`). The built-in list: `docker build`, `docker buildx build`, `docker compose build`, `run build`, `cargo build`, `cargo test`, `cargo clippy`, `cargo nextest`, `go build`, `go test`, `make`, `gradle`, `mvn`, `tsc`, `vite build`, `webpack`, `next build`, `pytest`, `jest`, `vitest`. Entries must not be empty, contain control characters or have more than 8 words; at most 256 entries with `heavy_commands_extra`. |
+| `agent.heavy_commands_extra` | `[]` | Appended to the built-in (or replaced) list. |
+| `agent.exec_weight` | `0` | Default weight of `sluice exec` when `--weight` is absent; `0` means `ceil(budget / 2)`. |
 | `repos."<path>".budget_share_max` | unset | Optional cap on the budget one repository may use at once. Must be >= 1. |
 
 The daemon reads `[daemon]`, `[scheduler]`, `[admission]`, `[repos]`, `[queue]`,

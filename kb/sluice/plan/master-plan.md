@@ -28,6 +28,7 @@ Related: [[sluice/research/problem-statement.md]],
 | 6a | Debugging and observability (after Phase 6) | **done** (2026-10-22) | [[sluice/changes/debugging.md]]; `docs/debugging.md`. `sluice update` landed in the same stretch: [[sluice/changes/self-update.md]]. |
 | 6b | Agent integration package (after Phase 6) | **done** (2026-10-22) | [[sluice/changes/agent-plugin.md]]; `plugin/`, `docs/agents.md`. |
 | final | Final reconciliation of KB, docs and CLI | **done** (2026-10-22) | [[sluice/changes/final-reconciliation.md]]. |
+| alpha | Alpha readiness and v0.3.0 | **in progress** (2026-10-23) | [[sluice/plan/alpha-plan.md]] (progress table in section 4a): every task through R2 is done; E5 (full harness run) and R3 (reconciliation, [[sluice/changes/alpha-reconciliation.md]]) are in progress; R4 (release) is pending. Evidence: [[sluice/changes/alpha-readiness.md]], [[sluice/changes/alpha-review-fixes.md]], [[sluice/changes/ci-flakes.md]]. |
 
 ## Phase 0 — Setup and research
 
@@ -216,12 +217,12 @@ unit of work; tick these items when its tasks close them).
 
 - [x] Real stacks: a public Node project with Husky and a public Python project with the pre-commit framework, installed from the release binary, gates are the projects' own test commands.
 - [x] Hook managers for real: husky, lefthook, pre-commit and plain hooks installed with their own tools, driving `sluice run --hook …` in real `git commit` / `git push`.
-- [ ] The original problem, measured: N simulated agents in N worktrees verify, commit and push concurrently, with and without Sluice; suite executions, wall time, peak concurrent suites vs budget, CPU load.
-- [ ] Correctness invariants under concurrency: a broken tree never gets a pass; identical trees share one run; untracked files invalidate, ignored files do not; no stale pass after TTL or `key_inputs` change.
-- [ ] Chaos: SIGKILL of the daemon and of clients mid-run, many concurrent clients, synthetic CPU pressure; no orphan process, no stale lock, every client gets an answer or a clear error.
-- [ ] Merge queue on a real project: several simulated agents enqueue (conflicting and not), a human approves, the bare remote only moves on approval.
-- [ ] Upgrade with live state: v0.1.0 daemon, markers and database, then `sluice update` to v0.2.0; markers still hit, database opens, daemon restarts cleanly.
-- [ ] User intake: issue templates asking for `sluice doctor --bundle`, CHANGELOG, known limitations in the README; badge to alpha when every item above passes.
+- [x] The original problem, measured: N simulated agents in N worktrees verify, commit and push concurrently, with and without Sluice; suite executions, wall time, peak concurrent suites vs budget, CPU load.
+- [x] Correctness invariants under concurrency: a broken tree never gets a pass; identical trees share one run; untracked files invalidate, ignored files do not; no stale pass after TTL or `key_inputs` change.
+- [x] Chaos: SIGKILL of the daemon and of clients mid-run, many concurrent clients, synthetic CPU pressure; no orphan process, no stale lock, every client gets an answer or a clear error.
+- [x] Merge queue on a real project: several simulated agents enqueue (conflicting and not), a human approves, the bare remote only moves on approval.
+- [x] Upgrade with live state: v0.1.0 daemon, markers and database, then `sluice update` to v0.2.0; markers still hit, database opens, daemon restarts cleanly.
+- [x] User intake: issue templates asking for `sluice doctor --bundle`, CHANGELOG, known limitations in the README (task F). The badge change to alpha is part of release task R4.
 
 ## Working agreements
 
@@ -235,11 +236,14 @@ unit of work; tick these items when its tasks close them).
 
 ## Next steps
 
-All phases and both post-phase blocks are done and reconciled
-([[sluice/changes/final-reconciliation.md]]). What remains is outside the
-plan: deferred items are listed in that note (for example the unimplemented
-`committed_tree` evidence in `sluice cache status`), and the next release
-tag needs the user's approval.
+Phases 0 to 6b and the final reconciliation are done. The alpha block
+([[sluice/plan/alpha-plan.md]]) is in its last stretch: E5 (full harness
+run) and R3 (this documentation-versus-code reconciliation) are in progress
+and R4 (badge to alpha, `scripts/release.sh 0.3.0`, push and tag, upgrade
+rerun) is pending; pushing and tagging need the user's approval. Deferred
+items from the earlier phases are listed in
+[[sluice/changes/final-reconciliation.md]] (for example the unimplemented
+`committed_tree` evidence in `sluice cache status`).
 
 Earlier plan for Phase 3: `sluice-gate-mcp` with rmcp per [[sluice/design/mcp-tools.md]]
    (`verify`, `status`, `gate_list`, `logs`), fail-fast message pointing to

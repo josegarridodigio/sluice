@@ -55,8 +55,8 @@ with `status:"cached"` for every subscriber.
 
 ## The decision: a pure plan over a snapshot
 
-Every admission pass (job finished, request arrived, PSI sample changed,
-1 s timer) builds a `Snapshot` (now, policy, pressure, running and queued
+Every admission pass (job finished, request arrived, PSI blocking state
+changed, 1 s timer) builds a `Snapshot` (now, policy, pressure, running and queued
 jobs, time of the last over-admission) and calls `scheduler::plan`, a pure
 function; `Scheduler` only owns the state and applies the plan. Unit tests
 drive `plan` and `rank` directly.
@@ -84,7 +84,8 @@ With every switch off the order is plain FIFO (ADR-0007).
 
 1. **PSI blocking:** nothing starts, except the starvation guard
    (`psi_max_wait`, [[sluice/design/psi-admission.md]]) which may start the
-   first ranked job within the nominal budget (`admission = guard`).
+   first ranked job within the nominal budget and its repository cap
+   (`admission = guard`).
 2. **Nominal pass** in rank order: a job that fits starts
    (`admission = nominal`). **Backfill:** while the first waiting job does
    not fit, lighter jobs behind it may start. **Reservation:** once the
@@ -98,9 +99,12 @@ With every switch off the order is plain FIFO (ADR-0007).
    both values, not blocking, resumed at least `overcommit_interval` ago,
    CPU `some avg10 < cpu_some_avg10_low`, memory `< memory_some_avg10_low`),
    the mean idle CPUs of the last two utilisation samples are
-   `≥ max(1, ⌈w/3⌉)`, and no over-admission happened in the last
-   `overcommit_interval`. `cap = ⌊overcommit × B⌋`. Over-admitted jobs are
-   never preempted; while `used > B` nothing is admitted nominally.
+   `≥ max(1, ⌈w/3⌉)`, the newest utilisation sample was taken at least one
+   sampler tick (`psi_poll_interval`) after the latest admission of any kind
+   (`Scheduler::last_start_at`), and no over-admission happened in the last
+   `overcommit_interval`. `cap = ⌊overcommit × B⌋` (`overcommit` is
+   validated to `1.0..=4.0`; `1.0` disables over-admission). Over-admitted
+   jobs are never preempted; while `used > B` nothing is admitted nominally.
 
 Each queued job left waiting gets a cause: `budget`, `psi`, `repo-cap`,
 `head-reserved`, or `order` (it fitted the budget before this pass but
@@ -117,27 +121,35 @@ The daemon's 1 s sampler reads `/proc/[0-9]*/stat` for the processes of
 each running gate's process group and their tasks'
 `/proc/<pid>/task/<tid>/schedstat` (CPU and run-queue wait, deltas keyed by
 `(tid, start time)`), plus the leader's `utime+stime+cutime+cstime`. At the
-end of a pass or fail run: `cpu_ms = max(sampled, leader)`,
+end of a run: `cpu_ms = max(sampled, leader)`,
 `demand = (cpu_ms + run_delay_ms) / wall_ms`. Without `schedstat` the
 fallback `cpu / wall` is kept only when CPU `some avg10 < 10` at both ends.
-A run never sampled (shorter than a tick) records nothing. Samples go to
-`gate_stats`, keyed by `(repo identity, gate, cmd_hash)` (`cmd_hash` = 16
+A run never sampled (shorter than a tick) records nothing. Only passing
+runs are samples: a failing run often stops early and would teach a weight
+below what the suite needs (the job's own `jobs` columns record its demand
+regardless). Samples go to `gate_stats`, keyed by `(repo identity, gate, cmd_hash)` (`cmd_hash` = 16
 hex of SHA-256 over the normalised command, NUL, and the extra arguments
 joined by NUL); the newest 20 per key are kept, keys unseen for 90 days are
 pruned daily, and the daemon caches the last 10 per key in memory.
 
-At enqueue, with `learned_weights = true` and at least 3 samples:
+Resolved at every admission pass, not at enqueue, with `learned_weights =
+true` and at least 3 samples:
 `w = clamp(round_half_up(P75(demand)), max(1, ⌈weight_cfg/4⌉), weight_cfg)`
-(nearest-rank P75 of the last 10). Never above the configured weight.
+(nearest-rank P75 of the last 10). Never above the configured weight. A
+queued job takes the current learned weight as soon as one exists; a running
+job keeps the weight it was admitted with, and `jobs.weight` records it.
 `exec` jobs keep their declared weight. The same history gives
-`expected_ms` (median wall time of the last 10 runs) for SJF and `status`.
+`expected_ms` (median wall time of the last 10 passing runs) for SJF and
+`status`.
 
 ## Utilisation sampler and `idle_while_waiting_ms` (L1)
 
 Every `psi_poll_interval` (1 s; the task runs with PSI off too) the daemon
 reads the `cpuN` lines of `/proc/stat` for the CPUs of its affinity mask
 (`idle = idle + iowait`, `total` = user..steal). `idle_frac = ΣΔidle /
-ΣΔtotal`, `idle_cpus = idle_frac × N`. If at least one job was queued at
+ΣΔtotal`, `idle_cpus = idle_frac × N`. Under a cgroup CPU limit `L < N`
+(read under the parent of the proc root), `idle_cpus = max(0, L − (N −
+idle_frac × N))` and `idle_frac = idle_cpus / L`. If at least one job was queued at
 the previous sample, `waiting_wall_ms += Δt` and `idle_while_waiting_ms +=
 Δt × idle_frac`. Both are per daemon instance, in memory, reported in
 `status.totals`. The proc root is a `DaemonConfig` field (tests use a fake

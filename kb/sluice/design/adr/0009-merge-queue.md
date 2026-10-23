@@ -34,7 +34,8 @@ recoverable (write-ahead marker, pin ref, atomic push, endpoint-bound reconcile)
   markers becomes `ready` without running anything.
 - Nothing is pushed without explicit approval: `sluice queue approve <train>` (TTY prompt or
   `--yes`), or MCP `queue_approve` only when the user config sets
-  `[queue] allow_agent_approval = true` (default false). The approval binds a train hash
+  `[queue] allow_agent_approval = true` (default false); the daemon also refuses a CLI approval
+  whose client environment is detected as an agent's unless that flag is set. The approval binds a train hash
   (members' SHAs, base, landing SHA and tree, gate keys, endpoint); any drift voids it.
 - Push protocol: pin ref `refs/sluice/pending/<train>`, then a fsynced write-ahead marker in
   the same transaction that moves the train to `pushing`, then
@@ -50,7 +51,7 @@ recoverable (write-ahead marker, pin ref, atomic push, endpoint-bound reconcile)
   `Extension` trait and a `DaemonHandle` (`submit_run`, lease fence, store transaction).
   Queue tables carry their own `queue_schema` version; the daemon schema stays 1.
 - Protocol stays version 1: new message types and optional fields only, with
-  `welcome.features = ["queue"]` for detection.
+  `queue` in `welcome.features` for detection.
 - v1 batching splits a failing multi-member train into single-job trains; bisection is an
   optional stretch goal.
 

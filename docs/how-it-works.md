@@ -54,10 +54,21 @@ run at once, and it makes identical simultaneous requests share one run.
 ## Scheduling
 
 - **Budget.** The daemon runs gates under a budget of units (default
-  `max(2, cpus - 1)`, `[daemon] budget` in the user config). Each gate declares
-  a `weight`, so a heavy suite takes more of the budget than a linter.
-- **Queue.** FIFO with backfill and a head-of-line reservation
-  (`[scheduler] head_reserve_after`), so heavy jobs never starve.
+  `max(2, cpus)`, `[daemon] budget` in the user config; `cpus` honours CPU
+  affinity and cgroup limits). Each gate declares a `weight`, so a heavy suite
+  takes more of the budget than a linter. With `[scheduler] learned_weights`
+  (default on) a gate's weight follows its measured CPU demand once it has
+  run 3 times, never above its configured `weight`.
+- **Queue.** Jobs a person waits for (`sluice run` from a terminal, human
+  hooks) go before agent jobs (`human_first`); at equal priority, worktrees
+  take turns (`fairness = "lane"`) and arrival order decides (`order =
+  "fifo"`, or `sjf`). A job that does not fit is backfilled around, up to a
+  head-of-line reservation (`head_reserve_after`, 30 s) that also bounds how
+  long anything can be overtaken, so heavy jobs never starve. While the
+  machine is calm and CPUs are idle, one job at a time may start beyond the
+  budget, up to `overcommit` (default 1.5) times it, at most once per
+  `overcommit_interval` (5 s). `sluice logs --timeline` shows why each job
+  waited.
 - **PSI admission.** Admission pauses while the machine is under real pressure
   (Linux PSI `some avg10` above 60 % CPU or 20 % memory by default, the
   `[admission]` table of the user config). While pressure blocks, the head of

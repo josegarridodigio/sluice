@@ -42,6 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Gate field `mode = "queue-only"`: the gate always runs, is never cached,
   coalesces simultaneous identical requests, and an agent hook waits for
   it instead of failing fast.
+- `sluice logs --timeline [JOB_ID] [--since DUR]` and, in `status --json` and
+  `verify` results, a per-job scheduler timeline (requested, queued,
+  admitted, started, finished, wait reasons, measured CPU demand,
+  requesters) and `idle_while_waiting_ms`: why a job waited.
 - `SLUICE_JOB` on every process Sluice runs, so a nested `exec` or `run`
   runs directly; welcome features `exec` and `queue-only`; `kind` and
   `label` in `status --json`.
@@ -52,7 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Alpine (musl), git 2.31.0 built from source and native aarch64, on main,
   tags, weekly and on demand.
 - Issue templates that ask for `sluice doctor --bundle`, this changelog,
-  release notes taken from it, and a "Known limitations" README section.
+  release notes taken from it, and a "Status and limitations" README section.
 - Package metadata, per-crate READMEs and LICENSE files; `cargo publish
   --workspace --dry-run` passes for all six crates (crates.io readiness,
   nothing published).
@@ -61,26 +65,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `sluice queue approve` run from an agent's environment is refused unless
   `[queue] allow_agent_approval = true`.
-- Learned gate weights are resolved at every admission pass instead of at
-  enqueue, so jobs that queued before the weight was learned are admitted
-  with it; running jobs keep the weight they were admitted with.
 - Scheduler throughput (ADR-0011): the default budget is the number of
-  available CPUs (affinity and cgroup limits honoured); gates learn their
-  real CPU demand and are admitted with it; PSI-driven over-admission up to
+  available CPUs, at least 2 (affinity and cgroup limits honoured; 0.2.0:
+  CPUs minus one); gates learn their real CPU demand from passing runs and
+  are admitted with it (resolved at every admission pass; running jobs keep
+  the weight they started with); PSI-driven over-admission up to
   1.5x the budget when the machine has idle CPUs; MCP `verify` runs its
   gates concurrently and stops at the first failure (`fail_fast`); jobs are
   shared fairly between worktrees, humans first, with optional
   shortest-job-first. Every mechanism has a config switch.
-- A per-job scheduler timeline and `idle_while_waiting_ms` in
-  `status --json`, `verify` results and `sluice logs --timeline`.
 - The daemon database gains additive, transactional migrations with a
   backup copy before migrating; 0.2.0 binaries still open the migrated
   file.
 - The README is short and current (no development phases, no pinned
   release numbers); the details moved to `docs/how-it-works.md`,
   `docs/cli.md` (generated from `--help`) and `docs/configuration.md`.
-- Markers and miss records tolerate unknown fields; cache `prune` also
-  removes expired miss records and foreign-format files.
+- Markers and miss records tolerate unknown fields; the TTL pruning of
+  markers also removes expired miss records and foreign-format files.
 - Wire enums parse unknown values as `unknown`; an unknown outcome is an
   error, never a pass.
 - A refusal to open a newer database names the release that wrote it (new
@@ -90,20 +91,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Guard: picks the right `.sluice.toml` after `cd ..` through symlinks,
-  skips rewrites when `CDPATH` is set or `PATH=` is assigned, and the
-  approval deny sees through quotes and wrappers.
-- A non-UTF-8 environment variable no longer makes `sluice exec`, shims or
-  the guard panic; exec falls back in-process with the raw environment.
-- Scheduler: over-admission waits for a CPU sample taken after the latest
-  start; learned weights come from passing runs only; idle CPUs respect a
-  cgroup CPU quota below the CPU mask.
+- A non-UTF-8 environment variable no longer makes `sluice` commands panic
+  (such entries are skipped; `sluice exec` then runs in-process with the raw
+  environment).
 - A queued job dropped by its last subscriber or a stop can no longer
-  start unsupervised; terminated process groups are never signalled again;
-  in-process exec kills the whole process group on timeout and signals.
-- Database migration backups are written atomically and checked before
-  being trusted; `doctor` no longer connects through an unsafe fallback
-  socket directory.
+  start unsupervised, and terminated process groups are never signalled
+  again (pid reuse).
 - Every git process Sluice spawns now runs with
   `-c maintenance.auto=false -c gc.auto=0`: the merge queue's `fetch` and
   `merge` could start git's automatic maintenance (repack, prune) in the

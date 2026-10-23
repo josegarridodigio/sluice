@@ -8,7 +8,7 @@ that exist today (see [docs/configuration.md](configuration.md)): `cmd`,
 ## Rules of thumb
 
 - **Weight is roughly the number of CPU threads the gate uses.** The daemon
-  budget defaults to `max(2, CPUs - 1)`; a gate of weight 4 takes 4 units
+  budget defaults to `max(2, CPUs)`; a gate of weight 4 takes 4 units
   while it runs. A single-threaded linter is `weight = 1`; a test runner
   started with `--maxWorkers=4` or `-n 4` is `weight = 4`. Pin the tool's
   thread count in `cmd` so the weight is true.
@@ -252,7 +252,8 @@ The command runs in the daemon under the budget with your environment and
 directory; its stdout and stderr come back byte for byte, its exit code is
 yours, and Ctrl-C reaches the whole build. Stdin is `/dev/null` and there is
 no terminal (use `SLUICE_DISABLE=1` for an interactive run). The default
-weight is half the budget, rounded up. Add `--coalesce-key <k>` to let
+weight is half the budget, rounded up (`[agent] exec_weight` in the user config
+changes it; `--weight` overrides both). Add `--coalesce-key <k>` to let
 simultaneous identical requests (same key, command and directory) share one
 run. Without a daemon it runs in-process under the same budget semaphore.
 

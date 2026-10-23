@@ -211,8 +211,8 @@ one (so the frozen fixture `status-schema-1.json` is unchanged):
 `needs_reconcile` = trains in that state). The daemon fills it from the
 first extension whose `status_summary()` returns one.
 
-`schema` is bumped when a field changes meaning; Phase 4 freezes it and
-adds a test. `sluice status --json` prints this object (pretty-printed,
+`schema` is bumped when a field changes meaning; it is frozen at 1 by the
+fixture `status-schema-1.json` and a test (`crates/sluice-gate-proto/tests/status_schema.rs`). `sluice status --json` prints this object (pretty-printed,
 without the `type`/`id` envelope); with no daemon running it prints
 `{"schema":1,"daemon":null}`, so `daemon` is nullable in the CLI output
 and every other field is absent in that case. Queued `reason` precedence: `psi` for every queued job while PSI blocks,
@@ -331,7 +331,7 @@ Timestamps in the views are RFC 3339; paths are absolute.
 |---|---|---|
 | `queue-enqueue` | `id`, `repo` (git common dir), `worktree`, `branch`, `head_sha`, `base` (as typed, optional), `caller` (`agent`/`human`), `session` (optional), `env` (map, default `{}`), `via` (`cli`/`mcp`, optional) | `queue-job` |
 | `queue-status` | `id`, `repo` (common dir, optional = all) | `queue-status` |
-| `queue-approve` | `id`, `train_id`, `train_hash`, `via` (`cli`/`mcp`), `env` (map, default `{}`) | `queue-approved` |
+| `queue-approve` | `id`, `train_id`, `train_hash`, `via` (`cli`/`mcp`), `env` (map, default `{}`; the push allowlist, plus, from the CLI, the agent-detection variables that are set, which the daemon uses to refuse an agent's approval and never stores) | `queue-approved` |
 | `queue-retry` | `id`, `job_id`, `head_sha`, `via` (`cli`/`mcp`, optional) | `queue-job` |
 | `queue-cancel` | `id`, `job_id`, `via` (`cli`/`mcp`, optional) | `queue-job` |
 | `queue-reconcile` | `id`, `repo` (common dir, optional = all) | `queue-reconcile` |
@@ -355,7 +355,7 @@ Server replies:
   `pushing`, `landed`, `dissolved`, `needs_reconcile`), `members` (job ids
   in merge order), `merge_sha?`, `gates: [{gate, key?, job_id?, status,
   duration_ms?}]` (`status`: `pending`, `running`, `pass`, `cached`,
-  `fail`, `timeout`, `killed`, `error`), `train_hash?`, `approved_via?`,
+  `fail`, `timeout`, `killed`, `error`), `train_hash?` (only from `ready` on), `approved_via?`,
   `approved_at?`, `created_at`, `updated_at`, `landed_at?`, `note?`,
   `push_timeout_ms?`, `network_timeout_ms?` (the base's `[queue]` limits
   stored with the train; clients bound their wait for a landing with them).
@@ -431,5 +431,9 @@ panics on malformed input.
   `queued.weight_cfg`/`expected_ms`, the `outcome` timeline fields and the
   `status` scheduler fields above) keep `protocol` and `status` schema at 1:
   optional, omitted when unset, ignored by old peers.
+- Enums that a newer peer may extend (`caller`, `outcome.status`, `error.code`,
+  `queued[].reason`, the queue job, train and reconcile-decision values) carry a
+  `#[serde(other)] Unknown` variant, so an unknown value parses instead of
+  failing the message.
 - `sluice-gate-proto` exposes `PROTOCOL_VERSION` and the typed enums
   `ClientMessage` / `ServerMessage`, each `#[serde(tag = "type", rename_all = "kebab-case")]`.

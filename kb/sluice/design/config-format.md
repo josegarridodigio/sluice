@@ -7,9 +7,11 @@ tags: [sluice, design, config]
 
 Status: approved 2026-10-22 (Phase-0 answers Q10, Q11, Q14). `version = 1`
 is frozen: only additive, optional fields are allowed (the merge-queue
-`[queue]` tables, the user `[mcp]` and `[debug]` tables, `gates.<name>.cache`
-and `gates.<name>.paths` / `paths_ignore` were added this way). Renames and incompatible changes bump the version
-with a migration note.
+`[queue]` tables, the user `[mcp]`, `[debug]`, `[scheduler]` and `[agent]`
+tables, the `[admission]` overcommit keys, `gates.<name>.cache`,
+`gates.<name>.mode` and `gates.<name>.paths` / `paths_ignore` were added this
+way). Renames and incompatible changes bump the version with a migration
+note.
 
 ## Repository config: `.sluice.toml`
 
@@ -89,7 +91,9 @@ Rules:
 - Gate names: `[a-z0-9][a-z0-9_-]*`, max 64 chars.
 - Unknown fields are an error (strict parsing, at every level), so typos
   cannot silently change behaviour.
-- `version` must be `1` (`unsupported version N` otherwise); `cmd` must be
+- `version` must be `1` (`unsupported version N: `version` must be 1
+  (supported versions: 1)` otherwise; the same check applies to the user
+  config); `cmd` must be
   non-empty after trimming; `weight >= 1`; `key_files` must be relative
   paths without `..`; `depends_on` entries must name existing gates other
   than the gate itself; `human_hook_policy` may not be `fail-fast`.
@@ -113,8 +117,9 @@ Rules:
   empty, leading `/`, leading `./`, a `..`, `.` or empty (`//`) component
   (one trailing `/` is fine), leading `:` (`magic pathspecs are not
   supported; use paths_ignore`), leading `!` (`negation is not supported;
-  use paths_ignore`), a backslash (no escapes), NUL or control characters;
-  at most 64 patterns per list. With `cache = false` they are accepted and
+  use paths_ignore`), a backslash (no escapes), NUL or control characters.
+  More than 64 patterns in a list read `gates.<name>.<field>: at most 64
+  patterns are allowed` (no index). With `cache = false` they are accepted and
   have no effect (`sluice doctor` notes it).
 - The file is read from the current worktree's root (`git rev-parse
   --show-toplevel`); there is no parent-directory search. `sluice init`
@@ -160,7 +165,7 @@ verify_parallel = true     # 0.3.0, ADR-0011 M4: verify runs its gates concurren
 
 [debug]
 level = "info"             # log filter (RUST_LOG syntax) of the daemon, `sluice mcp` and `sluice run`; SLUICE_LOG wins
-daemon_log_max_mib = 20    # rotate daemon.log above this size (0 = never); keeps daemon.log.1 .. .3
+daemon_log_max_mib = 20    # rotate daemon.log above this size, at daemon start and by the daily pruning task (0 = never); keeps daemon.log.1 .. .3
 
 [cache]
 ttl_days = 30
@@ -197,7 +202,11 @@ Environment variables (highest precedence):
 | `SLUICE_SOCKET` | Override the daemon socket path. |
 | `SLUICE_JOB` | Set by Sluice on every process it runs (`<job id>`, or `inproc-<pid>` for in-process runs). When set, `sluice exec` runs the command directly and a `sluice run` miss runs in-process, unqueued (the parent job holds the budget). Not meant to be set by hand. |
 | `SLUICE_LOG` | Log filter of the daemon (`sluice daemon`), MCP (`sluice mcp`) and CLI (`sluice run`) processes, e.g. `debug`. Precedence: `SLUICE_LOG` (when valid), then `[debug] level`, then `info`. Written to stderr (the daemon's goes to `daemon.log`, the MCP server's also to `logs/mcp-<pid>.log`). |
+| `SLUICE_SHIMS` | Shell shims (`sluice shim`): truthy forces the shims to queue their heavy commands even without agent detection (`sluice shim install` prints it exported with the shim directory on `PATH`); falsy (`0`) makes them exec the real binary unchanged. Inside a Sluice job (`SLUICE_JOB` set) they always exec directly. |
+| `SLUICE_SHIM_DIR` | Directory of the shims, set by the shims themselves; `sluice exec` and the shims skip it (and any file carrying the shim marker) when resolving the real binary. Default `$XDG_DATA_HOME/sluice/shims`, else `$HOME/.local/share/sluice/shims`. Not meant to be set by hand. |
 | `SLUICE_GUARD` | Plugin guard hook: `0` (or another falsy word) disables it; `deny` turns rewrites into denials suggesting the rewritten command; anything else rewrites. |
+| `SLUICE_GUARD_NOJQ` | Test-only: `plugin/hooks/guard.sh` uses its `sed` fallback instead of `jq`. Not a user setting. |
+| `SLUICE_TEST_SOCKET_FALLBACK_DIR` | Test-only: base directory of the socket fallback instead of `/tmp`. Not a user setting. |
 | `SLUICE_TEST_GUARD_WATCHDOG_MS` | Test-only: the guard's watchdog in milliseconds instead of 500. Not a user setting. |
 | `SLUICE_TEST_CLIENT_LOG_CAP` | Test-only: byte cap that triggers the `client.log` rotation instead of 5 MiB. Not a user setting. |
 | `SLUICE_CONFIG` | Override the user config path (ignored when empty). |
@@ -223,6 +232,8 @@ no effect and is not range-checked. `[agent]`: `heavy_commands` and
 `heavy_commands_extra` entries must not be empty or contain control
 characters, have at most 8 words each and at most 256 entries together;
 `exec_weight` is a non-negative integer (the daemon clamps it to the budget).
+Errors read `agent.<field>[<i>]: <reason>` and `agent: at most 256 heavy
+commands are allowed`.
 Entries are command words compared after the guard's equivalences
 (`npm run build`, `pnpm build`, `yarn build` all mean `run build`); the
 default list is `docker build`, `docker buildx build`, `docker compose build`,

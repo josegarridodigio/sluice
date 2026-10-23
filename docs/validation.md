@@ -9,6 +9,10 @@ Sluice verifies itself. The repository declares three gates in
 | `clippy` | `cargo clippy --workspace --all-targets -- -D warnings` | pre-commit | 4 |
 | `test` | `cargo test --workspace` | pre-push | 6 |
 
+All three are path-scoped (`crates/**`, the manifests and lockfiles, the
+toolchain file and `plugin/**`), so a documentation-only change keeps their
+cached passes.
+
 ## Set it up
 
 ```sh

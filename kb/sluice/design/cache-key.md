@@ -3,7 +3,7 @@ title: Cache key and markers
 tags: [sluice, design, cache]
 ---
 
-# Cache key and markers (draft)
+# Cache key and markers
 
 Status: implemented in Phase 1 (`sluice-gate-core::tree`, `key`, `marker`),
 see [[sluice/changes/phase-1-cache-only.md]]. Reference analysis in
@@ -22,7 +22,9 @@ Procedure, ported from gate-cache's `_private_snapshot` (see
    honours an inherited `GIT_INDEX_FILE`, which is what makes partial
    commits key on the content being committed.
 2. Create a scratch dir under the runtime dir (`$XDG_RUNTIME_DIR/sluice/snap-*`,
-   mode `0700`; stale `snap-*` dirs older than an hour are swept). Copy the
+   else `/tmp/sluice-<uid>/snap-*`; mode `0700`, refused when it is not a
+   directory owned by the user; stale `snap-*` dirs older than an hour are
+   swept). Copy the
    index into it **preserving mtime** (git's racily-clean detection depends
    on it). Missing index (fresh repo) means an empty index.
 3. Run `git -c core.splitIndex=false add -A` from the worktree root with:
@@ -50,7 +52,10 @@ and `could not write tree: …`.
 
 Read-only probes (`rev-parse`, `ls-files`, `config --get core.worktree`)
 always pass `--no-optional-locks` so a cache check never blocks on
-`index.lock` held by another agent. `git rev-parse --local-env-vars` is
+`index.lock` held by another agent. Every git process Sluice spawns also
+carries `-c maintenance.auto=false -c gc.auto=0`, so git never starts an
+automatic repack or prune in the user's repository (the merge queue's
+`fetch` and `merge` would otherwise). `git rev-parse --local-env-vars` is
 spawned only when a gate actually runs (or has `key_inputs`), to build the
 sanitised gate environment.
 
@@ -69,7 +74,8 @@ the gate simply runs.
 
 Cost: five git spawns plus an index copy; `git add -A` stat calls dominate
 on large repositories. Measured in [[sluice/changes/hit-path-latency.md]]
-(median 29 ms on 5 000 files). gate-cache publishes no numbers; its Python
+(median 29 ms on 5 000 files under a load average of 21; 22 to 26 ms at a
+load of about 3). gate-cache publishes no numbers; its Python
 start-up plus about ten subprocesses is the baseline to beat.
 
 ### Inside hooks
@@ -78,7 +84,7 @@ Git exports variables to hook processes; Sluice reads them explicitly:
 
 | Hook | Relevant env | Content to hash |
 |---|---|---|
-| `pre-commit` | `GIT_INDEX_FILE` points at the index being committed (or a temp index for `git commit -a` / partial commits) | Same procedure as outside hooks: copy the index git gave us, then `add -A` on top. The result is the **working tree** content, which is what the gate command actually sees. Hook managers that stash unstaged changes (pre-commit/prek, lefthook with `stage_fixed`) make it equal to the committed tree; Husky and plain hooks do not. The marker additionally records `committed_tree` (`write-tree` from the copied hook index without `add -A`, one extra spawn only inside `pre-commit`). It is recorded but never used for an automatic hit: the decision in [[sluice/design/committed-tree-lookup.md]] is to keep it as evidence only (it is stored in the marker; nothing reads it back). When the working tree was clean apart from the staged changes, the working-tree hash equals the committed tree and the normal lookup already hits at push time. Confirmed as the draft answer to Q12 in [[sluice/questions/open-questions.md]]. |
+| `pre-commit` | `GIT_INDEX_FILE` points at the index being committed (or a temp index for `git commit -a` / partial commits) | Same procedure as outside hooks: copy the index git gave us, then `add -A` on top. The result is the **working tree** content, which is what the gate command actually sees. Hook managers that stash unstaged changes (pre-commit/prek, lefthook with `stage_fixed`) make it equal to the committed tree; Husky and plain hooks do not. The marker additionally records `committed_tree` (`write-tree` from the copied hook index without `add -A`, one extra spawn only inside `pre-commit`). It is recorded but never used for an automatic hit: the decision in [[sluice/design/committed-tree-lookup.md]] is to keep it as evidence only (`sluice cache status` reads it back to add a note to a missing gate; the lookup never does). When the working tree was clean apart from the staged changes, the working-tree hash equals the committed tree and the normal lookup already hits at push time. Confirmed as the draft answer to Q12 in [[sluice/questions/open-questions.md]]. |
 | `pre-push` | `GIT_DIR` (stdin lists the pushed refs; Sluice does not read it) | Working-tree hash, like everywhere else. On a clean checkout that equals the pushed commit's tree, so a pass recorded at commit time hits. |
 | other hooks | whatever git exports | Same working-tree hash; the hook policy applies to any `--hook` value (or whenever `GIT_DIR`/`GIT_INDEX_FILE` is present). Only `pre-commit` triggers the `committed_tree` record. |
 
@@ -110,6 +116,14 @@ key = sha256(
 ```
 
 Hex-encoded, 64 chars. The marker filename is the key.
+
+`normalised_cmd` is the gate's `cmd` with whitespace runs collapsed and the
+ends trimmed, followed, when the call passes extra arguments
+(`sluice run <gate> -- <args>`), by one space and each argument (wrapped in
+single quotes, inner `'` written as `'\''`, only when it is empty or
+contains whitespace or quotes), so calls with different arguments never
+share a key. `env` is the gate's own `env` table, not the caller's.
+`gate_name` and `key_input` / `key_file` entries are hashed as written.
 
 **Path-scoped gates** (`paths` / `paths_ignore`, Sluice >= 0.3.0,
 [[sluice/design/path-scoped-keys.md]], ADR-0012): the `tree_hash` field
@@ -166,7 +180,7 @@ repository share the common dir, so they share markers.
   "exit_code": 0,
   "job_id": "1761138311123-4242-0a1b2c",
   "sluice_version": "0.1.0",
-  "committed_tree": "…"   
+  "committed_tree": "…"   // null unless written from `--hook pre-commit`
 }
 ```
 
@@ -189,7 +203,10 @@ Rules:
 - `sluice cache status [--all]` prints the markers directory, the current
   tree, and one line per configured gate: `HIT (passed <age> ago, job <id>)`,
   `MISS (last run <age> ago: <reason>, exit <code>)`, `MISS`,
-  `always runs (cache = false)` or `ERROR (<why>)`; a path-scoped gate's
+  `always runs (cache = false)` or `ERROR (<why>)` (a `queue-only` gate has
+  `cache` forced to `false`, so it shows `always runs`; an unknown tree
+  prints `tree:    unknown (<reason>); every gate runs uncached` instead of
+  the gate lines); a path-scoped gate's
   line gets ` [scoped: <n> of <total> files, <12 hex of the scope hash>]`
   (MCP `status`: `scope: {files, total, hash}` per gate). It runs the gates'
   `key_inputs` to derive their keys. `--all` appends every stored marker
@@ -217,9 +234,10 @@ Rules:
   `.tmp-<pid>-<n>` files, `fsync` and rename; the directory is `0700`.
   Unknown fields are tolerated on read (ignored); the format still forbids
   writing new fields in 0.3.0 because released binaries delete such markers.
-- The daemon writes markers with its job id and daemon instance id; a
-  marker from an unknown daemon instance is still valid (markers are facts
-  about trees, not about processes).
+- The daemon writes markers with its job id and its own version as
+  `sluice_version` (the CLI writes its own when it runs a gate in-process);
+  a marker written by any process or release is still valid (markers are
+  facts about trees, not about processes).
 
 ## Disabling
 

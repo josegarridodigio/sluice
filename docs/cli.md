@@ -9,6 +9,7 @@ authoritative.
 |---|---|
 | [`sluice run`](#sluice-run) | Run a gate: cache hit in milliseconds, otherwise queue it in the daemon under the budget. |
 | [`sluice exec`](#sluice-exec) | Run any command under the budget, without cache. |
+| [`sluice guard`](#sluice-guard) | `PreToolUse` hook of the agent plugin: read the hook JSON on stdin, print a decision. |
 | [`sluice shim`](#sluice-shim) | Shell shims that route heavy commands of non-Claude agents through the queue. |
 | [`sluice mcp`](#sluice-mcp) | Start the MCP stdio server (spawned by the coding agent). |
 | [`sluice daemon`](#sluice-daemon) | Start the per-user daemon, or stop or restart it. |
@@ -31,7 +32,18 @@ Sluice runs named gates (tests, linters, type checks) under a global concurrency
 
 On a cache miss `sluice run` hands the gate to the per-user daemon (`sluice daemon`), starting it on demand; when the daemon cannot be reached or started the gate runs in-process. `sluice status` shows the queue. `sluice exec -- <cmd>` runs any other heavy command under the same budget, without cache.
 
-Exit codes of `sluice run`: 0 pass or cache hit; the gate's own code on failure; 3 refused by agent_hook_policy = "fail-fast"; 124 gate timeout; 143 gate killed (signal or `sluice daemon stop --force`); 1 Sluice error; 2 usage error.
+Exit codes:
+  0    pass or cache hit
+  N    the gate's own code when it fails (`sluice run`, `sluice exec`)
+  1    Sluice error
+  2    usage error (also `sluice queue` and `sluice update`)
+  3    refused by agent_hook_policy = "fail-fast"
+  4    `sluice queue` request refused by the state of the queue
+  75   `sluice daemon` found a daemon already holding the lock
+  124  gate timeout
+  125  `sluice exec` failed after the daemon accepted the request
+  141  `sluice exec` stdout is a closed pipe
+  143  gate killed (signal or `sluice daemon stop --force`)
 
 Environment: SLUICE_DISABLE=1 runs the gate directly (no cache, no queue); SLUICE_CACHE=0|1 forces the cache off or on (on overrides CI); CI disables the cache; SLUICE_AGENT=1|0 forces agent or human detection; SLUICE_CONFIG points at the user config; SLUICE_SOCKET overrides the daemon socket path; SLUICE_LOG sets the log filter of the daemon, `sluice mcp` and `sluice run` (then `[debug] level` of the user config, then info).
 
@@ -128,6 +140,30 @@ Options:
 
   -q, --quiet
           Do not print Sluice's informational lines (errors are still printed)
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+</details>
+
+### `sluice guard`
+
+`PreToolUse` hook of the agent plugin: read the hook JSON on stdin, print a decision. Setup: [agents.md](agents.md). It is not meant to be typed by hand.
+
+<details>
+<summary>Full help</summary>
+
+```text
+`PreToolUse` hook of the agent plugin: read the hook JSON on stdin, print a decision.
+
+Denies `sluice queue approve` (reserved to humans). Rewrites a gate command to `sluice run <gate> -v` and a heavy command (`[agent] heavy_commands`) to `sluice exec --label <L> -- <cmd>` by inserting that prefix into the unchanged original, answering `allow` or `ask` as the agent client's permission settings permit, or not at all. Otherwise denies raw gate commands as the shell guard does. Never fails closed: any error prints nothing and exits 0. Never contacts the daemon. `SLUICE_GUARD=0` disables it; `SLUICE_GUARD=deny` denies with the rewritten command as a suggestion.
+
+Usage: sluice guard [OPTIONS]
+
+Options:
+      --hook
+          Accepted for the plugin's hook script (the hook JSON is always read on stdin)
 
   -h, --help
           Print help (see a summary with '-h')
@@ -749,7 +785,7 @@ Options:
 | Command | Codes |
 |---|---|
 | `sluice run` | 0 pass or cache hit; the gate's own code on failure; 3 refused by `agent_hook_policy = "fail-fast"`; 124 timeout; 143 gate killed by a signal; 1 Sluice error; 2 usage error. |
-| `sluice exec` | The command's own code; 128+N when killed by signal N; 124 on `--timeout`; 143 when the daemon stopped and killed it; 127 not found; 126 not executable; 125 Sluice error after the request was accepted. |
+| `sluice exec` | The command's own code; 128+N when killed by signal N; 124 on `--timeout`; 143 when the daemon stopped and killed it; 127 not found; 126 not executable; 125 Sluice error after the request was accepted; 141 when its own stdout is a closed pipe. |
 | `sluice daemon` | 75 when another daemon already holds the lock. |
 | `sluice queue` | 0 ok; 1 error; 2 usage; 4 refused by the state of the queue (`conflict-state`, `not-allowed`, `stale-plan`, `duplicate-branch`). |
 | `sluice doctor` | 1 when a check fails, 0 otherwise. |

@@ -7,7 +7,7 @@ tags: [sluice, design, scheduler, latency, alpha]
 
 Status: design for alpha tasks B1, L1, L2 and L3 of
 [[sluice/plan/alpha-plan.md]]; sections 2–7 are the source of the ADR-0011
-draft. B1 and L1 (with M4–M7 of L2) are implemented; section 12 lists
+draft. B1, L1 and L2 (M4–M7) are implemented and tuned by L3; section 12 lists
 where the code differs from this text, and
 [[sluice/design/scheduler.md]] describes the current behaviour. Extends [[sluice/design/scheduler.md]],
 [[sluice/design/psi-admission.md]] and
@@ -230,7 +230,7 @@ recorded but unused for scheduling.
 
 `verify` resolves every gate's hit check, then submits all misses at once
 (one connection per gate, as today) instead of one after another, and
-returns when all passed or **one failed** (fail, timeout, error), sending
+returns when all passed or **one failed** (fail, timeout, error, killed), sending
 `cancel` on the other pending connections. The existing detach logic does
 the rest: at 0 subscribers a queued job is dropped and a running one
 killed under `last_subscriber_gone = cancel`; a job another agent
@@ -291,7 +291,8 @@ waiting on tree X gets tree Y's verdict); the rest get `killed`,
 
 Every 1 s (the PSI tick task, running even with PSI off) the daemon reads
 the `/proc/stat` lines of the CPUs in its affinity mask
-(`nix::sched::sched_getaffinity`: a `taskset` run counts 6, not 20);
+(`Cpus_allowed_list` of `<proc_root>/self/status`: a `taskset` run counts 6,
+not 20);
 `idle_j = idle + iowait`, `total_j` = sum of all fields except
 `guest`/`guest_nice` (already inside user/nice):
 
@@ -333,8 +334,11 @@ reason), `cpu_ms`, `run_delay_ms`, `demand_milli`, `killed_by`
 `job_requests`): who waited, since when, whether they stayed. The
 dominant wait reason is the largest accumulator. `sluice logs --timeline
 [--since 10m]` prints one line per job (`queued +0.0 admitted +31.2
-started +31.3 done +43.9 pass; waited budget 29.0 s, order 2.2 s; demand
-6.1/8; 3 subscribers`).
+started +31.3 done +43.9 pass; waited budget 29.0s, order 2.2s; demand
+6.1/8; 3 request(s)`; an optional `requested -0.1` precedes `queued`, an
+over-admission shows `admitted +31.2 (over)`, a job with no measured demand
+and a weight below the configured one shows `weight 6/8`, detached requests
+`(1 left)`, a killed job `killed by <who>`).
 
 ### 7.3 Exposure: optional fields only (protocol 1, status schema 1)
 
@@ -355,9 +359,13 @@ new string field, because a new enum variant breaks old clients.
 | `status.totals` | `idle_while_waiting_ms`, `waiting_wall_ms`, `over_admissions` (per instance) |
 | MCP `verify` | `GateResult.queue_wait_ms`, `GateResult.wait_reason`, `VerifyReport.wall_ms` |
 
-Text: `test: pass in 12.1 s (queued 31.0 s: budget)` in `verify` and
-`sluice run -v`; `sluice status` shows `budget: 24/20 (cap 30, 3 cpus
-idle)` and each queued job's expected duration.
+Text: `PASS 12.1s (job j1) (queued 31.0s: budget)` in the `verify` line (not
+for cached results; `sluice run -v` does not print it); `sluice status` shows
+`budget:   24 of 20 units busy (cap 30, 3.0 of 20 cpus idle)` (the cap only
+when above the budget; `budget.cap` is always in the JSON), each queued job
+as `#<rank> ... (<reason>[: <wait_detail>])  expected <duration>`, and a
+`waiting:` line with the time jobs were queued, how much of it CPU-idle and
+the over-admissions.
 
 ### 7.4 SQLite: additive migration from v0.2.0
 
@@ -415,26 +423,29 @@ module doc ("never migrated").
 function over a snapshot, and `Scheduler` only owns state and applies it.
 
 ```rust
-pub struct QueuedJob { id, key: Option<CacheKey>, repo, lane: PathBuf, gate,
-    weight /* effective */, weight_cfg: u32, class: Class /* Human|Agent */,
-    queued_at: u64, expected_ms: Option<u64> }
-pub struct RunningJob { id, repo, lane, weight: u32, started_at: u64, admission: Admission }
+pub struct QueuedSnap { id, repo, lane: PathBuf,
+    weight_cfg: u32, learn_key: Option<LearnKey>, class: Class /* Human|Agent */,
+    queued_at: u64, expected_ms: Option<u64> }   // effective weight: queued_weight()
+pub struct RunningSnap { id, repo, lane: PathBuf, weight: u32 }
 pub struct Pressure { blocking: bool, guard_due: bool,
-    calm_for_overcommit: bool /* section 5, conditions 1-3 */,
+    calm: bool /* section 5, conditions 1-3 */,
     idle_cpus: Option<f64>, sampled_at: Option<u64> /* newest utilisation sample */ }
-/* Snapshot also carries last_overcommit_at and last_start_at; Policy
-   carries sample_tick_ms (the sampler period). */
-pub struct Policy { budget, cap: u32, head_reserve_after_ms, overcommit_interval_ms: u64,
-    order: Order /* Fifo|Hrrn */, fairness: bool, human_first: bool,
+pub struct Policy { budget, cap: u32, head_reserve_after_ms, overcommit_interval_ms,
+    sample_tick_ms: u64 /* sampler period */, order: Order /* Fifo|Sjf */,
+    fairness: bool, human_first: bool, learned_weights: bool,
     repo_caps: BTreeMap<PathBuf, u32> }
 pub struct Snapshot<'a> { now: u64, policy: &'a Policy, pressure: Pressure,
-    running: &'a [RunningJob], queued: &'a [QueuedJob] }
+    last_overcommit_at: Option<u64>, last_start_at: Option<u64>,
+    running: &'a [RunningSnap], queued: &'a [QueuedSnap],
+    learned: &'a Learned /* learned weight per stats key */ }
 pub enum Admission { Nominal, Over, Guard }
 pub struct Plan { start: Vec<(String, Admission)>, reserved: Option<String>,
-    waits: Vec<(String, WaitReason, WaitDetail)> }
+    waits: Vec<Wait /* id, cause: WaitCause, detail */>,
+    order: Vec<String> /* rank order */, weights: Vec<u32> /* parallel to order */ }
 
 pub fn rank(s: &Snapshot) -> Vec<usize>;                           // 6.1
 pub fn plan(s: &Snapshot) -> Plan;
+pub fn queued_weight(s: &Snapshot, j: &QueuedSnap) -> u32;         // 4, per pass
 pub fn effective_weight(w_cfg: u32, demands_milli: &[u32]) -> u32; // 4
 pub fn expected_ms(walls_ms: &[u64]) -> Option<u64>;               // 6.6
 ```
@@ -478,6 +489,17 @@ neutral on s2 and kept for workloads s2 does not generate ("keep only if
 it helps E2" read as "keep unless it hurts E2"), except M7, off by
 default.
 
+Measured (the tuning rounds L3, [[sluice/changes/alpha-readiness.md]]): the
+shipped defaults (`overcommit = 1.5`, `overcommit_interval = "5s"`, every
+policy of section 2 on, `order = "fifo"`) meet every target in the normal,
+overload and low-core variants (overload: wall 0.58x the baseline, p95
+1.10x, idle while waiting 7.8 %, peak load 16.6 vs 63.3). Round 2 added the
+resolution of learned weights at admission (section 4); a 2.0x / 2 s
+setting also met every target but left the normal variant nearer the p95
+limit (1.18x against 1.14x), so the defaults stayed. The predictions above
+are the design estimates; the low-core prediction below was pessimistic
+(measured p95 0.94x).
+
 Low-core variant (6 logical CPUs, budget 6): k = 1 heavy suite throughout.
 Suite alone ≈ 64/6 + 3.5 ≈ 14 s; Sluice wall ≈ 25 × 14 + base ≈ 370 s vs
 baseline ≈ 48 × 69 / 6 ≈ 550 s (met); p95 ≈ 12 × 14 + 3 ≈ 170 s vs the
@@ -499,17 +521,18 @@ is exactly the plan's overload risk.
   the longest running job.
 - Sampler cost: one `/proc` scan per second (1–5 ms) while gates run.
 
-## 11. Open questions (recommended answers)
+## 11. Open questions and how they were decided
 
 1. Additive `sched_schema` instead of `schema.version = 2`? Yes (downgrade
-   safety, queue precedent); ADR-0013 (H3) states it as the database rule.
-2. Supersede in v0.3.0? No (6.7); revisit with L1 data.
-3. SJF on by default? No; add a mixed-length E2 variant in L3 if evidence
-   is wanted.
-4. Parallel `verify` with `fail_fast = true` by default? Yes.
+   safety, queue precedent); decided in ADR-0011 item 8, and ADR-0013 (H3)
+   states it as the database rule.
+2. Supersede in v0.3.0? No (6.7, deferred in ADR-0011); revisit with L1 data.
+3. SJF on by default? No (`order = "fifo"`, unchanged by the L3 rounds); a
+   mixed-length E2 variant was not needed.
+4. Parallel `verify` with `fail_fast = true` by default? Yes (implemented, M4).
 5. Learned weights for `exec` jobs? No (their CPU escapes the group).
-6. ADR-0011: extracted by the lead from sections 2–7; ADR-0007 becomes
-   "amended" and [[sluice/design/scheduler.md]] is updated when B1 lands.
+6. ADR-0011: extracted from sections 2–7 (accepted); ADR-0007 is marked
+   amended and [[sluice/design/scheduler.md]] was updated when B1 landed.
 
 ## 12. Implementation notes and deviations (B1 + L1)
 
