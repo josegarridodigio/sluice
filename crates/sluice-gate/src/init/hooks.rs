@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use sluice_gate_core::pkgscripts::pieces;
 
-use crate::snippets::HookManager;
+use crate::snippets::{HookManager, fallback_sh_c, fallback_shell};
 
 /// The hooks Sluice wires.
 pub const HOOKS: [&str; 2] = ["pre-commit", "pre-push"];
@@ -76,6 +76,8 @@ pub struct Candidate {
     pub line: usize,
     pub hook: String,
     pub cmd: Command,
+    /// The command exactly as the line ran it, environment words included.
+    pub original: String,
     /// Text of the line before the command (indentation, `run: `, ...).
     pub prefix: String,
     /// Text after the command that stays (`|| exit $?`).
@@ -89,10 +91,74 @@ pub struct Candidate {
 #[derive(Debug, Clone)]
 pub enum Found {
     Command(Candidate),
-    /// A line that already calls `sluice run`.
+    /// A line that already calls `sluice run`, bare (0.4.0) or with the
+    /// fallback for a machine without Sluice.
     Wired {
         gate: String,
+        /// The line, when it is the bare 0.4.0 form `init --force` upgrades.
+        upgrade: Option<Candidate>,
     },
+}
+
+/// A hook line in the fallback form, taken apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fallback {
+    pub hook: String,
+    pub gate: String,
+    /// The command that runs when Sluice is not installed.
+    pub original: String,
+}
+
+const FALLBACK_HEAD: &str = "if command -v sluice >/dev/null 2>&1; then sluice run --hook ";
+
+/// Takes the fallback form `if command -v sluice ...; then sluice run --hook
+/// <hook> <gate>; else <original>; fi` apart.
+pub fn parse_fallback(text: &str) -> Option<Fallback> {
+    let rest = text.trim().strip_prefix(FALLBACK_HEAD)?;
+    let (call, tail) = rest.split_once("; else ")?;
+    let original = tail.strip_suffix("; fi")?.trim();
+    let mut words = call.split(' ');
+    let (hook, gate) = (words.next()?, words.next()?);
+    if words.next().is_some() || hook.is_empty() || gate.is_empty() || original.is_empty() {
+        return None;
+    }
+    Some(Fallback {
+        hook: hook.to_owned(),
+        gate: gate.to_owned(),
+        original: original.to_owned(),
+    })
+}
+
+/// The fallback form inside `sh -c '...'`, as a pre-commit `entry:` has it.
+pub fn parse_sh_c(entry: &str) -> Option<Fallback> {
+    let inner = entry.trim().strip_prefix("sh -c '")?.strip_suffix('\'')?;
+    if inner.contains('\'') {
+        return None;
+    }
+    parse_fallback(inner)
+}
+
+/// The text that replaces a command in a hook file of `format`, `None` when
+/// the original cannot be nested in it safely.
+pub fn render_wired(format: Format, hook: &str, gate: &str, original: &str) -> Option<String> {
+    match format {
+        Format::Script => Some(fallback_shell(hook, gate, original)),
+        Format::Lefthook => yaml_safe(original).then(|| fallback_shell(hook, gate, original)),
+        Format::PreCommit => yaml_safe(original)
+            .then(|| fallback_sh_c(hook, gate, original))
+            .flatten(),
+    }
+}
+
+/// A command that can sit in a plain YAML scalar.
+fn yaml_safe(command: &str) -> bool {
+    !command.contains(": ") && !command.ends_with(':') && !command.contains(" #")
+}
+
+/// `words` are exactly `sluice run --hook <hook> <gate>`.
+fn is_bare(words: &[String], hook: &str) -> bool {
+    matches!(words, [s, r, h, name, gate]
+        if s == "sluice" && r == "run" && h == "--hook" && name == hook && !gate.starts_with('-'))
 }
 
 /// The hook files of a repository.
@@ -307,18 +373,27 @@ pub fn scan(files: &[HookFile]) -> Vec<Found> {
 }
 
 fn found_for(mut candidate: Candidate, file: &HookFile, out: &mut Vec<Found>) {
-    if let Some(gate) = wired_gate(&candidate.cmd.words) {
-        out.push(Found::Wired { gate });
-        return;
-    }
     if !file.editable {
         candidate.manual = Some("the file is a symlink that leaves the repository");
+    }
+    if let Some(gate) = wired_gate(&candidate.cmd.words) {
+        let upgrade = (candidate.cmd.env.is_empty()
+            && is_bare(&candidate.cmd.words, &candidate.hook))
+        .then_some(candidate);
+        out.push(Found::Wired { gate, upgrade });
+        return;
     }
     out.push(Found::Command(candidate));
 }
 
 fn scan_script(index: usize, file: &HookFile, out: &mut Vec<Found>) {
     let Some(hook) = file.hook else { return };
+    // A file `init` created has no original command to fall back to.
+    let created = file
+        .lines
+        .iter()
+        .any(|l| l.trim() == "command -v sluice >/dev/null 2>&1 || exit 0");
+    let first = out.len();
     let mut continued = false;
     for (line_no, raw) in file.lines.iter().enumerate() {
         let (line, _) = split_terminator(raw);
@@ -339,6 +414,13 @@ fn scan_script(index: usize, file: &HookFile, out: &mut Vec<Found>) {
             }
             _ => (trimmed, String::new()),
         };
+        if let Some(fallback) = parse_fallback(body) {
+            out.push(Found::Wired {
+                gate: fallback.gate,
+                upgrade: None,
+            });
+            continue;
+        }
         let Some(cmd) = parse_command(body) else {
             continue;
         };
@@ -350,6 +432,7 @@ fn scan_script(index: usize, file: &HookFile, out: &mut Vec<Found>) {
                 line: line_no,
                 hook: hook.to_owned(),
                 cmd,
+                original: body.to_owned(),
                 prefix: indent.to_owned(),
                 suffix,
                 aux: Aux::None,
@@ -358,6 +441,13 @@ fn scan_script(index: usize, file: &HookFile, out: &mut Vec<Found>) {
             file,
             out,
         );
+    }
+    if created {
+        for item in &mut out[first..] {
+            if let Found::Wired { upgrade, .. } = item {
+                *upgrade = None;
+            }
+        }
     }
 }
 
@@ -441,6 +531,13 @@ fn scan_lefthook(index: usize, file: &HookFile, out: &mut Vec<Found>) {
         let Some((command, comment)) = plain_scalar(value) else {
             continue;
         };
+        if let Some(fallback) = parse_fallback(&command) {
+            out.push(Found::Wired {
+                gate: fallback.gate,
+                upgrade: None,
+            });
+            continue;
+        }
         // Lefthook templates ({staged_files}) are not whole-tree commands.
         let Some(cmd) = parse_command(&command) else {
             continue;
@@ -451,6 +548,7 @@ fn scan_lefthook(index: usize, file: &HookFile, out: &mut Vec<Found>) {
                 line: line_no,
                 hook: hook.to_owned(),
                 cmd,
+                original: command.clone(),
                 prefix: line[..value_at].to_owned(),
                 suffix: comment,
                 aux: Aux::None,
@@ -538,6 +636,13 @@ fn scan_pre_commit(index: usize, file: &HookFile, out: &mut Vec<Found>) {
         let Some(stage) = framework_stage(hook.stages.as_deref()) else {
             continue;
         };
+        if let Some(fallback) = parse_sh_c(&entry) {
+            out.push(Found::Wired {
+                gate: fallback.gate,
+                upgrade: None,
+            });
+            continue;
+        }
         let Some(cmd) = parse_command(&entry) else {
             continue;
         };
@@ -545,7 +650,7 @@ fn scan_pre_commit(index: usize, file: &HookFile, out: &mut Vec<Found>) {
         let (line, terminator) = split_terminator(raw);
         let manual = if hook.has_args {
             Some("the hook has args")
-        } else if !matches!(hook.language.as_deref(), Some("system" | "script")) {
+        } else if hook.language.as_deref() != Some("system") {
             Some("the hook's language is not system")
         } else if terminator.is_empty() {
             Some("the entry is the last line of the file")
@@ -575,6 +680,7 @@ fn scan_pre_commit(index: usize, file: &HookFile, out: &mut Vec<Found>) {
                 line: line_no,
                 hook: stage.to_owned(),
                 cmd,
+                original: entry.clone(),
                 prefix: line[..value_at].to_owned(),
                 suffix: comment,
                 aux,
@@ -751,5 +857,103 @@ mod tests {
             "        entry: sluice run --hook pre-push lint\n        pass_filenames: false\n        language: system\n"
         ));
         assert!(out.contains("      - id: other\n        entry: npx ng lint\n"));
+    }
+
+    #[test]
+    fn fallback_lines_are_recognised_in_every_format() {
+        let line = fallback_shell("pre-commit", "lint", "CI=1 npx ng lint");
+        let parsed = parse_fallback(&line).unwrap();
+        assert_eq!(parsed.hook, "pre-commit");
+        assert_eq!(parsed.gate, "lint");
+        assert_eq!(parsed.original, "CI=1 npx ng lint");
+        assert_eq!(parse_fallback("sluice run --hook pre-commit lint"), None);
+        let entry = fallback_sh_c("pre-push", "t", "pytest -q").unwrap();
+        assert_eq!(parse_sh_c(&entry).unwrap().gate, "t");
+        assert_eq!(fallback_sh_c("pre-push", "t", "echo 'x'"), None);
+
+        let gates = |f: &HookFile| -> Vec<(String, bool)> {
+            scan(std::slice::from_ref(f))
+                .iter()
+                .filter_map(|found| match found {
+                    Found::Wired { gate, upgrade } => Some((gate.clone(), upgrade.is_some())),
+                    Found::Command(_) => None,
+                })
+                .collect()
+        };
+        let script = file(
+            Format::Script,
+            Some("pre-commit"),
+            &format!("#!/bin/sh\n  {line} || exit 1\nsluice run --hook pre-commit fmt\n"),
+        );
+        assert_eq!(
+            gates(&script),
+            [("lint".to_owned(), false), ("fmt".to_owned(), true)]
+        );
+        let lefthook = file(
+            Format::Lefthook,
+            None,
+            &format!("pre-commit:\n  commands:\n    l:\n      run: {line}\n"),
+        );
+        assert_eq!(gates(&lefthook), [("lint".to_owned(), false)]);
+        let framework = file(
+            Format::PreCommit,
+            None,
+            &format!(
+                "repos:\n  - repo: local\n    hooks:\n      - id: l\n        entry: {}\n        \
+                 language: system\n        pass_filenames: false\n",
+                fallback_sh_c("pre-commit", "lint", "pytest -q").unwrap()
+            ),
+        );
+        assert_eq!(gates(&framework), [("lint".to_owned(), false)]);
+    }
+
+    #[test]
+    fn rewire_writes_the_fallback_around_the_original_and_keeps_the_tail() {
+        let f = file(
+            Format::Script,
+            Some("pre-commit"),
+            "#!/bin/sh\r\n  CI=1 npx ng lint || exit 1\r\n",
+        );
+        let found = scan(std::slice::from_ref(&f));
+        let Found::Command(c) = &found[0] else {
+            panic!("no command")
+        };
+        assert_eq!(c.original, "CI=1 npx ng lint");
+        let replacement = render_wired(Format::Script, "pre-commit", "lint", &c.original).unwrap();
+        assert_eq!(
+            rewire(&f, &[(c, replacement)]),
+            "#!/bin/sh\r\n  if command -v sluice >/dev/null 2>&1; then sluice run --hook \
+             pre-commit lint; else CI=1 npx ng lint; fi || exit 1\r\n"
+        );
+    }
+
+    #[test]
+    fn yaml_formats_refuse_what_cannot_be_nested() {
+        assert!(render_wired(Format::Lefthook, "pre-commit", "t", "npx x --a: b").is_none());
+        assert!(render_wired(Format::PreCommit, "pre-commit", "t", "pytest -k 'a b'").is_none());
+        assert!(render_wired(Format::Script, "pre-commit", "t", "pytest -k 'a b'").is_some());
+    }
+
+    #[test]
+    fn only_the_exact_bare_form_is_upgraded() {
+        let f = file(
+            Format::Script,
+            Some("pre-push"),
+            "sluice run --hook pre-push lint\nsluice run --hook pre-commit lint\n\
+             sluice run lint\nsluice run --hook pre-push lint --timeout 5\n",
+        );
+        let upgrades: Vec<bool> = scan(std::slice::from_ref(&f))
+            .iter()
+            .map(|found| {
+                matches!(
+                    found,
+                    Found::Wired {
+                        upgrade: Some(_),
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(upgrades, [true, false, false, false]);
     }
 }

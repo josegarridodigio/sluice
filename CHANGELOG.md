@@ -14,7 +14,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `sluice init` writes every rewired hook line with a fallback to the original
+  command when Sluice is not installed (`if command -v sluice ...; then sluice
+  run --hook <hook> <gate>; else <original>; fi`, through `sh -c` for the
+  pre-commit framework), so the rewired hooks can be committed for a team. The
+  `.githooks/` files it creates start with `command -v sluice ... || exit 0`.
+  `init --force` upgrades the bare lines of 0.4.0 to the new form.
+
 ### Fixed
+
+- `sluice init` writes `.sluice.toml` and hook files atomically (temporary
+  file in the same directory, fsync, mode kept, `rename`; the target of an
+  in-repository symlink), so a hook that is running is never read half
+  written.
 
 ## [0.4.0] - 2026-10-23
 
