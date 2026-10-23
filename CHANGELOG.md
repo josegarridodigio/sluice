@@ -59,6 +59,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Learned gate weights are resolved at every admission pass instead of at
+  enqueue, so jobs that queued before the weight was learned are admitted
+  with it; running jobs keep the weight they were admitted with.
 - Scheduler throughput (ADR-0011): the default budget is the number of
   available CPUs (affinity and cgroup limits honoured); gates learn their
   real CPU demand and are admitted with it; PSI-driven over-admission up to

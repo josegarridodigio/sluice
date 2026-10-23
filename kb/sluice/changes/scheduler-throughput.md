@@ -144,3 +144,56 @@ sluice: test PASS 96.8s (job 1792711026680-3052613-8b2307)
 
 (clippy ran as a daemon job; its 0.1 s is cargo reusing the results of the
 identical `cargo clippy` run just before.)
+
+## Tuning loop
+
+### Round 2: learned weights resolved at admission (L3)
+
+**Evidence.** Low-core variant of `scripts/alpha/s2_problem.py` (budget 6
+on 6 CPUs, `test` weight_cfg 4, `lint` weight 1): `test` learned a demand
+of about 3.0 (`demand_milli` 2900–3200) after the first runs, but the
+tests queued at t = 10–33 s kept `weight = 4` for their whole wait; only
+later ones got 3. The budget admitted one test (4) plus lint instead of
+two tests (3 + 3), leaving about 2 CPUs idle while tests waited:
+`idle_while_waiting` 11.3 % of wall (target < 10 %).
+
+**Cause.** `Scheduler::enqueue` fixed `JobSpec::weight` from the history
+the job carried at enqueue (`effective_weight(weight_cfg, demands_milli)`);
+nothing refreshed it while the job waited.
+
+**Change** (`sluice-gate-daemon`):
+- `scheduler.rs`: `LearnKey`, `Learned` (learned weight per stats key);
+  `Snapshot::learned`; `QueuedSnap` carries `weight_cfg` and `learn_key`
+  instead of a fixed weight; `queued_weight` resolves the effective weight
+  of each queued job in every `plan` pass, bounded to
+  `max(1, ceil(w_cfg/4))..=w_cfg` (`clamp_learned`); `Plan::weights`
+  (parallel to `order`); `learned_weight` (unbounded rounded P75, split out
+  of `effective_weight`). `Scheduler` keeps a `learned` map refreshed by
+  `set_learned` and by the history a job brings at enqueue;
+  `JobSpec::learn_key`. `admit_with` writes each queued job's weight of
+  the pass; started jobs keep it while running, so `used` and `finish`
+  stay consistent. `snapshot` shows queued jobs' current effective weight.
+- `server.rs`: `StatsKey = sched::LearnKey`; `register_job` passes the
+  key; `finish_job` calls `set_learned` with the key's new history after
+  a measured run (stats mutex released first); the scheduling loop
+  records the admitted weight in `jobs.weight`.
+- `store.rs`: `Store::set_weight`.
+- `exec` jobs (no key) unchanged: always `w_cfg`.
+
+**Tests.** `scheduler/tests.rs`:
+`job_queued_before_learning_is_admitted_with_the_learned_weight`,
+`configured_weight_admits_one_where_learned_admits_two`,
+`running_jobs_keep_their_admitted_weight_when_stats_change`,
+`resolved_weights_respect_the_bounds`,
+`plan_resolves_weights_from_the_snapshot`; `store.rs`
+`timeline_requests_and_gate_stats` checks `set_weight`.
+
+**Verification.**
+
+```
+sluice: fmt PASS 0.5s (job 1792715498780-3591840-85c2e7)
+sluice: clippy PASS 14.2s (job 1792715499431-3591840-b6cf4a)
+sluice: test PASS 136.6s (job 1792715515782-3591840-9f5864)
+```
+
+The S2 low-core re-measurement is left to the lead.

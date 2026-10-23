@@ -22,6 +22,14 @@ pub const LEARN_AFTER: usize = 3;
 /// Samples (most recent) a learned weight and an expected time look at.
 pub const LEARN_WINDOW: usize = 10;
 
+/// Key of a gate's learned statistics: repository identity, gate name and
+/// command hash. Jobs without a key (`exec`) never learn.
+pub type LearnKey = (PathBuf, String, String);
+
+/// Learned weights by statistics key: the rounded P75 demand of the last
+/// [`LEARN_WINDOW`] runs ([`learned_weight`]), before the per-job clamp.
+pub type Learned = BTreeMap<LearnKey, u32>;
+
 /// Priority class of a job (ADR-0011 M6): a human always waits for it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Class {
@@ -136,7 +144,9 @@ pub struct JobSpec {
     /// Gate name.
     pub gate: String,
     /// Budget units the job holds. On input the configured weight; after
-    /// [`Scheduler::enqueue`] the effective one (learned, clamped).
+    /// [`Scheduler::enqueue`] the effective one (learned, clamped). While
+    /// queued it is recomputed at every admission pass from the current
+    /// learned weights; once running it is the weight it was admitted with.
     pub weight: u32,
     /// Configured weight after the budget and repository-cap clamp (set by
     /// [`Scheduler::enqueue`]).
@@ -147,8 +157,11 @@ pub struct JobSpec {
     pub queued_at: u64,
     /// Expected run time from history ([`expected_ms`]).
     pub expected_ms: Option<u64>,
-    /// Measured demands of earlier runs (milli-CPUs, oldest first); empty
-    /// for jobs that never learn (`exec`).
+    /// Learned-statistics key; `None` for jobs that never learn (`exec`).
+    pub learn_key: Option<LearnKey>,
+    /// Measured demands of earlier runs of `learn_key` (milli-CPUs, oldest
+    /// first) known at enqueue; they refresh the scheduler's learned weight
+    /// of that key.
     pub demands_milli: Vec<u32>,
 }
 
@@ -204,7 +217,8 @@ pub struct QueuedView {
     pub lane: PathBuf,
     /// Gate name.
     pub gate: String,
-    /// Budget units needed (effective weight).
+    /// Budget units needed (effective weight from the current learned
+    /// statistics).
     pub weight: u32,
     /// Configured weight after the clamp.
     pub weight_cfg: u32,
@@ -272,7 +286,7 @@ pub struct Policy {
     pub fairness: bool,
     /// Humans before agents.
     pub human_first: bool,
-    /// Use learned weights at enqueue.
+    /// Use learned weights (resolved at every admission pass).
     pub learned_weights: bool,
     /// Per-repository caps.
     pub repo_caps: BTreeMap<PathBuf, u32>,
@@ -335,8 +349,11 @@ pub struct QueuedSnap {
     pub repo: PathBuf,
     /// Fairness lane.
     pub lane: PathBuf,
-    /// Effective weight.
-    pub weight: u32,
+    /// Configured weight after the budget and repository-cap clamp; the
+    /// effective weight is resolved from it by [`queued_weight`].
+    pub weight_cfg: u32,
+    /// Learned-statistics key; `None` never learns.
+    pub learn_key: Option<LearnKey>,
     /// Priority class.
     pub class: Class,
     /// Queue time.
@@ -373,6 +390,8 @@ pub struct Snapshot<'a> {
     pub running: &'a [RunningSnap],
     /// Queued jobs (any order).
     pub queued: &'a [QueuedSnap],
+    /// Current learned weights by key.
+    pub learned: &'a Learned,
 }
 
 /// One queued job left waiting by a [`Plan`].
@@ -397,6 +416,9 @@ pub struct Plan {
     pub waits: Vec<Wait>,
     /// Every queued job id in rank order (before the starts).
     pub order: Vec<String>,
+    /// Effective weight of each job of `order` in this pass, parallel to it
+    /// (the weight a started job is admitted with).
+    pub weights: Vec<u32>,
 }
 
 fn overdue(s: &Snapshot<'_>, j: &QueuedSnap) -> bool {
@@ -476,8 +498,11 @@ pub fn plan(s: &Snapshot<'_>) -> Plan {
     let lanes = lane_ranks(s);
     let mut order: Vec<usize> = (0..s.queued.len()).collect();
     order.sort_by(|&a, &b| compare(s, &lanes, a, b));
+    // Effective weights from the current learned statistics, by queue index.
+    let w: Vec<u32> = s.queued.iter().map(|j| queued_weight(s, j)).collect();
     let mut plan = Plan {
         order: order.iter().map(|&i| s.queued[i].id.clone()).collect(),
+        weights: order.iter().map(|&i| w[i]).collect(),
         ..Plan::default()
     };
     let mut held: Vec<(&Path, u32)> = s
@@ -486,14 +511,15 @@ pub fn plan(s: &Snapshot<'_>) -> Plan {
         .map(|r| (r.repo.as_path(), r.weight))
         .collect();
     let used_of = |held: &[(&Path, u32)]| held.iter().map(|(_, w)| *w).sum::<u32>();
-    let fits_repo = |held: &[(&Path, u32)], j: &QueuedSnap| {
+    let fits_repo = |held: &[(&Path, u32)], i: usize| {
+        let j = &s.queued[i];
         p.repo_caps.get(&j.repo).is_none_or(|&cap| {
             let repo_used: u32 = held
                 .iter()
                 .filter(|(r, _)| *r == j.repo.as_path())
                 .map(|(_, w)| *w)
                 .sum();
-            repo_used + j.weight <= cap
+            repo_used + w[i] <= cap
         })
     };
     let used0 = used_of(&held);
@@ -501,11 +527,7 @@ pub fn plan(s: &Snapshot<'_>) -> Plan {
     if s.pressure.blocking {
         for (pos, &i) in order.iter().enumerate() {
             let j = &s.queued[i];
-            if pos == 0
-                && s.pressure.guard_due
-                && used0 + j.weight <= p.budget
-                && fits_repo(&held, j)
-            {
+            if pos == 0 && s.pressure.guard_due && used0 + w[i] <= p.budget && fits_repo(&held, i) {
                 plan.start.push((j.id.clone(), Admission::Guard));
                 continue;
             }
@@ -521,14 +543,15 @@ pub fn plan(s: &Snapshot<'_>) -> Plan {
     let mut reserved: Option<usize> = None;
     let mut first_waiting = true;
     let mut started: Vec<usize> = Vec::new();
+    let mut waiting: Vec<usize> = Vec::new();
     for &i in &order {
         let j = &s.queued[i];
         let used = used_of(&held);
-        let fits_budget = used + j.weight <= p.budget;
-        let fits_cap = fits_repo(&held, j);
+        let fits_budget = used + w[i] <= p.budget;
+        let fits_cap = fits_repo(&held, i);
         if reserved.is_none() && fits_budget && fits_cap {
             plan.start.push((j.id.clone(), Admission::Nominal));
-            held.push((j.repo.as_path(), j.weight));
+            held.push((j.repo.as_path(), w[i]));
             started.push(i);
             continue;
         }
@@ -539,7 +562,7 @@ pub fn plan(s: &Snapshot<'_>) -> Plan {
         }
         first_waiting = false;
         let (cause, detail) = if !fits_budget {
-            if !started.is_empty() && used0 + j.weight <= p.budget {
+            if !started.is_empty() && used0 + w[i] <= p.budget {
                 (WaitCause::Order, Some(order_detail(s, &lanes, &started, i)))
             } else {
                 (WaitCause::Budget, None)
@@ -549,6 +572,7 @@ pub fn plan(s: &Snapshot<'_>) -> Plan {
         } else {
             (WaitCause::Reserved, None)
         };
+        waiting.push(i);
         plan.waits.push(Wait {
             id: j.id.clone(),
             cause,
@@ -562,26 +586,39 @@ pub fn plan(s: &Snapshot<'_>) -> Plan {
         .is_none_or(|t| s.now.saturating_sub(t) >= p.overcommit_interval_ms);
     if p.cap > p.budget && plan.start.is_empty() && s.pressure.calm && interval_ok {
         let used = used_of(&held);
-        let candidate = match reserved {
-            Some(i) => Some(&s.queued[i]),
-            None => plan
-                .waits
+        let candidate = reserved.or_else(|| {
+            waiting
                 .iter()
-                .filter_map(|w| s.queued.iter().find(|q| q.id == w.id))
-                .find(|j| used + j.weight <= p.cap && fits_repo(&held, j)),
-        };
-        if let Some(j) = candidate
-            && used + j.weight <= p.cap
-            && fits_repo(&held, j)
+                .copied()
+                .find(|&i| used + w[i] <= p.cap && fits_repo(&held, i))
+        });
+        if let Some(i) = candidate
+            && used + w[i] <= p.cap
+            && fits_repo(&held, i)
             && s.pressure
                 .idle_cpus
-                .is_some_and(|idle| idle >= f64::from(j.weight.div_ceil(3).max(1)))
+                .is_some_and(|idle| idle >= f64::from(w[i].div_ceil(3).max(1)))
         {
-            plan.start.push((j.id.clone(), Admission::Over));
-            plan.waits.retain(|w| w.id != j.id);
+            let id = &s.queued[i].id;
+            plan.start.push((id.clone(), Admission::Over));
+            plan.waits.retain(|wt| &wt.id != id);
         }
     }
     plan
+}
+
+/// Effective weight of a queued job in this pass: with learned weights on
+/// and a learned weight for its key, that weight bounded to
+/// `max(1, ceil(w_cfg / 4))..=w_cfg`; `w_cfg` otherwise.
+pub fn queued_weight(s: &Snapshot<'_>, j: &QueuedSnap) -> u32 {
+    let w_cfg = j.weight_cfg.max(1);
+    if !s.policy.learned_weights {
+        return w_cfg;
+    }
+    j.learn_key
+        .as_ref()
+        .and_then(|k| s.learned.get(k))
+        .map_or(w_cfg, |&l| clamp_learned(w_cfg, l))
 }
 
 /// Why a job that fitted the budget before this pass lost its room.
@@ -601,16 +638,27 @@ fn order_detail(s: &Snapshot<'_>, lanes: &[usize], started: &[usize], i: usize) 
 /// once there are [`LEARN_AFTER`]; `w_cfg` otherwise.
 pub fn effective_weight(w_cfg: u32, demands_milli: &[u32]) -> u32 {
     let w_cfg = w_cfg.max(1);
+    learned_weight(demands_milli).map_or(w_cfg, |l| clamp_learned(w_cfg, l))
+}
+
+/// The unbounded learned weight: `round_half_up(P75(demand))` over the last
+/// [`LEARN_WINDOW`] samples, once there are [`LEARN_AFTER`]; `None` before.
+pub fn learned_weight(demands_milli: &[u32]) -> Option<u32> {
     let window = &demands_milli[demands_milli.len().saturating_sub(LEARN_WINDOW)..];
     if window.len() < LEARN_AFTER {
-        return w_cfg;
+        return None;
     }
     let mut v = window.to_vec();
     v.sort_unstable();
     // Nearest-rank 75th percentile.
     let p75 = v[(v.len() * 3).div_ceil(4) - 1];
-    let rounded = p75.saturating_add(500) / 1000;
-    rounded.clamp(w_cfg.div_ceil(4).max(1), w_cfg)
+    Some(p75.saturating_add(500) / 1000)
+}
+
+/// Bounds a learned weight to `max(1, ceil(w_cfg / 4))..=w_cfg`.
+fn clamp_learned(w_cfg: u32, learned: u32) -> u32 {
+    let w_cfg = w_cfg.max(1);
+    learned.clamp(w_cfg.div_ceil(4).max(1), w_cfg)
 }
 
 /// Expected run time (ADR-0011 M7): the median wall time of the last
@@ -677,7 +725,8 @@ impl Job {
             id: self.spec.id.clone(),
             repo: self.spec.repo.clone(),
             lane: self.spec.lane.clone(),
-            weight: self.spec.weight,
+            weight_cfg: self.spec.weight_cfg,
+            learn_key: self.spec.learn_key.clone(),
             class: self.spec.class,
             queued_at: self.spec.queued_at,
             expected_ms: self.spec.expected_ms,
@@ -701,6 +750,9 @@ pub struct Scheduler {
     /// Queued jobs in arrival order.
     queue: Vec<Job>,
     running: Vec<Job>,
+    /// Current learned weights by key (refreshed by [`Scheduler::set_learned`]
+    /// and by the history a job carries at enqueue).
+    learned: Learned,
     last_overcommit_at: Option<u64>,
     over_admissions: u64,
     /// `now` of the last pass (orders `position` between passes).
@@ -723,6 +775,7 @@ impl Scheduler {
             policy,
             queue: Vec::new(),
             running: Vec::new(),
+            learned: Learned::new(),
             last_overcommit_at: None,
             over_admissions: 0,
             last_now: 0,
@@ -759,10 +812,26 @@ impl Scheduler {
         !self.queue.is_empty()
     }
 
+    /// Replaces the learned weight of `key` from its recent demands
+    /// (milli-CPUs, oldest first); removes it while there are fewer than
+    /// [`LEARN_AFTER`]. Queued jobs of that key pick it up at the next pass;
+    /// running jobs keep the weight they were admitted with.
+    pub fn set_learned(&mut self, key: LearnKey, demands_milli: &[u32]) {
+        match learned_weight(demands_milli) {
+            Some(w) => {
+                self.learned.insert(key, w);
+            }
+            None => {
+                self.learned.remove(&key);
+            }
+        }
+    }
+
     /// Adds a request. The configured weight is clamped to
     /// `1..=min(budget, repo cap)` (a warning is logged once per clamped
-    /// job) and becomes `weight_cfg`; with learned weights the effective
-    /// weight is [`effective_weight`] of it. If `spec.key` is `Some` and a
+    /// job) and becomes `weight_cfg`; the history it carries refreshes the
+    /// learned weight of its key, and its effective weight (recomputed at
+    /// every pass while it waits) is [`queued_weight`] of it. If `spec.key` is `Some` and a
     /// queued or running job has the same key, the request is attached to it
     /// (subscribers += 1) and [`Enqueued::Coalesced`] is returned. Otherwise
     /// the job is queued with one subscriber and [`Enqueued::Created`] is
@@ -791,12 +860,17 @@ impl Scheduler {
             );
         }
         spec.weight_cfg = spec.weight.clamp(1, max);
-        spec.weight = if self.policy.learned_weights {
-            effective_weight(spec.weight_cfg, &spec.demands_milli)
-        } else {
-            spec.weight_cfg
-        };
-        self.queue.push(Job::new(spec));
+        if let Some(key) = &spec.learn_key
+            && learned_weight(&spec.demands_milli).is_some()
+        {
+            self.set_learned(key.clone(), &spec.demands_milli);
+        }
+        let mut job = Job::new(spec);
+        job.spec.weight = queued_weight(
+            &self.snapshot_at(self.last_now, &[], &[]),
+            &job.queued_snap(),
+        );
+        self.queue.push(job);
         Enqueued::Created {
             position: self.queue.len(),
         }
@@ -809,15 +883,28 @@ impl Scheduler {
         )
     }
 
+    fn snapshot_at<'a>(
+        &'a self,
+        now: u64,
+        running: &'a [RunningSnap],
+        queued: &'a [QueuedSnap],
+    ) -> Snapshot<'a> {
+        Snapshot {
+            now,
+            policy: &self.policy,
+            pressure: Pressure::default(),
+            last_overcommit_at: self.last_overcommit_at,
+            running,
+            queued,
+            learned: &self.learned,
+        }
+    }
+
     fn plan_at(&self, now: u64, pressure: Pressure) -> Plan {
         let (running, queued) = self.snaps();
         plan(&Snapshot {
-            now,
-            policy: &self.policy,
             pressure,
-            last_overcommit_at: self.last_overcommit_at,
-            running: &running,
-            queued: &queued,
+            ..self.snapshot_at(now, &running, &queued)
         })
     }
 
@@ -846,6 +933,13 @@ impl Scheduler {
             job.account(now);
         }
         let plan = self.plan_at(now, pressure);
+        // Every queued job takes the weight of this pass; a started one keeps
+        // it while running (the units `used` and `finish` account).
+        for (id, &weight) in plan.order.iter().zip(&plan.weights) {
+            if let Some(job) = self.queue.iter_mut().find(|j| &j.spec.id == id) {
+                job.spec.weight = weight;
+            }
+        }
         for (id, admission) in &plan.start {
             let Some(idx) = self.queue.iter().position(|j| &j.spec.id == id) else {
                 continue;
@@ -871,15 +965,7 @@ impl Scheduler {
     /// The first ranked queued job at `now`: `(id, queued_at)`.
     pub fn head(&self, now: u64) -> Option<(String, u64)> {
         let (running, queued) = self.snaps();
-        let s = Snapshot {
-            now,
-            policy: &self.policy,
-            pressure: Pressure::default(),
-            last_overcommit_at: self.last_overcommit_at,
-            running: &running,
-            queued: &queued,
-        };
-        rank(&s)
+        rank(&self.snapshot_at(now, &running, &queued))
             .first()
             .map(|&i| (queued[i].id.clone(), queued[i].queued_at))
     }
@@ -966,15 +1052,7 @@ impl Scheduler {
             return None;
         }
         let (running, queued) = self.snaps();
-        let s = Snapshot {
-            now: self.last_now,
-            policy: &self.policy,
-            pressure: Pressure::default(),
-            last_overcommit_at: self.last_overcommit_at,
-            running: &running,
-            queued: &queued,
-        };
-        rank(&s)
+        rank(&self.snapshot_at(self.last_now, &running, &queued))
             .iter()
             .position(|&i| queued[i].id == id)
             .map(|p| p + 1)
@@ -1034,7 +1112,8 @@ impl Scheduler {
             .order
             .iter()
             .enumerate()
-            .filter_map(|(pos, id)| {
+            .zip(&plan.weights)
+            .filter_map(|((pos, id), &weight)| {
                 let j = self.queue.iter().find(|j| &j.spec.id == id)?;
                 let wait = plan.waits.iter().find(|w| &w.id == id);
                 let cause = wait.map_or(WaitCause::Budget, |w| w.cause);
@@ -1043,7 +1122,7 @@ impl Scheduler {
                     repo: j.spec.repo.clone(),
                     lane: j.spec.lane.clone(),
                     gate: j.spec.gate.clone(),
-                    weight: j.spec.weight,
+                    weight,
                     weight_cfg: j.spec.weight_cfg,
                     queued_at: j.spec.queued_at,
                     subscribers: j.subscribers,

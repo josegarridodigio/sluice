@@ -819,6 +819,21 @@ impl Store {
         Ok(())
     }
 
+    /// Records the effective weight a job was admitted with (`jobs.weight`
+    /// holds the enqueue-time weight until then).
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn set_weight(&self, id: &str, weight: u32) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE jobs SET weight = ?2 WHERE id = ?1",
+                params![id, weight],
+            )
+            .map_err(db)?;
+        Ok(())
+    }
+
     /// Records the admission decision of a job.
     ///
     /// # Errors
@@ -1505,6 +1520,8 @@ mod tests {
             })
             .unwrap()
             .unwrap();
+        s.set_weight("j1", 1).unwrap();
+        assert_eq!(s.job("j1").unwrap().unwrap().weight, 1);
         s.set_admitted("j1", 200, "over").unwrap();
         assert!(
             s.mark_started("j1", "A", 210, None, None, Path::new("/l"))

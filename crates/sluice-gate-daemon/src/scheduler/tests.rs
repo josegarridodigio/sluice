@@ -252,7 +252,8 @@ fn q(id: &str, lane: &str, weight: u32, queued_at: u64) -> QueuedSnap {
         id: id.into(),
         repo: PathBuf::from("/repo"),
         lane: PathBuf::from(lane),
-        weight,
+        weight_cfg: weight,
+        learn_key: None,
         class: Class::Agent,
         queued_at,
         expected_ms: None,
@@ -290,7 +291,15 @@ fn snapshot<'a>(
         last_overcommit_at: None,
         running,
         queued,
+        learned: &NO_LEARNED,
     }
+}
+
+static NO_LEARNED: Learned = BTreeMap::new();
+
+/// A learned-statistics key of repository `/r`.
+fn lk(gate: &str) -> LearnKey {
+    (PathBuf::from("/r"), gate.into(), "c0ffee".into())
 }
 
 fn started(p: &Plan) -> Vec<(&str, Admission)> {
@@ -342,6 +351,7 @@ fn learned_weights_admit_more_suites() {
     for s in [&mut fixed, &mut learned] {
         for i in 0..5 {
             let mut j = spec(&format!("t{i}"), None, "/r", 8, i);
+            j.learn_key = Some(lk("t"));
             j.demands_milli = vec![6_100, 6_400, 6_000];
             s.enqueue(j);
         }
@@ -825,6 +835,7 @@ fn snapshot_views_carry_rank_lane_and_weights() {
         ..policy(2)
     });
     let mut a = spec("a", None, "/r", 2, 0);
+    a.learn_key = Some(lk("a"));
     a.demands_milli = vec![1_000, 1_000, 1_000];
     a.lane = PathBuf::from("/wt1");
     s.enqueue(a);
@@ -850,4 +861,134 @@ fn snapshot_views_carry_rank_lane_and_weights() {
     assert_eq!(queued[1].lane, PathBuf::from("/wt1"));
     assert_eq!(queued[1].expected_ms, Some(7));
     assert_eq!(s.position("b"), Some(2));
+}
+
+// ------------------------------------------- weights resolved at admission
+
+fn learning(budget: u32) -> Scheduler {
+    Scheduler::with_policy(Policy {
+        learned_weights: true,
+        ..policy(budget)
+    })
+}
+
+fn gate_job(id: &str, weight: u32, queued_at: u64) -> JobSpec {
+    let mut j = spec(id, None, "/r", weight, queued_at);
+    j.learn_key = Some(lk("test"));
+    j
+}
+
+#[test]
+fn job_queued_before_learning_is_admitted_with_the_learned_weight() {
+    let mut s = learning(6);
+    for i in 0..3 {
+        s.enqueue(gate_job(&format!("t{i}"), 4, i));
+    }
+    assert_eq!(s.spec("t1").unwrap().weight, 4, "nothing learned yet");
+    assert_eq!(s.admit(10, false), vec!["t0"]);
+    // The first runs teach a demand of about 3 CPUs.
+    s.set_learned(lk("test"), &[2_900, 3_200, 3_000]);
+    let (_, queued) = s.snapshot(20, false);
+    assert!(
+        queued.iter().all(|v| v.weight == 3 && v.weight_cfg == 4),
+        "status shows the current effective weight"
+    );
+    assert!(s.finish("t0").is_some());
+    // Two tests of 3 fit the budget of 6 where the configured 4 fit one.
+    assert_eq!(s.admit(30, false), vec!["t1", "t2"]);
+    assert_eq!(s.used(), 6);
+    let rec = s.record("t1", 30).unwrap();
+    assert_eq!((rec.weight, rec.weight_cfg), (3, 4));
+}
+
+#[test]
+fn configured_weight_admits_one_where_learned_admits_two() {
+    let mut fixed = learning(6);
+    let mut learned = learning(6);
+    learned.set_learned(lk("test"), &[2_900, 3_200, 3_000]);
+    for s in [&mut fixed, &mut learned] {
+        s.enqueue(gate_job("t0", 4, 0));
+        s.enqueue(gate_job("t1", 4, 1));
+    }
+    assert_eq!(fixed.admit(10, false), vec!["t0"]);
+    assert_eq!(learned.admit(10, false), vec!["t0", "t1"]);
+}
+
+#[test]
+fn running_jobs_keep_their_admitted_weight_when_stats_change() {
+    let mut s = learning(8);
+    s.enqueue(gate_job("t0", 4, 0));
+    s.enqueue(gate_job("t1", 4, 1));
+    assert_eq!(s.admit(10, false), vec!["t0", "t1"]);
+    assert_eq!(s.used(), 8);
+    s.set_learned(lk("test"), &[1_000, 1_000, 1_000]);
+    assert_eq!(
+        s.used(),
+        8,
+        "running jobs hold what they were admitted with"
+    );
+    let (running, _) = s.snapshot(20, false);
+    assert!(running.iter().all(|v| v.weight == 4));
+    s.enqueue(gate_job("t2", 4, 20));
+    assert_eq!(s.admit(30, false), Vec::<String>::new(), "no room left");
+    assert_eq!(s.finish("t0").unwrap().weight, 4);
+    assert_eq!(s.used(), 4);
+    assert_eq!(s.admit(40, false), vec!["t2"]);
+    assert_eq!(s.used(), 5, "4 still held by t1, plus the learned 1");
+    assert_eq!(s.finish("t1").unwrap().weight, 4);
+    assert_eq!(s.finish("t2").unwrap().weight, 1);
+    assert_eq!(s.used(), 0);
+}
+
+#[test]
+fn resolved_weights_respect_the_bounds() {
+    let mut s = learning(8);
+    s.enqueue(gate_job("hi", 4, 0));
+    let mut low = gate_job("low", 8, 1);
+    low.learn_key = Some(lk("lint"));
+    s.enqueue(low);
+    let mut exec = spec("exec", None, "/r", 3, 2);
+    exec.demands_milli = vec![500, 500, 500];
+    s.enqueue(exec);
+    s.set_learned(lk("test"), &[12_000, 11_000, 15_000]);
+    s.set_learned(lk("lint"), &[100, 0, 50]);
+    let weights = |s: &Scheduler| {
+        let (_, queued) = s.snapshot(5, false);
+        queued
+            .iter()
+            .map(|v| (v.id.clone(), v.weight))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let w = weights(&s);
+    assert_eq!(w["hi"], 4, "never above the configured weight");
+    assert_eq!(w["low"], 2, "never below ceil(w_cfg / 4)");
+    assert_eq!(w["exec"], 3, "jobs without a key never learn");
+    // Too few samples again: back to the configured weight.
+    s.set_learned(lk("lint"), &[100]);
+    assert_eq!(weights(&s)["low"], 8);
+}
+
+#[test]
+fn plan_resolves_weights_from_the_snapshot() {
+    let p = Policy {
+        learned_weights: true,
+        ..policy(6)
+    };
+    let mut a = q("a", "/wt", 4, 0);
+    a.learn_key = Some(lk("test"));
+    let mut b = q("b", "/wt", 4, 1);
+    b.learn_key = Some(lk("test"));
+    let queued = [a, b];
+    let learned: Learned = [(lk("test"), 3)].into_iter().collect();
+    let s = Snapshot {
+        learned: &learned,
+        ..snapshot(10, &p, Pressure::default(), &[], &queued)
+    };
+    let decided = plan(&s);
+    assert_eq!(decided.weights, [3, 3]);
+    assert_eq!(started(&decided).len(), 2);
+    // Without a learned weight the configured 4 starts only one.
+    let decided = plan(&snapshot(10, &p, Pressure::default(), &[], &queued));
+    assert_eq!(decided.weights, [4, 4]);
+    assert_eq!(started(&decided).len(), 1);
 }

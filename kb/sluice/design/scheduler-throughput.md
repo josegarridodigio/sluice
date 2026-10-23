@@ -126,8 +126,17 @@ learned after **3**.
 `w_eff = clamp(round_half_up(P75(demand)), max(1, ⌈w_cfg/4⌉), w_cfg)`,
 `w_cfg` = configured weight after the budget and repo-cap clamp. Never
 above `w_cfg`; the floor stops a sleeping or memory-heavy gate from
-collapsing to 1 (weight is also a memory proxy). Fixed at enqueue;
-`status` shows both.
+collapsing to 1 (weight is also a memory proxy). **Resolved at
+admission, not at enqueue:** every planning pass recomputes the
+effective weight of each queued gate job from the current learned
+statistics (the snapshot carries the learned weight per stats key, each
+queued job its `w_cfg` and key), so a job queued before its gate had
+learned is admitted with the learned weight as soon as one exists. A
+running job keeps the weight it was admitted with until it finishes (the
+units it holds and releases never change); `jobs.weight` records that
+admitted weight (the enqueue-time weight until then). `status` shows
+both, the effective one of a queued job being the current one. `exec`
+jobs have no stats key and always use `w_cfg`.
 
 **Overload effect.** demand ≈ (3.5 × 1.5 + 8.5 × 8) / 12 ≈ 6.1 (≈ 6.4 with
 three suites running) → **w_eff = 6** → `⌊20/6⌋` = **k = 3**: 17.3

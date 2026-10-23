@@ -181,7 +181,7 @@ enum JobEvent {
 
 /// Key of a gate's learned statistics: repository identity, gate name and
 /// [`cmd_hash`].
-type StatsKey = (PathBuf, String, String);
+type StatsKey = sched::LearnKey;
 
 /// Recent measured runs of each gate (newest last, at most
 /// [`sched::LEARN_WINDOW`]): `(demand_milli, wall_ms)`.
@@ -1129,8 +1129,13 @@ async fn scheduling_loop(shared: Arc<Shared>) {
         let now = now_ms();
         let started = admit(&shared, now);
         for (id, admission) in started {
-            tracing::debug!(job = %id, admission = admission.as_str(), "admitted");
+            // The weight resolved by this pass, held until the job finishes.
+            let weight = shared.state().sched.spec(&id).map(|s| s.weight);
+            tracing::debug!(job = %id, admission = admission.as_str(), ?weight, "admitted");
             shared.store("recording the admission", |s| {
+                if let Some(weight) = weight {
+                    s.set_weight(&id, weight)?;
+                }
                 s.set_admitted(&id, now, admission.as_str())
             });
             tokio::spawn(start_job(Arc::clone(&shared), id));
@@ -1228,7 +1233,14 @@ fn finish_job(shared: &Shared, id: &str, outcome: Outcome, exit_code: Option<i32
         (entry.map(|e| e.events), started_at, learned)
     };
     if let Some((key, stat)) = learned {
-        lock(&shared.stats).push(key, stat.demand_milli, stat.wall_ms);
+        // The stats mutex is never held with the state one: queued jobs of
+        // this key take the new learned weight at the next admission pass.
+        let demands = {
+            let mut stats = lock(&shared.stats);
+            stats.push(key.clone(), stat.demand_milli, stat.wall_ms);
+            stats.history(&key).0
+        };
+        shared.state().sched.set_learned(key, &demands);
     }
     tracing::info!(job = %id, outcome = label, "job done");
     if let Some(events) = events {
@@ -2377,6 +2389,7 @@ fn register_job(shared: &Shared, job: NewJob) -> std::result::Result<Registered,
         class: class_of(job.request.caller()),
         queued_at: now,
         expected_ms,
+        learn_key: job.stats_key.clone(),
         demands_milli,
     };
     match st.sched.enqueue(spec) {
