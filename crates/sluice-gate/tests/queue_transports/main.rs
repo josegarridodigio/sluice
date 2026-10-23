@@ -79,11 +79,7 @@ impl Q {
         let srv = root.join("srv");
         fs::create_dir_all(&srv).expect("srv");
         let bare = srv.join("remote.git");
-        fs::write(
-            sb.home.join(".config/sluice/config.toml"),
-            "version = 1\n[queue]\ntick = \"200ms\"\n",
-        )
-        .expect("user config");
+        sb.write_user_config("[queue]\ntick = \"200ms\"\n");
         let repo = sb.repo.display().to_string();
         sb.git_in(
             &root,

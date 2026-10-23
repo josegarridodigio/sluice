@@ -116,11 +116,7 @@ fn the_budget_limits_overlap() {
     };
     let sb = Sandbox::new(&format!("{}{}{}", gate("a"), gate("b"), gate("c")));
     fs::write(sb.repo.join(".gitignore"), "ignored.txt\nts\n").unwrap();
-    fs::write(
-        sb.home.join(".config/sluice/config.toml"),
-        "version = 1\n[daemon]\nbudget = 2\n",
-    )
-    .unwrap();
+    sb.write_user_config("[daemon]\nbudget = 2\n");
     let handles: Vec<_> = ["a", "b", "c"]
         .into_iter()
         .map(|g| {
@@ -279,11 +275,7 @@ cmd = "true"
 cache = false
 "#,
     );
-    fs::write(
-        sb.home.join(".config/sluice/config.toml"),
-        "version = 1\n[daemon]\nbudget = 1\n",
-    )
-    .unwrap();
+    sb.write_user_config("[daemon]\nbudget = 1\n");
     let running = spawn_run(&sb, "gate");
     assert!(
         wait_for(Duration::from_secs(10), || pgrep("sleep 1.05")),

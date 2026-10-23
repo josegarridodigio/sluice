@@ -67,11 +67,7 @@ impl Q {
     }
 
     fn user_config(&self, queue: &str) {
-        fs::write(
-            self.sb.home.join(".config/sluice/config.toml"),
-            format!("version = 1\n[queue]\n{queue}"),
-        )
-        .expect("user config");
+        self.sb.write_user_config(&format!("[queue]\n{queue}"));
     }
 
     /// A linked worktree on a new branch from `main` with one commit.

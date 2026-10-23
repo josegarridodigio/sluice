@@ -104,6 +104,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Database migration backups are written atomically and checked before
   being trusted; `doctor` no longer connects through an unsafe fallback
   socket directory.
+- Every git process Sluice spawns now runs with
+  `-c maintenance.auto=false -c gc.auto=0`: the merge queue's `fetch` and
+  `merge` could start git's automatic maintenance (repack, prune) in the
+  user's repository. The cache check itself never did.
 - `sluice queue status` retries once when the daemon drops the connection
   before replying (for example right after it died), instead of failing.
 - A daemon killed while it applied `nice` and `ionice` to a new gate left

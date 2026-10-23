@@ -43,11 +43,7 @@ fn field<'a>(line: &'a str, key: &str) -> &'a str {
 }
 
 fn write_user_config(sb: &Sandbox, body: &str) {
-    fs::write(
-        sb.home.join(".config/sluice/config.toml"),
-        format!("version = 1\n{body}"),
-    )
-    .expect("user config");
+    sb.write_user_config(body);
 }
 
 fn daemon_pid(sb: &Sandbox) -> u64 {

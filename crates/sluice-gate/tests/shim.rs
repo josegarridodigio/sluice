@@ -432,27 +432,55 @@ fn agent_sessions_go_through_the_queue_and_show_in_status() {
     assert!(text.starts_with("job=") && text != "job=none\n", "{out:?}");
 }
 
-/// Real `make` processes running with `tag` as last argument (`/proc` scan):
-/// `/bin/sh <bin>/make <tag>`.
+/// True when `pid` runs the real `make` with `tag` as last argument:
+/// `/bin/sh <bin>/make <tag>` (a zombie's cmdline is empty: no match).
+fn runs_real_make(pid: u32, real: &str, tag: &str) -> bool {
+    fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| {
+        let args: Vec<&[u8]> = c
+            .strip_suffix(b"\0")
+            .unwrap_or(&c)
+            .split(|b| *b == 0)
+            .collect();
+        args.get(1).is_some_and(|a| *a == real.as_bytes())
+            && args.last().is_some_and(|a| *a == tag.as_bytes())
+    })
+}
+
+/// Parent pid of `pid` (field 4 of `/proc/<pid>/stat`).
+fn ppid(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat[stat.rfind(')')? + 1..]
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// Real `make` jobs tagged `tag` that were all running at one instant
+/// (`/proc` scan). As in `exec.rs`, two artefacts of a naive scan are
+/// removed so the count never exceeds the real concurrency (CI flake
+/// "/proc peak 3 > 2" with a counter peak of 2):
+/// - the script forking `sleep` is briefly two processes with the same
+///   cmdline (the child before its `exec`): a match whose parent also
+///   matches is that copy, not a job;
+/// - the scan is not a snapshot: a job that ended early in the scan and its
+///   successor that started late in it would both be counted, so every
+///   leader is checked again after the scan and only those still running
+///   count.
 fn proc_count(bin: &Path, tag: &str) -> usize {
     let real = bin.join("make").display().to_string();
     let Ok(entries) = fs::read_dir("/proc") else {
         return 0;
     };
-    entries
+    let leaders: Vec<u32> = entries
         .filter_map(Result::ok)
-        .filter(|e| e.file_name().to_string_lossy().parse::<u32>().is_ok())
-        .filter(|e| {
-            fs::read(e.path().join("cmdline")).is_ok_and(|c| {
-                let args: Vec<&[u8]> = c
-                    .strip_suffix(b"\0")
-                    .unwrap_or(&c)
-                    .split(|b| *b == 0)
-                    .collect();
-                args.get(1).is_some_and(|a| *a == real.as_bytes())
-                    && args.last().is_some_and(|a| *a == tag.as_bytes())
-            })
-        })
+        .filter_map(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter(|&pid| runs_real_make(pid, &real, tag))
+        .filter(|&pid| ppid(pid).is_some_and(|p| !runs_real_make(p, &real, tag)))
+        .collect();
+    leaders
+        .into_iter()
+        .filter(|&pid| runs_real_make(pid, &real, tag))
         .count()
 }
 
@@ -494,6 +522,9 @@ fn ten_concurrent_shimmed_makes_stay_within_the_budget() {
     for child in children {
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success(), "{out:?}");
+        // A run that fell back in-process holds the `flock` budget, not the
+        // daemon's: the peaks below would not prove anything about it.
+        assert!(!stderr(&out).contains("in-process"), "{}", stderr(&out));
     }
     let (mut current, mut peak) = (0i32, 0i32);
     for line in fs::read_to_string(&log).unwrap().lines() {
@@ -591,11 +622,7 @@ fn install_and_uninstall_are_idempotent_and_leave_foreign_files_alone() {
     );
 
     // A command dropped from the heavy list loses its shim on the next install.
-    fs::write(
-        s.sb.home.join(".config/sluice/config.toml"),
-        "version = 1\n[agent]\nheavy_commands = [\"make\"]\n",
-    )
-    .unwrap();
+    s.sb.write_user_config("[agent]\nheavy_commands = [\"make\"]\n");
     let out = s.sluice(&["shim", "install"]);
     assert!(out.status.success(), "{out:?}");
     let mut left: Vec<String> = fs::read_dir(&s.dir)

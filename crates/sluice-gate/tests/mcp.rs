@@ -239,11 +239,7 @@ cmd = "sleep 2.5"
 cmd = "echo $$ > \"$SLUICE_TEST_COUNTER.pid\"; exec sleep 30"
 "#,
     );
-    fs::write(
-        sb.home.join(".config/sluice/config.toml"),
-        "version = 1\n[mcp]\nprogress_interval = \"1s\"\n",
-    )
-    .expect("user config");
+    sb.write_user_config("[mcp]\nprogress_interval = \"1s\"\n");
     let counter = Counter::default();
     let client = connect(&sb, counter.clone()).await;
     let dir = repo_arg(&sb);
@@ -428,11 +424,7 @@ async fn timeout_seconds_and_logs_limits() {
 // ---------------------------------------------------------------- merge queue
 
 fn write_user_queue_config(sb: &Sandbox, body: &str) {
-    fs::write(
-        sb.home.join(".config/sluice/config.toml"),
-        format!("version = 1\n[queue]\n{body}"),
-    )
-    .expect("user config");
+    sb.write_user_config(&format!("[queue]\n{body}"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

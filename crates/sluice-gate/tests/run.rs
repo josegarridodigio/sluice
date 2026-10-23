@@ -467,11 +467,7 @@ cmd = "sleep 1"
 cmd = "sleep 1"
 "#,
     );
-    fs::write(
-        sb.home.join(".config/sluice/config.toml"),
-        "version = 1\n[daemon]\nbudget = 1\n",
-    )
-    .unwrap();
+    sb.write_user_config("[daemon]\nbudget = 1\n");
     let start = Instant::now();
     let a = {
         let mut cmd = sb.sluice();

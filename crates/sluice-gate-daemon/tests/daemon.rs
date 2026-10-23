@@ -1164,6 +1164,7 @@ async fn a_late_coalescer_gets_started() {
 
 fn git_in(dir: &Path, args: &[&str]) {
     let status = std::process::Command::new("git")
+        .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "T")

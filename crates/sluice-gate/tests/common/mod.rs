@@ -10,6 +10,9 @@ use std::process::Command as StdCommand;
 use assert_cmd::Command;
 use tempfile::TempDir;
 
+/// Options for the test's own git calls: no auto-maintenance, no `gc --auto`.
+pub const NO_AUTO_MAINTENANCE: [&str; 4] = ["-c", "maintenance.auto=false", "-c", "gc.auto=0"];
+
 /// A temporary HOME / XDG layout plus one repository with a `.sluice.toml`.
 pub struct Sandbox {
     pub root: TempDir,
@@ -37,6 +40,7 @@ impl Sandbox {
             repo,
             counter,
         };
+        sb.write_user_config("");
         sb.git(&["init", "-q", "-b", "main"]);
         sb.git(&["config", "user.name", "Test"]);
         sb.git(&["config", "user.email", "test@example.com"]);
@@ -71,6 +75,25 @@ timeout = "1s"
         )
     }
 
+    /// Writes the user config (`version = 1` is prepended). Unless `body`
+    /// has its own `[admission]` table, PSI admission is off: the daemon
+    /// reads the machine-wide `/proc/pressure`, and on a loaded runner
+    /// (`cpu some avg10` above 60 %) it would hold every gate until the
+    /// 5-minute starvation guard, so a test waiting seconds for a gate to
+    /// start fails for reasons outside the test.
+    pub fn write_user_config(&self, body: &str) {
+        let admission = if body.contains("[admission]") {
+            ""
+        } else {
+            "[admission]\npsi_enabled = false\n"
+        };
+        fs::write(
+            self.home.join(".config/sluice/config.toml"),
+            format!("version = 1\n{body}\n{admission}"),
+        )
+        .expect("user config");
+    }
+
     pub fn write_config(&self, body: &str) {
         fs::write(
             self.repo.join(".sluice.toml"),
@@ -80,8 +103,16 @@ timeout = "1s"
     }
 
     /// Runs git in the repository (or another directory).
+    ///
+    /// The test's own git calls never start git's auto-maintenance: since
+    /// git 2.55 a `commit` leaves a detached `maintenance run --auto` holding
+    /// `.git/objects/maintenance.lock` after it returns, which would race
+    /// with assertions on the object store. Only these setup calls get the
+    /// override (not the sandbox config or env), so what Sluice itself
+    /// spawns is still observed with git's defaults.
     pub fn git_in(&self, dir: &Path, args: &[&str]) -> String {
         let out = StdCommand::new("git")
+            .args(NO_AUTO_MAINTENANCE)
             .args(args)
             .current_dir(dir)
             .env_clear()

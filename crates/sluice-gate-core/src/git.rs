@@ -41,9 +41,25 @@ fn non_empty<'a>(env: &'a EnvMap, key: &str) -> Option<&'a str> {
     env.get(key).map(String::as_str).filter(|v| !v.is_empty())
 }
 
+/// Global options every git process Sluice spawns gets: no automatic
+/// maintenance and no `gc --auto`. `commit`, `merge` and `fetch` (the merge
+/// queue runs the last two against the user's object store) otherwise start
+/// `git maintenance run --auto`, which may repack or prune the user's
+/// objects and, since git 2.55, holds `objects/maintenance.lock` from a
+/// detached child after git itself has exited. `-c` also reaches git's own
+/// subprocesses (through `GIT_CONFIG_PARAMETERS`).
+pub const NO_AUTO_MAINTENANCE: [&str; 4] = ["-c", "maintenance.auto=false", "-c", "gc.auto=0"];
+
+/// A bare `git` command carrying [`NO_AUTO_MAINTENANCE`].
+fn git_binary() -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(NO_AUTO_MAINTENANCE);
+    cmd
+}
+
 /// Spawns git and collects its output. Spawn failure maps to [`Error::GitMissing`].
 pub(crate) fn output(args: &[&str], cwd: &Path, env: &EnvMap, read_only: bool) -> Result<Output> {
-    let mut cmd = Command::new("git");
+    let mut cmd = git_binary();
     if read_only {
         cmd.arg("--no-optional-locks");
     }
@@ -63,7 +79,7 @@ pub(crate) fn output(args: &[&str], cwd: &Path, env: &EnvMap, read_only: bool) -
 /// everything else uses [`run`] or [`run_output`].
 #[must_use]
 pub fn command(args: &[&str], cwd: &Path, env: &EnvMap) -> Command {
-    let mut cmd = Command::new("git");
+    let mut cmd = git_binary();
     cmd.args(args)
         .current_dir(cwd)
         .env_clear()
@@ -497,8 +513,12 @@ pub(crate) mod test_support {
     }
 
     /// Runs git in `dir` with `env`, panicking on failure; returns trimmed stdout.
+    ///
+    /// Setup commits never start git's (detached) auto-maintenance, so tests
+    /// that compare `.git/objects` before and after see only Sluice's effect.
     pub fn git_with(dir: &Path, env: &EnvMap, args: &[&str]) -> String {
         let out = Command::new("git")
+            .args(super::NO_AUTO_MAINTENANCE)
             .args(["-c", "commit.gpgsign=false"])
             .args(args)
             .current_dir(dir)
@@ -591,6 +611,40 @@ mod tests {
         git(&root, &["commit", "-q", "-m", "c"]);
         let expected = git(&root, &["rev-parse", "HEAD^{tree}"]);
         assert_eq!(head_tree(&paths, &env).unwrap().unwrap().as_str(), expected);
+    }
+
+    /// Every git Sluice spawns (here a `commit`, `merge` and `fetch` like
+    /// the merge queue's) never starts git's automatic maintenance or gc in
+    /// the user's repository.
+    #[test]
+    fn spawned_git_never_starts_auto_maintenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        init_repo(&root);
+        let trace = root.join("trace.txt");
+        let mut env = base_env();
+        env.insert("GIT_TRACE".into(), trace.display().to_string());
+        std::fs::write(root.join("b.txt"), "two\n").unwrap();
+        run(&["add", "b.txt"], &root, &env, false).unwrap();
+        run(&["commit", "-q", "-m", "second"], &root, &env, false).unwrap();
+        run(
+            &["checkout", "-q", "-b", "side", "HEAD~1"],
+            &root,
+            &env,
+            false,
+        )
+        .unwrap();
+        run(&["merge", "-q", "--no-edit", "main"], &root, &env, false).unwrap();
+        let origin = root.display().to_string();
+        run(&["fetch", "-q", &origin, "main"], &root, &env, false).unwrap();
+        let mut cmd = command(&["commit", "-q", "--allow-empty", "-m", "e"], &root, &env);
+        assert!(cmd.status().unwrap().success());
+        let trace = std::fs::read_to_string(&trace).unwrap();
+        assert!(trace.contains("built-in: git commit"), "{trace}");
+        assert!(
+            !trace.contains("maintenance") && !trace.contains(" gc "),
+            "auto-maintenance was started:\n{trace}"
+        );
     }
 
     #[test]

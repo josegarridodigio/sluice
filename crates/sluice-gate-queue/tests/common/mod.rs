@@ -47,7 +47,9 @@ pub fn git_env(home: &Path) -> EnvMap {
 }
 
 pub fn git_in(dir: &Path, env: &EnvMap, args: &[&str]) -> String {
+    // No (detached) auto-maintenance from the test's own commits and pushes.
     let out = Command::new("git")
+        .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
         .args(["-c", "commit.gpgsign=false"])
         .args(args)
         .current_dir(dir)

@@ -244,12 +244,17 @@ fn a_restarted_daemon_kills_the_gates_a_dead_daemon_left_behind() {
     sigkill(daemon);
     let (status, _, stderr) = client.finish();
     assert_eq!(status.code(), Some(143), "{stderr}");
-    thread::sleep(Duration::from_millis(500));
+    // Daemon and reaper are both gone (observed, not slept for): nothing
+    // else can kill the gate before the restart.
+    assert!(wait_for(LIMIT, || stat_fields(daemon)
+        .is_none_or(|f| f.first().is_some_and(|s| s == "Z"))));
     assert_eq!(
         live("sleep 315.2").len(),
         3,
         "the orphaned gate must still be running before the restart"
     );
+    // `sluice daemon` returns once it has forked; the new daemon kills the
+    // orphans and closes their rows before it binds its socket.
     sb.sluice().arg("daemon").assert().success();
     assert!(
         wait_for(LIMIT, || live("sleep 315.2").is_empty()),
@@ -272,7 +277,16 @@ fn a_restarted_daemon_kills_the_gates_a_dead_daemon_left_behind() {
     let row = newest().expect("the interrupted job");
     assert_eq!(row.gate, "long");
     assert_eq!(row.outcome.as_deref(), Some("killed"));
-    let status = sb.status_json();
+    // Reconciliation precedes the bind (CI flake: `status` ran in between
+    // and saw `"daemon": null`): wait for the daemon to answer.
+    let mut status = serde_json::Value::Null;
+    assert!(
+        wait_for(LIMIT, || {
+            status = sb.status_json();
+            status["daemon"].is_object()
+        }),
+        "the restarted daemon never answered: {status}"
+    );
     assert_eq!(status["running"].as_array().map(Vec::len), Some(0));
 }
 

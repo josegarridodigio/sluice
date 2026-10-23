@@ -62,11 +62,7 @@ fn enqueue_on_a_detached_head_fails_without_contacting_the_daemon() {
 #[test]
 fn a_daemon_with_the_queue_disabled_answers_not_supported() {
     let sb = Sandbox::standard();
-    std::fs::write(
-        sb.home.join(".config/sluice/config.toml"),
-        "version = 1\n[queue]\nenabled = false\n",
-    )
-    .expect("user config");
+    sb.write_user_config("[queue]\nenabled = false\n");
     for args in [
         &["queue", "enqueue"][..],
         &["queue", "status"],
