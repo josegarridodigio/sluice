@@ -23,6 +23,7 @@ mod logging;
 mod logs;
 mod queue;
 mod run;
+mod session_start;
 mod shim;
 mod snippets;
 mod status;
@@ -146,6 +147,12 @@ enum Command {
         /// Accepted for the plugin's hook script (the hook JSON is always read on stdin).
         #[arg(long)]
         hook: bool,
+    },
+    /// Internal: hooks of the agent plugin.
+    #[command(hide = true)]
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
     },
     /// Shell shims: route heavy commands of agents that only have a shell through the queue.
     ///
@@ -316,6 +323,18 @@ enum ShimCommand {
         /// Its arguments (after `--`).
         #[arg(last = true)]
         args: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentCommand {
+    /// `SessionStart` hook: install the shims, put them first in the agent's PATH through
+    /// `$CLAUDE_ENV_FILE` and print the rules as additional context. Reads the hook JSON on
+    /// stdin. Never fails: any error prints nothing and exits 0.
+    SessionStart {
+        /// Version of the plugin that calls this (informational).
+        #[arg(long, value_name = "X.Y.Z")]
+        plugin_version: String,
     },
 }
 
@@ -491,6 +510,9 @@ fn main() -> ExitCode {
         } => logs::timeline(job_id.as_deref(), &since),
         Command::Logs { job_id, lines, .. } => logs::show(job_id.as_deref(), lines),
         Command::Guard { hook: _ } => guard::run_hook(),
+        Command::Agent {
+            command: AgentCommand::SessionStart { plugin_version },
+        } => session_start::run_hook(&plugin_version),
         Command::Shim { command } => match command {
             ShimCommand::Install { dir, force } => shim::install(dir.as_deref(), force),
             ShimCommand::Uninstall { dir } => shim::uninstall(dir.as_deref()),

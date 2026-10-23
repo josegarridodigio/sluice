@@ -8,7 +8,7 @@
     {
       "name": "sluice",
       "source": "./plugin",
-      "description": "Verify each git tree once: the sluice MCP server, a skill that teaches agents the verify and merge-queue flow, and a guard hook for raw test commands"
+      "description": "Verify each git tree once: the sluice MCP server, a skill that teaches agents the verify and merge-queue flow, a session hook that sets up the shell shims and the agent rules, and a guard hook for raw test commands"
     }
   ]
 }

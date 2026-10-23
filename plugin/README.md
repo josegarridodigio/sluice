@@ -25,8 +25,10 @@ or from a shell: `claude plugin marketplace add josegarridodigio/sluice` and
 step. Run `/reload-plugins` (or restart) and check `claude mcp list`: the
 `plugin:sluice:sluice` server should be connected.
 
-The repository must have a `.sluice.toml` (`sluice init`). Nothing else has to
-be added to its `CLAUDE.md`.
+Nothing else has to be added to `CLAUDE.md` or `PATH`: when a session starts,
+the plugin installs the shell shims, puts them first in the session's `PATH`
+and gives the agent the rules. In a git repository without a `.sluice.toml`
+the agent offers to run `sluice init` and asks you first.
 
 ## What is inside
 
@@ -34,6 +36,7 @@ be added to its `CLAUDE.md`.
 |---|---|---|
 | MCP server | `.mcp.json` | Registers `sluice mcp`. Tools: `verify`, `status`, `gate_list`, `logs`, `queue_enqueue`, `queue_status`, `queue_approve`, `queue_retry`, `queue_cancel`. From a plugin they are named `mcp__plugin_sluice_sluice__<tool>`; use that form in permission rules. |
 | Skill | `skills/sluice/SKILL.md` (+ `reference.md`) | Loaded when the agent is about to run tests, linters or type checks, commit, push or land a branch in a repository with a `.sluice.toml`. Teaches `verify`, reading its result, exit code 3 from hooks, and the merge-queue flow (verify, `queue_enqueue`, stop, never approve). |
+| Session hook | `hooks/hooks.json`, `hooks/session-start.sh` | `SessionStart` (`startup`, `resume`, `clear`, `compact`). Runs `sluice agent session-start`: installs the shims in `~/.local/share/sluice/shims`, prepends that directory to the session's `PATH` through `CLAUDE_ENV_FILE` (once) and adds the rules as context. A missing or older `sluice` is reported to the agent, which asks you before installing or updating. Test: `hooks/test-session-start.sh`. |
 | Guard hook | `hooks/hooks.json`, `hooks/guard.sh` | `PreToolUse` on `Bash`. Runs `sluice guard`: rewrites gate commands to `sluice run <gate> -v` and heavy commands (builds, test runners) to `sluice exec -- ...` so they share the machine's budget, as `allow` or `ask` depending on your permission settings; denies `sluice queue approve` and raw gate commands it does not rewrite. Falls back to the 0.2.0 deny-only shell logic with an older `sluice`. |
 
 ### The guard hook

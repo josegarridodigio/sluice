@@ -59,6 +59,24 @@ e2e   FAIL exit=1 12.3s (job 1761...) log=/home/u/.local/state/sluice/logs/1761.
 Error codes: `conflict-state`, `stale-plan`, `duplicate-branch`, `not-allowed`,
 `not-supported`. Report them to the human.
 
+## Session start and shims
+
+The plugin's `SessionStart` hook (`startup`, `resume`, `clear`, `compact`)
+runs `sluice agent session-start`. It installs the shell shims in
+`$XDG_DATA_HOME/sluice/shims` (default `~/.local/share/sluice/shims`), puts
+that directory first in the session's `PATH` (through the session env file,
+once, also after `--resume`) and adds the rules to your context. The shims
+apply to every Bash command, background command and subagent of the session,
+in every repository, with or without a `.sluice.toml`. `sluice shim status`
+shows whether they are first in `PATH`. Commands run by absolute path or
+under `env -i` bypass them. A human can turn them off with `SLUICE_SHIMS=0`.
+
+Context variants: repository with `.sluice.toml` (rules and gate names); git
+repository without it (propose Sluice once: `sluice init --dry-run`, show
+the output, `sluice init` only after the user agrees); anything else (one
+line). A missing or older binary yields a note asking you to tell the user
+and, only with their consent, run the installer or `sluice update`.
+
 ## Troubleshooting
 
 - Tools missing: Sluice is not installed or not in the `PATH` Claude Code
