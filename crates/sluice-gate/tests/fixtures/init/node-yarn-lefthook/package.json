@@ -1,0 +1,8 @@
+{
+  "name": "node-yarn-app",
+  "version": "1.0.0",
+  "scripts": {
+    "lint": "eslint .",
+    "test": "jest --ci"
+  }
+}

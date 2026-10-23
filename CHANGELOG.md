@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Golden files recorded from the 0.3.0 release binary, read by the
   compatibility tests next to 0.1.0 and 0.2.0.
+- `weight = "auto"` for gates: the ceiling is half the daemon's budget and
+  learned weights lower it, so there is no number to guess. A declared number
+  stays a ceiling and an omitted `weight` stays 1. A `.sluice.toml` that uses
+  `"auto"` needs 0.4.0 (older binaries accept only integers).
+- `sluice exec` jobs learn their weight from the measured demand after three
+  runs, per repository and `--label`; `--weight` or `[agent] exec_weight` is
+  the ceiling.
+- `sluice status` shows configured and effective weights (`weight auto→5`);
+  its JSON gains the optional `weight_effective` and `weight_auto` (schema 1).
 - The built-in heavy list knows the Angular CLI, Nx, Turborepo, Playwright,
   Cypress, react-scripts, Astro, Nuxt, .NET, Bazel, Ninja and `cmake --build`,
   so the guard and the shims catch them with no user config. Dev servers and
@@ -31,8 +40,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent proposes `sluice init` to the user once. A missing or older `sluice`
   binary is reported to the agent, which asks the user before installing or
   updating. Users no longer edit `PATH` or their `CLAUDE.md`.
+- `sluice init` detects the stack and the existing hooks. It takes gates from
+  the heavy commands of husky, lefthook, pre-commit framework and plain hooks,
+  fills the rest from Angular, Node (npm/pnpm/yarn/bun), Rust, Python and Go
+  projects, picks weights (`"auto"` for test runners) and timeouts, and
+  rewires the hooks in place to `sluice run --hook <hook> <gate>` (comments,
+  mode and CRLF kept; formatters and fixers untouched). With no hook manager
+  it creates `.githooks/` and sets `core.hooksPath` locally. `--dry-run`
+  prints the gates, the files and the diff and writes nothing; `--force` is
+  idempotent.
 
 ### Changed
+
+- `sluice init` outside a git repository is now an error, and writes at the
+  repository root instead of the current directory.
 
 ### Fixed
 

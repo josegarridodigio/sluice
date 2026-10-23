@@ -440,7 +440,11 @@ fn to_request(m: RunMaterial) -> RunRequest {
         gate: GateSpec {
             name: m.gate_name,
             cmd: m.gate.cmd,
-            weight: m.gate.weight,
+            weight: m
+                .gate
+                .weight
+                .ceiling(sluice_gate_core::cpus::default_budget()),
+            weight_auto: m.gate.weight.is_auto(),
             timeout_ms: m.timeout_ms,
             env: m.gate.env,
             cache: m.gate.cache,
@@ -1169,10 +1173,14 @@ impl Server {
     ) -> Result<CallToolResult, McpError> {
         let dir = workdir(&params.working_directory)?;
         let env = Arc::clone(&self.env);
-        let (root, config) = blocking(move || {
+        let (root, config, budget) = blocking(move || {
             let paths = git::discover(&dir, &env).map_err(|e| e.to_string())?;
             let config = RepoConfig::load(&paths.toplevel).map_err(|e| e.to_string())?;
-            Ok::<_, String>((paths.toplevel, config))
+            let budget = UserConfig::load(&env).map_or_else(
+                |_| sluice_gate_core::cpus::default_budget(),
+                |u| u.daemon.budget,
+            );
+            Ok::<_, String>((paths.toplevel, config, budget))
         })
         .await?
         .map_err(invalid)?;
@@ -1182,7 +1190,7 @@ impl Server {
             .map(|(name, g)| GateInfo {
                 name: name.clone(),
                 cmd: g.cmd.trim().to_owned(),
-                weight: g.weight,
+                weight: g.weight.ceiling(budget),
                 timeout_seconds: g.timeout.as_secs(),
                 hooks: g.hooks.clone(),
                 cache: g.cache,
@@ -1199,7 +1207,7 @@ impl Server {
                 "{:<width$}  {}  (weight {}, timeout {}, hooks: {}, cache {})",
                 g.name,
                 gate.normalized_cmd(),
-                g.weight,
+                gate.weight,
                 humantime::format_duration(gate.timeout),
                 if g.hooks.is_empty() {
                     "-".to_owned()

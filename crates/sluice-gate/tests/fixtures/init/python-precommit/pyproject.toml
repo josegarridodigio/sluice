@@ -1,0 +1,9 @@
+[project]
+name = "py-app"
+version = "0.1.0"
+
+[tool.ruff]
+line-length = 100
+
+[tool.mypy]
+strict = true

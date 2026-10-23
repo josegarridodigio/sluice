@@ -22,8 +22,9 @@ pub const LEARN_AFTER: usize = 3;
 /// Samples (most recent) a learned weight and an expected time look at.
 pub const LEARN_WINDOW: usize = 10;
 
-/// Key of a gate's learned statistics: repository identity, gate name and
-/// command hash. Jobs without a key (`exec`) never learn.
+/// Key of a job's learned statistics: repository identity (the canonical cwd
+/// outside a repository), gate name (`exec:<label>` for `sluice exec`) and
+/// command hash (empty for `exec`). Jobs without a key never learn.
 pub type LearnKey = (PathBuf, String, String);
 
 /// Learned weights by statistics key: the rounded P75 demand of the last
@@ -151,13 +152,16 @@ pub struct JobSpec {
     /// Configured weight after the budget and repository-cap clamp (set by
     /// [`Scheduler::enqueue`]).
     pub weight_cfg: u32,
+    /// The configured weight is `"auto"` (ADR-0015): `weight` on input is
+    /// already `ceil(budget / 2)` of this daemon. Only shown by `status`.
+    pub weight_auto: bool,
     /// Priority class.
     pub class: Class,
     /// Time the job was queued, unix milliseconds.
     pub queued_at: u64,
     /// Expected run time from history ([`expected_ms`]).
     pub expected_ms: Option<u64>,
-    /// Learned-statistics key; `None` for jobs that never learn (`exec`).
+    /// Learned-statistics key; `None` for jobs that never learn.
     pub learn_key: Option<LearnKey>,
     /// Measured demands of earlier runs of `learn_key` (milli-CPUs, oldest
     /// first) known at enqueue; they refresh the scheduler's learned weight
@@ -196,6 +200,8 @@ pub struct RunningView {
     pub weight: u32,
     /// Configured weight after the clamp.
     pub weight_cfg: u32,
+    /// The configured weight is `"auto"`.
+    pub weight_auto: bool,
     /// Start time, unix milliseconds.
     pub started_at: u64,
     /// Queue time, unix milliseconds.
@@ -222,6 +228,8 @@ pub struct QueuedView {
     pub weight: u32,
     /// Configured weight after the clamp.
     pub weight_cfg: u32,
+    /// The configured weight is `"auto"`.
+    pub weight_auto: bool,
     /// Queue time, unix milliseconds.
     pub queued_at: u64,
     /// Current subscribers.
@@ -1123,6 +1131,7 @@ impl Scheduler {
                 gate: j.spec.gate.clone(),
                 weight: j.spec.weight,
                 weight_cfg: j.spec.weight_cfg,
+                weight_auto: j.spec.weight_auto,
                 started_at: j.started_at,
                 queued_at: j.spec.queued_at,
                 subscribers: j.subscribers,
@@ -1154,6 +1163,7 @@ impl Scheduler {
                     gate: j.spec.gate.clone(),
                     weight,
                     weight_cfg: j.spec.weight_cfg,
+                    weight_auto: j.spec.weight_auto,
                     queued_at: j.spec.queued_at,
                     subscribers: j.subscribers,
                     reason: cause.reason(),

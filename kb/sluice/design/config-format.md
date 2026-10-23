@@ -67,7 +67,7 @@ Field reference:
 | `defaults.human_hook_policy` | enum | `wait` | |
 | `defaults.tail_lines` | int | unset | Overrides the user config's `cache.tail_lines` (40) for this repository. |
 | `gates.<name>.cmd` | string | required | Run with `sh -c` in the repo worktree root. |
-| `gates.<name>.weight` | int ≥ 1 | 1 | Budget units consumed while running. |
+| `gates.<name>.weight` | int ≥ 1 or `"auto"` | 1 | Budget units consumed while running; a ceiling that learned weights lower. `"auto"` (0.4.0, ADR-0015) is `ceil(budget / 2)` of the admitting daemon. Omitted stays 1. Other strings are rejected: `invalid weight "x": use an integer >= 1 or "auto"`. |
 | `gates.<name>.timeout` | duration | `30m` | Execution time only; queue wait does not count. Formats: `90s`, `5m`, `1h`. |
 | `gates.<name>.hooks` | list | `[]` | Hook names this gate is meant for. Free-form, but `pre-commit` and `pre-push` are recognised by `sluice hook print`. |
 | `gates.<name>.key_inputs` | list of commands | `[]` | Each command's stdout (via `sh -c` in the worktree root, stderr discarded) is part of the key. Keep them fast; they run on every invocation that consults the cache, including hits. A failing command makes the run uncached (notice on stderr), never a gate failure. |
@@ -94,7 +94,7 @@ Rules:
 - `version` must be `1` (`unsupported version N: `version` must be 1
   (supported versions: 1)` otherwise; the same check applies to the user
   config); `cmd` must be
-  non-empty after trimming; `weight >= 1`; `key_files` must be relative
+  non-empty after trimming; `weight >= 1` or `"auto"`; `key_files` must be relative
   paths without `..`; `depends_on` entries must name existing gates other
   than the gate itself; `human_hook_policy` may not be `fail-fast`.
   `[defaults]` and `[gates]` are optional; a file with only `version = 1`
@@ -185,7 +185,7 @@ env_any_equals = {}               # e.g. { CLAUDE_CODE_ENTRYPOINT = "cli" }
 [agent]                            # optional; needs sluice >= 0.3.0 (older binaries reject the table)
 # heavy_commands = ["make", "cargo build"]  # replaces the built-in heavy-command list when present
 heavy_commands_extra = []         # appended to the (default or replaced) list, e.g. ["bazel build"]
-exec_weight = 0                   # default `sluice exec` weight; 0 = ceil(budget / 2)
+exec_weight = 0                   # default `sluice exec` weight (ceiling, learned down since 0.4.0); 0 = ceil(budget / 2)
 
 [repos."/home/jose/Escritorio/Proyectos/foo"]
 budget_share_max = 4       # optional per-repo cap

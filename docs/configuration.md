@@ -61,7 +61,7 @@ Gate names match `[a-z0-9][a-z0-9_-]*` and are at most 64 characters.
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `cmd` | string | required | Run with `sh -c` in the worktree root. Must not be empty. |
-| `weight` | int >= 1 | `1` | Budget units consumed while running. Roughly the number of CPU threads the gate uses. |
+| `weight` | int >= 1 or `"auto"` | `1` | Budget units consumed while running, at most: the number is a ceiling that learned weights only lower. Roughly the number of CPU threads the gate uses. `"auto"` (0.4.0) uses `ceil(budget / 2)` of the daemon that admits the job and learns from there, so you need not guess; an omitted `weight` stays `1`. |
 | `timeout` | duration | `30m` | Execution time only; queue wait does not count. Formats such as `90s`, `5m`, `1h`. |
 | `hooks` | list | `[]` | Hook names this gate is meant for. Free-form; `pre-commit` and `pre-push` are recognised by `sluice hook print`. `verify` without an explicit gate list runs the gates whose `hooks` contain `pre-commit`. |
 | `key_inputs` | list of commands | `[]` | The stdout of each command (`sh -c` in the worktree root) is folded into the cache key. They run on every cache consultation, hits included, so keep them fast. A failing command makes the run uncached, never a gate failure. |
@@ -207,7 +207,7 @@ budget_share_max = 4
 | `admission.memory_some_avg10_low` | `5.0` | Percent: over-admission only below this memory pressure. |
 | `admission.overcommit_interval` | `5s` | At most one over-admission per interval, and none sooner than this after PSI stopped blocking. Must be > 0. |
 | `scheduler.head_reserve_after` | `30s` | Backfill behind the queue head only this long; also the ageing bound: a job waiting longer goes ahead of everything else, in arrival order. |
-| `scheduler.learned_weights` | `true` | After 3 runs, a gate holds the 75th percentile of its measured CPU demand (CPU plus run-queue wait over wall time, last 10 runs), never more than its `weight` and never less than a quarter of it. `sluice exec` jobs keep their weight. |
+| `scheduler.learned_weights` | `true` | After 3 runs, a gate holds the 75th percentile of its measured CPU demand (CPU plus run-queue wait over wall time, last 10 runs), never more than its `weight` (for `"auto"`, half the budget) and never less than a quarter of it. `sluice exec` jobs learn the same way, per repository and `--label`, starting from their `--weight` or `agent.exec_weight`. |
 | `scheduler.fairness` | `"lane"` | `lane`: at equal priority, worktrees take turns (a worktree with jobs running or several queued goes behind the others). `off`: arrival order. |
 | `scheduler.human_first` | `true` | Jobs a person waits for (`sluice run` from a terminal, human hooks) go before agent jobs. |
 | `scheduler.order` | `"fifo"` | `fifo` or `sjf` (shortest expected job first with ageing: highest `(waited + expected) / expected` next, expected = median of the gate's last runs, 60 s when unknown). |
@@ -225,7 +225,7 @@ budget_share_max = 4
 | `agent_detection.env_any_equals` | `{}` | Variable/value pairs that mean agent, for example `{ CLAUDE_CODE_ENTRYPOINT = "cli" }`. |
 | `agent.heavy_commands` | built-in list | Replaces the list of commands that the plugin guard rewrites to `sluice exec` and that the shell shims route through the queue. Entries are command words (`cargo build`, `docker compose build`), compared after package-manager equivalences (`pnpm build`, `npm run build` and `yarn build` are all `run build`). The built-in list: `docker build`, `docker buildx build`, `docker compose build`, `run build`, `cargo build`, `cargo test`, `cargo clippy`, `cargo nextest`, `go build`, `go test`, `make`, `gradle`, `mvn`, `tsc`, `vite build`, `webpack`, `next build`, `pytest`, `jest`, `vitest`. Entries must not be empty, contain control characters or have more than 8 words; at most 256 entries with `heavy_commands_extra`. |
 | `agent.heavy_commands_extra` | `[]` | Appended to the built-in (or replaced) list. |
-| `agent.exec_weight` | `0` | Default weight of `sluice exec` when `--weight` is absent; `0` means `ceil(budget / 2)`. |
+| `agent.exec_weight` | `0` | Default weight (ceiling) of `sluice exec` when `--weight` is absent; `0` means `ceil(budget / 2)`. Since 0.4.0 the daemon lowers it after 3 runs of the same repository and label, from the measured demand (never below a quarter of it). |
 | `repos."<path>".budget_share_max` | unset | Optional cap on the budget one repository may use at once. Must be >= 1. |
 
 The daemon reads `[daemon]`, `[scheduler]`, `[admission]`, `[repos]`, `[queue]`,

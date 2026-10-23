@@ -15,8 +15,9 @@ from the released binaries (see [Proof](#proof)).
    queue since 0.2.0).
 2. Changes are additive only: new optional fields, new optional messages
    negotiated through the daemon handshake, new subcommands and flags, new
-   tables or nullable columns. Nothing is renamed, removed, retyped,
-   re-nested or given another meaning.
+   tables or nullable columns, and new accepted values of an existing key
+   (`weight = "auto"`, 0.4.0; every value valid before keeps its meaning).
+   Nothing is renamed, removed, retyped, re-nested or given another meaning.
 3. A breaking change needs all three of: a new version number for that
    interface, a migration path (automatic where data is involved) and one
    release of deprecation warnings before it happens.
@@ -53,7 +54,8 @@ is a new format and comes with a migration note and a warning release.
 Old binaries read new data like this: parsing is strict (unknown keys are an
 error), so **an older binary rejects a config that uses a newer option**. For
 example 0.1.0 rejects a `[queue]` table, and 0.2.0 will reject options added in
-0.3.0. If several versions share a repository, avoid the new keys until
+0.3.0. The same holds for a new value of an existing key: `weight = "auto"`
+(0.4.0) is rejected by 0.3.0 and older, which accept only integers. If several versions share a repository, avoid the new keys until
 everyone has upgraded.
 
 ### User config `~/.config/sluice/config.toml`

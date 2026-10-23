@@ -54,6 +54,18 @@ fn in_dir(dir: &tempfile::TempDir, args: &[&str]) -> assert_cmd::assert::Assert 
     sluice().current_dir(dir.path()).args(args).assert()
 }
 
+/// A temporary directory that is a repository (`init` needs one).
+fn repo_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .expect("spawn git");
+    assert!(status.success());
+    dir
+}
+
 #[test]
 fn hook_print_without_config_shows_example() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -67,7 +79,7 @@ fn hook_print_without_config_shows_example() {
 
 #[test]
 fn init_creates_config_and_refuses_overwrite() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = repo_dir();
     in_dir(&dir, &["init"])
         .success()
         .stdout(predicate::str::contains("sluice: wrote .sluice.toml"))
@@ -83,7 +95,7 @@ fn init_creates_config_and_refuses_overwrite() {
 
 #[test]
 fn hook_print_after_init_uses_config_hooks() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = repo_dir();
     in_dir(&dir, &["init"]).success();
     let assert = in_dir(&dir, &["hook", "print", "pre-commit"]).success();
     let out = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8");
@@ -96,7 +108,7 @@ fn hook_print_after_init_uses_config_hooks() {
 
 #[test]
 fn hook_print_lefthook_and_plain_have_expected_lines() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = repo_dir();
     in_dir(&dir, &["init"]).success();
     in_dir(&dir, &["hook", "print", "lefthook"])
         .success()

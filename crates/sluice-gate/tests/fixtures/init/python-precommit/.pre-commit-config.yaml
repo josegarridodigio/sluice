@@ -1,0 +1,18 @@
+repos:
+  - repo: https://example.com/ruff-pre-commit
+    rev: v0.5.0
+    hooks:
+      - id: ruff
+        entry: pytest -q
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest
+        entry: pytest -q
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+      - id: pytest-fast
+        name: pytest fast
+        entry: python -m pytest -x
+        language: system

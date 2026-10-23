@@ -147,7 +147,7 @@ fn render(r: &StatusReport, log_path: &Path, socket_fallback: Option<&str>) -> S
             "  {:<16} {:<20} weight {:<2} {:>8}  {} subscriber(s)  job {}",
             j.gate,
             basename(&j.repo),
-            j.weight,
+            weight_text(j.weight, j.weight_cfg, j.weight_auto),
             dur(j.elapsed_ms),
             j.subscribers,
             j.job_id
@@ -168,7 +168,7 @@ fn render(r: &StatusReport, log_path: &Path, socket_fallback: Option<&str>) -> S
             j.rank.unwrap_or(i + 1),
             j.gate,
             basename(&j.repo),
-            j.weight,
+            weight_text(j.weight, j.weight_cfg, j.weight_auto),
             dur(j.waiting_ms),
             reason(j.reason)
         );
@@ -201,6 +201,20 @@ fn render(r: &StatusReport, log_path: &Path, socket_fallback: Option<&str>) -> S
     out
 }
 
+/// The weight of a job as `configured→effective`: `auto→5` for
+/// `weight = "auto"`, `10→3` when learning lowered a declared 10, and just
+/// the number when both agree (or an older daemon sent no configured one).
+fn weight_text(effective: u32, configured: Option<u32>, auto: Option<bool>) -> String {
+    if auto == Some(true) {
+        format!("auto\u{2192}{effective}")
+    } else {
+        match configured.filter(|c| *c != effective) {
+            Some(c) => format!("{c}\u{2192}{effective}"),
+            None => effective.to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +226,31 @@ mod tests {
         assert_eq!(dur(12_300), "12.3s");
         assert_eq!(dur(245_000), "4m05s");
         assert_eq!(dur(7_800_000), "2h10m");
+    }
+
+    #[test]
+    fn weights_show_configured_and_effective() {
+        assert_eq!(weight_text(4, None, None), "4");
+        assert_eq!(weight_text(4, Some(4), None), "4");
+        assert_eq!(weight_text(3, Some(10), None), "10\u{2192}3");
+        assert_eq!(weight_text(5, Some(10), Some(true)), "auto\u{2192}5");
+        let mut r = StatusReport::default();
+        r.running.push(RunningJob {
+            gate: "test".into(),
+            weight: 5,
+            weight_cfg: Some(10),
+            weight_auto: Some(true),
+            ..RunningJob::default()
+        });
+        r.queued.push(QueuedJob {
+            gate: "build".into(),
+            weight: 3,
+            weight_cfg: Some(10),
+            ..QueuedJob::default()
+        });
+        let text = render(&r, Path::new("/s/daemon.log"), None);
+        assert!(text.contains("weight auto\u{2192}5"), "{text}");
+        assert!(text.contains("weight 10\u{2192}3"), "{text}");
     }
 
     #[test]

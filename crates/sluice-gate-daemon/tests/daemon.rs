@@ -192,6 +192,7 @@ fn run_msg(
                 name: gate.to_owned(),
                 cmd: cmd.to_owned(),
                 weight: 1,
+                weight_auto: false,
                 timeout_ms,
                 env: BTreeMap::new(),
                 cache: key.is_some(),

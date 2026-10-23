@@ -398,9 +398,15 @@ pub struct GateSpec {
     pub name: String,
     /// Configured command.
     pub cmd: String,
-    /// Scheduler weight (budget units).
+    /// Scheduler weight (budget units). With `weight_auto` it is the
+    /// ceiling the client computed from its own budget; daemons that
+    /// predate `weight_auto` use it as a declared weight.
     #[serde(default)]
     pub weight: u32,
+    /// `weight = "auto"` in the gate: the daemon replaces `weight` with
+    /// `ceil(budget / 2)` of its own budget. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub weight_auto: bool,
     /// Timeout in milliseconds.
     #[serde(default)]
     pub timeout_ms: u64,
@@ -816,6 +822,14 @@ pub struct RunningJob {
     /// Configured weight (after the clamp); `weight` is the effective one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub weight_cfg: Option<u32>,
+    /// The effective weight (same value as `weight`, named explicitly for
+    /// consumers that show configured and effective side by side).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight_effective: Option<u32>,
+    /// True when the gate is configured with `weight = "auto"`; omitted
+    /// otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight_auto: Option<bool>,
     /// Milliseconds the job waited in the queue before it started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waited_ms: Option<u64>,
@@ -823,7 +837,7 @@ pub struct RunningJob {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admission: Option<String>,
     /// Measured demand so far (CPU time plus run-queue wait over wall time,
-    /// in CPUs); gates only.
+    /// in CPUs); gates and `exec` jobs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub demand: Option<f64>,
 }
@@ -866,6 +880,13 @@ pub struct QueuedJob {
     /// Configured weight (after the clamp); `weight` is the effective one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub weight_cfg: Option<u32>,
+    /// The effective weight (same value as `weight`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight_effective: Option<u32>,
+    /// True when the gate is configured with `weight = "auto"`; omitted
+    /// otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight_auto: Option<bool>,
     /// Detail of `reason` when the job would fit but higher-ranked jobs
     /// took the room: `outranked`, `lane` or `human-first`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1251,6 +1272,7 @@ mod tests {
                 name: "test".into(),
                 cmd: "npm test".into(),
                 weight: 4,
+                weight_auto: false,
                 timeout_ms: 1_200_000,
                 env: BTreeMap::from([("NODE_ENV".into(), "test".into())]),
                 cache: true,

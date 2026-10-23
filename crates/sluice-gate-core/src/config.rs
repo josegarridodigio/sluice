@@ -181,8 +181,94 @@ impl Default for Defaults {
     }
 }
 
-fn default_weight() -> u32 {
-    1
+fn default_weight() -> Weight {
+    Weight::Fixed(1)
+}
+
+/// The `weight` of a gate: an integer ceiling or `"auto"` (ADR-0015).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Weight {
+    /// A declared number of budget units, at least 1. Learned weights only
+    /// lower it.
+    Fixed(u32),
+    /// `ceil(budget / 2)` of the daemon that admits the job; learned weights
+    /// lower it like any ceiling.
+    Auto,
+}
+
+impl Weight {
+    /// The ceiling for a daemon whose budget is `budget` units.
+    pub fn ceiling(self, budget: u32) -> u32 {
+        match self {
+            Self::Fixed(n) => n,
+            Self::Auto => auto_ceiling(budget),
+        }
+    }
+
+    /// Whether this is `"auto"`.
+    pub fn is_auto(self) -> bool {
+        self == Self::Auto
+    }
+}
+
+/// The ceiling of `weight = "auto"`: `ceil(budget / 2)`, at least 1.
+pub fn auto_ceiling(budget: u32) -> u32 {
+    budget.div_ceil(2).max(1)
+}
+
+impl std::fmt::Display for Weight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fixed(n) => write!(f, "{n}"),
+            Self::Auto => f.write_str("auto"),
+        }
+    }
+}
+
+impl Serialize for Weight {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Fixed(n) => s.serialize_u32(*n),
+            Self::Auto => s.serialize_str("auto"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Weight {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = Weight;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an integer >= 1 or the string \"auto\"")
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> std::result::Result<Weight, E> {
+                // 0 parses and is rejected by the validation (with the key path).
+                u32::try_from(v)
+                    .map(Weight::Fixed)
+                    .map_err(|_| E::custom("weight must be an integer >= 1 or \"auto\""))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<Weight, E> {
+                i64::try_from(v)
+                    .map_err(|_| E::custom("weight is too large"))
+                    .and_then(|v| self.visit_i64(v))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<Weight, E> {
+                if v == "auto" {
+                    Ok(Weight::Auto)
+                } else {
+                    Err(E::custom(format!(
+                        "invalid weight \"{v}\": use an integer >= 1 or \"auto\""
+                    )))
+                }
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 fn default_timeout() -> Duration {
@@ -199,9 +285,10 @@ fn default_true() -> bool {
 pub struct Gate {
     /// Command run with `sh -c` in the worktree root.
     pub cmd: String,
-    /// Budget units consumed while running (at least 1).
+    /// Budget units consumed while running: an integer ceiling (at least 1)
+    /// or `"auto"`.
     #[serde(default = "default_weight")]
-    pub weight: u32,
+    pub weight: Weight,
     /// Maximum execution time; queue wait does not count.
     #[serde(with = "humantime_serde", default = "default_timeout")]
     pub timeout: Duration,
@@ -452,7 +539,7 @@ impl RepoConfig {
                     format!("gates.{name}.cmd must not be empty"),
                 ));
             }
-            if gate.weight < 1 {
+            if gate.weight == Weight::Fixed(0) {
                 return Err(config_err(
                     path,
                     format!("gates.{name}.weight must be >= 1"),
@@ -529,7 +616,10 @@ hooks = ["pre-commit"]
 
 [gates.test]
 cmd = "npm test"
-weight = 4
+# A number is a ceiling in budget units (roughly the CPU threads the gate
+# uses); "auto" starts at half the daemon budget and learns a lower weight
+# from measured runs (needs Sluice 0.4.0). An omitted weight means 1.
+weight = "auto"
 timeout = "20m"
 hooks = ["pre-commit", "pre-push"]
 # Stdout of each command is folded into the cache key.
@@ -617,7 +707,7 @@ impl AgentConfig {
     /// The `sluice exec` weight to use when `--weight` is absent.
     pub fn exec_weight_or(&self, budget: u32) -> u32 {
         if self.exec_weight == 0 {
-            budget.div_ceil(2).max(1)
+            auto_ceiling(budget)
         } else {
             self.exec_weight
         }
@@ -1133,7 +1223,7 @@ depends_on = ["lint"]
         assert_eq!(c.defaults.tail_lines, Some(28));
         assert_eq!(c.gates.len(), 2);
         let t = c.gate("test").unwrap();
-        assert_eq!(t.weight, 4);
+        assert_eq!(t.weight, Weight::Fixed(4));
         assert_eq!(t.timeout, Duration::from_mins(20));
         assert_eq!(t.hooks, ["pre-commit", "pre-push"]);
         assert_eq!(t.key_inputs, ["node --version"]);
@@ -1147,7 +1237,7 @@ depends_on = ["lint"]
     fn gate_defaults() {
         let c = parse(&gate_with("cmd = \"true\"")).unwrap();
         let g = c.gate("g").unwrap();
-        assert_eq!(g.weight, 1);
+        assert_eq!(g.weight, Weight::Fixed(1));
         assert_eq!(g.timeout, Duration::from_mins(30));
         assert!(g.hooks.is_empty() && g.key_inputs.is_empty() && g.key_files.is_empty());
         assert!(g.env.is_empty() && g.depends_on.is_empty());
@@ -1225,6 +1315,30 @@ depends_on = ["lint"]
     #[test]
     fn weight_must_be_positive() {
         assert!(msg(&gate_with("cmd = \"x\"\nweight = 0")).contains("gates.g.weight"));
+    }
+
+    #[test]
+    fn weight_accepts_auto_and_integers_only() {
+        let w = |body: &str| parse(&gate_with(body)).unwrap().gates["g"].weight;
+        assert_eq!(w("cmd = \"x\""), Weight::Fixed(1));
+        assert_eq!(w("cmd = \"x\"\nweight = 8"), Weight::Fixed(8));
+        assert_eq!(w("cmd = \"x\"\nweight = \"auto\""), Weight::Auto);
+        for bad in ["\"heavy\"", "\"8\"", "-2", "1.5", "true"] {
+            let m = msg(&gate_with(&format!("cmd = \"x\"\nweight = {bad}")));
+            assert!(m.contains("weight"), "{bad}: {m}");
+        }
+        let m = msg(&gate_with("cmd = \"x\"\nweight = \"heavy\""));
+        assert!(m.contains("integer >= 1") && m.contains("\"auto\""), "{m}");
+    }
+
+    #[test]
+    fn weight_ceiling_resolves_auto_from_the_budget() {
+        assert_eq!(Weight::Fixed(8).ceiling(20), 8);
+        assert_eq!(Weight::Auto.ceiling(20), 10);
+        assert_eq!(Weight::Auto.ceiling(7), 4);
+        assert_eq!(Weight::Auto.ceiling(1), 1);
+        assert_eq!(Weight::Auto.to_string(), "auto");
+        assert_eq!(Weight::Fixed(3).to_string(), "3");
     }
 
     #[test]
@@ -1467,10 +1581,10 @@ cmd = \"x\"
     fn starter_config_parses() {
         let c = parse(starter_repo_config()).unwrap();
         let lint = c.gate("lint").unwrap();
-        assert_eq!(lint.weight, 1);
+        assert_eq!(lint.weight, Weight::Fixed(1));
         assert_eq!(lint.hooks, ["pre-commit"]);
         let test = c.gate("test").unwrap();
-        assert_eq!(test.weight, 4);
+        assert_eq!(test.weight, Weight::Auto);
         assert_eq!(test.timeout, Duration::from_mins(20));
         assert_eq!(test.hooks, ["pre-commit", "pre-push"]);
     }

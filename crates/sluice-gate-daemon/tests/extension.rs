@@ -222,6 +222,7 @@ fn run_request(dir: &Path, cmd: &str) -> RunRequest {
             name: "g".to_owned(),
             cmd: cmd.to_owned(),
             weight: 1,
+            weight_auto: false,
             timeout_ms: 60_000,
             env: BTreeMap::new(),
             cache: false,

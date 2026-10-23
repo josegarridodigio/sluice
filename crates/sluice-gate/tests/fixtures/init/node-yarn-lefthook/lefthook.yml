@@ -1,0 +1,13 @@
+# Hooks of the project.
+pre-commit:
+  parallel: true
+  commands:
+    format:
+      glob: "*.{ts,js}"
+      run: npx prettier --write {staged_files}
+    typecheck:
+      run: npx tsc --noEmit
+pre-push:
+  commands:
+    test:
+      run: yarn test # the whole suite
