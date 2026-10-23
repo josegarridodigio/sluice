@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "trains": [
+    {
+      "train_id": "t-1792756817104-3ad1a6",
+      "repo": "/tmp/sa-compat.B9v3ST/v0.4.0/queue-clone/.git",
+      "remote": "origin",
+      "target": "main",
+      "base_sha": "4dc9c73c21c0a90179df66c74f8bc2e791be48f1",
+      "state": "ready",
+      "members": [
+        "1792756817074-975986-6c28f3"
+      ],
+      "merge_sha": "ac8562c97d06d62d4ac4bbac12bf57003378f020",
+      "gates": [
+        {
+          "gate": "test",
+          "key": "e44a930cfd3ae1bbc69d805ea9fc285097fb78fe0578d740b9a66379bcbcc692",
+          "job_id": "1792756817131-975986-d3eac4",
+          "status": "pass",
+          "duration_ms": 2
+        }
+      ],
+      "train_hash": "b0d4f5531cce9180ba6ec49dc107f42871da3bf416afd673fdc633082e628d06",
+      "created_at": "2026-10-23T12:00:17Z",
+      "updated_at": "2026-10-23T12:00:17Z",
+      "push_timeout_ms": 600000,
+      "network_timeout_ms": 60000
+    }
+  ],
+  "jobs": [
+    {
+      "job_id": "1792756817074-975986-6c28f3",
+      "repo": "/tmp/sa-compat.B9v3ST/v0.4.0/queue-clone/.git",
+      "worktree": "/tmp/sa-compat.B9v3ST/v0.4.0/queue-clone",
+      "branch": "feature",
+      "head_sha": "ac8562c97d06d62d4ac4bbac12bf57003378f020",
+      "remote": "origin",
+      "target": "main",
+      "state": "ready",
+      "train_id": "t-1792756817104-3ad1a6",
+      "caller": "human",
+      "cancel_requested": false,
+      "attempts": 1,
+      "enqueued_at": "2026-10-23T12:00:17Z",
+      "updated_at": "2026-10-23T12:00:17Z"
+    }
+  ]
+}

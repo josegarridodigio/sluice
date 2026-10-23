@@ -27,7 +27,7 @@ use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-const RELEASES: [&str; 3] = ["v0.1.0", "v0.2.0", "v0.3.0"];
+const RELEASES: [&str; 4] = ["v0.1.0", "v0.2.0", "v0.3.0", "v0.4.0"];
 const WAIT: Duration = Duration::from_secs(20);
 
 fn own_fixtures(release: &str) -> PathBuf {

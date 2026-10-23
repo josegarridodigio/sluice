@@ -168,7 +168,7 @@ gen_version() {
     cp "$W/doc/repo-example.toml" "$CORE/config/full.toml"
   fi
   : > "$CORE/user-config/empty.toml"
-  mkdir -p "$W/init" && (cd "$W/init" && sl init >/dev/null && cp .sluice.toml "$CORE/config/init.toml")
+  mkdir -p "$W/init" && (cd "$W/init" && gitq init -q && sl init >/dev/null && cp .sluice.toml "$CORE/config/init.toml")
 
   cat > "$CORE/config/recorded.toml" <<'EOF'
 version = 1

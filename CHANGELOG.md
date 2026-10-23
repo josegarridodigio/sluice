@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Golden files recorded from the 0.4.0 release binary, read by the
+  compatibility tests next to 0.1.0, 0.2.0 and 0.3.0.
+
 ### Changed
 
 ### Fixed

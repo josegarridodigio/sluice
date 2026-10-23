@@ -208,3 +208,13 @@ The five ignored tests were un-ignored (fixtures untouched) by task H3b:
 - G11: `sluice --help` lists every exit code (0, N, 1, 2, 3, 4, 75, 124, 125,
   141, 143); unit test `exit_code_tests` in `sluice-gate/src/main.rs` pins the
   constants and the help text.
+
+## v0.4.0 recording (2026-10-23)
+
+Fixtures recorded from the published v0.4.0 release binary with
+`scripts/compat/generate.sh v0.4.0` and added to the `RELEASES` lists of the
+four `tests/compat.rs` files. The generator needed one change: since 0.4.0
+`sluice init` refuses to run outside a git repository, so the `init` step now
+runs `git init` in its scratch directory first (older releases are not
+affected: they never look for a repository). Verified with `sluice run fmt`,
+`clippy` and `test`.

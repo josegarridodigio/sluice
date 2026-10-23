@@ -1,0 +1,10 @@
+{
+  "format": 1,
+  "key": "2cfefd3a87eab347057f5676912a5ffcfb374e47b5fb2fe93623f58315a74819",
+  "gate": "timeout",
+  "exit_code": null,
+  "reason": "timed out",
+  "job_id": "1792756806882-975986-97c101",
+  "log_path": "/tmp/sa-compat.B9v3ST/v0.4.0/home/.state/sluice/logs/1792756806882-975986-97c101.log",
+  "recorded_at": "2026-10-23T12:00:07Z"
+}
