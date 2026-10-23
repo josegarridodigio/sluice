@@ -342,3 +342,39 @@ or shimmed 2 concurrent in 8.6–8.9 s (sandbox budget 8, exec weight 4).
   for beta).
 - Golden files recorded from the published 0.3.0 binary (58 files) are read
   by the compatibility tests of every crate next to 0.1.0 and 0.2.0.
+
+## L2 — policy ablation (overload variant, release binary 0.3.0)
+
+The plan asks each L2 policy to be measured on its own and kept only if it
+helps. The tuning rounds measured them together, so this ablation changes
+one switch at a time from the shipped defaults (round 3: wall 0.58x, p95
+1.10x, idle while waiting 7.8 %), each run with its own baseline on an
+otherwise idle machine (baselines ranged 125.6–135.7 s, so differences of
+a few hundredths are noise).
+
+| Single change from the defaults | Wall vs baseline | p95 vs baseline | Idle while waiting | Targets |
+|---|---|---|---|---|
+| `scheduler.fairness = "off"` | 75.1 / 135.7 s = 0.55x | 1.06x | 4.0 % | 5/5 |
+| `scheduler.human_first = false` | 71.1 / 125.6 s = 0.57x | 1.05x | 5.5 % | 5/5 |
+| `scheduler.order = "sjf"` | 72.6 / 127.5 s = 0.57x | 1.05x | 7.3 % | 5/5 |
+| `mcp.verify_parallel = false` | 76.7 / 126.6 s = 0.61x | 1.12x | 8.7 % | 5/5 |
+| `scheduler.learned_weights = false` | 83.3 / 129.9 s = 0.64x | 1.19x | 17.3 % | 4/5 (idle-while-waiting missed) |
+| `admission.overcommit = 1.0` | 72.3 / 126.8 s = 0.57x | 1.12x | 6.7 % | 5/5 |
+
+Decisions:
+
+- Learned weights are the mechanism that matters (without them CPUs sit
+  idle while suites wait: 17.3 %); kept on.
+- Parallel `verify` with the early verdict helps wall time and p95 a
+  little; kept on.
+- Over-admission makes no difference under overload (no idle CPUs to use),
+  but round 1 showed it helping on six CPUs; kept at 1.5x.
+- Lane fairness and humans-first make no measurable difference here (all
+  jobs come from agents with similar suites); kept on because they cost
+  nothing in this scenario and protect cases it does not exercise (one
+  worktree flooding the queue, a human waiting in a hook).
+- Shortest-expected-job-first brings no gain with similar job lengths and
+  adds starvation risk (bounded by ageing); stays off by default.
+- Supersede was deferred by ADR-0011 (no stale queued work under these
+  defaults) and is not implemented; a candidate for beta if timelines from
+  real use show stale queued jobs.

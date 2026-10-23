@@ -140,7 +140,7 @@ change notes named in the last column.
 | H5 shell shims | done | [[sluice/changes/shell-shims.md]] |
 | H2 authenticated remotes | done | [[sluice/changes/queue-transports.md]] |
 | E2, E3, E4 harness runs | done | [[sluice/changes/alpha-readiness.md]] |
-| L2, L3 latency policies and tuning | done | [[sluice/changes/alpha-readiness.md]] |
+| L2, L3 latency policies and tuning | done | [[sluice/changes/alpha-readiness.md]] (L3 rounds 1–3; L2 per-policy ablation: learned weights decisive, parallel verify helps, the others neutral; supersede deferred by ADR-0011) |
 | R1 adversarial review | done | [[sluice/changes/alpha-review.md]] |
 | R2 review fixes | done | [[sluice/changes/alpha-review-fixes.md]], [[sluice/changes/ci-flakes.md]] |
 | E5 full harness run | done | 320/320 checks ([[sluice/changes/alpha-readiness.md]]) |

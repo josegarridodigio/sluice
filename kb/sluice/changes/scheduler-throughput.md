@@ -197,3 +197,11 @@ sluice: test PASS 136.6s (job 1792715515782-3591840-9f5864)
 ```
 
 The S2 low-core re-measurement is left to the lead.
+
+## L2 ablation (2026-10-23)
+
+Each policy switch was measured alone on the overload variant; results and
+decisions in [[sluice/changes/alpha-readiness.md]] ("L2 — policy
+ablation"). Learned weights are decisive, parallel verify helps, the rest
+is neutral in that scenario; defaults unchanged, SJF stays off, supersede
+stays deferred.
