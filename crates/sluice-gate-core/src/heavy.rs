@@ -7,7 +7,10 @@
 //! are used only for matching, never to build a command. Design:
 //! `kb/sluice/design/command-control.md` sections 4.3 and 4.4.
 
+use std::path::Path;
+
 use crate::config::AgentConfig;
+use crate::pkgscripts::{self, MAX_DEPTH, ScriptSource, Scripts};
 
 /// Built-in heavy-command list, in canonical words (`[agent] heavy_commands`
 /// replaces it, `heavy_commands_extra` extends it).
@@ -32,7 +35,75 @@ pub const DEFAULT_HEAVY_COMMANDS: &[&str] = &[
     "pytest",
     "jest",
     "vitest",
+    "ng build",
+    "ng test",
+    "ng lint",
+    "ng e2e",
+    "nx run",
+    "nx run-many",
+    "nx affected",
+    "nx build",
+    "nx test",
+    "nx lint",
+    "nx e2e",
+    "turbo run",
+    "turbo build",
+    "turbo test",
+    "turbo lint",
+    "playwright test",
+    "cypress run",
+    "react-scripts build",
+    "react-scripts test",
+    "astro build",
+    "nuxt build",
+    "dotnet build",
+    "dotnet test",
+    "bazel build",
+    "bazel test",
+    "ninja",
+    "cmake --build",
 ];
+
+/// Subcommands that start a dev server: never heavy, whatever the list says
+/// (they never end, so queueing them would hold a slot forever).
+const SERVER_COMMANDS: &[(&str, &[&str])] = &[
+    ("ng", &["serve", "s"]),
+    ("nx", &["serve"]),
+    ("next", &["dev"]),
+    ("astro", &["dev", "preview"]),
+    ("nuxt", &["dev", "preview"]),
+    ("react-scripts", &["start"]),
+    ("vite", &["dev", "serve", "preview"]),
+];
+
+/// Tools whose `-w` is `--watch`.
+const SHORT_WATCH_TOOLS: &[&str] = &["tsc", "jest", "vitest", "webpack", "vite"];
+
+/// True for a command that never ends by itself: a dev server (`ng serve`,
+/// `nx serve`, `next dev`, bare `vite`) or a watch mode (`--watch`,
+/// `--watch=true`, `--watchAll`; `--watch=false` is not a watch, and `-w`
+/// only counts for the tools where it means `--watch`).
+pub fn is_never_heavy<S: AsRef<str>>(canonical: &[S]) -> bool {
+    let Some(first) = canonical.first().map(AsRef::as_ref) else {
+        return false;
+    };
+    let second = canonical.get(1).map(AsRef::as_ref);
+    if first == "vite" && second.is_none_or(|w| w.starts_with('-')) {
+        return true;
+    }
+    if SERVER_COMMANDS
+        .iter()
+        .any(|(tool, subs)| *tool == first && second.is_some_and(|s| subs.contains(&s)))
+    {
+        return true;
+    }
+    canonical.iter().skip(1).map(AsRef::as_ref).any(|w| {
+        matches!(
+            w,
+            "--watch" | "--watch=true" | "--watchAll" | "--watchAll=true"
+        ) || (w == "-w" && SHORT_WATCH_TOOLS.contains(&first))
+    })
+}
 
 /// Package-manager subcommands that are builtins, not package scripts
 /// (`pnpm install` is not `pnpm run install`).
@@ -196,6 +267,17 @@ fn package_manager(pm: &str, tail: &[&str]) -> Vec<String> {
     }
 }
 
+/// Why a command is heavy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Match {
+    /// The entry of the list that matched (the command's own, or the one a
+    /// package script runs).
+    pub entry: Vec<String>,
+    /// The package script that led to the entry (`npm run axe` -> `axe`),
+    /// `None` when the typed words matched directly.
+    pub script: Option<String>,
+}
+
 /// Matches canonical words against a heavy-command list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeavyMatcher {
@@ -249,9 +331,70 @@ impl HeavyMatcher {
             .map(Vec::as_slice)
     }
 
-    /// True when `canonical` starts with an entry of the list.
+    /// True when `canonical` starts with an entry of the list and is not a
+    /// dev server or watch mode. Words only: package scripts are not read
+    /// (see [`Self::classify`]).
     pub fn matches<S: AsRef<str>>(&self, canonical: &[S]) -> bool {
-        self.matching_entry(canonical).is_some()
+        self.word_match(canonical).is_some()
+    }
+
+    fn word_match<S: AsRef<str>>(&self, canonical: &[S]) -> Option<&[String]> {
+        if is_never_heavy(canonical) {
+            None
+        } else {
+            self.matching_entry(canonical)
+        }
+    }
+
+    /// Classifies `canonical` run in `dir`: heavy when its words match the
+    /// list, or when it is `run <name>` and the script `<name>` of the
+    /// nearest `package.json` (read through `scripts`) runs, in any of its
+    /// `&&`, `||`, `;`, `|` pieces, something heavy (nested `npm run x`
+    /// scripts are followed up to [`MAX_DEPTH`], cycles end the walk).
+    /// Words are matched first, so a script is read only for `run <name>`
+    /// that the list does not already know.
+    pub fn classify<S: AsRef<str>>(
+        &self,
+        canonical: &[S],
+        dir: &Path,
+        scripts: &dyn ScriptSource,
+    ) -> Option<Match> {
+        if let Some(entry) = self.word_match(canonical) {
+            return Some(Match {
+                entry: entry.to_vec(),
+                script: None,
+            });
+        }
+        let name = script_name(canonical)?;
+        let found = Scripts::find(scripts, dir)?;
+        let entry = self.script_entry(&found, name, &mut Vec::new())?;
+        Some(Match {
+            entry,
+            script: Some(name.to_owned()),
+        })
+    }
+
+    fn script_entry(
+        &self,
+        scripts: &Scripts,
+        name: &str,
+        stack: &mut Vec<String>,
+    ) -> Option<Vec<String>> {
+        if stack.len() >= MAX_DEPTH || stack.iter().any(|s| s == name) {
+            return None;
+        }
+        let body = scripts.body(name)?;
+        stack.push(name.to_owned());
+        let found = pkgscripts::pieces(body).iter().find_map(|piece| {
+            let words = canonical_words(piece);
+            if let Some(entry) = self.word_match(&words) {
+                return Some(entry.to_vec());
+            }
+            let inner = script_name(&words)?;
+            self.script_entry(scripts, inner, stack)
+        });
+        stack.pop();
+        found
     }
 
     /// Executable names a shell shim must intercept so that every entry of
@@ -280,6 +423,16 @@ impl HeavyMatcher {
             names.insert("npx".to_owned());
         }
         names.into_iter().collect()
+    }
+}
+
+/// `<name>` of canonical words `run <name> ...`.
+fn script_name<S: AsRef<str>>(canonical: &[S]) -> Option<&str> {
+    match canonical {
+        [run, name, ..] if run.as_ref() == "run" && !name.as_ref().starts_with('-') => {
+            Some(name.as_ref())
+        }
+        _ => None,
     }
 }
 
@@ -321,8 +474,38 @@ mod tests {
         assert_eq!(
             HeavyMatcher::default().shim_names(),
             [
-                "bun", "cargo", "docker", "go", "gradle", "gradlew", "jest", "make", "mvn", "mvnw",
-                "next", "npm", "npx", "pnpm", "pytest", "tsc", "vite", "vitest", "webpack", "yarn",
+                "astro",
+                "bazel",
+                "bun",
+                "cargo",
+                "cmake",
+                "cypress",
+                "docker",
+                "dotnet",
+                "go",
+                "gradle",
+                "gradlew",
+                "jest",
+                "make",
+                "mvn",
+                "mvnw",
+                "next",
+                "ng",
+                "ninja",
+                "npm",
+                "npx",
+                "nuxt",
+                "nx",
+                "playwright",
+                "pnpm",
+                "pytest",
+                "react-scripts",
+                "tsc",
+                "turbo",
+                "vite",
+                "vitest",
+                "webpack",
+                "yarn",
             ]
         );
         assert_eq!(
@@ -439,6 +622,146 @@ mod tests {
             let words: Vec<&str> = no.split_whitespace().collect();
             assert!(!m.matches(&words), "{no}");
         }
+    }
+
+    fn words(cmd: &str) -> Vec<String> {
+        canonical_words(&cmd.split_whitespace().collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn new_builtin_entries_match() {
+        let m = HeavyMatcher::default();
+        for yes in [
+            "npx ng test --watch=false",
+            "npx ng build -c x",
+            "ng lint",
+            "nx run-many -t build",
+            "nx affected -t test",
+            "turbo run build",
+            "pnpm exec playwright test",
+            "cypress run",
+            "react-scripts build",
+            "astro build",
+            "nuxt build",
+            "dotnet test",
+            "bazel build //...",
+            "ninja -C out",
+            "cmake --build out",
+        ] {
+            assert!(m.matches(&words(yes)), "{yes}");
+        }
+        for no in [
+            "ng serve",
+            "ng s",
+            "npx ng serve",
+            "nx serve app",
+            "next dev",
+            "vite",
+            "vite --port 80",
+            "vite preview",
+            "ng test --watch",
+            "ng test --watch=true",
+            "vitest --watch",
+            "vitest -w",
+            "jest --watchAll",
+            "tsc -w",
+            "react-scripts start",
+            "ng version",
+            "cmake .",
+            "dotnet run",
+        ] {
+            assert!(!m.matches(&words(no)), "{no}");
+        }
+        // `-w` is only a watch flag for the tools where it means that.
+        assert!(m.matches(&words("cargo test -w")));
+        assert!(m.matches(&words("vite build --watch=false")));
+        assert!(m.matches(&words("ng test --watch=false")));
+    }
+
+    struct Files(Vec<(&'static str, &'static str)>);
+
+    impl ScriptSource for Files {
+        fn package_json(&self, dir: &Path) -> Option<String> {
+            self.0
+                .iter()
+                .find(|(d, _)| Path::new(d) == dir)
+                .map(|(_, t)| (*t).to_owned())
+        }
+
+        fn is_repo_root(&self, dir: &Path) -> bool {
+            dir == Path::new("/r")
+        }
+    }
+
+    const PKG: &str = r#"{"scripts":{
+        "test":"ng test",
+        "axe":"npm run axe:a",
+        "axe:a":"playwright test",
+        "start":"ng serve",
+        "lint":"eslint .",
+        "ci":"npm run lint && CI=1 npm test",
+        "all":"pnpm lint; pnpm ci",
+        "a":"npm run b", "b":"npm run c", "c":"npm run d", "d":"npm run e", "e":"ng build",
+        "loop1":"npm run loop2", "loop2":"npm run loop1 && echo x",
+        "watchy":"ng test --watch",
+        "both":"ng serve & ng build",
+        "fine":"ng test --watch=false"
+    }}"#;
+
+    fn classify(files: &Files, dir: &str, cmd: &str) -> Option<Match> {
+        HeavyMatcher::default().classify(&words(cmd), Path::new(dir), files)
+    }
+
+    #[test]
+    fn classify_follows_package_scripts() {
+        let files = Files(vec![("/r", PKG)]);
+        let heavy = |cmd: &str| classify(&files, "/r", cmd).is_some();
+        for yes in [
+            "npm test",
+            "npm run axe",
+            "pnpm axe",
+            "yarn run axe:a",
+            "npm run ci",
+            "pnpm all",
+            "npm run both",
+            "npm run fine",
+            "npx ng test --watch=false",
+            // Four scripts in a chain are followed (b, c, d, e) ...
+            "npm run b",
+            "npm run d",
+        ] {
+            assert!(heavy(yes), "{yes}");
+        }
+        for no in [
+            "npm start",
+            "npm run lint",
+            "npm run watchy",
+            "npm run loop1",
+            "npm run missing",
+            "npm install",
+            // ... a fifth is not.
+            "npm run a",
+            "ng test --watch",
+            "npx ng serve",
+            "npm --version",
+        ] {
+            assert!(!heavy(no), "{no}");
+        }
+        let m = classify(&files, "/r", "npm run axe").unwrap();
+        assert_eq!(m.script.as_deref(), Some("axe"));
+        assert_eq!(m.entry, ["playwright", "test"]);
+        let direct = classify(&files, "/r", "ng build").unwrap();
+        assert_eq!(direct.script, None);
+        // Found from a subdirectory; not found past the git root, in an
+        // invalid file or when there is none.
+        assert!(classify(&files, "/r/web/src", "npm test").is_some());
+        assert!(classify(&files, "/elsewhere", "npm test").is_none());
+        let bad = Files(vec![("/r", "{")]);
+        assert!(classify(&bad, "/r", "npm test").is_none());
+        // Words that the list knows need no file at all.
+        assert!(classify(&bad, "/r", "npm run build").is_some());
+        // `matches` never reads scripts.
+        assert!(!HeavyMatcher::default().matches(&words("npm test")));
     }
 
     #[test]

@@ -21,6 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `sluice status` shows configured and effective weights (`weight auto→5`);
   its JSON gains the optional `weight_effective` and `weight_auto` (schema 1).
 
+- The built-in heavy list knows the Angular CLI, Nx, Turborepo, Playwright,
+  Cypress, react-scripts, Astro, Nuxt, .NET, Bazel, Ninja and `cmake --build`,
+  so the guard and the shims catch them with no user config. Dev servers and
+  watch modes (`ng serve`, `nx serve`, `next dev`, bare `vite`, `--watch`)
+  are never heavy.
+- `npm run <script>` (and `npm test`, `pnpm <script>`, `yarn <script>`) is
+  classified by what the script in the nearest `package.json` runs, following
+  nested scripts, in both the guard and the shims.
+- A shim call that is exactly a gate command inside a repository with a
+  `.sluice.toml` now runs `sluice run <gate> -v` (cache and coalescing)
+  instead of `sluice exec`.
+
 ### Changed
 
 ### Fixed
