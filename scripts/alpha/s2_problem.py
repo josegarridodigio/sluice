@@ -219,7 +219,10 @@ def run_mode(mode: str) -> dict:
     sb = Sandbox(f"problem-{mode}")
     try:
         if mode == "sluice":
-            sb.write_user_config("[mcp]\nprogress_interval = \"5s\"\n")
+            # ALPHA_USER_CONFIG_EXTRA appends tables to the sandbox's user
+            # config (tuning-loop rounds change scheduler switches this way).
+            extra = os.environ.get("ALPHA_USER_CONFIG_EXTRA", "").replace("\\n", "\n")
+            sb.write_user_config("[mcp]\nprogress_interval = \"5s\"\n" + extra)
         repo, wts = prepare(sb, mode)
         # The test command writes nothing that git tracks; count executions
         # from the processes that ran (one `alpha-burn` main per suite).

@@ -180,3 +180,31 @@ that breaks `ava`, the rest independent) verify over MCP and enqueue
 
 Not covered: a multi-member train whose combined tree an agent verified
 (the reuse check uses fast-forward trains); SSH and HTTP remotes (task H2).
+
+## E2 — the problem scenario after the scheduler work (binary at c381a12)
+
+Same scenario as the first runs (work-bounded synthetic suites behind the
+real `ava` suite), three variants, each run with and without Sluice on an
+otherwise idle machine (cool-down to load < 2 before each mode). Targets
+from the plan (workstream L). `idle_while_waiting` is the daemon's own
+metric: the time integral of the idle fraction of its CPUs while at least
+one job is queued, compared with the wall time.
+
+| Variant | Mode | Heavy suites | Wall | Verify p50 / p95 | Peak load | Idle while waiting |
+|---|---|---|---|---|---|---|
+| normal: 8 agents x 3, 4 threads, 20 CPUs | baseline | 40 | 71.2 s | 13.1 / 14.6 s | 25.7 | — |
+| | sluice | 25 | 35.8 s | 8.1 / 13.0 s | 10.5 | 5.5 % |
+| overload: 12 agents x 2, 8 threads, 20 CPUs | baseline | 48 | 122.2 s | 29.3 / 31.7 s | 64.0 | — |
+| | sluice | 25 | 70.9 s | 23.9 / 37.0 s | 13.9 | 13.1 % |
+| low-core: 6 agents x 2, 4 threads, 6 CPUs | baseline | 24 | 84.7 s | 21.2 / 23.2 s | 15.1 | — |
+| | sluice | 13 | 51.9 s | 10.3 / 32.4 s | 4.5 | 13.1 % |
+
+Targets: wall ≤ baseline (met in all three: 0.50x, 0.58x, 0.61x); p95 ≤
+1.2x baseline (met in normal 0.89x and overload 1.17x, missed in low-core
+1.40x); suite executions = distinct trees (met in all three); idle CPU
+while waiting < 10 % (met in normal 5.5 %, missed in overload and
+low-core at 13.1 %); peak load ≤ baseline (met in all three).
+
+Before the scheduler work the overload variant finished later than the
+baseline (162.5 s vs 147.3 s with p95 79.6 s vs 37.5 s); it now finishes
+in 0.58x the baseline's time with p95 within the target.
