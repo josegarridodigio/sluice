@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Fixed
+
+## [0.4.0] - 2026-10-23
+
+### Added
+
 - Golden files recorded from the 0.3.0 release binary, read by the
   compatibility tests next to 0.1.0 and 0.2.0.
 - `weight = "auto"` for gates: the ceiling is half the daemon's budget and
@@ -294,7 +302,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PSI thresholds must be percentages (rejected at config load otherwise).
 - Findings of the Phase 1, 2, 3 and 4 reconciliation passes.
 
-[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/josegarridodigio/sluice/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/josegarridodigio/sluice/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/josegarridodigio/sluice/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/josegarridodigio/sluice/releases/tag/v0.1.0
