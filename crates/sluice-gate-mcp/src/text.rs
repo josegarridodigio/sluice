@@ -104,6 +104,20 @@ fn reason(r: WaitReason) -> &'static str {
     }
 }
 
+/// The weight of a job as `configured\u{2192}effective` (`auto\u{2192}5`,
+/// `10\u{2192}3`), or just the number when both agree or the daemon sent no
+/// configured one. Same rule as `sluice status`.
+fn weight_text(effective: u32, configured: Option<u32>, auto: Option<bool>) -> String {
+    if auto == Some(true) {
+        format!("auto\u{2192}{effective}")
+    } else {
+        match configured.filter(|c| *c != effective) {
+            Some(c) => format!("{c}\u{2192}{effective}"),
+            None => effective.to_string(),
+        }
+    }
+}
+
 /// Text form of a status report, as `sluice status` prints it; jobs of
 /// `this_repo` are marked with `*`.
 pub(crate) fn render_status(r: &StatusReport, this_repo: Option<&Path>) -> String {
@@ -132,7 +146,7 @@ pub(crate) fn render_status(r: &StatusReport, this_repo: Option<&Path>) -> Strin
             mark(&j.repo),
             j.gate,
             basename(&j.repo),
-            j.weight,
+            weight_text(j.weight, j.weight_cfg, j.weight_auto),
             dur(j.elapsed_ms),
             j.subscribers,
             j.job_id
@@ -147,7 +161,7 @@ pub(crate) fn render_status(r: &StatusReport, this_repo: Option<&Path>) -> Strin
             i + 1,
             j.gate,
             basename(&j.repo),
-            j.weight,
+            weight_text(j.weight, j.weight_cfg, j.weight_auto),
             dur(j.waiting_ms),
             reason(j.reason),
             j.job_id
@@ -195,6 +209,31 @@ mod tests {
         assert_eq!(omitted, 8 * 6);
         let (kept, omitted) = cap_lines(&lines, 1 << 16);
         assert_eq!((kept.len(), omitted), (10, 0));
+    }
+
+    #[test]
+    fn status_text_shows_configured_and_effective_weights() {
+        use sluice_gate_proto::{QueuedJob, RunningJob};
+        assert_eq!(weight_text(4, None, None), "4");
+        assert_eq!(weight_text(4, Some(4), None), "4");
+        assert_eq!(weight_text(3, Some(10), None), "10\u{2192}3");
+        let mut r = StatusReport::default();
+        r.running.push(RunningJob {
+            gate: "test".into(),
+            weight: 5,
+            weight_cfg: Some(10),
+            weight_auto: Some(true),
+            ..RunningJob::default()
+        });
+        r.queued.push(QueuedJob {
+            gate: "build".into(),
+            weight: 3,
+            weight_cfg: Some(10),
+            ..QueuedJob::default()
+        });
+        let text = render_status(&r, None);
+        assert!(text.contains("weight auto\u{2192}5"), "{text}");
+        assert!(text.contains("weight 10\u{2192}3"), "{text}");
     }
 
     #[test]

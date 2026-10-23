@@ -19,9 +19,11 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 use serde::Serialize;
-use sluice_gate_core::config::{Gate, REPO_CONFIG_FILE, RepoConfig, UserConfig};
+use sluice_gate_core::agent::{self, Caller};
+use sluice_gate_core::config::{Gate, REPO_CONFIG_FILE, RepoConfig, UserConfig, Weight};
 use sluice_gate_core::dirs;
 use sluice_gate_core::git::{self, EnvMap, RepoPaths};
+use sluice_gate_core::heavy::HeavyMatcher;
 use sluice_gate_core::logfile;
 use sluice_gate_core::marker::MarkerStore;
 use sluice_gate_core::scope::{self, PathScope};
@@ -166,6 +168,8 @@ fn collect(env: &EnvMap, cwd: &Path) -> Vec<Check> {
     out.push(check_socket_path(env));
     out.extend(check_daemon(env));
     out.push(check_user_config(env));
+    out.push(check_shims(env, cwd));
+    out.push(check_plugin(env));
     match git::discover(cwd, env) {
         Ok(paths) => out.extend(check_repo(env, &paths)),
         Err(_) => out.push(check(
@@ -563,10 +567,235 @@ fn check_repo(env: &EnvMap, paths: &RepoPaths) -> Vec<Check> {
     }
     out.push(check_hooks(env, paths));
     out.push(check_markers(paths));
-    if let Ok(cfg) = &config {
-        out.extend(check_scoped_gates(env, paths, cfg));
+    match &config {
+        Ok(cfg) => {
+            out.extend(check_scoped_gates(env, paths, cfg));
+            out.push(check_weights(env, paths, cfg));
+        }
+        Err(_) if !paths.toplevel.join(REPO_CONFIG_FILE).exists() => out.push(check(
+            "init",
+            Status::Ok,
+            "this repository has no .sluice.toml; run 'sluice init --dry-run' to see what Sluice \
+             would propose",
+        )),
+        Err(_) => {}
     }
     out
+}
+
+/// Learned weight over this share of the declared ceiling (in percent)
+/// makes `weights` warn.
+const WEIGHT_WARN_PERCENT: u64 = 150;
+
+/// `weights`: one warning naming every gate whose declared numeric ceiling
+/// is more than 50 % below the unbounded learned weight (`learned` returns
+/// it per gate), `ok` otherwise. Gates with `weight = "auto"` are skipped.
+fn weight_check(cfg: &RepoConfig, learned: impl Fn(&str) -> Option<u32>) -> Check {
+    let low: Vec<String> = cfg
+        .gates
+        .iter()
+        .filter_map(|(name, gate)| {
+            let Weight::Fixed(ceiling) = gate.weight else {
+                return None;
+            };
+            let l = learned(name)?;
+            (u64::from(l) * 100 > u64::from(ceiling) * WEIGHT_WARN_PERCENT)
+                .then(|| format!("'{name}' needs about {l} but declares weight = {ceiling}"))
+        })
+        .collect();
+    if low.is_empty() {
+        check(
+            "weights",
+            Status::Ok,
+            "no gate declares a weight well below what its runs need",
+        )
+    } else {
+        check(
+            "weights",
+            Status::Warn,
+            format!(
+                "{}: raise the number or use weight = \"auto\" (a ceiling that low makes the \
+                 gate oversubscribe the machine)",
+                low.join("; ")
+            ),
+        )
+    }
+}
+
+/// `weights`: compares each declared ceiling with the learned weight in the
+/// database (opened read-only; nothing is written).
+fn check_weights(env: &EnvMap, paths: &RepoPaths, cfg: &RepoConfig) -> Check {
+    let db = dirs::database_path(env);
+    if !db.exists() {
+        return check("weights", Status::Ok, "no run history yet");
+    }
+    match Store::open_read_only(&db) {
+        Ok(store) => weight_check(cfg, |gate| {
+            store
+                .unbounded_learned(&paths.toplevel, gate)
+                .ok()
+                .flatten()
+        }),
+        Err(_) => check("weights", Status::Ok, "skipped: the database is unreadable"),
+    }
+}
+
+/// Index of the first `PATH` entry that is `dir` (compared canonically).
+fn path_index(dir: &Path, env: &EnvMap, cwd: &Path) -> Option<usize> {
+    let dir = fs::canonicalize(dir).ok()?;
+    env.get("PATH")?.split(':').position(|e| {
+        let entry = if e.is_empty() {
+            cwd.to_path_buf()
+        } else {
+            cwd.join(e)
+        };
+        fs::canonicalize(entry).is_ok_and(|c| c == dir)
+    })
+}
+
+/// `shims`: installed in the stable directory, current, and first in `PATH`
+/// for this shell. Only an agent shell is warned about `PATH`: the agent
+/// plugin puts the directory first for agent sessions.
+fn check_shims(env: &EnvMap, cwd: &Path) -> Check {
+    const NAME: &str = "shims";
+    let user = UserConfig::load(env).unwrap_or_default();
+    let agent_shell = env
+        .get(crate::shim::SHIMS_VAR)
+        .and_then(|v| agent::parse_bool(v))
+        .unwrap_or_else(|| {
+            matches!(
+                agent::detect(
+                    env,
+                    &user.agent_detection.env_any_set,
+                    &user.agent_detection.env_any_equals,
+                ),
+                Caller::Agent { .. }
+            )
+        });
+    let dir = match crate::shim::default_dir(env, cwd) {
+        Ok(d) => d,
+        Err(e) => return check(NAME, Status::Warn, e),
+    };
+    let names = HeavyMatcher::from_config(&user.agent).shim_names();
+    let Ok(sluice) = crate::shim::current_binary() else {
+        return check(NAME, Status::Warn, "cannot locate the sluice binary");
+    };
+    let dir = fs::canonicalize(&dir).unwrap_or(dir);
+    let (mut missing, mut stale) = (0usize, 0usize);
+    for name in &names {
+        let want = crate::shim::script(&dir, &sluice, name);
+        match fs::read_to_string(dir.join(name)) {
+            Ok(have) if have == want => {}
+            Ok(_) => stale += 1,
+            Err(_) => missing += 1,
+        }
+    }
+    if missing == names.len() && !names.is_empty() {
+        let status = if agent_shell {
+            Status::Warn
+        } else {
+            Status::Ok
+        };
+        return check(
+            NAME,
+            status,
+            format!(
+                "not installed in {}; the agent plugin installs them at session start, or run \
+                 'sluice shim install'",
+                dir.display()
+            ),
+        );
+    }
+    if missing + stale > 0 {
+        return check(
+            NAME,
+            Status::Warn,
+            format!(
+                "{missing} shim(s) missing and {stale} stale in {}; run 'sluice shim install'",
+                dir.display()
+            ),
+        );
+    }
+    let detail = format!("{} shim(s) current in {}", names.len(), dir.display());
+    let export = format!(
+        "export PATH={}:\"$PATH\"",
+        crate::shim::quote(&dir.display().to_string())
+    );
+    match path_index(&dir, env, cwd) {
+        Some(0) => check(NAME, Status::Ok, format!("{detail}; first in PATH")),
+        Some(i) if agent_shell => check(
+            NAME,
+            Status::Warn,
+            format!(
+                "{detail}; entry {} of PATH in this agent shell, not first: commands found \
+                 before it skip the shims ({export})",
+                i + 1
+            ),
+        ),
+        None if agent_shell => check(
+            NAME,
+            Status::Warn,
+            format!("{detail}; not in PATH of this agent shell ({export})"),
+        ),
+        _ => check(
+            NAME,
+            Status::Ok,
+            format!(
+                "{detail}; not first in PATH of this human shell: the agent plugin puts them \
+                 in PATH for agent sessions"
+            ),
+        ),
+    }
+}
+
+/// The version of the Sluice plugin in `installed_plugins.json` (the entry
+/// whose key starts with `sluice@`), if any.
+fn plugin_version(json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let plugins = value.get("plugins")?.as_object()?;
+    let (_, entries) = plugins.iter().find(|(k, _)| k.starts_with("sluice@"))?;
+    let entry = entries.as_array()?.first()?;
+    Some(entry.get("version")?.as_str()?.to_owned())
+}
+
+/// `plugin`: the installed agent plugin against this binary. Never fails: a
+/// missing or unreadable plugin list is not a problem.
+fn check_plugin(env: &EnvMap) -> Check {
+    const NAME: &str = "plugin";
+    let root = env
+        .get("CLAUDE_CONFIG_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env.get("HOME")
+                .filter(|v| !v.is_empty())
+                .map(|h| Path::new(h).join(".claude"))
+        });
+    let version = root
+        .map(|r| r.join("plugins").join("installed_plugins.json"))
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|text| plugin_version(&text));
+    let binary = env!("CARGO_PKG_VERSION");
+    match version {
+        None => check(
+            NAME,
+            Status::Ok,
+            "no agent plugin found (nothing to compare)",
+        ),
+        Some(v) if v == binary => check(
+            NAME,
+            Status::Ok,
+            format!("agent plugin and binary are {binary}"),
+        ),
+        Some(v) => check(
+            NAME,
+            Status::Warn,
+            format!(
+                "agent plugin is {v} but this binary is {binary}; update the older one (the \
+                 plugin from its marketplace, the binary with 'sluice update')"
+            ),
+        ),
+    }
 }
 
 /// Well-known build inputs a scoped gate usually depends on even when they
@@ -1177,6 +1406,127 @@ mod tests {
         assert!(out.contains("https://github.com/o/r.git"), "{out}");
         assert!(out.contains("plain line gate=test"), "{out}");
         assert!(!out.contains("abc") && !out.contains("s3cr3t") && !out.contains("pw@"));
+    }
+
+    fn env_of(pairs: &[(&str, &str)]) -> EnvMap {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn plugin_version_is_read_from_the_installed_list() {
+        let json = r#"{"version":2,"plugins":{
+            "other@m":[{"version":"9.9.9"}],
+            "sluice@sluice":[{"scope":"user","version":"0.3.0"}]}}"#;
+        assert_eq!(plugin_version(json).as_deref(), Some("0.3.0"));
+        assert_eq!(plugin_version(r#"{"plugins":{}}"#), None);
+        assert_eq!(plugin_version("not json"), None);
+    }
+
+    #[test]
+    fn plugin_check_warns_on_a_different_version_and_never_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let env = env_of(&[("CLAUDE_CONFIG_DIR", home.path().to_str().unwrap())]);
+        let c = check_plugin(&env);
+        assert_eq!(c.status, Status::Ok, "{}", c.detail);
+        fs::create_dir_all(home.path().join("plugins")).unwrap();
+        let file = home.path().join("plugins/installed_plugins.json");
+        fs::write(&file, r#"{"plugins":{"sluice@s":[{"version":"0.0.1"}]}}"#).unwrap();
+        let c = check_plugin(&env);
+        assert_eq!(c.status, Status::Warn, "{}", c.detail);
+        assert!(c.detail.contains("0.0.1"), "{}", c.detail);
+        fs::write(
+            &file,
+            format!(
+                r#"{{"plugins":{{"sluice@s":[{{"version":"{}"}}]}}}}"#,
+                env!("CARGO_PKG_VERSION")
+            ),
+        )
+        .unwrap();
+        assert_eq!(check_plugin(&env).status, Status::Ok);
+        fs::write(&file, "garbage").unwrap();
+        assert_eq!(check_plugin(&env).status, Status::Ok);
+    }
+
+    #[test]
+    fn weights_warn_only_when_the_ceiling_is_far_below_the_learned_weight() {
+        let cfg = RepoConfig::parse(
+            "version = 1\n[gates.a]\ncmd = \"x\"\nweight = 2\n\
+             [gates.b]\ncmd = \"x\"\nweight = 4\n\
+             [gates.c]\ncmd = \"x\"\nweight = \"auto\"\n",
+            Path::new(".sluice.toml"),
+        )
+        .unwrap();
+        let learned = |g: &str| match g {
+            "a" => Some(5),
+            "b" => Some(6),
+            "c" => Some(20),
+            _ => None,
+        };
+        let c = weight_check(&cfg, learned);
+        assert_eq!(c.status, Status::Warn, "{}", c.detail);
+        assert!(
+            c.detail.contains("'a'") && !c.detail.contains("'b'"),
+            "{}",
+            c.detail
+        );
+        assert!(!c.detail.contains("'c'"), "{}", c.detail);
+        assert!(c.detail.contains("auto"), "{}", c.detail);
+        assert_eq!(weight_check(&cfg, |_| None).status, Status::Ok);
+    }
+
+    #[test]
+    fn shims_report_state_and_path_position_by_shell_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shims = tmp.path().join("shims");
+        let env = |agent: &str, path: &str| {
+            env_of(&[
+                ("HOME", tmp.path().to_str().unwrap()),
+                ("SLUICE_SHIM_DIR", shims.to_str().unwrap()),
+                ("SLUICE_AGENT", agent),
+                ("PATH", path),
+            ])
+        };
+        let plain = "/usr/bin:/bin";
+        // Not installed: ok for a human, a warning for an agent shell.
+        assert_eq!(check_shims(&env("0", plain), tmp.path()).status, Status::Ok);
+        assert_eq!(
+            check_shims(&env("1", plain), tmp.path()).status,
+            Status::Warn
+        );
+        let user = UserConfig::default();
+        let names = HeavyMatcher::from_config(&user.agent).shim_names();
+        let done = crate::shim::install_into(
+            &shims,
+            &crate::shim::current_binary().unwrap(),
+            &names,
+            false,
+        )
+        .unwrap();
+        // Installed but not in PATH: warn for an agent, ok with a note for a human.
+        let agent = check_shims(&env("1", plain), tmp.path());
+        assert_eq!(agent.status, Status::Warn, "{}", agent.detail);
+        let human = check_shims(&env("0", plain), tmp.path());
+        assert_eq!(human.status, Status::Ok, "{}", human.detail);
+        assert!(human.detail.contains("agent plugin"), "{}", human.detail);
+        // First in PATH: ok everywhere.
+        let first = format!("{}:/usr/bin", done.dir.display());
+        let c = check_shims(&env("1", &first), tmp.path());
+        assert_eq!(c.status, Status::Ok, "{}", c.detail);
+        assert!(c.detail.contains("first in PATH"), "{}", c.detail);
+        // Behind another entry: warn for an agent.
+        let behind = format!("/usr/bin:{}", done.dir.display());
+        assert_eq!(
+            check_shims(&env("1", &behind), tmp.path()).status,
+            Status::Warn
+        );
+        // A stale shim warns for everyone.
+        fs::write(done.dir.join(&names[0]), "#!/bin/sh\nold\n").unwrap();
+        let c = check_shims(&env("0", plain), tmp.path());
+        assert_eq!(c.status, Status::Warn, "{}", c.detail);
+        assert!(c.detail.contains("stale"), "{}", c.detail);
     }
 
     #[test]
