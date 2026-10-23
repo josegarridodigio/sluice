@@ -106,7 +106,10 @@ start may be hours away.
   instructions between the fork and the pipe write.
 - On end of file the reaper SIGTERMs every registered group that
   `group_is_ours`, waits up to `KILL_GRACE` (5 s), SIGKILLs the rest and
-  exits. After a clean stop the daemon closes the pipe, nothing is
+  exits. While it waits (`executor::terminate_groups_blocking`, also used
+  by the daemon's own shutdown), a group is dropped the first time it is
+  seen empty and never signalled again: its pgid may already name an
+  unrelated new group (alpha review finding 8). After a clean stop the daemon closes the pipe, nothing is
   registered and the reaper exits at once.
 - Clients waiting on a daemon that died get `sluice: error: the daemon died
   while running <gate>; it was killed` and exit 143 (`while <gate> was
@@ -140,6 +143,27 @@ Limit: a job spawned in the instant before the daemon dies may be missed
 by the reaper (registered right after the spawn); the next start
 reconciles it. If both the daemon and the reaper are SIGKILLed together
 (`pkill -9 sluice`), only reconciliation remains.
+
+**Known limitation (accepted, alpha review finding 13): the
+fork-to-registration window.** Between the fork in `executor::spawn` and
+the `+ <pgid>` line on the reaper pipe there are a few instructions (no
+await, no helper process) during which a SIGKILLed daemon leaves a gate
+the reaper never heard of. Closing it would need the registration before
+the fork (an unknown pgid) or a `pre_exec` hook (`unsafe`, forbidden).
+The gate's row is already `queued`/`started` in the store with the
+daemon's instance id, so the next daemon start reconciles it (kills the
+group when its start ticks match, marks the row `killed`). Until then the
+gate may run to completion unsupervised; it can never write a marker
+(markers are written by the daemon after a verdict).
+
+**A job finished while it is being spawned.** `detach` (last subscriber
+gone) and `drain` (stop) drop a queued job under the same state lock as
+the "still queued" check (`close_job`), so the scheduling loop cannot
+admit it in between. Should a job's entry nevertheless be gone when
+`launch` registers its process, the daemon cancels it (SIGTERM to the
+group, SIGKILL after the grace), awaits it and untracks it from the
+reaper instead of leaving it running unsupervised (alpha review
+finding 7).
 
 ## Executor
 

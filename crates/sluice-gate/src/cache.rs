@@ -21,7 +21,7 @@ fn fail(message: &str) -> ExitCode {
 /// marker (and how old it is) or a recorded miss. With `all`, also lists
 /// every marker stored for the repository.
 pub fn status(all: bool) -> ExitCode {
-    let env: EnvMap = std::env::vars().collect();
+    let env: EnvMap = sluice_gate_core::config::process_env();
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => return fail(&format!("cannot read the current directory: {e}")),
@@ -122,7 +122,7 @@ pub fn status(all: bool) -> ExitCode {
 
 /// `sluice cache clear [--gate <name>]`.
 pub fn clear(gate: Option<&str>) -> ExitCode {
-    let env: EnvMap = std::env::vars().collect();
+    let env: EnvMap = sluice_gate_core::config::process_env();
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => return fail(&format!("cannot read the current directory: {e}")),

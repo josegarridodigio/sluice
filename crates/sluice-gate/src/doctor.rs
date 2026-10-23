@@ -107,7 +107,7 @@ struct Report<'a> {
 
 /// Entry point of `sluice doctor`.
 pub fn run(args: &DoctorArgs) -> ExitCode {
-    let env: EnvMap = std::env::vars().collect();
+    let env: EnvMap = sluice_gate_core::config::process_env();
     let cwd = std::env::current_dir().unwrap_or_default();
     let checks = collect(&env, &cwd);
     let ok = checks.iter().all(|c| c.status != Status::Fail);
@@ -338,11 +338,43 @@ fn check_socket_path(env: &EnvMap) -> Check {
     }
 }
 
+/// The daemon socket doctor may connect to: `Err` with the problem when it
+/// is the short fallback and its directory exists but is unsafe (another
+/// user could have planted the socket), `Ok(None)` when no path can be
+/// planned. Nothing is created.
+fn socket_to_contact(env: &EnvMap) -> Result<Option<PathBuf>, String> {
+    let Ok(location) = dirs::plan_socket(env) else {
+        return Ok(None);
+    };
+    if let dirs::SocketSource::Fallback { .. } = location.source {
+        let dir = location.path.parent().unwrap_or(Path::new("/"));
+        if let Some(problem) = dirs::current_uid()
+            .filter(|_| fs::symlink_metadata(dir).is_ok())
+            .and_then(|uid| dirs::unsafe_socket_dir(dir, uid))
+        {
+            return Err(format!("{} {problem}", dir.display()));
+        }
+    }
+    Ok(Some(location.path))
+}
+
 /// Socket, daemon version and lease checks.
 fn check_daemon(env: &EnvMap) -> Vec<Check> {
     let mut out = Vec::new();
     let installed = env!("CARGO_PKG_VERSION");
-    let socket = dirs::socket_path_no_create(env);
+    let socket = match socket_to_contact(env) {
+        Ok(socket) => socket,
+        Err(problem) => {
+            out.push(check(
+                "daemon",
+                Status::Fail,
+                format!("not contacted: the fallback socket directory is unsafe: {problem}"),
+            ));
+            out.push(check_lease(env, None));
+            out.push(check_database(env));
+            return out;
+        }
+    };
     let mut live_pid = None;
     match socket {
         Some(socket) if socket.exists() => {
@@ -975,7 +1007,7 @@ fn write_bundle(
         put("repo-sluice.toml", &text)?;
     }
 
-    let socket = dirs::socket_path_no_create(env).filter(|s| s.exists());
+    let socket = socket_to_contact(env).ok().flatten().filter(|s| s.exists());
     let status = socket
         .as_deref()
         .and_then(|s| client::connect(s).and_then(client::Client::status).ok());

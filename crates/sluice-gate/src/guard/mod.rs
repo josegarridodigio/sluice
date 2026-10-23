@@ -209,7 +209,8 @@ pub fn respond(input: &str, inputs: &Inputs<'_>) -> Option<String> {
         }
     };
     let heavy = HeavyMatcher::from_config(&user.agent);
-    let plan = match matcher::plan(command, &cwd, &heavy, world) {
+    let shell = matcher::ShellContext::from_env(inputs.env);
+    let plan = match matcher::plan(command, &cwd, shell, &heavy, world) {
         Ok(plan) => plan,
         Err(NoPlan::Nothing) => return legacy(),
         Err(NoPlan::Error) => return None,
@@ -271,7 +272,7 @@ fn watchdog_limit(env: &EnvMap) -> Duration {
 
 /// `sluice guard`: always exits 0; prints the decision JSON or nothing.
 pub fn run_hook() -> ExitCode {
-    let env: EnvMap = std::env::vars().collect();
+    let env: EnvMap = sluice_gate_core::config::process_env();
     if Mode::from_env(&env) == Mode::Off {
         return ExitCode::SUCCESS;
     }

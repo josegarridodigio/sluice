@@ -7,7 +7,7 @@
 //! re-quoted, unescaped or moved. Design: `kb/sluice/design/command-control.md`
 //! sections 4.3 and 4.7.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use sluice_gate_core::heavy::{HeavyMatcher, canonical_words};
 
@@ -221,7 +221,58 @@ fn dir_cmd(s: &Segment) -> Option<&str> {
         .filter(|w| *w == "cd" || DIR_CHANGERS.contains(w))
 }
 
-/// Plans the rewrite of `command` run in `cwd`.
+/// `base` joined with `rel` the way a shell's logical `cd` does it: `.` is
+/// dropped and `..` removes the previous component of the path as typed,
+/// without resolving symlinks. `None` unless the result is absolute.
+pub fn lexical_join(base: &Path, rel: &str) -> Option<PathBuf> {
+    let mut out = PathBuf::from("/");
+    for comp in base.join(rel).components() {
+        match comp {
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(c) => out.push(c),
+            Component::Prefix(_) => return None,
+        }
+    }
+    base.is_absolute().then_some(out)
+}
+
+/// True when `word` has a `..` component.
+fn has_parent_component(word: &str) -> bool {
+    Path::new(word)
+        .components()
+        .any(|c| c == Component::ParentDir)
+}
+
+/// The shell context of a command besides its text.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ShellContext {
+    /// `CDPATH` is set (non-empty): a relative `cd` may go elsewhere.
+    pub cdpath: bool,
+}
+
+impl ShellContext {
+    /// The context the hook's environment implies (the agent's shell
+    /// inherits it).
+    pub fn from_env(env: &sluice_gate_core::config::EnvMap) -> Self {
+        Self {
+            cdpath: env.get("CDPATH").is_some_and(|v| !v.is_empty()),
+        }
+    }
+}
+
+/// Plans the rewrite of `command` run in `cwd` (the logical working
+/// directory the hook reports, as the shell's `$PWD`).
+///
+/// A `cd` target is resolved lexically on the logical directory, as the
+/// shell's `cd` does, and only then canonicalised to find the
+/// `.sluice.toml`. No rewrite is planned when `CDPATH` is set and the
+/// command changes directory, nor when a `cd` argument has a `..`
+/// component while the logical and canonical current directories differ
+/// (a symlink on the way: the guard does not guess which one the shell
+/// follows).
 ///
 /// # Errors
 /// [`NoPlan::Nothing`] when no segment is rewritten, [`NoPlan::Error`] when a
@@ -229,6 +280,7 @@ fn dir_cmd(s: &Segment) -> Option<&str> {
 pub fn plan(
     command: &str,
     cwd: &Path,
+    shell: ShellContext,
     heavy: &HeavyMatcher,
     world: &dyn World,
 ) -> Result<Plan, NoPlan> {
@@ -239,7 +291,11 @@ pub fn plan(
         // on exit codes; the guard does not guess.
         return Err(NoPlan::Nothing);
     }
-    let mut dir = world.resolve_dir(cwd).ok_or(NoPlan::Nothing)?;
+    if has_cd && shell.cdpath {
+        return Err(NoPlan::Nothing);
+    }
+    let mut logical = lexical_join(cwd, ".").ok_or(NoPlan::Nothing)?;
+    let mut dir = world.resolve_dir(&logical).ok_or(NoPlan::Nothing)?;
     let mut edits = Vec::new();
     let mut prev_op: Option<Op> = None;
     for seg in &segs {
@@ -259,9 +315,11 @@ pub fn plan(
                 {
                     return Err(NoPlan::Nothing);
                 }
-                dir = world
-                    .resolve_dir(&dir.join(&arg.value))
-                    .ok_or(NoPlan::Nothing)?;
+                if has_parent_component(&arg.value) && logical != dir {
+                    return Err(NoPlan::Nothing);
+                }
+                logical = lexical_join(&logical, &arg.value).ok_or(NoPlan::Nothing)?;
+                dir = world.resolve_dir(&logical).ok_or(NoPlan::Nothing)?;
                 continue;
             }
             Some(_) => return Err(NoPlan::Nothing),
@@ -286,6 +344,13 @@ fn plan_segment(
     heavy: &HeavyMatcher,
     world: &dyn World,
 ) -> Result<Option<Edit>, NoPlan> {
+    // `PATH=... cmd` would also apply to the inserted `sluice`.
+    if seg.words[..seg.assignments]
+        .iter()
+        .any(|w| w.value.starts_with("PATH="))
+    {
+        return Ok(None);
+    }
     let mut words = seg.command_words();
     // An optional leading `time` (the keyword, without options) is kept.
     if words
@@ -432,11 +497,102 @@ fn naive_pieces(command: &str) -> Vec<String> {
         .collect()
 }
 
-/// True when some piece of `command` runs `sluice queue approve`.
+/// True when some piece of `command` runs `sluice queue approve`, or may
+/// run it and the guard cannot tell (deny when unsure).
+///
+/// Each segment's words are looked at after quote removal, with the program
+/// as its base name (`"sluice"`, `/usr/bin/sluice`), through the wrappers
+/// that run their arguments as a command (`env` with its assignments,
+/// `command`, `builtin`, `exec`, `nohup`, `time`, `setsid`, `sluice exec
+/// --`). A wrapper whose arguments the guard does not parse (`sh -c`,
+/// `eval`, `xargs`, `sudo`, `timeout`, ...) and a command the tokenizer
+/// refuses count as approving when the text mentions both `queue` and
+/// `approve`.
 pub fn runs_approve(command: &str) -> bool {
-    naive_pieces(command)
+    if naive_pieces(command)
         .iter()
         .any(|p| has_prefix(p, "sluice queue approve"))
+    {
+        return true;
+    }
+    match lex::split(command) {
+        None => mentions_approve(command),
+        Some(segs) => segs.iter().any(|seg| {
+            let words: Vec<&str> = seg
+                .command_words()
+                .iter()
+                .map(|w| w.value.as_str())
+                .collect();
+            words_approve(&words, &command[seg.start..seg.end])
+        }),
+    }
+}
+
+/// The text names both `queue` and `approve`.
+fn mentions_approve(text: &str) -> bool {
+    text.contains("approve") && text.contains("queue")
+}
+
+/// Wrappers that run the rest of their words as a command, after their own
+/// options (none of which takes a separate argument).
+const PLAIN_WRAPPERS: &[&str] = &["command", "builtin", "exec", "nohup", "time", "setsid"];
+
+/// Wrappers whose arguments the guard does not parse.
+const OPAQUE_WRAPPERS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "xargs", "sudo", "doas", "su", "timeout",
+    "nice", "ionice", "chrt", "taskset", "strace", "stdbuf", "flock", "watch", "parallel",
+    "script", "unbuffer", "source", ".",
+];
+
+fn words_approve(words: &[&str], text: &str) -> bool {
+    let mut i = 0;
+    while let Some(&word) = words.get(i) {
+        let program = word.rsplit('/').next().unwrap_or(word);
+        match program {
+            "sluice" => {
+                let rest = &words[i + 1..];
+                match rest.iter().position(|w| !w.starts_with('-')) {
+                    Some(k) if rest[k] == "queue" => {
+                        return rest[k + 1..].contains(&"approve");
+                    }
+                    Some(k) if rest[k] == "exec" => {
+                        let Some(dd) = rest[k..].iter().position(|w| *w == "--") else {
+                            return mentions_approve(text);
+                        };
+                        i += 1 + k + dd + 1;
+                    }
+                    _ => return false,
+                }
+            }
+            "env" => {
+                i += 1;
+                while let Some(w) = words.get(i) {
+                    if matches!(
+                        *w,
+                        "-S" | "--split-string" | "-C" | "--chdir" | "-u" | "--unset"
+                    ) || w.starts_with("-S")
+                        || w.starts_with("--split-string")
+                    {
+                        return mentions_approve(text);
+                    }
+                    if w.starts_with('-') || w.contains('=') {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            _ if PLAIN_WRAPPERS.contains(&program) => {
+                i += 1;
+                while words.get(i).is_some_and(|w| w.starts_with('-')) {
+                    i += 1;
+                }
+            }
+            _ if OPAQUE_WRAPPERS.contains(&program) => return mentions_approve(text),
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// The gate a piece of `command` runs outside Sluice (verbatim gate command,

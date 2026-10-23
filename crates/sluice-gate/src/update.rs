@@ -357,7 +357,7 @@ fn replace_executable(new: &Path, target: &Path) -> Outcome {
 
 /// Stops an idle daemon so the next command starts the new version.
 fn restart_daemon() {
-    let env: EnvMap = std::env::vars().collect();
+    let env: EnvMap = sluice_gate_core::config::process_env();
     let Ok(socket) = dirs::socket_path(&env) else {
         return;
     };
@@ -396,7 +396,7 @@ pub fn run(args: &UpdateArgs) -> ExitCode {
 }
 
 fn do_update(args: &UpdateArgs) -> Outcome {
-    let env: EnvMap = std::env::vars().collect();
+    let env: EnvMap = sluice_gate_core::config::process_env();
     let current = Version::parse(CURRENT)
         .ok_or_else(|| Failure::error(format!("cannot parse own version '{CURRENT}'")))?;
     let base_override = env

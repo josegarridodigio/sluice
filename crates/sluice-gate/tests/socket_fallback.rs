@@ -273,3 +273,34 @@ fn an_over_long_sluice_socket_is_a_clear_error() {
         "{detail}"
     );
 }
+
+/// Alpha review finding 12: `doctor` (checks and bundle) never connects to
+/// a socket planted in an unsafe fallback directory.
+#[test]
+fn doctor_never_connects_through_an_unsafe_fallback_dir() {
+    let lr = LongRuntime::new("[gates.test]\ncmd = \"true\"\n");
+    let dir = lr.fallback_dir();
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+    let planted = std::os::unix::net::UnixListener::bind(lr.socket()).unwrap();
+    planted.set_nonblocking(true).unwrap();
+    let check = lr.doctor_check("daemon");
+    assert_eq!(check["status"], "fail", "{check}");
+    assert!(
+        check["detail"].as_str().unwrap().contains("not contacted"),
+        "{check}"
+    );
+    let out_dir = tempfile::tempdir().unwrap();
+    let bundle = out_dir.path().join("b.tar.gz");
+    let out = lr
+        .sluice()
+        .args(["doctor", "--bundle"])
+        .arg(&bundle)
+        .output()
+        .expect("doctor --bundle");
+    assert!(bundle.exists(), "{out:?}");
+    match planted.accept() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("doctor connected to the planted socket: {other:?}"),
+    }
+}

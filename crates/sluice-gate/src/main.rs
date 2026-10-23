@@ -543,7 +543,7 @@ fn main() -> ExitCode {
 /// `sluice mcp`: the MCP stdio server on a multi-threaded tokio runtime
 /// (only this subcommand builds one; the `sluice run` hit path stays synchronous).
 fn mcp() -> ExitCode {
-    let env = std::env::vars().collect();
+    let env = sluice_gate_core::config::process_env();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

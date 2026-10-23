@@ -1002,6 +1002,7 @@ fn assert_safe(original: &str) -> bool {
     let Ok(plan) = matcher::plan(
         original,
         Path::new("/r"),
+        matcher::ShellContext::default(),
         &HeavyMatcher::default(),
         &FakeWorld,
     ) else {
@@ -1306,4 +1307,136 @@ fn injection_fuzz() {
         rewrites > 500,
         "only {rewrites} random commands were rewritten"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Alpha review fixes (kb/sluice/changes/alpha-review-fixes.md).
+
+/// A world with symlinks: `/link` -> `/real/deep`, `/r/l` -> `/x/y`.
+/// `resolve_dir` canonicalises like `realpath`, component by component.
+struct SymWorld;
+
+impl World for SymWorld {
+    fn resolve_dir(&self, path: &Path) -> Option<PathBuf> {
+        let links = [("/link", "/real/deep"), ("/r/l", "/x/y")];
+        let mut out = PathBuf::from("/");
+        for comp in path.components() {
+            match comp {
+                std::path::Component::ParentDir => {
+                    out.pop();
+                }
+                std::path::Component::Normal(c) => {
+                    out.push(c);
+                    if let Some((_, to)) = links.iter().find(|(from, _)| out == Path::new(from)) {
+                        out = PathBuf::from(to);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(out)
+    }
+
+    fn gates_from(&self, dir: &Path) -> Result<Option<Gates>, ()> {
+        FakeWorld.gates_from(dir)
+    }
+}
+
+fn plan_in(cmd: &str, cwd: &str, cdpath: bool) -> Option<String> {
+    matcher::plan(
+        cmd,
+        Path::new(cwd),
+        matcher::ShellContext { cdpath },
+        &HeavyMatcher::default(),
+        &SymWorld,
+    )
+    .ok()
+    .map(|p| p.apply(cmd))
+}
+
+#[test]
+fn cd_targets_resolve_on_the_logical_directory() {
+    // The shell's `cd l/..` from /r comes back to /r (logical), not /x.
+    assert_eq!(
+        plan_in("cd l/.. && cargo test --workspace", "/r", false).as_deref(),
+        Some("cd l/.. && sluice run test -v")
+    );
+    assert_eq!(
+        matcher::lexical_join(Path::new("/a/b"), "../c/./d").as_deref(),
+        Some(Path::new("/a/c/d"))
+    );
+    assert_eq!(matcher::lexical_join(Path::new("rel"), "x"), None);
+    // `..` while the logical directory differs from the canonical one: the
+    // guard does not guess which one the shell follows.
+    assert_eq!(
+        plan_in("cd .. && cargo test --workspace", "/link/sub", false),
+        None
+    );
+    // Without `..` the same directory is fine.
+    assert!(plan_in("cd sub && cargo build", "/link", false).is_some());
+}
+
+#[test]
+fn cdpath_disables_rewrites_that_change_directory() {
+    assert_eq!(plan_in("cd sub && cargo build", "/r", true), None);
+    // Without a `cd`, CDPATH does not matter.
+    assert!(plan_in("cargo build", "/r", true).is_some());
+    let env = |v: &str| EnvMap::from([("CDPATH".to_owned(), v.to_owned())]);
+    assert!(matcher::ShellContext::from_env(&env("/src")).cdpath);
+    assert!(!matcher::ShellContext::from_env(&env("")).cdpath);
+    assert!(!matcher::ShellContext::from_env(&EnvMap::new()).cdpath);
+}
+
+#[test]
+fn a_path_assignment_is_never_rewritten() {
+    assert_eq!(plan_in("PATH=/evil:$PATH cargo build", "/r", false), None);
+    assert_eq!(
+        plan_in("PATH=/evil cargo test --workspace", "/r", false),
+        None
+    );
+    assert_eq!(
+        plan_in("FOO=1 cargo build", "/r", false).as_deref(),
+        Some("FOO=1 sluice exec --label cargo-build -- cargo build")
+    );
+}
+
+#[test]
+fn approval_is_found_through_quotes_paths_and_wrappers() {
+    for cmd in [
+        "sluice queue approve t-1",
+        "\"sluice\" queue approve t-1",
+        "'sluice' 'queue' 'approve' t-1",
+        "/home/u/.cargo/bin/sluice queue approve t-1",
+        "./sluice queue approve --yes t-1",
+        "sluice queue --yes approve t-1",
+        "env sluice queue approve t-1",
+        "env -i A=1 B=2 sluice queue approve t-1",
+        "command sluice queue approve t-1",
+        "nohup sluice queue approve t-1",
+        "exec sluice queue approve t-1",
+        "time sluice queue approve t-1",
+        "sluice exec -- sluice queue approve t-1",
+        "sluice exec --label x -- env sluice queue approve t-1",
+        "sh -c 'sluice queue approve t-1'",
+        "bash -lc \"s=sluice; \\$s queue approve t-1\"",
+        "eval sluice queue approve t-1",
+        "echo t-1 | xargs sluice queue approve",
+        "timeout 5 sluice queue approve t-1",
+        "s\\luice queue approve t-1",
+        "$(echo sluice) queue approve t-1",
+        "make && SLUICE_X=1 sluice queue approve t-1",
+    ] {
+        assert!(matcher::runs_approve(cmd), "{cmd}");
+    }
+    for cmd in [
+        "sluice queue status",
+        "sluice run test",
+        "echo sluice queue approve",
+        "git commit -m 'approve the queue design'",
+        "sluice exec -- cargo build",
+        "env FOO=1 cargo test",
+        "sh -c 'cargo test'",
+    ] {
+        assert!(!matcher::runs_approve(cmd), "{cmd}");
+    }
 }

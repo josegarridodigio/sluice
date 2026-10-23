@@ -121,8 +121,11 @@ jobs (A1) keep their declared weight.
 main worktree path (as for the repo cap); `cmd_hash` = 16 hex of SHA-256
 over the normalised `cmd`, `\0`, and the `extra` args joined by `\0` (a new
 command or a `--grep` filter starts a new history). Samples from `pass`
-and `fail` only (timeouts, kills, cached are partial); window = last 10;
-learned after **3**.
+runs only (alpha review finding 5: a failing run often stops early, a
+compile error or the first failed test, and taught a weight far below what
+the suite needs once it passes; timeouts, kills, cached are partial);
+`gate_stats` rows of failed runs written by earlier releases are ignored
+when the statistics are loaded; window = last 10; learned after **3**.
 `w_eff = clamp(round_half_up(P75(demand)), max(1, ⌈w_cfg/4⌉), w_cfg)`,
 `w_cfg` = configured weight after the budget and repo-cap clamp. Never
 above `w_cfg`; the floor stops a sleeping or memory-heavy gate from
@@ -158,7 +161,11 @@ A job that does not fit the nominal budget starts anyway when all hold:
 5. `used + w_eff ≤ cap = ⌊overcommit × budget⌋` (**1.5**); the repository
    cap still applies strictly;
 6. at most **one** over-admission per `overcommit_interval` (**5 s**), so
-   each step shows in `avg10` before the next.
+   each step shows in `avg10` before the next;
+7. the newest utilisation sample was taken at least one sampler tick
+   (`psi_poll_interval`) after the latest admission of any kind
+   (`Scheduler::last_start_at`), so the idle CPUs it reports do not predate
+   jobs that just started (alpha review finding 4).
 
 Interactions: over-admitted jobs are never preempted; while
 `used > budget` nothing is admitted nominally, so the system drains back.
@@ -258,7 +265,7 @@ script misdetected as human floods the queue; bounded by the overdue rule.
 
 HRRN is SJF with built-in ageing and no parameter (a waiting job's ratio
 grows without bound), plus the hard overdue rule. `expected_ms` = median
-`wall_ms` of the key's last 10 pass/fail runs; unknown → 60 s. Effect in
+`wall_ms` of the key's last 10 passing runs; unknown → 60 s. Effect in
 s2: **none expected** (homogeneous tests; lints backfill because 1 unit is
 almost always free). It helps mixed queues only when the budget is full
 and the next slot must be chosen. Implement and unit-test; default
@@ -291,6 +298,9 @@ the `/proc/stat` lines of the CPUs in its affinity mask
 ```
 idle_frac = Σ Δidle_j / Σ Δtotal_j          # 0..1
 idle_cpus = idle_frac × N_allowed           # input of M3
+# under a cgroup CPU limit L < N_allowed (alpha review finding 6):
+idle_cpus = max(0, L − (N_allowed − idle_frac × N_allowed))
+idle_frac = idle_cpus / L
 if the queue was non-empty at the previous sample:
     waiting_wall_ms       += Δt_ms
     idle_while_waiting_ms += Δt_ms × idle_frac
@@ -411,7 +421,9 @@ pub struct QueuedJob { id, key: Option<CacheKey>, repo, lane: PathBuf, gate,
 pub struct RunningJob { id, repo, lane, weight: u32, started_at: u64, admission: Admission }
 pub struct Pressure { blocking: bool, guard_due: bool,
     calm_for_overcommit: bool /* section 5, conditions 1-3 */,
-    idle_cpus: Option<f64>, last_overcommit_at: Option<u64> }
+    idle_cpus: Option<f64>, sampled_at: Option<u64> /* newest utilisation sample */ }
+/* Snapshot also carries last_overcommit_at and last_start_at; Policy
+   carries sample_tick_ms (the sampler period). */
 pub struct Policy { budget, cap: u32, head_reserve_after_ms, overcommit_interval_ms: u64,
     order: Order /* Fifo|Hrrn */, fairness: bool, human_first: bool,
     repo_caps: BTreeMap<PathBuf, u32> }
@@ -543,4 +555,13 @@ defaults are exactly those of section 2. Where the code differs:
 10. **CPU budget source.** `sluice_gate_core::cpus` reads
     `Cpus_allowed_list` and the cgroup v2/v1 limits itself (injectable root,
     unit-tested) and falls back to `available_parallelism`; the daemon's
-    utilisation sampler uses the mask from `<proc_root>/self/status`.
+    utilisation sampler uses the mask from `<proc_root>/self/status`, and
+    the cgroup limit read under the parent of `proc_root`
+    (`sampler::cgroup_cpu_limit`: `/proc` → `/`, a fake `<root>/proc` →
+    `<root>`): when the limit is below the mask, idle CPUs are the limit
+    minus the busy CPUs of the mask, never below 0 (alpha review finding 6).
+11. **Fresh samples for over-admission.** `Pressure::sampled_at` is the
+    time of the newest utilisation reading; `plan` over-admits only when
+    it is at least `Policy::sample_tick_ms` after `Snapshot::last_start_at`
+    (set by every admission: nominal, guard or over). Note 1 above remains
+    (no over-admission in a pass that started a job nominally).

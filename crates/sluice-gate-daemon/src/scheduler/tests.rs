@@ -289,6 +289,7 @@ fn snapshot<'a>(
         policy,
         pressure,
         last_overcommit_at: None,
+        last_start_at: None,
         running,
         queued,
         learned: &NO_LEARNED,
@@ -483,6 +484,7 @@ fn the_guard_never_over_admits() {
             guard_due: true,
             calm: true,
             idle_cpus: Some(8.0),
+            sampled_at: None,
         },
         &running,
         &queued,
@@ -564,16 +566,21 @@ fn scheduler_counts_over_admissions_and_drains_back() {
     }
     let first = s.admit_with(10, calm(4.0));
     assert_eq!(first.len(), 2, "nominal: 2 + 2");
-    let over = s.admit_with(20, calm(4.0));
+    // Over-admission needs a sample one tick after the latest start.
+    let fresh = |idle: f64, at: u64| Pressure {
+        sampled_at: Some(at),
+        ..calm(idle)
+    };
+    let over = s.admit_with(1_100, fresh(4.0, 1_010));
     assert_eq!(over, vec![("j2".into(), Admission::Over)]);
     assert_eq!(s.used(), 6);
     assert_eq!(s.over_admissions(), 1);
     // used > budget: nothing nominal; the cap holds.
-    assert_eq!(s.admit_with(10_000, calm(4.0)), Vec::new());
+    assert_eq!(s.admit_with(10_000, fresh(4.0, 9_000)), Vec::new());
     assert!(s.finish("j0").is_some());
     // 4 used = budget: still no room nominally; over-admission again.
     assert_eq!(
-        s.admit_with(20_000, calm(4.0)),
+        s.admit_with(20_000, fresh(4.0, 19_000)),
         vec![("j3".into(), Admission::Over)]
     );
     assert_eq!(
@@ -991,4 +998,39 @@ fn plan_resolves_weights_from_the_snapshot() {
     let decided = plan(&snapshot(10, &p, Pressure::default(), &[], &queued));
     assert_eq!(decided.weights, [4, 4]);
     assert_eq!(started(&decided).len(), 1);
+}
+
+// ------------------------------------------- alpha review: fresh samples
+
+#[test]
+fn over_admission_waits_for_a_sample_taken_after_the_latest_start() {
+    let p = over_policy();
+    let mut s = Scheduler::with_policy(p);
+    // Three suites of 6 fill 18 of 20; the fourth does not fit nominally.
+    for i in 0..4 {
+        s.enqueue(spec(&format!("s{i}"), None, &format!("/r{i}"), 6, i));
+    }
+    let calm_at = |sampled_at: u64| Pressure {
+        calm: true,
+        idle_cpus: Some(8.0),
+        sampled_at: Some(sampled_at),
+        ..Pressure::default()
+    };
+    let started = s.admit_with(10_000, calm_at(9_900));
+    assert_eq!(started.len(), 3, "three nominal starts at 10 s");
+    // The newest sample predates the starts: its idle CPUs are stale.
+    assert_eq!(s.admit_with(10_500, calm_at(9_900)), Vec::new());
+    // A sample less than one tick after the start still overlaps it.
+    assert_eq!(s.admit_with(10_800, calm_at(10_700)), Vec::new());
+    // No sample at all is never fresh after a start.
+    let no_sample = Pressure {
+        sampled_at: None,
+        ..calm_at(0)
+    };
+    assert_eq!(s.admit_with(11_500, no_sample), Vec::new());
+    // One full tick after the start: the over-admission may happen.
+    assert_eq!(
+        s.admit_with(11_500, calm_at(11_000)),
+        [("s3".to_owned(), Admission::Over)]
+    );
 }

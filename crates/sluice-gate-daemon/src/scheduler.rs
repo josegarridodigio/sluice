@@ -280,6 +280,9 @@ pub struct Policy {
     pub head_reserve_after_ms: u64,
     /// At most one over-admission per this many milliseconds.
     pub overcommit_interval_ms: u64,
+    /// Period of the utilisation and PSI sampler: an over-admission needs a
+    /// sample taken at least this long after the latest admission.
+    pub sample_tick_ms: u64,
     /// Tie-break among equal priorities.
     pub order: Order,
     /// Interleave lanes (worktrees).
@@ -306,6 +309,7 @@ impl Policy {
             cap: budget,
             head_reserve_after_ms,
             overcommit_interval_ms: 5_000,
+            sample_tick_ms: 1_000,
             order: Order::Fifo,
             fairness: false,
             human_first: false,
@@ -338,6 +342,8 @@ pub struct Pressure {
     pub calm: bool,
     /// Mean idle CPUs over the last two utilisation samples.
     pub idle_cpus: Option<f64>,
+    /// Time of the newest utilisation sample (unix milliseconds).
+    pub sampled_at: Option<u64>,
 }
 
 /// A queued job in a [`Snapshot`].
@@ -386,6 +392,8 @@ pub struct Snapshot<'a> {
     pub pressure: Pressure,
     /// Time of the last over-admission.
     pub last_overcommit_at: Option<u64>,
+    /// Time of the latest admission of any kind.
+    pub last_start_at: Option<u64>,
     /// Running jobs.
     pub running: &'a [RunningSnap],
     /// Queued jobs (any order).
@@ -584,7 +592,12 @@ pub fn plan(s: &Snapshot<'_>) -> Plan {
     let interval_ok = s
         .last_overcommit_at
         .is_none_or(|t| s.now.saturating_sub(t) >= p.overcommit_interval_ms);
-    if p.cap > p.budget && plan.start.is_empty() && s.pressure.calm && interval_ok {
+    if p.cap > p.budget
+        && plan.start.is_empty()
+        && s.pressure.calm
+        && interval_ok
+        && samples_after_last_start(s)
+    {
         let used = used_of(&held);
         let candidate = reserved.or_else(|| {
             waiting
@@ -605,6 +618,18 @@ pub fn plan(s: &Snapshot<'_>) -> Plan {
         }
     }
     plan
+}
+
+/// Whether the pressure facts reflect the latest admission: no admission
+/// yet, or a utilisation sample taken at least one sampler tick after it
+/// (a sample of the interval before the job started would count its CPUs
+/// as idle).
+fn samples_after_last_start(s: &Snapshot<'_>) -> bool {
+    s.last_start_at.is_none_or(|t| {
+        s.pressure
+            .sampled_at
+            .is_some_and(|at| at >= t.saturating_add(s.policy.sample_tick_ms))
+    })
 }
 
 /// Effective weight of a queued job in this pass: with learned weights on
@@ -754,6 +779,8 @@ pub struct Scheduler {
     /// and by the history a job carries at enqueue).
     learned: Learned,
     last_overcommit_at: Option<u64>,
+    /// Time of the latest admission of any kind.
+    last_start_at: Option<u64>,
     over_admissions: u64,
     /// `now` of the last pass (orders `position` between passes).
     last_now: u64,
@@ -777,6 +804,7 @@ impl Scheduler {
             running: Vec::new(),
             learned: Learned::new(),
             last_overcommit_at: None,
+            last_start_at: None,
             over_admissions: 0,
             last_now: 0,
         }
@@ -894,6 +922,7 @@ impl Scheduler {
             policy: &self.policy,
             pressure: Pressure::default(),
             last_overcommit_at: self.last_overcommit_at,
+            last_start_at: self.last_start_at,
             running,
             queued,
             learned: &self.learned,
@@ -947,6 +976,7 @@ impl Scheduler {
             let mut job = self.queue.remove(idx);
             job.started_at = now;
             job.admission = Some(*admission);
+            self.last_start_at = Some(now);
             if *admission == Admission::Over {
                 self.last_overcommit_at = Some(now);
                 self.over_admissions += 1;

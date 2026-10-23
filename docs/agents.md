@@ -164,8 +164,11 @@ gist as its own instructions, but the file is read first:
 Approval is a human decision. `queue_approve` is off by default and answers
 `not-allowed` without contacting the daemon; it only works when the user
 enables `[queue] allow_agent_approval = true` in
-`~/.config/sluice/config.toml` (the daemon checks the flag again). The daemon
-cannot tell a human from an agent on its socket, so also deny the CLI path to
+`~/.config/sluice/config.toml` (the daemon checks the flag again). Without the
+flag the daemon also refuses `sluice queue approve` run from an agent's
+environment (the `[agent_detection]` rules, for example `CLAUDECODE` set), and
+the plugin's guard denies the command. An agent controls its environment, so
+the daemon cannot be sure who is on its socket: also deny the CLI path to
 agents in `.claude/settings.json`:
 
 ```json

@@ -21,7 +21,7 @@ use sluice_gate_proto::client;
 /// Prints the log of `job_id`, or of the newest job when `None`.
 /// With `lines`, only the last that many lines.
 pub fn show(job_id: Option<&str>, lines: Option<usize>) -> ExitCode {
-    let env: EnvMap = std::env::vars().collect();
+    let env: EnvMap = sluice_gate_core::config::process_env();
     if let Some((path, tail)) = from_daemon(&env, job_id, lines) {
         // Without `-n` the whole file is printed; the daemon only sends a tail.
         let all = read_lines(&path).unwrap_or(tail);
@@ -71,7 +71,7 @@ pub fn show(job_id: Option<&str>, lines: Option<usize>) -> ExitCode {
 /// `sluice logs --timeline [<job>] [--since D]`: one line per job from the
 /// database (read-only; works without a daemon).
 pub fn timeline(job_id: Option<&str>, since: &str) -> ExitCode {
-    let env: EnvMap = std::env::vars().collect();
+    let env: EnvMap = sluice_gate_core::config::process_env();
     let db = core_dirs::database_path(&env);
     let store = match Store::open_read_only(&db) {
         Ok(s) => s,

@@ -69,10 +69,26 @@ pub fn read_proc_stat(
     (!times.is_empty()).then_some(times)
 }
 
+/// The cgroup CPU limit of the daemon (cgroup v2 `cpu.max`, v1 CFS quota),
+/// read under the parent of `proc_root` (`/proc` -> `/`, so a fake tree
+/// `<root>/proc` reads `<root>/proc/self/cgroup` and `<root>/sys/fs/cgroup`).
+pub fn cgroup_cpu_limit(proc_root: &Path) -> Option<u32> {
+    sluice_gate_core::cpus::cgroup_cpu_limit_in(proc_root.parent()?)
+}
+
 /// The utilisation sampler: idle CPUs and the `idle_while_waiting_ms`
 /// integral (ADR-0011 section 7.1).
+///
+/// Under a cgroup CPU quota below the number of sampled CPUs, an idle CPU
+/// of the mask is not necessarily usable: the idle capacity is then the
+/// limit minus the busy CPUs of the mask (never below zero), and the idle
+/// fraction is taken over the limit.
 #[derive(Debug, Clone, Default)]
 pub struct Utilisation {
+    /// The cgroup CPU limit, when one applies.
+    limit: Option<u32>,
+    /// Time of the newest reading that produced a rate.
+    sampled_at: Option<u64>,
     prev: Option<(BTreeMap<u32, CpuTimes>, u64)>,
     /// Whether the queue was non-empty at the previous sample.
     queue_was_nonempty: bool,
@@ -84,6 +100,20 @@ pub struct Utilisation {
 }
 
 impl Utilisation {
+    /// A sampler bounded by a cgroup CPU limit (`None`: no limit).
+    pub fn with_cpu_limit(limit: Option<u32>) -> Self {
+        Self {
+            limit,
+            ..Self::default()
+        }
+    }
+
+    /// Time of the newest sample behind [`Self::idle_cpus`]; `None` before
+    /// two readings.
+    pub fn sampled_at(&self) -> Option<u64> {
+        self.sampled_at
+    }
+
     /// Feeds one `/proc/stat` reading taken at `now_ms` and whether jobs
     /// are queued now. The queue state before the sample decides whether the
     /// elapsed interval counts as waiting time.
@@ -107,12 +137,20 @@ impl Utilisation {
                     d_total += t.total.saturating_sub(p.total);
                 }
             }
-            let idle_frac = (d_total > 0).then(|| (d_idle as f64 / d_total as f64).clamp(0.0, 1.0));
-            if let Some(f) = idle_frac {
-                self.recent.push_back(f * times.len() as f64);
+            let mask = times.len() as f64;
+            let usable = self.limit.map_or(mask, |l| f64::from(l).min(mask));
+            // Idle CPUs usable by the daemon's gates, and their fraction.
+            let idle = (d_total > 0).then(|| {
+                let idle_mask = (d_idle as f64 / d_total as f64).clamp(0.0, 1.0) * mask;
+                (usable - (mask - idle_mask)).max(0.0)
+            });
+            let idle_frac = idle.map(|i| if usable > 0.0 { i / usable } else { 0.0 });
+            if let Some(i) = idle {
+                self.recent.push_back(i);
                 while self.recent.len() > 2 {
                     self.recent.pop_front();
                 }
+                self.sampled_at = Some(now_ms);
             }
             if self.queue_was_nonempty {
                 self.waiting_wall_ms += dt;
@@ -367,6 +405,59 @@ mod tests {
         assert!(read_proc_stat(dir.path(), None).is_none());
         std::fs::write(dir.path().join("stat"), STAT).unwrap();
         assert_eq!(read_proc_stat(dir.path(), None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_cgroup_quota_below_the_mask_bounds_the_idle_cpus() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let proc_root = root.join("proc");
+        write(root, "proc/self/cgroup", "0::/user.slice/a.scope\n");
+        write(
+            root,
+            "sys/fs/cgroup/user.slice/a.scope/cpu.max",
+            "200000 100000\n",
+        );
+        // Four CPUs in the mask, a quota of two.
+        let stat4 = |idle: u64, busy: u64| {
+            (0..4).fold(String::new(), |mut out, n| {
+                use std::fmt::Write as _;
+                let _ = writeln!(out, "cpu{n} {busy} 0 0 {idle} 0 0 0 0 0 0");
+                out
+            })
+        };
+        write(root, "proc/stat", &format!("cpu  0 0 0 0\n{}", stat4(0, 0)));
+        let limit = cgroup_cpu_limit(&proc_root);
+        assert_eq!(limit, Some(2));
+        let mut u = Utilisation::with_cpu_limit(limit);
+        u.observe(read_proc_stat(&proc_root, None), 0, true);
+        assert_eq!(u.sampled_at(), None);
+        // Each CPU 75 % idle: 3 of 4 mask CPUs idle, 1 busy; the quota of 2
+        // leaves one usable idle CPU, not three.
+        write(
+            root,
+            "proc/stat",
+            &format!("cpu  0 0 0 0\n{}", stat4(75, 25)),
+        );
+        u.observe(read_proc_stat(&proc_root, None), 1_000, true);
+        assert_eq!(u.idle_cpus(), Some(1.0));
+        assert_eq!(u.sampled_at(), Some(1_000));
+        assert_eq!(u.idle_while_waiting_ms(), 500, "half of the quota idle");
+        // Busier than the quota (2.4 busy CPUs): nothing idle, never negative.
+        write(
+            root,
+            "proc/stat",
+            &format!("cpu  0 0 0 0\n{}", stat4(115, 85)),
+        );
+        u.observe(read_proc_stat(&proc_root, None), 2_000, true);
+        assert_eq!(u.recent.back().copied(), Some(0.0));
+        // Without a limit the mask counts.
+        let mut free = Utilisation::default();
+        free.observe(Some(stat([0, 0], [0, 0])), 0, false);
+        free.observe(Some(stat([75, 75], [25, 25])), 1_000, false);
+        assert_eq!(free.idle_cpus(), Some(1.5));
+        // No cgroup file under the parent of the proc root: no limit.
+        assert_eq!(cgroup_cpu_limit(&root.join("elsewhere/proc")), None);
     }
 
     #[test]

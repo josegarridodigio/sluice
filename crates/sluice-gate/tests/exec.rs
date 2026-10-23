@@ -782,3 +782,87 @@ fn an_agent_hook_waits_for_a_queue_only_gate_instead_of_failing_fast() {
         .success();
     assert_eq!(sb.runs(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Alpha review fixes (kb/sluice/changes/alpha-review-fixes.md)
+// ---------------------------------------------------------------------------
+
+/// Finding 3: a variable that is not valid UTF-8 neither panics nor gets
+/// lost: the command runs in-process and sees the raw bytes.
+#[test]
+fn a_non_utf8_environment_runs_in_process_with_the_raw_environment() {
+    use std::os::unix::ffi::OsStrExt;
+    let sb = sandbox(2, "");
+    let out = StdCommand::new(Sandbox::binary())
+        .args([
+            "exec",
+            "--",
+            "sh",
+            "-c",
+            "printf '%s' \"$SLUICE_TEST_LATIN1\"",
+        ])
+        .current_dir(&sb.repo)
+        .env_clear()
+        .envs(sb.env())
+        .env(
+            "SLUICE_TEST_LATIN1",
+            std::ffi::OsStr::from_bytes(b"caf\xe9"),
+        )
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stdout, b"caf\xe9");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not valid UTF-8"),
+        "{out:?}"
+    );
+}
+
+/// `sluice exec` in-process (`SLUICE_DISABLE=1`) with a background child.
+fn spawn_inproc_with_background(sb: &Sandbox, pidf: &Path, extra: &[&str]) -> Child {
+    let script = format!("sleep 30 & echo $! > '{}'; wait", pidf.display());
+    StdCommand::new(Sandbox::binary())
+        .arg("exec")
+        .args(extra)
+        .args(["--", "sh", "-c", &script])
+        .current_dir(&sb.repo)
+        .env_clear()
+        .envs(sb.env())
+        .env("SLUICE_DISABLE", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// Finding 9: the in-process timeout kills the whole process group, not
+/// only its leader.
+#[test]
+fn an_in_process_timeout_kills_the_whole_group() {
+    let sb = sandbox(2, "");
+    let pidf = sb.root.path().join("bg.pid");
+    let child = spawn_inproc_with_background(&sb, &pidf, &["--timeout", "1s"]);
+    let bg = read_pid(&pidf);
+    let out = wait_output(child);
+    assert_eq!(out.status.code(), Some(124), "{out:?}");
+    wait_for("the background child to die", WAIT, || !alive(bg));
+}
+
+/// Finding 9: a forwarded signal reaches the whole process group.
+#[test]
+fn an_in_process_forwarded_signal_reaches_the_whole_group() {
+    let sb = sandbox(2, "");
+    let pidf = sb.root.path().join("bg.pid");
+    let child = spawn_inproc_with_background(&sb, &pidf, &[]);
+    let bg = read_pid(&pidf);
+    kill(
+        Pid::from_raw(i32::try_from(child.id()).unwrap()),
+        Signal::SIGTERM,
+    )
+    .unwrap();
+    let out = wait_output(child);
+    assert_eq!(out.status.code(), Some(143), "{out:?}");
+    wait_for("the background child to die", WAIT, || !alive(bg));
+}

@@ -26,9 +26,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nix::sys::signal::{SigSet, Signal, kill};
+use nix::sys::signal::{SigSet, Signal, killpg};
 use nix::sys::signalfd::SignalFd;
-use nix::unistd::Pid;
+use nix::unistd::{Pid, getpgrp, tcgetpgrp, tcsetpgrp};
 use sluice_gate_core::agent::{self, Caller};
 use sluice_gate_core::config::UserConfig;
 use sluice_gate_core::git::{self, EnvMap};
@@ -178,7 +178,7 @@ fn sluice_error(message: &str) -> ExitCode {
 
 /// Entry point of `sluice exec`.
 pub fn exec(args: &ExecArgs) -> ExitCode {
-    let env: EnvMap = std::env::vars().collect();
+    let env: EnvMap = sluice_gate_core::config::process_env();
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => return sluice_error(&format!("cannot read the current directory: {e}")),
@@ -235,6 +235,16 @@ pub fn exec(args: &ExecArgs) -> ExitCode {
     };
     if cache_mode(&job.env) == CacheMode::Bypass {
         // SLUICE_DISABLE=1: a direct run (with a terminal, if there is one).
+        return in_process(&job);
+    }
+    if !sluice_gate_core::config::process_env_is_utf8() {
+        // The protocol carries the environment as UTF-8 strings: a daemon
+        // run would lose the other entries. The in-process run inherits the
+        // raw environment unchanged.
+        job.info(&format!(
+            "the environment is not valid UTF-8; running '{}' in-process",
+            job.label
+        ));
         return in_process(&job);
     }
     match via_daemon(&job) {
@@ -632,7 +642,11 @@ fn report(job: &Job, job_id: &str, outcome: &Outcome, signo: i32) -> ExitCode {
 // ---------------------------------------------------------------------------
 
 /// Runs the command here: budget slots of the `flock` semaphore, inherited
-/// stdio, `SLUICE_JOB=inproc-<pid>`, signals forwarded with `kill(child)`.
+/// stdio and environment, `SLUICE_JOB=inproc-<pid>`. The command leads its
+/// own process group, so a timeout and the forwarded signals reach every
+/// process it started (`killpg`), as on the daemon path. When this process
+/// owns the terminal, the terminal is handed to the command's group for the
+/// run and taken back afterwards (what a shell does for a foreground job).
 fn in_process(job: &Job) -> ExitCode {
     let _slots = match tree::scratch_root(&job.env)
         .map_err(|e| e.to_string())
@@ -652,6 +666,7 @@ fn in_process(job: &Job) -> ExitCode {
         .args(&job.argv[1..])
         .current_dir(&job.cwd)
         .env(JOB_ENV_VAR, format!("inproc-{}", std::process::id()))
+        .process_group(0)
         .spawn()
     {
         Ok(c) => c,
@@ -660,7 +675,8 @@ fn in_process(job: &Job) -> ExitCode {
             return ExitCode::from(126);
         }
     };
-    let pid = Pid::from_raw(i32::try_from(child.id()).unwrap_or(0));
+    let pgid = Pid::from_raw(i32::try_from(child.id()).unwrap_or(0));
+    let terminal = Terminal::hand_to(pgid);
     // Blocked only now: the child keeps a clean signal mask.
     let mask = forwarded_signals();
     if mask.thread_block().is_ok()
@@ -671,7 +687,7 @@ fn in_process(job: &Job) -> ExitCode {
                 if let Some(info) = read
                     && let Ok(sig) = Signal::try_from(i32::try_from(info.ssi_signo).unwrap_or(0))
                 {
-                    let _ = kill(pid, sig);
+                    let _ = killpg(pgid, sig);
                 }
             }
         });
@@ -681,7 +697,10 @@ fn in_process(job: &Job) -> ExitCode {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {}
-            Err(e) => return sluice_error(&format!("cannot wait for the command: {e}")),
+            Err(e) => {
+                drop(terminal);
+                return sluice_error(&format!("cannot wait for the command: {e}"));
+            }
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
             break None;
@@ -689,13 +708,15 @@ fn in_process(job: &Job) -> ExitCode {
         thread::sleep(POLL_MIN);
     };
     let Some(status) = status else {
-        let _ = kill(pid, Signal::SIGTERM);
+        let _ = killpg(pgid, Signal::SIGTERM);
+        let _ = killpg(pgid, Signal::SIGCONT);
         let grace = Instant::now() + KILL_GRACE;
-        while Instant::now() < grace && matches!(child.try_wait(), Ok(None)) {
+        while Instant::now() < grace && group_alive(pgid, &mut child) {
             thread::sleep(POLL_MIN);
         }
-        let _ = kill(pid, Signal::SIGKILL);
+        let _ = killpg(pgid, Signal::SIGKILL);
         let _ = child.wait();
+        drop(terminal);
         eprintln!(
             "sluice: exec '{}' TIMEOUT after {}",
             job.label,
@@ -703,11 +724,65 @@ fn in_process(job: &Job) -> ExitCode {
         );
         return ExitCode::from(EXIT_TIMEOUT);
     };
+    drop(terminal);
     match (status.code(), status.signal()) {
         (Some(n), _) => code(n),
         (None, Some(s)) => signal_code(s),
         (None, None) => ExitCode::from(EXIT_SLUICE),
     }
+}
+
+/// True while a process of the group `pgid` exists; the leader is reaped as
+/// soon as it exits (a zombie leader would keep the group alive).
+fn group_alive(pgid: Pid, leader: &mut std::process::Child) -> bool {
+    let _ = leader.try_wait();
+    killpg(pgid, None).is_ok()
+}
+
+/// The controlling terminal lent to the command's process group; given
+/// back to this process's group on drop.
+struct Terminal {
+    own: Pid,
+}
+
+impl Terminal {
+    /// Makes `pgid` the foreground group of the terminal on stdin when this
+    /// process's group holds it now; `None` otherwise (no terminal, or a
+    /// background run), and then nothing changes.
+    fn hand_to(pgid: Pid) -> Option<Self> {
+        let stdin = std::io::stdin();
+        let own = getpgrp();
+        if tcgetpgrp(&stdin).ok()? != own {
+            return None;
+        }
+        let ok = with_sigttou_blocked(|| tcsetpgrp(&stdin, pgid).is_ok());
+        // A read of the terminal before the hand-over stopped the command
+        // (SIGTTIN): let it go on.
+        let _ = killpg(pgid, Signal::SIGCONT);
+        ok.then_some(Self { own })
+    }
+}
+
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        let stdin = std::io::stdin();
+        with_sigttou_blocked(|| {
+            let _ = tcsetpgrp(&stdin, self.own);
+        });
+    }
+}
+
+/// Runs `f` with SIGTTOU blocked in this thread (`tcsetpgrp` from a
+/// background group would otherwise stop the process).
+fn with_sigttou_blocked<T>(f: impl FnOnce() -> T) -> T {
+    let mut ttou = SigSet::empty();
+    ttou.add(Signal::SIGTTOU);
+    let blocked = ttou.thread_block().is_ok();
+    let out = f();
+    if blocked {
+        let _ = ttou.thread_unblock();
+    }
+    out
 }
 
 #[cfg(test)]

@@ -127,7 +127,7 @@ pub fn run(args: &RunArgs) -> ExitCode {
     let mut trace = Trace::default();
     let code = run_traced(args, &mut trace);
     if !args.explain {
-        let env: EnvMap = std::env::vars().collect();
+        let env: EnvMap = sluice_gate_core::config::process_env();
         let cwd = std::env::current_dir().unwrap_or_default();
         let exit = exit_byte(code);
         let decision = trace.decision.unwrap_or(if exit == EXIT_ERROR {
@@ -164,7 +164,7 @@ fn exit_byte(code: ExitCode) -> u8 {
 }
 
 fn run_traced(args: &RunArgs, trace: &mut Trace) -> ExitCode {
-    let env: EnvMap = std::env::vars().collect();
+    let env: EnvMap = sluice_gate_core::config::process_env();
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => return fail(&format!("cannot read the current directory: {e}")),

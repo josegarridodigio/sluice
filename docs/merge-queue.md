@@ -199,7 +199,7 @@ User, `~/.config/sluice/config.toml`:
 ```toml
 [queue]
 enabled = true                 # user-level kill switch for the merge queue runner
-allow_agent_approval = false   # let the MCP queue_approve tool approve trains
+allow_agent_approval = false   # let agents approve trains (MCP queue_approve, CLI from an agent)
 tick = "5s"                    # runner housekeeping period
 retention = "30d"              # finished jobs, trains and their history are pruned after this
 ```
@@ -212,10 +212,13 @@ never grant approval rights.
 
 Agents enqueue; humans approve. The MCP server tells agents to enqueue after `verify`
 passes and then stop; after a conflict or a failure they fix the branch and call
-`queue_retry` (`queue_cancel` withdraws a job). `queue_approve` over MCP is refused unless the user config sets
-`allow_agent_approval = true`. The daemon cannot tell a human from an agent on its socket,
-so also deny the command in the agent's permissions, for example in Claude Code's
-`.claude/settings.json`:
+`queue_retry` (`queue_cancel` withdraws a job). Unless the user config sets
+`allow_agent_approval = true`, approval by an agent is refused: `queue_approve` over MCP,
+and also `sluice queue approve` run from an agent's environment (detected with the same
+`[agent_detection]` rules that mark agent runs, for example `CLAUDECODE` set; `SLUICE_AGENT=0`
+marks a human). The Claude Code plugin's guard also denies the command. An agent controls its
+own environment, so the daemon cannot be sure who is on its socket: also deny the command in
+the agent's permissions, for example in Claude Code's `.claude/settings.json`:
 
 ```json
 { "permissions": { "deny": ["Bash(sluice queue approve:*)"] } }

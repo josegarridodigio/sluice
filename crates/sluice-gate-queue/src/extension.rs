@@ -421,6 +421,36 @@ fn status(core: &Core, id: u64, repo: Option<&Path>) -> ServerMessage {
     }
 }
 
+/// Why an approval is refused by the agent policy, or `None`. Unless the
+/// user config sets `[queue] allow_agent_approval = true`, an approval
+/// through MCP is refused, and so is one through the CLI whose client
+/// environment (the agent-detection variables the CLI sends next to the
+/// allowlisted ones) is detected as an agent's with the user's
+/// `[agent_detection]` rules.
+pub fn agent_approval_refusal(
+    config: &sluice_gate_core::config::UserConfig,
+    via: ApproveVia,
+    env: &EnvMap,
+) -> Option<String> {
+    if config.queue.allow_agent_approval {
+        return None;
+    }
+    if via == ApproveVia::Mcp {
+        return Some(
+            "approval through MCP is disabled; set [queue] allow_agent_approval = true in the user config"
+                .to_owned(),
+        );
+    }
+    let detection = &config.agent_detection;
+    match sluice_gate_core::agent::detect(env, &detection.env_any_set, &detection.env_any_equals) {
+        sluice_gate_core::agent::Caller::Agent { rule } => Some(format!(
+            "approval is reserved to humans and this client is an agent ({rule}); \
+             set [queue] allow_agent_approval = true in the user config to allow it"
+        )),
+        sluice_gate_core::agent::Caller::Human => None,
+    }
+}
+
 fn approve(
     core: &Core,
     id: u64,
@@ -429,12 +459,8 @@ fn approve(
     via: ApproveVia,
     env: &EnvMap,
 ) -> ServerMessage {
-    if via == ApproveVia::Mcp && !core.handle.config().queue.allow_agent_approval {
-        return err(
-            id,
-            ErrorCode::NotAllowed,
-            "approval through MCP is disabled; set [queue] allow_agent_approval = true in the user config",
-        );
+    if let Some(refusal) = agent_approval_refusal(core.handle.config(), via, env) {
+        return err(id, ErrorCode::NotAllowed, refusal);
     }
     let actor = if via == ApproveVia::Mcp {
         Actor::Mcp

@@ -966,7 +966,9 @@ impl Store {
         Ok(())
     }
 
-    /// The newest `per_key` runs of every key, oldest first within a key.
+    /// The newest `per_key` passing runs of every key, oldest first within
+    /// a key (rows of failed runs, written by earlier releases, are not
+    /// learning samples).
     ///
     /// # Errors
     /// SQLite or busy errors.
@@ -978,7 +980,7 @@ impl Store {
             .conn
             .prepare(
                 "SELECT repo, gate, cmd_hash, job_id, finished_at, outcome, wall_ms, cpu_ms, \
-                 run_delay_ms, demand_milli FROM gate_stats \
+                 run_delay_ms, demand_milli FROM gate_stats WHERE outcome = 'pass' \
                  ORDER BY repo, gate, cmd_hash, finished_at DESC, rowid DESC",
             )
             .map_err(db)?;
@@ -1599,6 +1601,16 @@ mod tests {
             .map(|g| g.finished_at)
             .collect();
         assert_eq!(a, (15..25).collect::<Vec<_>>(), "newest ten, oldest first");
+        // A failed run (written by an earlier release) is not a sample.
+        let mut failed = stat(30, "aaaa");
+        failed.outcome = "fail".into();
+        s.insert_gate_stat(&failed).unwrap();
+        assert!(
+            s.gate_stats_recent(10)
+                .unwrap()
+                .iter()
+                .all(|g| g.outcome == "pass" && g.finished_at != 30)
+        );
         assert_eq!(s.prune_gate_stats(10).unwrap(), 1, "bbbb unseen since 3");
         assert!(
             s.gate_stats_recent(10)

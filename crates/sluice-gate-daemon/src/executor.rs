@@ -696,17 +696,41 @@ pub fn group_is_ours(pgid: i32, leader_ticks: Option<u64>) -> bool {
 /// Sends SIGTERM to every group, then SIGKILL after `grace` to those still
 /// alive; blocking (the reaper process has no runtime).
 pub fn terminate_groups_blocking(pgids: &[i32], grace: Duration) {
-    for &pgid in pgids {
-        kill_group(pgid, Signal::SIGTERM);
-    }
     let deadline = Instant::now() + grace;
-    while Instant::now() < deadline && pgids.iter().any(|&p| group_alive(p)) {
-        std::thread::sleep(POLL);
-    }
+    terminate_groups_with(
+        pgids,
+        group_alive,
+        kill_group,
+        || Instant::now() < deadline,
+        || std::thread::sleep(POLL),
+    );
+}
+
+/// The sequence of [`terminate_groups_blocking`] over injected operations:
+/// SIGTERM to every group, then, while `waiting()` holds, drop each group
+/// the first time it is seen empty, and finally SIGKILL the groups never
+/// seen empty. A group seen empty is never signalled again: its id may
+/// already belong to an unrelated new group.
+pub fn terminate_groups_with(
+    pgids: &[i32],
+    mut alive: impl FnMut(i32) -> bool,
+    mut kill: impl FnMut(i32, Signal),
+    mut waiting: impl FnMut() -> bool,
+    mut pause: impl FnMut(),
+) {
     for &pgid in pgids {
-        if group_alive(pgid) {
-            kill_group(pgid, Signal::SIGKILL);
+        kill(pgid, Signal::SIGTERM);
+    }
+    let mut left: Vec<i32> = pgids.to_vec();
+    loop {
+        left.retain(|&p| alive(p));
+        if left.is_empty() || !waiting() {
+            break;
         }
+        pause();
+    }
+    for pgid in left {
+        kill(pgid, Signal::SIGKILL);
     }
 }
 
@@ -757,6 +781,43 @@ pub fn tail_lines(path: &Path, n: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_group_seen_empty_is_never_signalled_again() {
+        use std::cell::RefCell;
+        // Group 10 is empty at the first check and "alive" again later (its
+        // id reused); group 20 never exits.
+        let checks = RefCell::new(Vec::new());
+        let kills = RefCell::new(Vec::new());
+        let mut rounds = 0;
+        terminate_groups_with(
+            &[10, 20],
+            |p| {
+                checks.borrow_mut().push(p);
+                let n = checks.borrow().iter().filter(|&&c| c == p).count();
+                p == 20 || n > 1
+            },
+            |p, sig| kills.borrow_mut().push((p, sig)),
+            || {
+                rounds += 1;
+                rounds <= 3
+            },
+            || {},
+        );
+        assert_eq!(
+            kills.into_inner(),
+            [
+                (10, Signal::SIGTERM),
+                (20, Signal::SIGTERM),
+                (20, Signal::SIGKILL)
+            ]
+        );
+        assert_eq!(
+            checks.into_inner().iter().filter(|&&p| p == 10).count(),
+            1,
+            "dropped at its first empty check"
+        );
+    }
 
     fn spec(dir: &Path, cmd: &str) -> ExecSpec {
         let mut env = BTreeMap::new();

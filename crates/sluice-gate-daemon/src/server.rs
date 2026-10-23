@@ -378,6 +378,7 @@ fn policy(config: &DaemonConfig) -> Policy {
         cap: Policy::cap_for(budget, a.overcommit),
         head_reserve_after_ms: duration_ms(config.head_reserve_after),
         overcommit_interval_ms: duration_ms(a.overcommit_interval),
+        sample_tick_ms: duration_ms(a.psi_poll_interval),
         order: match s.order {
             QueueOrder::Fifo => sched::Order::Fifo,
             QueueOrder::Sjf => sched::Order::Sjf,
@@ -435,7 +436,7 @@ impl Shared {
 /// falls back to dropping `GIT_*` and `CLAUDE*` when git cannot list its
 /// local variables.
 fn sanitised_env() -> BTreeMap<String, String> {
-    let env: BTreeMap<String, String> = std::env::vars().collect();
+    let env: BTreeMap<String, String> = sluice_gate_core::config::process_env();
     git::child_env(&env).unwrap_or_else(|e| {
         tracing::warn!("cannot sanitise the environment through git: {e}");
         env.into_iter()
@@ -698,6 +699,11 @@ fn load_stats(store: &Store) -> StatsCache {
     stats
 }
 
+/// The utilisation sampler, bounded by the daemon's cgroup CPU limit.
+fn utilisation(proc_root: &Path) -> Utilisation {
+    Utilisation::with_cpu_limit(sampler::cgroup_cpu_limit(proc_root))
+}
+
 /// The daemon's affinity mask (`<proc>/self/status`) and its CPU count
 /// (the mask, else the affinity and cgroup limits seen by the core).
 fn daemon_cpus(proc_root: &Path) -> (Option<std::collections::BTreeSet<u32>>, u32) {
@@ -754,7 +760,7 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
         state: Mutex::new(State::new(&config)),
         store,
         psi: Mutex::new(Admission::new(&config.admission)),
-        util: Mutex::new(Utilisation::default()),
+        util: Mutex::new(utilisation(&config.proc_root)),
         stats: Mutex::new(stats),
         allowed_cpus,
         cpus,
@@ -899,18 +905,29 @@ async fn accept_loop(
 /// Stops accepting work, drops queued jobs, optionally kills running ones
 /// and waits until no job is left.
 async fn drain(shared: &Arc<Shared>, force: bool) {
-    let queued: Vec<String> = {
+    let dropped: Vec<(String, Closed)> = {
         let mut st = shared.state();
         st.accepting = false;
         st.refusal = "the daemon is stopping";
         let ids: Vec<String> = st.jobs.keys().cloned().collect();
-        let mut queued = Vec::new();
+        let mut dropped = Vec::new();
         for id in ids {
             if st.sched.is_queued(&id) {
-                if let Some(entry) = st.jobs.get_mut(&id) {
-                    entry.killed_by = Some("stop");
-                }
-                queued.push(id);
+                // Dropped under the lock of the check (see `close_job`).
+                let gate = match st.jobs.get_mut(&id) {
+                    Some(entry) => {
+                        entry.killed_by = Some("stop");
+                        entry.request.name()
+                    }
+                    None => String::new(),
+                };
+                let outcome = Outcome {
+                    status: OutcomeStatus::Killed,
+                    message: format!("{gate}: dropped from the queue, the daemon is stopping"),
+                    ..Outcome::default()
+                };
+                let closed = close_job(shared, &mut st, &id, outcome, None, false);
+                dropped.push((id, closed));
             } else if force && let Some(entry) = st.jobs.get_mut(&id) {
                 entry.cancelled = true;
                 entry.killed_by = Some("stop");
@@ -919,20 +936,10 @@ async fn drain(shared: &Arc<Shared>, force: bool) {
                 }
             }
         }
-        queued
+        dropped
     };
-    for id in queued {
-        let gate = gate_name(shared, &id);
-        finish_job(
-            shared,
-            &id,
-            Outcome {
-                status: OutcomeStatus::Killed,
-                message: format!("{gate}: dropped from the queue, the daemon is stopping"),
-                ..Outcome::default()
-            },
-            None,
-        );
+    for (id, closed) in dropped {
+        announce_closed(shared, &id, closed);
     }
     tracing::info!(force, "waiting for running jobs");
     loop {
@@ -945,15 +952,6 @@ async fn drain(shared: &Arc<Shared>, force: bool) {
             () = sleep(Duration::from_millis(100)) => {}
         }
     }
-}
-
-fn gate_name(shared: &Shared, id: &str) -> String {
-    shared
-        .state()
-        .jobs
-        .get(id)
-        .map(|e| e.request.name())
-        .unwrap_or_default()
 }
 
 async fn heartbeat_loop(shared: Arc<Shared>, token: String) {
@@ -1091,7 +1089,10 @@ fn admit(shared: &Shared, now: u64) -> Vec<(String, sched::Admission)> {
     let guard_due = head
         .as_ref()
         .is_some_and(|(_, queued_at)| lock(&shared.psi).starvation_override(*queued_at, now));
-    let idle_cpus = lock(&shared.util).idle_cpus();
+    let (idle_cpus, sampled_at) = {
+        let u = lock(&shared.util);
+        (u.idle_cpus(), u.sampled_at())
+    };
     let started = shared.state().sched.admit_with(
         now,
         Pressure {
@@ -1099,6 +1100,7 @@ fn admit(shared: &Shared, now: u64) -> Vec<(String, sched::Admission)> {
             guard_due,
             calm,
             idle_cpus,
+            sampled_at,
         },
     );
     for (id, admission) in &started {
@@ -1143,9 +1145,49 @@ async fn scheduling_loop(shared: Arc<Shared>) {
     }
 }
 
+/// Whether a finished run teaches its gate's demand and expected time:
+/// passing runs only. A failing run often stops early (a compile error, the
+/// first failed test) and would teach a weight far below what the suite
+/// needs once it passes again; leaving failures out keeps the learned
+/// weight at the demand of the recent passing runs.
+fn learns_from(status: OutcomeStatus) -> bool {
+    status == OutcomeStatus::Pass
+}
+
 /// Completes a job: records it, removes it from the scheduler and the job
 /// map, broadcasts `done` and wakes the scheduling loop.
 fn finish_job(shared: &Shared, id: &str, outcome: Outcome, exit_code: Option<i32>) {
+    let calm_end = cpu_calm(shared);
+    let closed = {
+        let mut st = shared.state();
+        close_job(shared, &mut st, id, outcome, exit_code, calm_end)
+    };
+    announce_closed(shared, id, closed);
+}
+
+/// What [`close_job`] leaves to do once the state lock is released.
+struct Closed {
+    label: &'static str,
+    outcome: Outcome,
+    events: Option<broadcast::Sender<JobEvent>>,
+    started_at: Option<u64>,
+    learned: Option<(StatsKey, GateStat)>,
+}
+
+/// The part of [`finish_job`] done under the state lock: the job leaves the
+/// scheduler and the job map and its outcome is recorded. Callers that
+/// decide to finish a job from what they read under the same lock (a queued
+/// job dropped by `detach` or `drain`) call it without releasing the lock in
+/// between, so the scheduling loop cannot admit the job meanwhile; they then
+/// call [`announce_closed`].
+fn close_job(
+    shared: &Shared,
+    st: &mut State,
+    id: &str,
+    outcome: Outcome,
+    exit_code: Option<i32>,
+    calm_end: bool,
+) -> Closed {
     let label = match outcome.status {
         OutcomeStatus::Pass => "pass",
         OutcomeStatus::Fail => "fail",
@@ -1156,10 +1198,8 @@ fn finish_job(shared: &Shared, id: &str, outcome: Outcome, exit_code: Option<i32
         OutcomeStatus::Unknown => "unknown",
     };
     let mut outcome = outcome;
-    let calm_end = cpu_calm(shared);
     let now = now_ms();
     let (events, started_at, learned) = {
-        let mut st = shared.state();
         let max = st.sched.subscribers_max(id).unwrap_or(1);
         let record = st.sched.record(id, now);
         if st.sched.finish(id).is_none() {
@@ -1189,7 +1229,7 @@ fn finish_job(shared: &Shared, id: &str, outcome: Outcome, exit_code: Option<i32
         let mut learned = None;
         if let (Some(e), Some(d), Some(wall)) = (&entry, demand, wall_ms)
             && let Some(key) = &e.stats_key
-            && matches!(outcome.status, OutcomeStatus::Pass | OutcomeStatus::Fail)
+            && learns_from(outcome.status)
         {
             learned = Some((
                 key.clone(),
@@ -1232,6 +1272,25 @@ fn finish_job(shared: &Shared, id: &str, outcome: Outcome, exit_code: Option<i32
         });
         (entry.map(|e| e.events), started_at, learned)
     };
+    Closed {
+        label,
+        outcome,
+        events,
+        started_at,
+        learned,
+    }
+}
+
+/// The part of [`finish_job`] done without the state lock: learned weights,
+/// `done` to the subscribers, wake-ups.
+fn announce_closed(shared: &Shared, id: &str, closed: Closed) {
+    let Closed {
+        label,
+        outcome,
+        events,
+        started_at,
+        learned,
+    } = closed;
     if let Some((key, stat)) = learned {
         // The stats mutex is never held with the state one: queued jobs of
         // this key take the new learned weight at the next admission pass.
@@ -1353,23 +1412,36 @@ async fn launch(shared: &Shared, id: &str, spec: ExecSpec) -> Option<Finished> {
     let calm = cpu_calm(shared);
     let events = {
         let mut st = shared.state();
-        let Some(entry) = st.jobs.get_mut(id) else {
-            handle.cancel();
-            return None;
-        };
-        entry.usage.calm_at_start = calm;
-        entry.handle = Some(handle.clone());
-        if entry.cancelled {
-            handle.cancel();
+        match st.jobs.get_mut(id) {
+            None => None,
+            Some(entry) => {
+                entry.usage.calm_at_start = calm;
+                entry.handle = Some(handle.clone());
+                if entry.cancelled {
+                    handle.cancel();
+                }
+                entry.started_at = Some(info.started_at);
+                entry.spool.clone_from(&spool);
+                entry.process = Some(info.clone());
+                let _ = entry.events.send(JobEvent::Started {
+                    started_at: info.started_at,
+                    spool,
+                });
+                Some(entry.events.clone())
+            }
         }
-        entry.started_at = Some(info.started_at);
-        entry.spool.clone_from(&spool);
-        entry.process = Some(info.clone());
-        let _ = entry.events.send(JobEvent::Started {
-            started_at: info.started_at,
-            spool,
-        });
-        entry.events.clone()
+    };
+    let Some(events) = events else {
+        // The job was finished while it was being spawned: nobody follows
+        // it any more. Kill its whole group, wait for it and stop tracking
+        // it, so nothing keeps running unsupervised.
+        tracing::warn!(job = %id, pgid = info.pgid, "job finished while starting; killing it");
+        handle.cancel();
+        let _ = running.wait().await;
+        if let Some(r) = &shared.reaper {
+            r.untrack(info.pgid);
+        }
+        return None;
     };
     tracing::info!(job = %id, name = %name, pgid = info.pgid, "job started");
 
@@ -1603,7 +1675,7 @@ impl CacheWrite {
         let Some(tree_before) = self.request.tree.clone() else {
             return (false, Some("the tree is unknown".to_owned()));
         };
-        let env: BTreeMap<String, String> = std::env::vars().collect();
+        let env: BTreeMap<String, String> = sluice_gate_core::config::process_env();
         let after = tree::scratch_root(&env).and_then(|root| {
             tree::snapshot(&repo_paths(&self.request), &self.request.probe_env, &root)
         });
@@ -2519,7 +2591,22 @@ fn detach_because(shared: &Shared, job_id: &str, reason: Option<&str>) {
             entry.killed_by = Some(killed_by);
         }
         if st.sched.is_queued(job_id) {
-            true
+            // Dropped under the lock of the check: the scheduling loop
+            // cannot admit it in between.
+            let gate = st
+                .jobs
+                .get(job_id)
+                .map(|e| e.request.name())
+                .unwrap_or_default();
+            tracing::info!(job = %job_id, killed_by, "last subscriber gone, dropping the queued job");
+            Some(close_job(
+                shared,
+                &mut st,
+                job_id,
+                killed_outcome(&gate),
+                None,
+                false,
+            ))
         } else {
             if let Some(entry) = st.jobs.get_mut(job_id) {
                 tracing::info!(job = %job_id, killed_by, "last subscriber gone, cancelling");
@@ -2528,13 +2615,11 @@ fn detach_because(shared: &Shared, job_id: &str, reason: Option<&str>) {
                     h.cancel();
                 }
             }
-            false
+            None
         }
     };
-    if drop_queued {
-        let gate = gate_name(shared, job_id);
-        tracing::info!(job = %job_id, killed_by, "last subscriber gone, dropping the queued job");
-        finish_job(shared, job_id, killed_outcome(&gate), None);
+    if let Some(closed) = drop_queued {
+        announce_closed(shared, job_id, closed);
     }
 }
 
@@ -3005,4 +3090,24 @@ pub async fn connect(
         .await
         .map_err(io_err("sending the request"))?;
     Ok((wr, lines))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_passing_runs_teach_the_demand() {
+        assert!(learns_from(OutcomeStatus::Pass));
+        for status in [
+            OutcomeStatus::Fail,
+            OutcomeStatus::Timeout,
+            OutcomeStatus::Killed,
+            OutcomeStatus::Cached,
+            OutcomeStatus::Error,
+            OutcomeStatus::Unknown,
+        ] {
+            assert!(!learns_from(status), "{status:?}");
+        }
+    }
 }

@@ -211,7 +211,7 @@ budget_share_max = 4
 | `mcp.progress_interval` | `15s` | Progress notifications while `verify` runs (floored at 1s). |
 | `mcp.verify_parallel` | `true` | `verify` starts all its gates at once and, with its `fail_fast` parameter (default true), returns at the first failure, cancelling the gates nobody else waits for. `false`: one gate after another, every gate runs (0.2.0 behaviour). |
 | `queue.enabled` | `true` | Kill switch for the merge queue runner. |
-| `queue.allow_agent_approval` | `false` | Let the MCP `queue_approve` tool approve trains. |
+| `queue.allow_agent_approval` | `false` | Let agents approve trains: the MCP `queue_approve` tool, and `sluice queue approve` run from an agent's environment. |
 | `queue.tick` | `5s` | Runner housekeeping period (floored at 50 ms). |
 | `queue.retention` | `30d` | Finished queue rows older than this are pruned at daemon start and hourly. |
 | `debug.level` | `info` | Log filter (`RUST_LOG` syntax, for example `sluice_gate_daemon=debug,info`) of the daemon, `sluice mcp` and `sluice run`. `SLUICE_LOG` wins. |

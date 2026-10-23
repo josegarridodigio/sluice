@@ -101,7 +101,7 @@ Side exits: `conflict`, `failed`, `cancelled`, `needs_reconcile`. Exact transiti
 | verifying | ready | every gate passed or hit | runner |
 | verifying | failed | a gate failed / timed out / was killed / errored and the train has a single surviving member (reason `gate_failed`), or `tree_mismatch` (checked before any gate runs) | runner |
 | verifying | queued | multi-member train failed: members split (section 5, step 7) | runner |
-| ready | approved | `queue approve <train>` with matching train hash | human (CLI) or MCP if allowed |
+| ready | approved | `queue approve <train>` with matching train hash | human (CLI); an agent (MCP, or the CLI from an agent's environment) only if allowed |
 | ready, approved | queued | base moved, member cancelled, `stale_plan` (train hash changed or a cancel pending), `endpoint_changed`, merge worktree changed; approval voided | runner |
 | approved | pushing | marker + pin ref written, lease re-checked | runner |
 | approved | failed | local target checked out at landing time (reason `target_checked_out`) | runner |
@@ -488,6 +488,18 @@ and again by the daemon; its wait has the same bound as the CLI's), `queue_retry
 instructions say: enqueue after `verify` passes, then stop; after a conflict or failure fix
 the branch and call `queue_retry` (a new `queue_enqueue` would be `duplicate-branch`);
 never approve.
+
+**Agent approval through the CLI** (alpha review finding 2). Without `[queue]
+allow_agent_approval = true` the daemon also refuses (`not-allowed`) a `queue-approve` with
+`via: cli` whose client environment is detected as an agent's: the CLI sends, in the
+existing `env` map of the request, the agent-detection variables that are set
+(`SLUICE_AGENT` and those named by `[agent_detection]`) next to the push allowlist, and the
+daemon runs `agent::detect` on them with its user config's rules
+(`extension::agent_approval_refusal`). Only the allowlisted variables are stored for the
+push. No protocol field was added (protocol 1 unchanged): an older client sends only the
+allowlist and is treated as a human, as before. The check is a speed bump against an
+agent's shell, not a security boundary (an agent controls its environment); the guard's
+deny and the forge's protected branches remain.
 
 ## 10. Crate and daemon APIs
 

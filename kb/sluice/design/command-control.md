@@ -176,9 +176,20 @@ Client receives SIGINT/SIGTERM/SIGHUP:
 `sluice: daemon unavailable (<why>); running '<label>' in-process` (one stderr line), then take
 `weight` slots of the `flock` semaphore (`acquire_budget`, moved from `run.rs` to
 `crates/sluice-gate/src/budget.rs` and shared), spawn with inherited stdin/stdout/stderr in the
-client's process group, set `SLUICE_JOB=inproc-<pid>`, wait, map the code. Signals are blocked only
-after the spawn (the child keeps a clean mask); a received signal is forwarded with `kill(child)`.
-Not visible in `status`, no nice/ionice (as gates today).
+command's own process group (`process_group(0)`), set `SLUICE_JOB=inproc-<pid>`, wait, map the
+code. When the client's group is the foreground group of the terminal on stdin, the terminal is
+handed to the command's group (`tcsetpgrp`, SIGTTOU blocked, then SIGCONT in case a read already
+stopped it) and taken back when it ends, as a shell does for a foreground job. Signals are blocked
+only after the spawn (the child keeps a clean mask); a received signal is forwarded to the whole
+group with `killpg`, and a `--timeout` sends SIGTERM to the group, then SIGKILL after 5 s, so
+background children of the command never outlive it (alpha review finding 9). Not visible in
+`status`, no nice/ionice (as gates today).
+
+The environment travels to the daemon as UTF-8 strings. The client reads it with `vars_os`
+(`sluice_gate_core::config::process_env`, which drops non-UTF-8 entries instead of panicking);
+when any entry is not valid UTF-8 (`process_env_is_utf8`), `sluice exec` skips the daemon and runs
+in-process, where the command inherits the raw environment unchanged. Shims and the guard use the
+same reader, so a non-UTF-8 variable never makes them panic (alpha review finding 3).
 
 ### 2.7 Coalescing
 
@@ -227,7 +238,15 @@ Semantics (`run.rs`, `lookup.rs`, `server.rs`):
 JSON on stdin (no daemon contact, reads files only); if it exits 0, print its stdout when it starts
 with `{"hookSpecificOutput"`; otherwise (binary missing, a pre-0.3 binary without `guard`, crash)
 run the current shell logic unchanged (`legacy_main`: deny gates, deny `sluice queue approve`).
-Always exit 0. Reason: rewriting needs exact JSON echo of `tool_input`, the user TOML config, the
+Always exit 0.
+
+The approval deny (`matcher::runs_approve`) looks at tokenised words, not a text prefix: quotes are
+removed, the program is taken by its base name (`"sluice"`, `/usr/bin/sluice`), and it looks
+through `env` (options and assignments), `command`, `builtin`, `exec`, `nohup`, `time`, `setsid`
+and `sluice exec ... --`. Wrappers whose arguments it does not parse (`sh -c`, `eval`, `xargs`,
+`sudo`, `timeout`, ...) and commands the tokenizer refuses are denied when their text mentions both
+`queue` and `approve` (deny when unsure). The daemon enforces the same rule for every surface (see
+`merge-queue.md`), so the guard is a first line, not the only one (alpha review finding 2). Reason: rewriting needs exact JSON echo of `tool_input`, the user TOML config, the
 Claude settings JSON and a quote-aware tokenizer; doing that in `sh` + optional `jq` is fragile, and
 the binary is already required by the plugin's MCP server. A Rust start costs ~2 ms, less than
 today's dozen `sed` forks.
@@ -252,9 +271,15 @@ single `&` (background), `|&`, unbalanced quotes, non-UTF-8, more than 4096 byte
 Per segment, after skipping env assignments and an optional leading `time`:
 - **Skip** when the first word is `sluice` (`sluice queue approve` stays a deny), or one of `sudo`,
   `env`, `nohup`, `nice`, `timeout`, `xargs`, `exec`, `eval`, `sh`, `bash`, `zsh`, `command`,
-  `builtin` (wrappers and `sh -c` are never looked into).
+  `builtin` (wrappers and `sh -c` are never looked into), and when a leading assignment sets `PATH`
+  (`PATH=... cmd` would also pick which `sluice` runs).
 - **Directory**: a previous segment `cd <word>` joined with `&&` changes the effective directory
-  (relative to `cwd`, no `~` or variables, must exist), else no rewrite at all.
+  (no `~` or variables, must exist), else no rewrite at all. The target is resolved lexically on
+  the logical directory (the hook's `cwd`, the shell's `$PWD`): `..` drops the previous component
+  as typed, like the shell's default `cd -L`; only the result is canonicalised to find the
+  `.sluice.toml`. No rewrite at all when `CDPATH` is set (a relative `cd` may go elsewhere) or when
+  a `cd` argument has a `..` component while the logical and canonical current directories differ
+  (alpha review finding 1).
 - **Gate**: config found by walking up from the effective directory. A gate matches when the
   effective directory is the config's directory, the segment has no env assignments, and the
   canonical words of the segment start with the canonical words of the gate `cmd` (one-line gates

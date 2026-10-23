@@ -18,6 +18,25 @@ pub const REPO_CONFIG_FILE: &str = ".sluice.toml";
 /// touch the process environment.
 pub type EnvMap = BTreeMap<String, String>;
 
+/// The process environment as an [`EnvMap`], without panicking: entries
+/// whose name or value is not valid UTF-8 are left out (see
+/// [`process_env_is_utf8`] for callers that must not lose them).
+pub fn process_env() -> EnvMap {
+    utf8_entries(std::env::vars_os())
+}
+
+/// True when every entry of the process environment is valid UTF-8, so
+/// [`process_env`] is the complete environment.
+pub fn process_env_is_utf8() -> bool {
+    std::env::vars_os().all(|(k, v)| k.to_str().is_some() && v.to_str().is_some())
+}
+
+/// Keeps the UTF-8 entries of `vars`.
+fn utf8_entries(vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>) -> EnvMap {
+    vars.filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect()
+}
+
 /// The only config format version this build understands.
 const SUPPORTED_VERSION: u32 = 1;
 
@@ -625,8 +644,8 @@ fn invalid_heavy_entry(entry: &str) -> Option<&'static str> {
 pub struct UserQueueConfig {
     /// User-level kill switch for the merge queue runner.
     pub enabled: bool,
-    /// Let the MCP `queue_approve` tool approve trains (off: humans only,
-    /// through the CLI).
+    /// Let agents approve trains: the MCP `queue_approve` tool and the CLI
+    /// run from an agent's environment (off: humans only, through the CLI).
     pub allow_agent_approval: bool,
     /// Period of the runner's housekeeping tick.
     #[serde(with = "humantime_serde")]
@@ -1050,6 +1069,19 @@ impl UserConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_utf8_environment_entries_are_skipped_not_fatal() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let vars = vec![
+            (OsString::from("A"), OsString::from("1")),
+            (OsString::from("BAD"), OsString::from_vec(vec![0x66, 0xff])),
+            (OsString::from_vec(vec![0xfe]), OsString::from("x")),
+        ];
+        let env = utf8_entries(vars.into_iter());
+        assert_eq!(env, EnvMap::from([("A".to_owned(), "1".to_owned())]));
+    }
 
     const DOC_REPO: &str = r#"
 version = 1

@@ -11,8 +11,9 @@
 //!   the version update (SQLite DDL is transactional: a failure leaves the
 //!   previous version and nothing applied);
 //! - before migrating an existing database, a consistent copy is written
-//!   next to it as `<db>.bak-<version before>` (`VACUUM INTO`), unless one
-//!   already exists;
+//!   next to it as `<db>.bak-<version before>` (`VACUUM INTO` a temporary
+//!   file, fsync, rename), unless a backup that passes `PRAGMA quick_check`
+//!   already exists (a damaged one is replaced);
 //! - a version newer than the build is a hard error
 //!   ([`crate::Error::NewerSchema`]).
 
@@ -104,18 +105,63 @@ pub fn backup_path(db: &Path, from: u32) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Writes a consistent copy of the database to [`backup_path`] (`VACUUM
-/// INTO`, which includes the WAL) unless that file already exists (an
-/// earlier attempt already saved the pre-migration state). Returns the path.
+/// Writes a consistent copy of the database to [`backup_path`] unless a
+/// sound one already exists (an earlier attempt already saved the
+/// pre-migration state). The copy is made with `VACUUM INTO` (which
+/// includes the WAL) into a temporary file next to it, fsynced, then
+/// renamed into place, so a crash never leaves a partial backup under the
+/// final name. An existing backup is trusted only when it opens and passes
+/// `PRAGMA quick_check`; otherwise it is replaced. Returns the path.
 ///
 /// # Errors
-/// SQLite errors.
+/// SQLite errors, and I/O errors as [`rusqlite::Error::ToSqlConversionFailure`].
 pub fn backup(conn: &Connection, db: &Path, from: u32) -> rusqlite::Result<PathBuf> {
     let path = backup_path(db, from);
-    if !path.exists() {
-        conn.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])?;
+    if path.exists() {
+        if backup_is_sound(&path) {
+            return Ok(path);
+        }
+        tracing::warn!(
+            backup = %path.display(),
+            "the existing database backup fails its integrity check; writing a new one"
+        );
     }
-    Ok(path)
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp-{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let _ = std::fs::remove_file(&tmp);
+    let written = conn
+        .execute("VACUUM INTO ?1", [tmp.to_string_lossy().as_ref()])
+        .map(|_| ())
+        .and_then(|()| persist(&tmp, &path).map_err(io_error));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written.map(|()| path)
+}
+
+/// Whether an existing backup opens read-only and passes `PRAGMA quick_check`.
+fn backup_is_sound(path: &Path) -> bool {
+    let Ok(conn) = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return false;
+    };
+    conn.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))
+        .is_ok_and(|v| v == "ok")
+}
+
+/// fsyncs `tmp`, renames it to `path` and fsyncs their directory.
+fn persist(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(tmp)?.sync_all()?;
+    std::fs::rename(tmp, path)?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn io_error(e: std::io::Error) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(e))
 }
 
 /// Applies the migrations of `migrations` above the current version of
@@ -159,4 +205,58 @@ pub fn apply(
     }
     tx.commit()?;
     Ok(reached)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn db_with_row(path: &Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (42);")
+            .unwrap();
+        conn
+    }
+
+    fn row_of(path: &Path) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .query_row("SELECT v FROM t", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_backup_is_written_whole_and_kept_when_sound() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sluice.db");
+        let conn = db_with_row(&db);
+        let path = backup(&conn, &db, 0).unwrap();
+        assert_eq!(path, backup_path(&db, 0));
+        assert_eq!(row_of(&path), 42);
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().all(|n| !n.contains(".tmp-")), "{names:?}");
+        // A sound backup is kept: the pre-migration state is not overwritten.
+        conn.execute("UPDATE t SET v = 7", []).unwrap();
+        backup(&conn, &db, 0).unwrap();
+        assert_eq!(row_of(&path), 42);
+    }
+
+    #[test]
+    fn a_damaged_backup_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sluice.db");
+        let conn = db_with_row(&db);
+        let path = backup_path(&db, 0);
+        // A partial copy left by a crash: the SQLite header and garbage.
+        let mut junk = b"SQLite format 3\0".to_vec();
+        junk.extend(std::iter::repeat_n(0xA5u8, 4096));
+        std::fs::write(&path, &junk).unwrap();
+        assert!(!backup_is_sound(&path));
+        backup(&conn, &db, 0).unwrap();
+        assert!(backup_is_sound(&path));
+        assert_eq!(row_of(&path), 42);
+    }
 }

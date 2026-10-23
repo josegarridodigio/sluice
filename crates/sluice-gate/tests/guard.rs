@@ -277,3 +277,24 @@ fn plugin_test_guard_script_passes() {
     );
     assert!(stdout.contains(", 0 failure(s)"), "{stdout}");
 }
+
+/// Alpha review finding 3: a variable that is not valid UTF-8 in the hook's
+/// environment does not make the guard panic into silence.
+#[test]
+fn a_non_utf8_environment_still_gets_an_answer() {
+    use std::os::unix::ffi::OsStrExt;
+    let e = Env::new();
+    let input = Env::hook(&e.path("repo"), "sluice queue approve t-1", "default");
+    let out = e
+        .guard()
+        .env(
+            "SLUICE_TEST_LATIN1",
+            std::ffi::OsStr::from_bytes(b"caf\xe9"),
+        )
+        .write_stdin(input)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let answer: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(answer["hookSpecificOutput"]["permissionDecision"], "deny");
+}

@@ -1602,3 +1602,61 @@ async fn an_early_verdict_cancel_kills_only_a_job_nobody_else_waits_for() {
     assert_eq!(killed_by.as_deref(), Some("early-verdict"));
     d.shutdown().await;
 }
+
+/// Alpha review finding 7: a queued job whose last subscriber leaves is
+/// dropped under the same lock as the "is it still queued" check, so it
+/// is never admitted afterwards and never runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_queued_job_dropped_by_its_last_subscriber_never_starts() {
+    let repo = make_repo();
+    let d = start(1, LastSubscriberGone::Cancel).await;
+    let release = d.path("release");
+    let holder_cmd = format!("while [ ! -e {} ]; do sleep 0.05; done", release.display());
+    let (wa, mut ra) = d
+        .request(&run_msg(&repo, "holder", &holder_cmd, None, None, 0))
+        .await;
+    until_started(&mut ra).await;
+    let flag = d.path("waiter-ran");
+    let (wb, mut rb) = d
+        .request(&run_msg(
+            &repo,
+            "waiter",
+            &format!("echo ran > {}", flag.display()),
+            None,
+            None,
+            0,
+        ))
+        .await;
+    let waiter = match next(&mut rb).await {
+        Some(ServerMessage::Queued { job_id, .. }) => job_id,
+        other => panic!("{other:?}"),
+    };
+    drop((wb, rb));
+    let db = d.path("sluice.db");
+    wait_for(
+        "the queued job to be dropped",
+        || {
+            Store::open_read_only(&db)
+                .ok()
+                .and_then(|s| s.timeline(&waiter).ok().flatten())
+                .is_some_and(|t| t.job.state == JobState::Done)
+        },
+        WAIT,
+    )
+    .await;
+    let t = Store::open_read_only(&db)
+        .unwrap()
+        .timeline(&waiter)
+        .unwrap()
+        .unwrap();
+    assert_eq!(t.job.outcome.as_deref(), Some("killed"));
+    assert_eq!(t.job.started_at, None, "never admitted");
+    // Free the budget: nothing is left to start.
+    std::fs::write(&release, "").unwrap();
+    assert_eq!(done_status(&until_done(&mut ra).await), OutcomeStatus::Pass);
+    let s = status(&d).await;
+    assert!(s.running.is_empty() && s.queued.is_empty(), "{s:?}");
+    assert!(!flag.exists(), "the dropped job never ran");
+    drop(wa);
+    d.shutdown().await;
+}

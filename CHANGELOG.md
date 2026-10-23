@@ -59,6 +59,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `sluice queue approve` run from an agent's environment is refused unless
+  `[queue] allow_agent_approval = true`.
 - Learned gate weights are resolved at every admission pass instead of at
   enqueue, so jobs that queued before the weight was learned are admitted
   with it; running jobs keep the weight they were admitted with.
@@ -88,6 +90,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Guard: picks the right `.sluice.toml` after `cd ..` through symlinks,
+  skips rewrites when `CDPATH` is set or `PATH=` is assigned, and the
+  approval deny sees through quotes and wrappers.
+- A non-UTF-8 environment variable no longer makes `sluice exec`, shims or
+  the guard panic; exec falls back in-process with the raw environment.
+- Scheduler: over-admission waits for a CPU sample taken after the latest
+  start; learned weights come from passing runs only; idle CPUs respect a
+  cgroup CPU quota below the CPU mask.
+- A queued job dropped by its last subscriber or a stop can no longer
+  start unsupervised; terminated process groups are never signalled again;
+  in-process exec kills the whole process group on timeout and signals.
+- Database migration backups are written atomically and checked before
+  being trusted; `doctor` no longer connects through an unsafe fallback
+  socket directory.
 - `sluice queue status` retries once when the daemon drops the connection
   before replying (for example right after it died), instead of failing.
 - A daemon killed while it applied `nice` and `ionice` to a new gate left

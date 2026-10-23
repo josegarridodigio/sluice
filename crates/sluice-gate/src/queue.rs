@@ -87,8 +87,27 @@ fn filter_env(env: &EnvMap) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// The environment sent with `queue-approve`: the allowlisted variables
+/// (used for the push) plus the agent-detection variables that are set
+/// (`SLUICE_AGENT` and those named by `[agent_detection]`), so the daemon
+/// can refuse an agent's approval. The daemon stores only the allowlisted
+/// ones.
+fn approve_env(env: &EnvMap, user: &UserConfig) -> BTreeMap<String, String> {
+    let mut out = filter_env(env);
+    let detection = &user.agent_detection;
+    let names = std::iter::once("SLUICE_AGENT")
+        .chain(detection.env_any_set.iter().map(String::as_str))
+        .chain(detection.env_any_equals.keys().map(String::as_str));
+    for name in names {
+        if let Some(v) = env.get(name) {
+            out.insert(name.to_owned(), v.clone());
+        }
+    }
+    out
+}
+
 fn process_env() -> EnvMap {
-    std::env::vars().collect()
+    sluice_gate_core::config::process_env()
 }
 
 // ---------------------------------------------------------------- transport
@@ -617,12 +636,13 @@ fn do_approve(train_id: &str, yes: bool) -> Outcome {
     if !yes && !confirm("Land this train? [y/N] ") {
         return Err(Failure::error("not approved"));
     }
+    let user = UserConfig::load(&env).unwrap_or_default();
     let msg = ClientMessage::QueueApprove {
         id: 1,
         train_id: train_id.to_owned(),
         train_hash: hash,
         via: ApproveVia::Cli,
-        env: filter_env(&env),
+        env: approve_env(&env, &user),
     };
     let ServerMessage::QueueApproved { train: after, .. } = send(&env, &msg, true)? else {
         return Err(Failure::error("unexpected reply to queue-approve"));
@@ -630,7 +650,6 @@ fn do_approve(train_id: &str, yes: bool) -> Outcome {
     match after.state {
         QueueTrainState::Approved | QueueTrainState::Pushing => {
             println!("sluice: approved; pushing\u{2026}");
-            let user = UserConfig::load(&env).unwrap_or_default();
             wait_for_landing(&env, &after, landing_deadline(&after, user.queue.tick))
         }
         _ => report_final(&after, &report.jobs),
@@ -1110,6 +1129,24 @@ mod tests {
         assert_eq!(
             kept.keys().map(String::as_str).collect::<Vec<_>>(),
             ["HOME", "PATH", "SSH_AUTH_SOCK"]
+        );
+    }
+
+    #[test]
+    fn approve_env_carries_the_agent_detection_variables() {
+        let env: EnvMap = [
+            ("PATH", "/bin"),
+            ("CLAUDECODE", "1"),
+            ("SLUICE_AGENT", "0"),
+            ("AWS_SECRET_ACCESS_KEY", "x"),
+        ]
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+        let sent = approve_env(&env, &UserConfig::default());
+        assert_eq!(
+            sent.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["CLAUDECODE", "PATH", "SLUICE_AGENT"]
         );
     }
 

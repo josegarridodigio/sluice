@@ -110,7 +110,7 @@ fn is_our_shim(path: &Path) -> bool {
 }
 
 fn env_map() -> EnvMap {
-    std::env::vars().collect()
+    sluice_gate_core::config::process_env()
 }
 
 fn load_user(env: &EnvMap, warn: bool) -> UserConfig {

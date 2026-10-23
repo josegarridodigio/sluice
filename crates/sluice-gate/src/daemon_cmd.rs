@@ -218,7 +218,7 @@ async fn shutdown_signal() {
 
 /// `sluice daemon [--foreground]`.
 pub fn start(foreground: bool) -> ExitCode {
-    let env: EnvMap = std::env::vars().collect();
+    let env: EnvMap = sluice_gate_core::config::process_env();
     let config = match UserConfig::load(&env)
         .map_err(anyhow::Error::from)
         .and_then(|user| daemon_config(&env, &user, !foreground))
@@ -319,7 +319,7 @@ fn wait_for_drain(env: &EnvMap, running: usize) {
 
 /// `sluice daemon stop [--force]`.
 pub fn stop(force: bool) -> ExitCode {
-    let env: EnvMap = std::env::vars().collect();
+    let env: EnvMap = sluice_gate_core::config::process_env();
     let Ok(socket) = dirs::socket_path(&env) else {
         println!("sluice: no daemon running");
         return ExitCode::SUCCESS;
@@ -364,7 +364,7 @@ pub fn stop(force: bool) -> ExitCode {
 /// `--force` kills them. With `--debug` the new daemon runs with
 /// `SLUICE_LOG=debug`, only for that instance.
 pub fn restart(debug: bool, force: bool) -> ExitCode {
-    let mut env: EnvMap = std::env::vars().collect();
+    let mut env: EnvMap = sluice_gate_core::config::process_env();
     if let Ok(socket) = dirs::socket_path(&env)
         && let Ok(client) = client::connect(&socket)
     {

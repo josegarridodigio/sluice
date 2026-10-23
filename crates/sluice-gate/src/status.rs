@@ -13,7 +13,7 @@ use sluice_gate_proto::client::{self, ClientError};
 
 /// Entry point of `sluice status`.
 pub fn show(json: bool) -> ExitCode {
-    let env: EnvMap = std::env::vars().collect();
+    let env: EnvMap = sluice_gate_core::config::process_env();
     let report = dirs::socket_path(&env)
         .map_err(|e| ClientError::Other(e.into()))
         .and_then(|socket| client::connect(&socket))

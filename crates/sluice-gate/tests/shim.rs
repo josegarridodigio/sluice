@@ -653,3 +653,24 @@ fn status_reports_path_order_and_this_shells_mode() {
         "{text}"
     );
 }
+
+/// Alpha review finding 3: a shim whose environment holds a variable that
+/// is not valid UTF-8 still runs the real binary, directly (human) or
+/// in-process through `sluice exec` (agent).
+#[test]
+fn a_non_utf8_environment_still_runs_the_real_binary() {
+    use std::os::unix::ffi::OsStrExt;
+    let s = setup(4, "");
+    for env in [&[][..], AGENT] {
+        let out = s
+            .command(&s.default_path(), env, "make", &["hello"])
+            .env(
+                "SLUICE_TEST_LATIN1",
+                std::ffi::OsStr::from_bytes(b"caf\xe9"),
+            )
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{env:?}: {out:?}");
+        assert_eq!(stdout(&out), "real make hello\n", "{env:?}");
+    }
+}
