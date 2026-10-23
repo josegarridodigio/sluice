@@ -208,3 +208,29 @@ low-core at 13.1 %); peak load ≤ baseline (met in all three).
 Before the scheduler work the overload variant finished later than the
 baseline (162.5 s vs 147.3 s with p95 79.6 s vs 37.5 s); it now finishes
 in 0.58x the baseline's time with p95 within the target.
+
+## L3 round 1 — overcommit 2.0, interval 2 s (configuration only)
+
+Hypothesis: idle CPUs while jobs wait come from too little over-admission
+(cap 1.5x, one over-admission every 5 s). Change: `[admission] overcommit
+= 2.0`, `overcommit_interval = "2s"` in the sandbox user config; no code.
+
+| Variant | Wall vs baseline | p95 vs baseline | Idle while waiting | Peak load sluice / baseline |
+|---|---|---|---|---|
+| overload | 74.1 / 129.6 s = 0.57x | 36.4 / 33.7 s = 1.08x | 9.9 % | 15.4 / 61.9 |
+| low-core | 50.6 / 85.1 s = 0.60x | 25.5 / 23.5 s = 1.08x | 11.3 % (miss) | 4.7 / 14.7 |
+| normal | 47.8 / 72.5 s = 0.66x | 17.8 / 15.3 s = 1.17x | 4.7 % | 11.8 / 15.7 |
+
+Effect: overload now meets every target and low-core p95 drops from 1.40x
+to 1.08x; low-core idle-while-waiting improves but still misses; the
+normal variant still meets every target but is slower than in E2 (0.66x
+vs 0.50x wall, p95 1.17x vs 0.89x), so the larger cap costs something when
+the machine has room. Kept for now as a candidate default; decided after
+round 2.
+
+Cause of the remaining idle time, from the low-core job timeline: `test`
+demand is learned at about 3.0 CPUs (weight_cfg 4) after three runs, but
+jobs queued earlier keep weight 4 for their whole wait, so one test plus
+lint run where two tests of weight 3 would fit, leaving about 2 CPUs idle.
+Round 2 resolves the learned weight at admission time instead of at
+enqueue time.
