@@ -282,3 +282,36 @@ Against the measurement that started the plan (overload, 0.2.0 scheduler):
 wall 162.5 s vs 147.3 s baseline (1.10x) → 79.2 s vs 137.5 s (0.58x);
 p95 79.6 s vs 37.5 s (2.12x) → 39.3 s vs 35.8 s (1.10x); suites 25 of 48
 in both; peak load 31 vs 74 → 16.6 vs 63.3.
+
+## E5 — the whole harness against the release candidate (663edaf)
+
+`scripts/alpha/run_all.sh` ran every scenario with the installed binary
+(built from 663edaf, after the R2 review fixes and the test stabilisation),
+on this machine with nothing else running. The first pass reported one
+failure in s3 item 2: the check still assumed a fixed gate weight
+(budget 8 / weight 3 => at most 2 concurrent gates) while ADR-0011 admits
+gates with their learned demand. The daemon's own job rows showed the
+`wide` test gate (a `sleep`, demand 0.011 CPU) learned the floor weight 1
+after three passing runs and the admitted weight peaked at exactly the
+budget, 8, with no over-admission: the budget was never exceeded. The check
+now asserts the real invariants (process concurrency within what the
+admitted weights allow, and the admitted weight from the job rows within
+the 1.5x cap) and s3 was rerun.
+
+Results (`python3 scripts/alpha/report.py <out-e5>`):
+
+| Scenario | Passed | Failed |
+|---|---|---|
+| s1_hooks | 36 | 0 |
+| s2_problem-default | 14 | 0 |
+| s3_correctness | 43 | 0 |
+| s4_chaos | 48 | 0 |
+| s5_merge_queue | 65 | 0 |
+| s6_upgrade | 50 | 0 |
+| s7_command_control | 64 | 0 |
+
+
+Total: 320 of 320 checks pass across the seven scenarios. s2 here is its
+default size (8 agents x 2 iterations); the three sized variants are the
+L3 rounds above. s7's numbers: raw 10 concurrent loads in 2.1 s, guarded
+or shimmed 2 concurrent in 8.6–8.9 s (sandbox budget 8, exec weight 4).

@@ -121,6 +121,27 @@ def tree_fingerprint(repo: Path) -> dict:
     }
 
 
+def admitted_weight_peak(sb, gate: str) -> int:
+    """Largest sum of admitted weights of `gate` jobs running at once,
+    from the daemon's own job rows (start/finish times, weight used)."""
+    import sqlite3
+    db = sb.state / "sluice" / "sluice.db"
+    with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+        rows = conn.execute(
+            "select weight, started_at, finished_at from jobs where gate = ? and started_at is not null",
+            (gate,),
+        ).fetchall()
+    events = []
+    for weight, started, finished in rows:
+        events.append((started, 1, weight))
+        events.append((finished or started, -1, weight))
+    current = peak = 0
+    for _, delta, weight in sorted(events, key=lambda e: (e[0], e[1])):
+        current += delta * weight
+        peak = max(peak, current)
+    return peak
+
+
 def main() -> int:
     require_testbeds()
     out = Path(os.environ.get("ALPHA_OUT", "."))
@@ -186,7 +207,12 @@ def main() -> int:
             wts.append(wt)
         weight = 3
         budget = 8
-        limit = budget // weight  # 2 gates of weight 3 fit in a budget of 8
+        # ADR-0011: gates are admitted with their learned demand, bounded to
+        # [ceil(w/4), w], and over-admission may reach 1.5x the budget. The
+        # invariant is on admitted weight, not on a fixed per-gate weight.
+        cap = int(budget * 1.5)
+        min_weight = -(-weight // 4)
+        limit = cap // min_weight
         before = int(sb.totals(repo).get("runs", 0))
         sampler = PidSampler(TOKEN + "-wide")
         sampler.start()
@@ -201,11 +227,15 @@ def main() -> int:
         rep.check("2: 16 distinct trees produce 16 runs, all passing",
                   executions == FANOUT and runs_after - before == FANOUT and all(r.get("status") == "pass" for r in rs),
                   f"gate executions {executions}, daemon runs +{runs_after - before}, distinct job ids {len({r.get('job_id') for r in rs})}")
-        rep.check("2: concurrent gates never exceed the budget (sampled from /proc)",
+        rep.check("2: concurrent gates never exceed what the admitted weights allow (sampled from /proc)",
                   1 <= sampler.peak <= limit,
-                  f"peak {sampler.peak} concurrent gates of weight {weight} (budget {budget} => at most {limit}), "
-                  f"{len(sampler.seen)} gate processes seen, wall {wall:.1f}s",
+                  f"peak {sampler.peak} concurrent gates (configured weight {weight}, learned floor {min_weight}, "
+                  f"budget {budget}, cap {cap} => at most {limit}), {len(sampler.seen)} gate processes seen, wall {wall:.1f}s",
                   peak=sampler.peak)
+        peak_weight = admitted_weight_peak(sb, "wide")
+        rep.check("2: the admitted weight of concurrent gates never exceeds the cap (daemon job rows)",
+                  0 < peak_weight <= cap,
+                  f"peak admitted weight {peak_weight} (budget {budget}, cap {cap})", peak_weight=peak_weight)
 
         # ---- 3. failing tree is never reported as pass ------------------------
         print("== 3. a failing tree is never reported as pass", flush=True)

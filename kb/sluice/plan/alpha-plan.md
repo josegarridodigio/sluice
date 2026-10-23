@@ -480,7 +480,7 @@ Waiting is fine while the CPU is full; waiting with idle CPU is waste.
 | Chaos | `s4_chaos.py` | E1 |
 | Merge queue on a real project | `s5_merge_queue.py` | E4 |
 | Upgrade with live state | `s6_upgrade.py` | E1, rerun at R4 |
-| Command control (exec, guard rewrite, shell shims) | `s7_command_control.py` | E3, H5 variant |
+| Command control (exec, guard rewrite, shell shims) | `s7_command_control.py` | done, 64/64 |
 | Merge queue over SSH and smart HTTP | `s5_merge_queue.py --transport ssh|http` | H2 |
 
 Test beds: `sindresorhus/slugify` (Node, xo + ava) and
