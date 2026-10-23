@@ -110,3 +110,20 @@ Verified locally with `docker run` of `scripts/ci/container-test.sh`
 --no-fail-fast -p sluice-gate-core -p sluice-gate -p sluice-gate-queue`, 463
 passed, 0 failed; before the runner fix 4 SSH transport tests failed
 (`error: unknown option 'reason'`), the 5 HTTP ones print the skip line.
+
+## Second round of matrix failures (run 39876237088, commit f396684)
+
+- git 2.31.0 no longer builds with the runner's GCC 15: C23 makes
+  `thread_local` a keyword that `builtin/index-pack.c` uses as an
+  identifier. `scripts/ci/build-git.sh` now passes `CFLAGS="-O2 -std=gnu17"`.
+- aarch64: `http_reconcile_after_a_killed_push` failed because the first
+  `sluice queue status --json` after the daemon was SIGKILLed got its
+  connection dropped before any reply (`reading from the daemon`) and the
+  CLI gave up. `queue status` (read-only) is now sent once more after
+  ensuring a daemon when the connection drops before a reply
+  (`crates/sluice-gate/src/queue.rs` `send`/`send_once`); requests with
+  effects are never retried. The new test
+  `queue_status_survives_a_daemon_that_just_died` (5 SIGKILL rounds) passes
+  locally with and without the retry, so it does not reproduce the race on
+  this machine; the matrix run on aarch64 is the confirmation.
+- Ubuntu 22.04/24.04, Debian 12, Fedora and Alpine pass since c381a12.

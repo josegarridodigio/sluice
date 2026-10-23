@@ -387,3 +387,33 @@ fn retry_rereads_the_branch_head() {
     assert_eq!(sent["job_id"], "j2");
     assert_eq!(sent["head_sha"], head.as_str());
 }
+
+/// `queue status` right after the daemon died (SIGKILL) answers instead of
+/// failing with a dropped connection: the read-only request is retried once
+/// after a new daemon is ensured.
+#[test]
+fn queue_status_survives_a_daemon_that_just_died() {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+    let sb = Sandbox::standard();
+    for _ in 0..5 {
+        sb.sluice().args(["queue", "status"]).assert().success();
+        let pid = sb.status_json()["daemon"]["pid"]
+            .as_u64()
+            .expect("a daemon runs");
+        kill(Pid::from_raw(i32::try_from(pid).unwrap()), Signal::SIGKILL).expect("SIGKILL");
+        sb.sluice()
+            .args(["queue", "status", "--json"])
+            .assert()
+            .success()
+            .stdout(
+                predicate::str::contains("\"schema\":1")
+                    .or(predicate::str::contains("\"schema\": 1")),
+            )
+            .stderr(
+                predicate::str::contains("reading from the daemon")
+                    .not()
+                    .and(predicate::str::is_empty().or(predicate::str::is_empty().not())),
+            );
+    }
+}

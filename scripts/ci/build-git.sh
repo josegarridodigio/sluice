@@ -10,7 +10,9 @@ curl -fsSL "https://mirrors.edge.kernel.org/pub/software/scm/git/git-$version.ta
 # NO_CURL: git 2.31 does not build against current libcurl headers
 # (`http.h: error: CURLUSESSL_TRY undeclared`), and the tests that need the
 # HTTP client skip themselves when `git-remote-http` is missing.
-make -C "$src" -j"$(nproc)" prefix="$prefix" NO_CURL=1 \
+# -std=gnu17: GCC 15 defaults to C23, where `thread_local` is a keyword that
+# git 2.31's builtin/index-pack.c uses as an identifier.
+make -C "$src" -j"$(nproc)" prefix="$prefix" NO_CURL=1 CFLAGS="-O2 -std=gnu17" \
     NO_GETTEXT=1 NO_TCLTK=1 NO_PERL=1 NO_PYTHON=1 all install
 rm -rf "$src"
 "$prefix/bin/git" --version

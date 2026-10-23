@@ -95,13 +95,46 @@ fn process_env() -> EnvMap {
 
 /// Sends one request to the daemon (starting it when needed) and returns the
 /// reply; an `error` reply becomes a [`Failure`] with the matching exit code.
+///
+/// A read-only request (`queue-status`) whose connection drops before any
+/// reply, typically because the daemon died or is restarting, is sent once
+/// more after making sure a daemon runs; requests with effects never are.
 fn send(env: &EnvMap, msg: &ClientMessage, wait_forever: bool) -> Result<ServerMessage, Failure> {
-    let socket = client::ensure_daemon(env).map_err(|e| Failure::error(format!("{e:#}")))?;
-    let conn = client::connect(&socket).map_err(|e| Failure::error(e.to_string()))?;
+    match send_once(env, msg, wait_forever) {
+        Err(Retryable::Lost(_)) if matches!(msg, ClientMessage::QueueStatus { .. }) => {
+            send_once(env, msg, wait_forever).map_err(Retryable::into_failure)
+        }
+        other => other.map_err(Retryable::into_failure),
+    }
+}
+
+/// A failure, and whether the connection dropped before any reply.
+enum Retryable {
+    Lost(Failure),
+    Final(Failure),
+}
+
+impl Retryable {
+    fn into_failure(self) -> Failure {
+        match self {
+            Self::Lost(f) | Self::Final(f) => f,
+        }
+    }
+}
+
+fn send_once(
+    env: &EnvMap,
+    msg: &ClientMessage,
+    wait_forever: bool,
+) -> Result<ServerMessage, Retryable> {
+    let lost = |e: String| Retryable::Lost(Failure::error(e));
+    let socket = client::ensure_daemon(env)
+        .map_err(|e| Retryable::Final(Failure::error(format!("{e:#}"))))?;
+    let conn = client::connect(&socket).map_err(|e| lost(e.to_string()))?;
     if !conn.supports(FEATURE_QUEUE) {
-        return Err(Failure::error(
+        return Err(Retryable::Final(Failure::error(
             "the running daemon does not support the merge queue; run 'sluice daemon stop' and retry",
-        ));
+        )));
     }
     let timeout = if wait_forever {
         None
@@ -109,7 +142,7 @@ fn send(env: &EnvMap, msg: &ClientMessage, wait_forever: bool) -> Result<ServerM
         Some(Duration::from_secs(60))
     };
     match conn.request_timeout(msg, timeout) {
-        Ok(ServerMessage::Error { code, message, .. }) => Err(Failure {
+        Ok(ServerMessage::Error { code, message, .. }) => Err(Retryable::Final(Failure {
             code: match code {
                 ErrorCode::ConflictState
                 | ErrorCode::NotAllowed
@@ -118,10 +151,10 @@ fn send(env: &EnvMap, msg: &ClientMessage, wait_forever: bool) -> Result<ServerM
                 _ => EXIT_ERROR,
             },
             message,
-        }),
+        })),
         Ok(reply) => Ok(reply),
-        Err(ClientError::Daemon(m)) => Err(Failure::error(m)),
-        Err(e) => Err(Failure::error(e.to_string())),
+        Err(ClientError::Daemon(m)) => Err(Retryable::Final(Failure::error(m))),
+        Err(e) => Err(lost(e.to_string())),
     }
 }
 

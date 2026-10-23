@@ -85,6 +85,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `sluice queue status` retries once when the daemon drops the connection
+  before replying (for example right after it died), instead of failing.
 - A daemon killed while it applied `nice` and `ionice` to a new gate left
   that gate running: the gate was registered with the reaper only after
   the `renice` and `ionice` helpers had finished. It is now registered
