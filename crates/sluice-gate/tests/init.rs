@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Output};
 
@@ -196,10 +196,37 @@ fn stderr(out: &Output) -> String {
 
 /// The `(hook, gate)` pairs of every `sluice run --hook H G` in `text`.
 fn wired(text: &str) -> BTreeSet<(String, String)> {
-    let re = Regex::new(r"sluice run --hook (\S+) (\S+)").unwrap();
+    let re = Regex::new(r"sluice run --hook ([\w-]+) ([\w-]+)").unwrap();
     re.captures_iter(text)
         .map(|c| (c[1].to_owned(), c[2].to_owned()))
         .collect()
+}
+
+/// A hook line that runs the gate through Sluice and falls back to `original`.
+fn fb(hook: &str, gate: &str, original: &str) -> String {
+    format!(
+        "if command -v sluice >/dev/null 2>&1; then sluice run --hook {hook} {gate}; \
+         else {original}; fi"
+    )
+}
+
+/// The same inside `sh -c '...'`, as a pre-commit `entry:` has it.
+fn fb_sh(hook: &str, gate: &str, original: &str) -> String {
+    format!("sh -c '{}'", fb(hook, gate, original))
+}
+
+/// Every `.sluice-tmp-` file under `dir`, `.git/` included.
+fn temp_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if entry.file_type().unwrap().is_dir() {
+            out.extend(temp_files(&path));
+        } else if path.to_string_lossy().contains("sluice-tmp") {
+            out.push(path);
+        }
+    }
+    out
 }
 
 /// The checks every fixture must pass; returns the repository after `init`.
@@ -310,15 +337,18 @@ fn angular_husky_keeps_the_formatter_and_wires_lint_and_test() {
     let dry = repo.sluice(&["init", "--dry-run"]);
     let text = stdout(&dry);
     assert!(
-        text.contains("+sluice run --hook pre-commit lint"),
+        text.contains(&format!("+{}", fb("pre-commit", "lint", "ng lint"))),
         "{text}"
     );
     assert!(text.contains("-ng lint"), "{text}");
     check_init(&repo, true);
     assert_eq!(
         repo.read(".husky/pre-commit"),
-        "npx pretty-quick --staged\nsluice run --hook pre-commit lint\n\
-         sluice run --hook pre-commit test\n"
+        format!(
+            "npx pretty-quick --staged\n{}\n{}\n",
+            fb("pre-commit", "lint", "ng lint"),
+            fb("pre-commit", "test", "ng test --watch=false")
+        )
     );
     let config = repo.config();
     assert_eq!(
@@ -363,13 +393,24 @@ fn node_pnpm_without_hooks_gets_githooks_and_a_local_hooks_path() {
     );
     assert_eq!(
         repo.read(".githooks/pre-commit"),
-        "#!/bin/sh\nset -e\nsluice run --hook pre-commit lint\n\
-         sluice run --hook pre-commit typecheck\n"
+        "#!/bin/sh\nset -e\ncommand -v sluice >/dev/null 2>&1 || exit 0\n\
+         sluice run --hook pre-commit lint\nsluice run --hook pre-commit typecheck\n"
     );
     assert_eq!(
         repo.read(".githooks/pre-push"),
-        "#!/bin/sh\nset -e\nsluice run --hook pre-push test\n"
+        "#!/bin/sh\nset -e\ncommand -v sluice >/dev/null 2>&1 || exit 0\n\
+         sluice run --hook pre-push test\n"
     );
+    // A clone without Sluice can still commit.
+    let bare_path = tempfile::tempdir().unwrap();
+    let status = StdCommand::new("/bin/sh")
+        .args(["-e", ".githooks/pre-commit"])
+        .current_dir(&repo.dir)
+        .env_clear()
+        .env("PATH", bare_path.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
     assert_eq!(mode(&repo, ".githooks/pre-commit"), 0o755);
     assert_eq!(mode(&repo, ".githooks/pre-push"), 0o755);
     assert_eq!(
@@ -387,11 +428,14 @@ fn node_yarn_lefthook_is_edited_textually() {
     let expected = before
         .replace(
             "run: npx tsc --noEmit",
-            "run: sluice run --hook pre-commit tsc",
+            &format!("run: {}", fb("pre-commit", "tsc", "npx tsc --noEmit")),
         )
         .replace(
             "run: yarn test # the whole suite",
-            "run: sluice run --hook pre-push test # the whole suite",
+            &format!(
+                "run: {} # the whole suite",
+                fb("pre-push", "test", "yarn test")
+            ),
         );
     assert_eq!(after, expected);
     assert!(after.contains("run: npx prettier --write {staged_files}"));
@@ -447,14 +491,16 @@ fn python_precommit_wires_local_hooks_and_prefers_the_virtualenv() {
     let yaml = repo.read(".pre-commit-config.yaml");
     // The hook of a remote repository is not ours to touch.
     assert!(yaml.contains("      - id: ruff\n        entry: pytest -q\n"));
-    assert!(yaml.contains(
-        "        entry: sluice run --hook pre-push pytest\n        language: system\n        \
-         pass_filenames: false\n        stages: [pre-push]\n"
-    ));
-    assert!(yaml.contains(
-        "        entry: sluice run --hook pre-commit pytest-2\n        pass_filenames: false\n        \
-         language: system\n"
-    ));
+    assert!(yaml.contains(&format!(
+        "        entry: {}\n        language: system\n        \
+         pass_filenames: false\n        stages: [pre-push]\n",
+        fb_sh("pre-push", "pytest", "pytest -q")
+    )));
+    assert!(yaml.contains(&format!(
+        "        entry: {}\n        pass_filenames: false\n        \
+         language: system\n",
+        fb_sh("pre-commit", "pytest-2", "python -m pytest -x")
+    )));
     let config = repo.config();
     assert_eq!(config.gates["pytest"].cmd, "pytest -q");
     assert_eq!(config.gates["pytest-2"].cmd, "python -m pytest -x");
@@ -516,14 +562,18 @@ fn mixed_husky_keeps_crlf_modes_and_the_missing_final_newline() {
     check_init(&repo, true);
     assert_eq!(
         repo.read(".husky/pre-commit"),
-        "#!/bin/sh\r\n. \"$(dirname -- \"$0\")/_/husky.sh\"\r\n\r\n# lint first\r\n\
-         sluice run --hook pre-commit lint || exit 1\r\nnpx commitlint --edit\r\n\
-         sluice run --hook pre-commit jest\r\nsluice run --hook pre-commit test"
+        format!(
+            "#!/bin/sh\r\n. \"$(dirname -- \"$0\")/_/husky.sh\"\r\n\r\n# lint first\r\n\
+             {} || exit 1\r\nnpx commitlint --edit\r\n{}\r\n{}",
+            fb("pre-commit", "lint", "ng lint"),
+            fb("pre-commit", "jest", "CI=true npx jest --ci"),
+            fb("pre-commit", "test", "ng test --watch=false")
+        )
     );
     assert_eq!(mode(&repo, ".husky/pre-commit"), 0o755);
     assert_eq!(
         repo.read(".husky/pre-push"),
-        "sluice run --hook pre-push test\n"
+        format!("{}\n", fb("pre-push", "test", "ng test --watch=false"))
     );
     let config = repo.config();
     // The same command in two hooks is one gate in both.
@@ -587,9 +637,13 @@ fn a_symlinked_hook_inside_the_repository_is_edited_at_its_target() {
     );
     assert_eq!(
         repo.read("tools/pre-commit"),
-        "npx pretty-quick --staged\nsluice run --hook pre-commit lint\n\
-         sluice run --hook pre-commit test\n"
+        format!(
+            "npx pretty-quick --staged\n{}\n{}\n",
+            fb("pre-commit", "lint", "ng lint"),
+            fb("pre-commit", "test", "ng test --watch=false")
+        )
     );
+    assert_eq!(temp_files(&repo.dir), Vec::<PathBuf>::new());
 }
 
 #[test]
@@ -609,7 +663,10 @@ fn a_symlinked_hook_outside_the_repository_is_left_alone_and_a_snippet_is_printe
     let text = stdout(&out);
     assert!(text.contains("could not edit .husky/pre-commit"), "{text}");
     assert!(
-        text.contains("sluice run --hook pre-commit lint || exit $?"),
+        text.contains(&format!(
+            "{} || exit $?",
+            fb("pre-commit", "lint", "ng lint")
+        )),
         "{text}"
     );
     // The gates still exist.
@@ -645,7 +702,10 @@ fn a_plain_git_dir_hook_with_a_heavy_command_is_rewired() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(
         fs::read_to_string(&hook).unwrap(),
-        "#!/bin/sh\nsluice run --hook pre-push test\n"
+        format!(
+            "#!/bin/sh\n{}\n",
+            fb("pre-push", "test", "cargo test --workspace")
+        )
     );
     assert_eq!(
         fs::metadata(&hook).unwrap().permissions().mode() & 0o777,
@@ -653,4 +713,240 @@ fn a_plain_git_dir_hook_with_a_heavy_command_is_rewired() {
     );
     assert!(!repo.dir.join(".githooks").exists());
     assert_eq!(repo.config().gates["test"].hooks, ["pre-push"]);
+}
+
+/// A directory with fake `ng` and `npx` (and `sluice` when asked) that only
+/// use shell builtins and append what they ran to `marker`.
+fn fake_bin(dir: &Path, with_sluice: bool) -> PathBuf {
+    let bin = dir.join(if with_sluice {
+        "bin-with"
+    } else {
+        "bin-without"
+    });
+    fs::create_dir_all(&bin).unwrap();
+    let marker = dir.join("marker");
+    let script = |name: &str, body: &str| {
+        let path = bin.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let log = |who: &str| format!("echo \"{who} $*\" >> '{}'", marker.display());
+    script("ng", &format!("{}\nexit ${{NG_EXIT:-0}}", log("ng")));
+    script("npx", "exit 0");
+    if with_sluice {
+        script(
+            "sluice",
+            &format!("{}\nexit ${{SLUICE_EXIT:-0}}", log("sluice")),
+        );
+    }
+    bin
+}
+
+/// Runs the hook script with `sh -e` and only `bin` in `PATH`.
+fn run_hook(repo: &Repo, bin: &Path, rel: &str, vars: &[(&str, &str)]) -> Option<i32> {
+    StdCommand::new("/bin/sh")
+        .args(["-e", rel])
+        .current_dir(&repo.dir)
+        .env_clear()
+        .env("PATH", bin)
+        .envs(vars.iter().copied())
+        .status()
+        .unwrap()
+        .code()
+}
+
+#[test]
+fn a_rewired_husky_hook_runs_the_original_command_without_sluice() {
+    let repo = Repo::new("angular-husky");
+    assert!(repo.sluice(&["init"]).status.success());
+    let marker = repo.dir.parent().unwrap().join("marker");
+
+    // Sluice absent: the original commands run, and their status is the hook's.
+    let bin = fake_bin(repo.dir.parent().unwrap(), false);
+    assert_eq!(run_hook(&repo, &bin, ".husky/pre-commit", &[]), Some(0));
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        "ng lint\nng test --watch=false\n"
+    );
+    fs::remove_file(&marker).unwrap();
+    assert_eq!(
+        run_hook(&repo, &bin, ".husky/pre-commit", &[("NG_EXIT", "3")]),
+        Some(3)
+    );
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "ng lint\n");
+    fs::remove_file(&marker).unwrap();
+
+    // Sluice present: it runs the gates instead of the original commands.
+    let bin = fake_bin(repo.dir.parent().unwrap(), true);
+    assert_eq!(run_hook(&repo, &bin, ".husky/pre-commit", &[]), Some(0));
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        "sluice run --hook pre-commit lint\nsluice run --hook pre-commit test\n"
+    );
+    fs::remove_file(&marker).unwrap();
+    assert_eq!(
+        run_hook(&repo, &bin, ".husky/pre-commit", &[("SLUICE_EXIT", "4")]),
+        Some(4)
+    );
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        "sluice run --hook pre-commit lint\n"
+    );
+}
+
+/// Turns every fallback line back into the bare 0.4.0 form.
+fn bare_form(text: &str) -> String {
+    let re = Regex::new(
+        r"(?:sh -c ')?if command -v sluice >/dev/null 2>&1; then (sluice run --hook [\w-]+ [\w-]+); else [^']*?; fi'?",
+    )
+    .unwrap();
+    re.replace_all(text, "$1").into_owned()
+}
+
+#[test]
+fn init_force_upgrades_the_bare_lines_of_0_4_0_once() {
+    for (fixture, files) in [
+        ("angular-husky", vec![".husky/pre-commit"]),
+        ("mixed", vec![".husky/pre-commit", ".husky/pre-push"]),
+        ("node-yarn-lefthook", vec!["lefthook.yml"]),
+        ("python-precommit", vec![".pre-commit-config.yaml"]),
+    ] {
+        let repo = Repo::new(fixture);
+        assert!(repo.sluice(&["init"]).status.success(), "{fixture}");
+        let fallback: Vec<String> = files.iter().map(|f| repo.read(f)).collect();
+        for (file, text) in files.iter().zip(&fallback) {
+            let bare = bare_form(text);
+            assert_ne!(&bare, text, "{fixture}: nothing was bare");
+            assert!(!bare.contains("command -v sluice"), "{fixture}: {bare}");
+            fs::write(repo.dir.join(file), bare).unwrap();
+        }
+        // The dry run shows the upgrade and writes nothing.
+        let before = repo.snapshot();
+        let dry = repo.sluice(&["init", "--force", "--dry-run"]);
+        assert!(stdout(&dry).contains("\n+++ "), "{fixture}");
+        assert_eq!(before, repo.snapshot(), "{fixture}: dry run wrote");
+
+        let out = repo.sluice(&["init", "--force"]);
+        assert!(out.status.success(), "{fixture}: {}", stderr(&out));
+        let upgraded: Vec<String> = files.iter().map(|f| repo.read(f)).collect();
+        for text in &upgraded {
+            assert!(text.contains("else "), "{fixture}: {text}");
+        }
+        match fixture {
+            // The gate's command is the original one.
+            "python-precommit" => assert_eq!(upgraded, fallback, "{fixture}"),
+            // The gate's environment (`CI=1`, added by detection) comes along.
+            "node-yarn-lefthook" => assert_eq!(
+                upgraded[0],
+                fallback[0].replace("else yarn test;", "else CI=1 yarn test;")
+            ),
+            _ => {}
+        }
+        // A second `--force` changes nothing.
+        let after = repo.snapshot();
+        let again = repo.sluice(&["init", "--force"]);
+        assert!(again.status.success(), "{fixture}");
+        assert_eq!(after, repo.snapshot(), "{fixture}: second force changed it");
+        assert!(!stdout(&again).contains("\n+++ "), "{fixture}");
+    }
+}
+
+#[test]
+fn the_upgrade_uses_the_gate_command_and_environment() {
+    let repo = Repo::new("angular-husky");
+    assert!(repo.sluice(&["init"]).status.success());
+    fs::write(
+        repo.dir.join(".husky/pre-commit"),
+        "npx pretty-quick --staged\nsluice run --hook pre-commit lint\n\
+         sluice run --hook pre-commit test\n",
+    )
+    .unwrap();
+    assert!(repo.sluice(&["init", "--force"]).status.success());
+    assert_eq!(
+        repo.read(".husky/pre-commit"),
+        format!(
+            "npx pretty-quick --staged\n{}\n{}\n",
+            fb("pre-commit", "lint", "npx ng lint"),
+            fb("pre-commit", "test", "npx ng test --watch=false")
+        )
+    );
+}
+
+#[test]
+fn a_command_that_cannot_be_nested_is_left_alone_and_printed() {
+    let repo = Repo::with("python-precommit", |dir| {
+        let path = dir.join(".pre-commit-config.yaml");
+        let text = fs::read_to_string(&path).unwrap();
+        // The second `entry: pytest -q` is the local hook.
+        let (head, tail) = text.split_once("      - id: pytest\n").unwrap();
+        let tail = tail.replacen("entry: pytest -q", "entry: pytest -k 'slow or fast'", 1);
+        fs::write(&path, format!("{head}      - id: pytest\n{tail}")).unwrap();
+    });
+    let out = repo.sluice(&["init"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let yaml = repo.read(".pre-commit-config.yaml");
+    assert!(
+        yaml.contains("        entry: pytest -k 'slow or fast'\n"),
+        "{yaml}"
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("could not edit .pre-commit-config.yaml (the command cannot be nested"),
+        "{text}"
+    );
+    assert!(
+        text.contains("entry: sluice run --hook pre-push pytest\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn files_are_replaced_atomically_keeping_mode_and_symlinks() {
+    let repo = Repo::with("angular-husky", |dir| {
+        let path = dir.join(".husky/pre-commit");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o750)).unwrap();
+    });
+    let hook = repo.dir.join(".husky/pre-commit");
+    let before = fs::metadata(&hook).unwrap();
+    assert!(repo.sluice(&["init"]).status.success());
+    let after = fs::metadata(&hook).unwrap();
+    assert_ne!(before.ino(), after.ino(), "the hook was rewritten in place");
+    assert_eq!(after.permissions().mode() & 0o777, 0o750);
+    assert_eq!(temp_files(&repo.dir), Vec::<PathBuf>::new());
+
+    // The config is replaced the same way on `--force`.
+    let config = repo.dir.join(".sluice.toml");
+    let before = fs::metadata(&config).unwrap().ino();
+    assert!(repo.sluice(&["init", "--force"]).status.success());
+    assert_ne!(before, fs::metadata(&config).unwrap().ino());
+    assert_eq!(
+        fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    assert_eq!(temp_files(&repo.dir), Vec::<PathBuf>::new());
+}
+
+#[test]
+fn a_symlinked_hook_keeps_its_link_and_the_target_is_replaced() {
+    let repo = Repo::with("angular-husky", |dir| {
+        fs::create_dir_all(dir.join("tools")).unwrap();
+        fs::rename(dir.join(".husky/pre-commit"), dir.join("tools/pre-commit")).unwrap();
+        symlink("../tools/pre-commit", dir.join(".husky/pre-commit")).unwrap();
+    });
+    let target = repo.dir.join("tools/pre-commit");
+    let before = fs::metadata(&target).unwrap().ino();
+    assert!(repo.sluice(&["init"]).status.success());
+    let link = repo.dir.join(".husky/pre-commit");
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        Path::new("../tools/pre-commit")
+    );
+    assert_ne!(before, fs::metadata(&target).unwrap().ino());
+    assert_eq!(temp_files(&repo.dir), Vec::<PathBuf>::new());
 }

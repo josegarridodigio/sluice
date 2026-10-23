@@ -10,7 +10,6 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -22,8 +21,9 @@ use sluice_gate_core::heavy::{HeavyMatcher, canonical_words};
 use sluice_gate_core::pkgscripts::{FsScripts, Scripts, pieces};
 
 use crate::run::EXIT_ERROR;
-use crate::snippets::{HookManager, snippet};
+use crate::snippets::{GUARD, HookManager, Wire, snippet, snippet_with};
 
+mod atomic;
 mod detect;
 mod hooks;
 mod render;
@@ -103,6 +103,8 @@ struct Manual {
     manager: HookManager,
     hook: String,
     gate: String,
+    /// The command the line ran, kept as the fallback in the snippet.
+    original: Option<String>,
 }
 
 /// `sluice init [--force] [--dry-run]`.
@@ -223,17 +225,21 @@ fn gates_from_hooks(
     };
     for (index, item) in found.iter().enumerate() {
         match item {
-            Found::Wired { gate, .. } => {
-                if out.gates.iter().any(|g| &g.name == gate) {
-                    continue;
+            Found::Wired { gate, upgrade } => {
+                if !out.gates.iter().any(|g| &g.name == gate) {
+                    match old
+                        .and_then(|(cfg, text)| cfg.gates.get(gate).map(|g| carried(gate, g, text)))
+                    {
+                        Some(plan) => out.gates.push(plan),
+                        None => out.notes.push(format!(
+                            "a hook runs gate \"{gate}\" but there is no such gate in \
+                             {REPO_CONFIG_FILE}; define it or remove the line"
+                        )),
+                    }
                 }
-                match old.and_then(|(cfg, text)| cfg.gates.get(gate).map(|g| carried(gate, g, text)))
-                {
-                    Some(plan) => out.gates.push(plan),
-                    None => out.notes.push(format!(
-                        "a hook runs gate \"{gate}\" but there is no such gate in {REPO_CONFIG_FILE}; \
-                         define it or remove the line"
-                    )),
+                // A 0.4.0 line (`sluice run` alone) gets the fallback.
+                if upgrade.is_some() && out.gates.iter().any(|g| &g.name == gate) {
+                    out.rewires.push((index, gate.clone()));
                 }
             }
             Found::Command(candidate) => {
@@ -354,7 +360,8 @@ fn hook_plan(root: &Path, layout: &hooks::Layout, hooks_path: Option<&str>) -> H
 }
 
 fn script_for(hook: &str, gates: &[&GatePlan]) -> String {
-    let mut text = String::from("#!/bin/sh\nset -e\n");
+    // A clone without Sluice can still commit: the file has no other command.
+    let mut text = format!("#!/bin/sh\nset -e\n{GUARD} || exit 0\n");
     for gate in gates {
         let _ = writeln!(text, "sluice run --hook {hook} {}", gate.name);
     }
@@ -393,34 +400,68 @@ fn gates_of(gates: &[GatePlan], hook: &str) -> Vec<String> {
         .collect()
 }
 
-/// The edits of the hook files that hold lines that became gates, and the
-/// lines that cannot be edited.
+/// The command a bare `sluice run` line of 0.4.0 stands for, rebuilt from
+/// its gate: the environment words and the gate's `cmd`. `None` when that
+/// cannot be written back into a hook line safely.
+fn gate_original(gates: &[GatePlan], name: &str) -> Option<String> {
+    let gate = gates.iter().find(|g| g.name == name)?;
+    hooks::parse_command(&gate.cmd)?;
+    let mut words = Vec::new();
+    for (key, value) in &gate.env {
+        let safe = !value.is_empty()
+            && value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_./:@%+-".contains(c));
+        if !safe {
+            return None;
+        }
+        words.push(format!("{key}={value}"));
+    }
+    words.push(gate.cmd.clone());
+    Some(words.join(" "))
+}
+
+/// The edits of the hook files that hold lines that became gates (or that
+/// still have the bare 0.4.0 form), and the lines that cannot be edited.
 fn hook_edits(
     layout: &hooks::Layout,
     found: &[Found],
     rewires: &[(usize, String)],
+    gates: &[GatePlan],
 ) -> (Vec<FileChange>, Vec<Manual>) {
     let mut manual = Vec::new();
     let mut by_file: BTreeMap<usize, Vec<(&Candidate, String)>> = BTreeMap::new();
     for (index, name) in rewires {
-        let Found::Command(candidate) = &found[*index] else {
-            continue;
+        let (candidate, original) = match &found[*index] {
+            Found::Command(candidate) => (candidate, candidate.original.clone()),
+            Found::Wired {
+                upgrade: Some(candidate),
+                ..
+            } => match gate_original(gates, name) {
+                Some(original) => (candidate, original),
+                None => continue,
+            },
+            Found::Wired { .. } => continue,
         };
         let file = &layout.files[candidate.file];
-        if let Some(reason) = candidate.manual {
+        let replacement = hooks::render_wired(file.format, &candidate.hook, name, &original);
+        let (Some(replacement), None) = (replacement, candidate.manual) else {
             manual.push(Manual {
                 file: file.rel.clone(),
-                reason,
+                reason: candidate
+                    .manual
+                    .unwrap_or("the command cannot be nested safely in the hook"),
                 manager: file.manager,
                 hook: candidate.hook.clone(),
                 gate: name.clone(),
+                original: Some(original),
             });
             continue;
-        }
-        by_file.entry(candidate.file).or_default().push((
-            candidate,
-            format!("sluice run --hook {} {name}", candidate.hook),
-        ));
+        };
+        by_file
+            .entry(candidate.file)
+            .or_default()
+            .push((candidate, replacement));
     }
     let changes = by_file
         .iter()
@@ -537,7 +578,7 @@ fn plan(root: &Path, paths: &RepoPaths, env: &EnvMap, force: bool) -> Result<Pla
         new: config,
         mode: None,
     }];
-    let (edits, manual) = hook_edits(&layout, &found, &from_hooks.rewires);
+    let (edits, manual) = hook_edits(&layout, &found, &from_hooks.rewires, &gates);
     changes.extend(edits);
 
     let mut set_hooks_path = false;
@@ -638,16 +679,16 @@ fn print_plan(plan: &Plan, root: &Path, dry_run: bool) {
             "sluice: could not edit {file} ({}); add this by hand:",
             items[0].reason
         );
-        let names = |hook: &str| -> Vec<String> {
+        let wires = |hook: &str| -> Vec<Wire> {
             items
                 .iter()
                 .filter(|m| m.hook == hook)
-                .map(|m| m.gate.clone())
+                .map(|m| (m.gate.clone(), m.original.clone()))
                 .collect()
         };
         print!(
             "{}",
-            snippet(items[0].manager, &names("pre-commit"), &names("pre-push"))
+            snippet_with(items[0].manager, &wires("pre-commit"), &wires("pre-push"))
         );
     }
     if let Some(text) = &plan.snippet {
@@ -668,12 +709,8 @@ fn write_changes(plan: &Plan, root: &Path, env: &EnvMap, paths: &RepoPaths) -> R
             fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
-        fs::write(&change.target, &change.new)
+        atomic::write(&change.target, change.new.as_bytes(), change.mode)
             .map_err(|e| format!("cannot write {}: {e}", change.rel))?;
-        if let Some(mode) = change.mode {
-            fs::set_permissions(&change.target, fs::Permissions::from_mode(mode))
-                .map_err(|e| format!("cannot set the mode of {}: {e}", change.rel))?;
-        }
     }
     if plan.set_hooks_path {
         let probe = git::probe_env(env, Some(paths));

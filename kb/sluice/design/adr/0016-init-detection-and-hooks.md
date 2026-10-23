@@ -45,6 +45,19 @@ tree. That rule protects the user from side effects of verification
 - Idempotent: lines already calling `sluice run` are recognised; a second
   run with `--force` changes no hook.
 
+## Amended in 0.4.1
+
+- A rewired line keeps working without Sluice: it is written as
+  `if command -v sluice >/dev/null 2>&1; then sluice run --hook <hook> <gate>;
+  else <original>; fi` (through `sh -c '...'` for a pre-commit `entry:`). The
+  files `init` creates itself start with `command -v sluice ... || exit 0`.
+  `init --force` recognises this form and upgrades the bare 0.4.0 lines to it,
+  taking the fallback from the gate's `cmd` and `env`.
+- Files are written atomically (temporary file in the same directory, fsync,
+  mode, `rename`; the target of an in-repo symlink, never the link), because
+  a hook may be executing while `init` rewrites it.
+  See [[sluice/changes/init-hook-fallback.md]].
+
 ## Consequences
 
 - `init` can surprise a user who expected only a config file; the summary and

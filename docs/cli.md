@@ -514,19 +514,44 @@ daemon budget at first, lowered by learning; see
 lint-like gates and 30m for tests. `key_inputs` carry the tool versions.
 
 **Hooks are rewired, always.** Every line that became a gate is replaced in
-place by `sluice run --hook <hook> <gate>`. Comments, other lines, the file
+place by a call to `sluice run --hook <hook> <gate>` that falls back to the
+original command when Sluice is not installed, so a teammate without Sluice
+can still commit:
+
+```sh
+if command -v sluice >/dev/null 2>&1; then sluice run --hook pre-commit lint; else ng lint; fi
+```
+
+The original text is kept exactly (leading `NAME=value` words included) and
+the status of whichever branch ran is the line's status. In the pre-commit
+framework (`entry:` with `language: system`, which is not a shell) the same
+goes through `sh -c '...'`. A command that cannot be nested safely (a single
+quote inside a pre-commit entry, a `: ` inside a YAML value) is left alone and
+its snippet is printed. Comments, other lines, the file
 mode, CRLF line endings and the trailing-newline state are kept. lefthook and
 pre-commit YAML are edited line by line (no re-serialisation, comments
 survive); a local pre-commit hook also gets `pass_filenames: false`. A line
 that cannot be matched safely (a symlink that leaves the repository, a pre-commit
 hook with `args` or a non-`system` language) is left alone and its snippet is
 printed. With no hook at all, `init` creates executable `.githooks/pre-commit`
-and `.githooks/pre-push` and sets `core.hooksPath` locally; if `.git/hooks`
+and `.githooks/pre-push` (they start with
+`command -v sluice >/dev/null 2>&1 || exit 0`, so a clone without Sluice can
+still commit) and sets `core.hooksPath` locally; if `.git/hooks`
 already has hooks of its own, or `core.hooksPath` points elsewhere, it prints
 the snippet and says why instead. Gates that no hook calls keep `hooks = []`.
 
 It is safe to run twice: lines that already call `sluice run` are recognised
-and `init --force` changes no hook.
+and `init --force` changes no hook. The one exception is a line of 0.4.0, a
+bare `sluice run --hook <hook> <gate>`: `init --force` upgrades it to the
+fallback form, using the gate's `cmd` (with its `env` words) from the existing
+`.sluice.toml` as the fallback command; a second `--force` changes nothing.
+
+**Writes are atomic.** Every file `init` writes (`.sluice.toml`, hooks) goes to
+a temporary file in the same directory, is synced, gets the target's mode (new
+hooks 0755, a new config 0644) and replaces the target with one `rename`, so a
+hook that `sh` is executing never reads half a file. A hook that is a symlink
+to a file inside the repository is replaced at the link's target; the link
+stays. A failed write removes its temporary file.
 
 **Output.** A table of the gates (name, command, weight, hooks, source: hook or
 detected), the files written, and a unified diff of the hook edits. `--dry-run`
