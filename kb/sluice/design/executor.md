@@ -99,13 +99,15 @@ start may be hours away.
   closes it when the daemon exits for any reason, SIGKILL and OOM
   included.
 - The `+` line is written right after `executor::spawn` returns, with no
-  await in between; `renice` and `ionice` run only when `Running::wait`
-  starts, after the registration and the store's `mark_started`. Until
-  2026-10-23 they ran inside `spawn`, before the registration, and a
-  daemon killed while those helpers ran (tens of milliseconds, seconds on
-  a loaded runner) left an unregistered gate behind (CI flake, see
-  [[sluice/changes/ci-flakes.md]]). The window that remains is the few
-  instructions between the fork and the pipe write.
+  await in between. Priorities no longer need helper processes after the
+  spawn (see Priority below); only the fallback `renice`/`ionice -p` for a
+  missing wrapper tool runs in `Running::wait`, after the registration and
+  the store's `mark_started`. Until 2026-10-23 they ran inside `spawn`,
+  before the registration, and a daemon killed while those helpers ran
+  (tens of milliseconds, seconds on a loaded runner) left an unregistered
+  gate behind (CI flake, see [[sluice/changes/ci-flakes.md]]). The window
+  that remains is the few instructions between the fork and the pipe
+  write.
 - On end of file the reaper SIGTERMs every registered group that
   `group_is_ours`, waits up to `KILL_GRACE` (5 s), SIGKILLs the rest and
   exits. While it waits (`executor::terminate_groups_blocking`, also used
@@ -201,11 +203,18 @@ finding 7).
   the spawn (the output pumps are already running; a queued row has a null
   `log_path`).
 - Priority: the `nix` crate exposes no `setpriority`, and calling libc
-  directly needs `unsafe`, so the CPU priority is applied with the
-  `renice` binary right after spawn (`renice -n <nice> -p <pid>`, skipped
-  when `nice = 0` or the binary is absent); the I/O class through the
-  `ionice` binary when present (`ionice -c <2|3> -n <level> -p <pid>`),
-  skipped silently otherwise. Results are ignored (debug log).
+  directly needs `unsafe` (no `pre_exec`), so the job is started through
+  the standard tools, which set their own priority and `exec` the next
+  program (same PID and process group; the reaper and `proc_start_ticks`
+  are unaffected): argv is `[nice -n <N>] [ionice -c <2|3> [-n <level>]]
+  <sh -c cmd | program args>`, with absolute paths resolved once per
+  process (`find_in_path`). Every descendant inherits the priority from its
+  first instruction (issue #1: the former asynchronous `renice -p <leader>`
+  left children forked before it at nice 0). `nice = 0` and no ionice add
+  no wrapper; the idle class takes no `-n`. When a tool is missing, that
+  half falls back to `renice`/`ionice -p <pid>` from `Running::wait`
+  (debug log). The command in the log header and the cache key do not
+  include the wrapper.
 - Output: both pipes drained concurrently into one append-only log
   `<state>/logs/<job-id>.log` (interleaved, 8 KiB chunks) with a header
   line (`# sluice job …`) and footer (`# exit: …`). `log_bytes` is reported

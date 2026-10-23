@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Gates and `sluice exec` jobs now start under `nice` and `ionice`, so every
+  process of a job inherits `daemon.nice` and the I/O class from its first
+  instruction; before, children forked before the asynchronous `renice` of
+  the leader stayed at nice 0 (#1).
+
 ## [0.3.0] - 2026-10-23
 
 ### Added
