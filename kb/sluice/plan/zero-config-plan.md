@@ -140,11 +140,11 @@ after wave 2. Nine sub-agents in total, at most three at once.
 
 | Task | State | Evidence |
 |---|---|---|
-| S0 PATH spike | in progress | |
-| ADR-0014..0016 | pending | |
+| S0 PATH spike | done: option 2 (`CLAUDE_ENV_FILE`), plugin `bin/` is last in PATH | [[sluice/research/plugin-path-spike.md]] |
+| ADR-0014..0016 | done | `kb/sluice/design/adr/0014..0016` |
 | T1 heavy classification | in progress | |
 | T2 gate priority (#1) | in progress | |
-| T4 automatic weights | pending | |
+| T4 automatic weights | in progress | |
 | T5 session start + plugin | pending | |
 | T3 init detection | pending | |
 | T6 doctor + docs | pending | |
