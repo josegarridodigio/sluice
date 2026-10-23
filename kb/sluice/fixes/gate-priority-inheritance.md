@@ -52,3 +52,14 @@ while four busy threads load the CPU; skipped when `nice` is absent),
 `ionice` is absent), `zero_nice_and_no_ionice_add_no_wrapper`. The existing
 executor, daemon and chaos tests cover exit codes, timeouts and kills.
 Verified through Sluice (`fmt`, `clippy`, `test`).
+
+## Review follow-up (2026-10-23)
+
+The adversarial review found that `ionice` without `-t` exits 1 without
+running its command when the kernel refuses `ioprio_set` (seccomp profiles,
+some containers). The gate would then fail with exit 1 although it never
+ran. The wrapper now passes `-t` (`--ignore`, util-linux 2.19 and later), so
+the gate runs with the default I/O class in that case. `nice` needs no
+equivalent: coreutils `nice` only warns when it cannot change the niceness
+and still runs the command. File: `crates/sluice-gate-daemon/src/executor.rs`
+(`command`).

@@ -604,6 +604,9 @@ fn command(
     if let Some(prio) = spec.ionice {
         if let Some(ionice) = &tools.ionice {
             prefix.push(ionice.into());
+            // `-t`: when the kernel refuses the I/O priority (seccomp, some
+            // containers), run the gate anyway instead of failing it.
+            prefix.push("-t".into());
             prefix.extend(ionice_args(prio).into_iter().map(Into::into));
         } else {
             tracing::debug!("ionice not found; the gate keeps the default I/O class");

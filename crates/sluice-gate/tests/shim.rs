@@ -486,8 +486,10 @@ fn proc_count(bin: &Path, tag: &str) -> usize {
 
 #[test]
 fn ten_concurrent_shimmed_makes_stay_within_the_budget() {
-    // Budget 4, weight 2: at most two at a time.
-    let s = setup(4, "exec_weight = 2");
+    // Budget 4, weight 2: at most two at a time. Learned exec weights
+    // (0.4.0) would lower an idle `make` to 1 after three runs, so they are
+    // off here: this test is about the budget, not about learning.
+    let s = setup(4, "exec_weight = 2\n[scheduler]\nlearned_weights = false");
     let log = s.sb.root.path().join("concurrency.log");
     exe(
         &s.bin.join("make"),
