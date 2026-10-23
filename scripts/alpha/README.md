@@ -23,6 +23,7 @@ by asserting that no daemon or gate process is left behind.
 | `s5_merge_queue.py` | Merge queue on the Node project with a bare remote: conflicts, failing gate split, human-only approval, audit ref, SIGKILL during the push and `reconcile`, gate reuse (`--transport local`, the default and the only one implemented here: the `--transport ssh|http` options exit with `not implemented yet`. Authenticated remotes, task H2, are covered by the Rust tests in `crates/sluice-gate/tests/queue_transports/`) |
 | `s6_upgrade.py` | Upgrade across real releases with a live daemon and state (`ALPHA_TAGS`, `ALPHA_RELEASES`) |
 | `s7_command_control.py` | Command control: 10 simulated agents through the guard hook (hook JSON on stdin, the returned command executed with `sh -c`) in `bypassPermissions` and `default` mode, a gate command answered from the cache, refusals (pipelines, `$(...)`, heredocs, `sluice queue approve`, deny rules), the shell-shim variant (`SLUICE_SHIMS=1` and off) and a raw baseline; budget 8, `exec_weight` 4, so at most 2 concurrent loads (`ALPHA_AGENTS`, `ALPHA_BURN_SECONDS`) |
+| `s8_zero_config.py` | Zero config (0.4.0), no AI session and no user config: the plugin's `session-start.sh` with hook JSON and a temp `CLAUDE_ENV_FILE` (shims installed, PATH entry once after startup and resume, init proposal then rules), an Angular-like fixture with fake `ng`, `playwright`, `npm`, `npx` and a husky-style hook (`node_modules/.bin` first in PATH), `sluice init --dry-run` and `init` (gates `lint` and `test`, hook rewired), then the incident's commands run concurrently by a script with `CLAUDECODE=1` (raw, `npx`, `(time ...) > log`, `$(...)`, `sh -c`, shell script, failing build, `npm start` and `ng test --watch` stay direct, `git commit` through the rewired hook) against a `SLUICE_SHIMS=0` baseline: timeline, peak admitted weight <= floor(overcommit x budget), outputs and exit codes, nice of every process and thread of every job, `weight = "auto"` dropping after 3 runs. The sandbox config only sets `[daemon] budget = 8` (test infrastructure). Builds the release binary itself unless `SLUICE_BIN` is set (`ALPHA_BURN_THREADS`, `ALPHA_BURN_SECONDS`) |
 
 Shared helpers: `lib.py` (sandbox, report, process census), `pygate.py`
 (controllable Python gate and process helpers used by s3, s4 and s6),
@@ -75,6 +76,7 @@ python3 s4_chaos.py         # about 2.5 min (60 s of hammering, two PSI phases)
 python3 s5_merge_queue.py    # about 2 min (needs the Node test bed only)
 python3 s6_upgrade.py       # about 20 s
 python3 s7_command_control.py  # about 1 min; needs `SLUICE_BIN` with exec, guard and shim (0.3.0+)
+python3 s8_zero_config.py   # about 1 min; needs python3, node and 0.4.0 (session start, init detection); no test bed needed
 ./run_all.sh                # every s*.py present, in order; exits non-zero if any fails
 ```
 

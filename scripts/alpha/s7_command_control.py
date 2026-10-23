@@ -25,7 +25,10 @@ build-like commands, through the guard path and through shell shims:
 The load is synthetic (like s2) and work-bounded: a fixed number of
 iterations, so contention makes it slower instead of making it do less.
 Budget 8, `[agent] exec_weight = 4`: at most 2 concurrent loads. PSI admission
-is disabled so the bound under test is the budget alone.
+is disabled so the bound under test is the budget alone, and so are learned
+weights (0.4.0 learns `sluice exec` weights per label: the loads here use about
+one CPU, so after three runs the weight would drop from 4 to 1 and the bound
+under test would no longer be budget / exec_weight).
 """
 
 from __future__ import annotations
@@ -464,7 +467,7 @@ def main() -> int:
     clean.sandboxes.append(sb)
     numbers: dict = {}
     try:
-        sb.write_user_config(f"[daemon]\nbudget = {BUDGET}\n[admission]\npsi_enabled = false\n[agent]\nexec_weight = {WEIGHT}\n")
+        sb.write_user_config(f"[daemon]\nbudget = {BUDGET}\n[admission]\npsi_enabled = false\n[scheduler]\nlearned_weights = false\n[agent]\nexec_weight = {WEIGHT}\n")
         w, repo, wts = prepare(sb, iterations)
         print("-- E: raw baseline (run first, on the idle machine)", flush=True)
         numbers["raw"] = baseline_phase(rep, w, wts)

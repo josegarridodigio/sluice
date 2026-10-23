@@ -1,5 +1,5 @@
 #!/bin/sh
-# Run every scenario script (s*.py: s1 ... s4, s6, s7_command_control, ...) next to this file, in name order, and exit
+# Run every scenario script (s*.py: s1 ... s4, s6, s7_command_control, s8_zero_config, ...) next to this file, in name order, and exit
 # non-zero if any of them fails. Environment: see README.md (ALPHA_TESTBEDS,
 # ALPHA_PYLIB, ALPHA_OUT, TMPDIR, SLUICE_BIN, ...). Extra arguments are not
 # forwarded; set the per-scenario knobs through the environment. s5_merge_queue.py
