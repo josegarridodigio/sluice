@@ -29,7 +29,7 @@ Related: [[sluice/research/problem-statement.md]],
 | 6b | Agent integration package (after Phase 6) | **done** (2026-10-22) | [[sluice/changes/agent-plugin.md]]; `plugin/`, `docs/agents.md`. |
 | final | Final reconciliation of KB, docs and CLI | **done** (2026-10-22) | [[sluice/changes/final-reconciliation.md]]. |
 | alpha | Alpha readiness and v0.3.0 | **done** (2026-10-23) | [[sluice/plan/alpha-plan.md]] (progress in section 4a): every task done; release `v0.3.0` published and installed with `sluice update`. Evidence: [[sluice/changes/alpha-readiness.md]], [[sluice/changes/alpha-review.md]], [[sluice/changes/alpha-review-fixes.md]], [[sluice/changes/ci-flakes.md]], [[sluice/changes/alpha-reconciliation.md]]. |
-| zero-config | Zero-config agent integration, v0.4.0 | **in progress** (approved 2026-10-23) | [[sluice/plan/zero-config-plan.md]]: plugin session hook with automatic shims, heavy classification without config (Angular, Playwright, package scripts), `sluice init` with stack detection and hook rewiring, `weight = "auto"` and learned exec weights, gate priority fix (issue #1). |
+| zero-config | Zero-config agent integration, v0.4.0 | **implemented** (2026-10-23), release pending approval | [[sluice/plan/zero-config-plan.md]]: plugin session hook with automatic shims, heavy classification without config (Angular, Playwright, package scripts), `sluice init` with stack detection and hook rewiring, `weight = "auto"` and learned exec weights, gate priority fix (issue #1). |
 
 ## Phase 0 — Setup and research
 

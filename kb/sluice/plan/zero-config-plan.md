@@ -5,7 +5,7 @@ tags: [sluice, plan, beta, plugin, shims, init, scheduler]
 
 # Plan: zero-config agent integration (v0.4.0)
 
-Status: approved by the user on 2026-10-23; in progress (see section 5a).
+Status: approved by the user on 2026-10-23; implemented and reconciled on 2026-10-23, release R4 pending the user's approval of the merge train (see section 5a).
 Parent: [[sluice/plan/master-plan.md]] ("Zero-config" block). Predecessor:
 [[sluice/plan/alpha-plan.md]] (v0.3.0).
 
@@ -142,15 +142,16 @@ after wave 2. Nine sub-agents in total, at most three at once.
 |---|---|---|
 | S0 PATH spike | done: option 2 (`CLAUDE_ENV_FILE`), plugin `bin/` is last in PATH | [[sluice/research/plugin-path-spike.md]] |
 | ADR-0014..0016 | done | `kb/sluice/design/adr/0014..0016` |
-| T1 heavy classification | in progress | |
-| T2 gate priority (#1) | in progress | |
-| T4 automatic weights | in progress | |
-| T5 session start + plugin | pending | |
-| T3 init detection | pending | |
-| T6 doctor + docs | pending | |
-| E1 harness s8 | pending | |
-| E2 plugin e2e | pending | |
-| R1..R4 | pending | |
+| T1 heavy classification | done | [[sluice/changes/heavy-classification.md]] |
+| T2 gate priority (#1) | done (+ `ionice -t` from R1) | [[sluice/fixes/gate-priority-inheritance.md]] |
+| T4 automatic weights | done | [[sluice/changes/automatic-weights.md]] |
+| T5 session start + plugin | done | [[sluice/changes/session-start.md]] |
+| T3 init detection | done | [[sluice/changes/init-detection.md]] |
+| T6 doctor + docs | done | [[sluice/changes/zero-config-docs.md]] |
+| E1 harness s8 | done: s8 37/37, s7 64/64 | [[sluice/changes/zero-config-proof.md]] |
+| E2 plugin e2e | done: 10/10 cases on haiku | [[sluice/changes/plugin-e2e-zero-config.md]] |
+| R1 review, R2 fixes, R3 reconciliation | done | [[sluice/changes/zero-config-reconciliation.md]] |
+| R4 release v0.4.0 | pending: trains await the user's approval | |
 
 ## 6. Tasks
 
