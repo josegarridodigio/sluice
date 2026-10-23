@@ -1,13 +1,14 @@
 # Using Sluice with coding agents
 
 This guide is for developers who run coding agents (Claude Code first, others
-second) on a repository that uses Sluice. It assumes `.sluice.toml` and your
-git hooks are already set up (`sluice init`, `sluice hook print`).
+second) on a repository that uses Sluice.
 
-For Claude Code, the recommended path is the Sluice plugin (section 2): one
-install per user, no block to paste into every repository. Other agents use
-the MCP server and a short instruction block (section 3), plus shell shims
-for agents that only have a shell (section 9).
+For Claude Code, install the binary and the agent plugin (section 2) and
+nothing else: no `PATH` edit, no `CLAUDE.md` block, no user config. The plugin
+sets the session up by itself and proposes `sluice init` in a repository that
+has no `.sluice.toml`. Other agents use the MCP server and a short instruction
+block (section 3), plus shell shims for agents that only have a shell
+(section 9).
 
 ## 1. Why agents need Sluice
 
@@ -27,16 +28,18 @@ later instead of cancelling it (background tasks do not survive the
 session). If you lower `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`, keep it above
 `[mcp] progress_interval` (15 s by default).
 
-## 2. Install the Claude Code plugin (recommended)
+## 2. Claude Code: install the binary and the agent plugin
 
-Prerequisite: `sluice` in the `PATH` that Claude Code sees (see the install
-section of the README: `curl -fsSL .../scripts/install.sh | sh`). Then, in
-Claude Code:
+Two installs, once per user:
 
-```
-/plugin marketplace add josegarridodigio/sluice
-/plugin install sluice@sluice
-```
+1. The binary, with `sluice` in the `PATH` that Claude Code sees (see the
+   install section of the README: `curl -fsSL .../scripts/install.sh | sh`).
+2. The agent plugin. In Claude Code:
+
+   ```
+   /plugin marketplace add josegarridodigio/sluice
+   /plugin install sluice@sluice
+   ```
 
 (From a shell: `claude plugin marketplace add josegarridodigio/sluice`, then
 `claude plugin install sluice@sluice`.) The plugin, in `plugin/` of this
@@ -49,6 +52,7 @@ repository, contains:
   push or land a branch in a repository with a `.sluice.toml`. It teaches the
   `verify` flow, exit code 3 from hooks, and the merge queue (verify,
   `queue_enqueue`, stop, never approve);
+- a `SessionStart` hook (0.4.0) that sets the session up (next subsection);
 - a `PreToolUse` hook on `Bash` (`sluice guard`, from 0.3.0) that rewrites a
   gate command to `sluice run <gate> -v` and a heavy command (builds, test
   runners, `docker build`, `make`: `[agent] heavy_commands` of the user
@@ -69,6 +73,62 @@ repository, contains:
 
 With the plugin, the repository needs no `CLAUDE.md` block. Details and the
 hook's limits: [plugin/README.md](../plugin/README.md).
+
+### What the session hook does
+
+At `startup`, `resume`, `clear` and `compact`, a thin wrapper finds `sluice`,
+compares its version with the plugin's and runs the hidden `sluice agent
+session-start`. Within a 300 ms watchdog it:
+
+- installs or refreshes the shell shims in the stable directory
+  `$XDG_DATA_HOME/sluice/shims` (`~/.local/share/sluice/shims`), in every
+  repository, with or without `.sluice.toml` (`SLUICE_SHIMS=0` is the escape
+  hatch);
+- puts that directory first in the session's `PATH` through
+  `CLAUDE_ENV_FILE`, with a guarded line, so it appears once even when the hook
+  fires again on resume. The file reaches the main session, background
+  commands, subshells, `$(...)`, `sh -c`, scripts and subagents. This is what
+  catches the heavy commands the guard never rewrites (inside subshells,
+  `$(...)`, `sh -c` and scripts);
+- gives the agent the rules as context (at most about 1,500 characters): verify
+  before every commit with the `verify` tool, never retry a queued command
+  without Sluice, do not wrap builds or tests in subshells or scripts, do not
+  start several dev servers while gates run, never approve merge trains.
+
+`CLAUDECODE` already marks the session as an agent, so the shims queue heavy
+commands without `SLUICE_SHIMS=1`. The hook fails open: on any error it prints
+nothing and exits 0, so a broken Sluice never blocks a session. How to see
+what it decided: [debugging.md](debugging.md#what-the-session-hook-decided).
+
+**Missing or older binary.** The hook never installs anything: it cannot ask.
+It tells the agent that `sluice` is missing (or older than the plugin), and the
+agent explains this to you and runs the install command, or `sluice update`,
+only after you agree.
+
+**No `.sluice.toml`.** In a git repository without one, the agent offers
+Sluice once: it shows the output of `sluice init --dry-run` (the gates it would
+write and the hook edits) and runs `sluice init` only if you accept. Shims keep
+queueing heavy commands there meanwhile. `init` is the only step that writes
+to your working tree, and only on your consent
+([ADR-0016](../kb/sluice/design/adr/0016-init-detection-and-hooks.md)).
+
+### Limits of the automatic setup
+
+The shims depend on the `PATH` of the shell that runs the command
+([ADR-0014](../kb/sluice/design/adr/0014-zero-config-agent-integration.md)):
+
+- A command run by absolute path (`/usr/bin/make`, `./gradlew`) is not
+  intercepted by the shims (the guard still rewrites simple commands).
+- `env -i` and login shells that reset `PATH` start without the shim
+  directory.
+- Git hooks run by husky put `node_modules/.bin` first in `PATH`, so a hook
+  that calls `ng test` or `jest` reaches the real tool, not the shim. That is
+  why `sluice init` rewrites the hook lines to `sluice run --hook <hook>
+  <gate>`: the hook then goes through the queue whatever its `PATH`.
+- The behaviour relies on Claude Code's handling of `CLAUDE_ENV_FILE`;
+  `sluice doctor` reports whether the shims are installed, current and first
+  in `PATH` (check `shims`), and whether the plugin and the binary versions
+  agree (check `plugin`).
 
 ### Manual MCP registration (any MCP-capable agent)
 
@@ -119,8 +179,8 @@ daemon is unreachable it reports an error.
 
 ## 3. Fallback: tell the agent what to do
 
-With the plugin you can skip this section: the skill carries the same
-instructions. For agents without the plugin, paste this into `AGENTS.md` (or
+With the plugin you can skip this section: the skill and the session hook carry
+the same instructions. For agents without the plugin, paste this into `AGENTS.md` (or
 `CLAUDE.md`):
 
 ```markdown
@@ -333,8 +393,9 @@ their builds and test runs under the budget too, use the shell shims (section 9)
 
 ## 9. Agents other than Claude Code: shell shims
 
-Claude Code users do not need this section: the plugin's guard (section 2)
-already rewrites heavy commands into the queue. Agents that only have a shell
+Claude Code users do not set this up: the agent plugin installs the shims and
+puts them first in the session's `PATH` by itself (section 2). This section is
+for the other agents. Agents that only have a shell
 (Codex, Cursor's agent, Aider, OpenCode, Gemini CLI and others) run `make`,
 `cargo build` or `pnpm build` directly, outside the budget. Shell shims give
 them the same control without any support from the agent.
@@ -342,7 +403,8 @@ them the same control without any support from the agent.
 A shim is a small `sh` script named after a command of the heavy list
 (`[agent] heavy_commands` in the user config, see [configuration.md](configuration.md)):
 `docker cargo go make gradle gradlew mvn mvnw tsc vite webpack next pytest
-jest vitest npm pnpm yarn bun npx` by default. With the shim directory first
+jest vitest ng nx turbo playwright cypress react-scripts astro nuxt dotnet
+bazel ninja cmake npm pnpm yarn bun npx` by default. With the shim directory first
 in `PATH`, `make all` runs the shim, which runs `sluice shim exec make -- all`:
 
 - In an agent session (agent detection, or `SLUICE_SHIMS=1`) and for a heavy
@@ -449,3 +511,9 @@ normal way and wait for them, even if they take longer to start.
   intercepted (`npx tsc`, `pnpm exec tsc` and package scripts are).
 - Package scripts that themselves call shimmed commands do not queue twice:
   the outer job sets `SLUICE_JOB`.
+- Shims need the shell's `PATH`: `env -i` and login shells that reset it skip
+  them, and so do absolute paths. Git hooks run by husky put
+  `node_modules/.bin` first; `sluice init` rewrites such hooks to
+  `sluice run --hook <hook> <gate>` for that reason.
+- `sluice doctor` has a `shims` check: installed and current, and first in
+  `PATH` for this shell (a warning in an agent shell when it is not).

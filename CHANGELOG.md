@@ -49,9 +49,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it creates `.githooks/` and sets `core.hooksPath` locally. `--dry-run`
   prints the gates, the files and the diff and writes nothing; `--force` is
   idempotent.
+- `sluice doctor` checks the zero-config setup: `shims` (installed and
+  current in the stable directory, first in `PATH` for this shell; a warning
+  in an agent shell when not), `plugin` (the installed agent plugin's version
+  against the binary; a warning when they differ, never a failure),
+  `weights` (a warning when a declared weight is more than 50 % below what the
+  gate's runs need, suggesting a higher number or `weight = "auto"`) and
+  `init` (a repository without `.sluice.toml`: a hint to run `sluice init
+  --dry-run`).
 
 ### Changed
 
+- The MCP `status` text shows configured and effective weights like the CLI
+  (`weight auto→5`).
+- `docs/agents.md`, the README quick start and the configuration, CLI and
+  debugging guides describe the zero-config flow: install the binary and the
+  agent plugin, then `sluice init`; the built-in heavy list, the never-heavy
+  rules and package-script resolution; the session hook and how to inspect
+  its decision.
 - `sluice init` outside a git repository is now an error, and writes at the
   repository root instead of the current directory.
 

@@ -45,7 +45,9 @@ removes the redundancy and never leaves an agent hanging.
 - **Git hooks** for Husky, lefthook, pre-commit/prek and plain `.githooks/`,
   failing fast inside agents instead of hanging.
 - **MCP tools and an agent plugin.** `sluice mcp` gives agents a blocking
-  `verify` tool; the Claude Code plugin adds a skill and a guard hook.
+  `verify` tool; the agent plugin adds a skill, a guard hook and a session
+  hook that puts shell shims in the agent's `PATH` and hands it the rules.
+  Install it and nothing else.
 - **`sluice exec` and queue-only gates** put any command (`docker build`,
   `make`) under the same budget, without cache.
 - **Path-scoped gates** key on part of the tree, so unrelated changes keep the
@@ -74,22 +76,30 @@ cargo install --path crates/sluice-gate
 ```
 
 The crate is `sluice-gate` because `sluice` is taken on crates.io; the binary
-is `sluice`. For Claude Code, install the agent plugin (with `sluice` in your
-`PATH`):
-
-```
-/plugin marketplace add josegarridodigio/sluice
-/plugin install sluice@sluice
-```
+is `sluice`.
 
 ## Quick start
 
-```sh
-sluice init                  # detects the stack, writes .sluice.toml, rewires your hooks
-sluice hook print husky      # or lefthook | pre-commit | plain
-git commit -m "my change"    # the hook runs `sluice run` on a cache miss
-sluice status                # daemon, budget, queue and totals
-```
+1. Install the binary (above).
+2. Install the agent plugin, in Claude Code (with `sluice` in your `PATH`):
+
+   ```
+   /plugin marketplace add josegarridodigio/sluice
+   /plugin install sluice@sluice
+   ```
+
+3. Run `sluice init` in each repository (or let the agent propose it):
+
+   ```sh
+   sluice init --dry-run        # detects the stack and your hooks; shows, writes nothing
+   sluice init                  # writes .sluice.toml, rewires your hooks
+   ```
+
+That is all: no `PATH` edit, no `CLAUDE.md`, no user config. From then on a
+commit runs `sluice run` on a cache miss, and `sluice status` shows the
+daemon, budget, queue and totals. Agents other than Claude Code use the MCP
+server and, if they only have a shell, `sluice shim install`
+([agents](docs/agents.md)).
 
 A gate is a named shell command in `.sluice.toml`:
 
@@ -128,9 +138,14 @@ Sluice is alpha: complete enough for early adopters, not yet proven by long use.
 - **Linux only**, git 2.31 or newer; other platforms are not planned.
 - **Verdicts, not artifacts.** A hit says a gate passed on this tree; it does
   not restore build outputs.
-- **Only declared gates and `sluice exec` are controlled.** Raw commands bypass
-  the queue; the plugin's guard hook and your forge's branch protection are
-  the enforcement.
+- **Only declared gates, `sluice exec` and the heavy command list are
+  controlled.** In agent sessions the plugin's guard and shims queue the
+  heavy commands, but a command run by absolute path, under `env -i` or from
+  a shell that resets `PATH` bypasses the shims; your forge's branch
+  protection is the enforcement.
+- **Shims need the agent plugin or setup by hand.** Claude Code gets them
+  automatically; other agents need `sluice shim install` and a `PATH` entry.
+  A `.sluice.toml` with `weight = "auto"` needs 0.4.0.
 - **A hit is a local optimisation.** CI stays authoritative, and inputs git
   cannot see must be declared (`key_inputs`, `key_files`).
 - **Per-worktree caches.** Tools that keep state inside the checkout, such as

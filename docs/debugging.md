@@ -24,6 +24,39 @@ All paths are under the state directory, `$XDG_STATE_HOME/sluice` or
 caller started), `in-process` (ran without the daemon), `disabled`
 (`SLUICE_DISABLE`) or `error`. Writing the line never fails the command.
 
+## What the session hook decided
+
+The agent plugin's `SessionStart` hook never shows anything to you, so to see
+what it did:
+
+- `logs/client.log`: each run of the hook that reaches the binary writes a line
+  with `hook=session-start`, `caller=agent`, `gate=-`, the session's `cwd` and a
+  `decision`: `rules` (the repository has a `.sluice.toml`; the rules were given
+  as context), `init-offer` (a git repository without one; the agent was told to
+  propose `sluice init`) or `non-git`. No such line after starting a session
+  means the hook did not run (plugin not installed or disabled), the binary was
+  not found or is older than the plugin (the wrapper script then only tells the
+  agent, and writes nothing), or Sluice failed open.
+
+  ```sh
+  grep 'hook=session-start' ~/.local/state/sluice/logs/client.log | tail -3
+  ```
+
+- The env file: the hook appends one guarded line to the file Claude Code
+  names in `CLAUDE_ENV_FILE` (one per session). From inside the session,
+  `echo "$PATH" | tr : '\n' | head -3` must show the shim directory first.
+- `sluice shim status`: the shim directory, whether it is in `PATH` and in
+  which position, each shim `current`, `stale` or `missing`, the real binary
+  it resolves to, and what this shell would do (queue or run directly).
+- `sluice doctor`: the `shims` check (installed, current, first in `PATH`)
+  and the `plugin` check (plugin and binary versions agree).
+
+Cases: shims are not first in `PATH` (a shell that resets it: `env -i`, a
+login shell; or a command by absolute path); `SLUICE_SHIMS=0` is set; the
+plugin is older than the binary (update the plugin); or the binary is missing
+or older than the plugin, in which case the agent was told to ask you before
+installing it.
+
 ## Raising the log level
 
 Precedence: the `SLUICE_LOG` environment variable, then `[debug] level` in
@@ -94,7 +127,16 @@ directory is not writable (passes are then never cached), `warn` with the
 count and the first path when marker or miss files are damaged (truncated,
 not valid JSON, or recorded under a key other than their file name; runs
 ignore and replace them, `sluice cache clear` removes them); the `sluice`
-found in `PATH` is the binary you are running. It exits 1 when any check
+found in `PATH` is the binary you are running; `shims`: the shims are installed in
+the stable directory, current, and first in `PATH` for this shell (a warning
+in an agent shell when they are not; in a human shell an `ok` that says the
+agent plugin puts them in `PATH` for agent sessions); `plugin`: the version of
+the installed agent plugin (from `installed_plugins.json`) against the binary,
+a warning when they differ, never a failure; `weights`: a warning when a gate
+declares a number well below (more than 50 % under) what its measured runs
+need, suggesting a higher number or `weight = "auto"`; `init`: in a git
+repository without `.sluice.toml`, an `ok` that suggests `sluice init
+--dry-run`. It exits 1 when any check
 fails and never uses the network (it does not look for new releases;
 `sluice update --check` does).
 

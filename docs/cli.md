@@ -11,6 +11,7 @@ authoritative.
 | [`sluice exec`](#sluice-exec) | Run any command under the budget, without cache. |
 | [`sluice guard`](#sluice-guard) | `PreToolUse` hook of the agent plugin: read the hook JSON on stdin, print a decision. |
 | [`sluice shim`](#sluice-shim) | Shell shims that route heavy commands of non-Claude agents through the queue. |
+| [`sluice agent session-start`](#sluice-agent-session-start) | Hidden: the `SessionStart` hook of the agent plugin. |
 | [`sluice mcp`](#sluice-mcp) | Start the MCP stdio server (spawned by the coding agent). |
 | [`sluice daemon`](#sluice-daemon) | Start the per-user daemon, or stop or restart it. |
 | [`sluice status`](#sluice-status) | Show the daemon, budget, system pressure, jobs and totals. |
@@ -263,6 +264,26 @@ Options:
 ```
 
 </details>
+
+### `sluice agent session-start`
+
+Hidden (it is absent from `sluice --help`) and not meant to be typed: the
+`SessionStart` hook of the agent plugin runs it at `startup`, `resume`,
+`clear` and `compact`. It is documented here for debugging.
+
+```sh
+echo '{"cwd":"/path/to/repo","source":"startup"}' \
+  | sluice agent session-start --plugin-version 0.4.0
+```
+
+It reads the hook JSON on stdin (`cwd`, `source`, `session_id`) and, under a
+300 ms watchdog, installs or refreshes the shims in the stable shim directory,
+appends a guarded line that prepends that directory to `PATH` to the file in
+`CLAUDE_ENV_FILE` (once; a repeated call changes nothing), and prints the hook
+JSON with the `additionalContext` (the rules, or the offer to run `sluice
+init` in a git repository without `.sluice.toml`). It always exits 0 and
+prints nothing on any error. Each call writes a `hook=session-start` line to
+`client.log`; see [debugging.md](debugging.md#what-the-session-hook-decided).
 
 ### `sluice mcp`
 
@@ -794,6 +815,26 @@ Options:
 ### `sluice doctor`
 
 Check the installation (git, PSI, daemon, lease, configs, hooks) and optionally collect a redacted diagnostics bundle for bug reports.
+
+Besides the basics, the zero-config checks are:
+
+| Check | Result |
+|---|---|
+| `shims` | The shims are installed in the stable directory and current (`warn` when missing or stale). First in `PATH` for this shell: in an agent shell `warn` when it is not; in a human shell `ok`, with a note that the agent plugin puts them in `PATH` for agent sessions. |
+| `plugin` | Version of the installed agent plugin (read from `installed_plugins.json` under `$CLAUDE_CONFIG_DIR` or `~/.claude`) against the binary: `warn` when they differ, `ok` when equal, missing or unreadable. Never fails. |
+| `weights` | For each gate that declares a number, `warn` when the weight the runs actually need (learned, without the ceiling) exceeds the declared ceiling by more than 50 %: raise it or use `weight = "auto"`. |
+| `init` | In a git repository without `.sluice.toml`: `ok`, with the hint `run 'sluice init --dry-run'`. |
+
+```text
+[ok  ] shims          27 shim(s) current in /home/u/.local/share/sluice/shims; first in PATH
+[ok  ] plugin         agent plugin and binary are 0.4.0
+[warn] weights        'test' needs about 9 but declares weight = 4: raise the number or use weight = "auto" (...)
+[ok  ] init           this repository has no .sluice.toml; run 'sluice init --dry-run' to see what Sluice would propose
+```
+
+(`weights` and `init` never appear together: the first needs a
+`.sluice.toml`, the second is for repositories without one.) `--json` carries
+the same checks with the same names.
 
 <details>
 <summary>Full help</summary>

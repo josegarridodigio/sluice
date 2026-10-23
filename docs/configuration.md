@@ -223,10 +223,43 @@ budget_share_max = 4
 | `debug.daemon_log_max_mib` | `20` | Rotate `daemon.log` above this size (0 = never); keeps `daemon.log.1` to `.3`. |
 | `agent_detection.env_any_set` | `["CLAUDECODE"]` | Any of these variables set and non-empty means the caller is an agent (`SLUICE_AGENT` overrides). |
 | `agent_detection.env_any_equals` | `{}` | Variable/value pairs that mean agent, for example `{ CLAUDE_CODE_ENTRYPOINT = "cli" }`. |
-| `agent.heavy_commands` | built-in list | Replaces the list of commands that the plugin guard rewrites to `sluice exec` and that the shell shims route through the queue. Entries are command words (`cargo build`, `docker compose build`), compared after package-manager equivalences (`pnpm build`, `npm run build` and `yarn build` are all `run build`). The built-in list: `docker build`, `docker buildx build`, `docker compose build`, `run build`, `cargo build`, `cargo test`, `cargo clippy`, `cargo nextest`, `go build`, `go test`, `make`, `gradle`, `mvn`, `tsc`, `vite build`, `webpack`, `next build`, `pytest`, `jest`, `vitest`. Entries must not be empty, contain control characters or have more than 8 words; at most 256 entries with `heavy_commands_extra`. |
+| `agent.heavy_commands` | built-in list | Replaces the list of commands that the plugin guard rewrites to `sluice exec` and that the shell shims route through the queue. Entries are command words (`cargo build`, `docker compose build`), compared after package-manager equivalences (`pnpm build`, `npm run build` and `yarn build` are all `run build`). The built-in list is in [Heavy commands](#heavy-commands-with-no-config). Entries must not be empty, contain control characters or have more than 8 words; at most 256 entries with `heavy_commands_extra`. |
 | `agent.heavy_commands_extra` | `[]` | Appended to the built-in (or replaced) list. |
 | `agent.exec_weight` | `0` | Default weight (ceiling) of `sluice exec` when `--weight` is absent; `0` means `ceil(budget / 2)`. Since 0.4.0 the daemon lowers it after 3 runs of the same repository and label, from the measured demand (never below a quarter of it). |
 | `repos."<path>".budget_share_max` | unset | Optional cap on the budget one repository may use at once. Must be >= 1. |
+
+### Heavy commands with no config
+
+With no `[agent]` section at all, the guard and the shims already know these
+(0.4.0 added everything from `ng build` on):
+
+| Group | Entries |
+|---|---|
+| Containers and generic builders | `docker build`, `docker buildx build`, `docker compose build`, `make`, `gradle`, `mvn`, `ninja`, `cmake --build`, `bazel build`, `bazel test` |
+| Rust, Go, .NET, Python | `cargo build`, `cargo test`, `cargo clippy`, `cargo nextest`, `go build`, `go test`, `dotnet build`, `dotnet test`, `pytest` |
+| JavaScript tools | `run build` (so `npm run build`, `pnpm build`, `yarn build`), `tsc`, `vite build`, `webpack`, `next build`, `jest`, `vitest`, `react-scripts build\|test`, `astro build`, `nuxt build` |
+| Angular, Nx, Turborepo | `ng build\|test\|lint\|e2e`, `nx run\|run-many\|affected\|build\|test\|lint\|e2e`, `turbo run\|build\|test\|lint` |
+| Browser test runners | `playwright test`, `cypress run` |
+
+**Never heavy.** Dev servers and watch modes never end, so queueing them would
+hold a slot forever: `ng serve`, `nx serve`, `next dev`, `astro dev|preview`,
+`nuxt dev|preview`, `react-scripts start`, `vite` alone or with only options
+(and `vite dev|serve|preview`), and any command with `--watch`,
+`--watch=true`, `--watchAll` (`--watch=false` is not a watch; `-w` counts only
+for `tsc`, `jest`, `vitest`, `webpack` and `vite`). This rule wins over the
+list and over `heavy_commands_extra`.
+
+**Package scripts.** `npm run <script>`, `npm test`, `pnpm <script>` and
+`yarn <script>` are classified by what the script runs, not by its name. The
+nearest `package.json` from the command's directory upwards (up to the git
+root, at most 1 MiB) supplies `scripts.<name>`; its body is split on `&&`,
+`||`, `;`, `|` and `&`, leading `NAME=value`, `env` and `cross-env` words are
+dropped, and each piece is classified with the same rules, following nested
+`npm run` calls (depth 4). The script is heavy when any piece is: `npm run
+axe` that runs `playwright test` is queued, `npm run start` that runs `ng
+serve` is not. An invalid or missing `package.json` means not heavy.
+`npm run build` is heavy by name. `-C`, `--dir`, `--prefix` and `--cwd` are not
+followed.
 
 The daemon reads `[daemon]`, `[scheduler]`, `[admission]`, `[repos]`, `[queue]`,
 `[debug]` and `cache.*` once at start: run `sluice daemon restart` to apply
