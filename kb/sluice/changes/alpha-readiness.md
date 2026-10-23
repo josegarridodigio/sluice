@@ -234,3 +234,21 @@ jobs queued earlier keep weight 4 for their whole wait, so one test plus
 lint run where two tests of weight 3 would fit, leaving about 2 CPUs idle.
 Round 2 resolves the learned weight at admission time instead of at
 enqueue time.
+
+## L3 round 2 — learned weights resolved at admission (code, ca35df7) + round-1 settings
+
+Change: the planner recomputes each queued gate job's weight from the
+current learned statistics on every pass (before: fixed at enqueue). Run
+with the round-1 settings (`overcommit = 2.0`, `overcommit_interval = "2s"`).
+
+| Variant | Wall vs baseline | p95 vs baseline | Idle while waiting | Peak load sluice / baseline | Checks |
+|---|---|---|---|---|---|
+| low-core | 37.4 / 75.9 s = 0.49x | 18.3 / 21.2 s = 0.86x | 4.2 % | 4.8 / 13.2 | 14/14 |
+| overload | 78.1 / 138.9 s = 0.56x | 39.7 / 35.4 s = 1.12x | 7.0 % | 18.2 / 68.3 | 14/14 |
+| normal | 43.9 / 67.6 s = 0.65x | 16.7 / 14.1 s = 1.18x | 4.7 % | 10.8 / 14.9 | 14/14 |
+
+Every target is met in every variant. Low-core idle-while-waiting fell from
+11.3 % to 4.2 % and its p95 from 1.08x to 0.86x. The normal variant is
+close to the p95 limit (1.18x; E2 with the default 1.5x cap had 0.89x), so
+round 3 measures the code defaults (`overcommit = 1.5`, interval 5 s) with
+the round-2 code to choose the shipped defaults.
