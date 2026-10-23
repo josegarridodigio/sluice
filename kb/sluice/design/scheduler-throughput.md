@@ -588,3 +588,14 @@ defaults are exactly those of section 2. Where the code differs:
     it is at least `Policy::sample_tick_ms` after `Snapshot::last_start_at`
     (set by every admission: nominal, guard or over). Note 1 above remains
     (no over-admission in a pass that started a job nominally).
+
+## Measured effect of each policy (L2 ablation)
+
+Measured on the alpha harness (normal, overload and low-core variants),
+[[sluice/changes/alpha-readiness.md]]: learned weights are decisive
+(without them idle CPU while jobs wait reaches 16–17 % on six CPUs and
+under overload); parallel `verify` lowers wall time everywhere and p95
+under overload and on six CPUs, while serial `verify` has the lower p95
+when the machine has room; lane fairness, humans-first, SJF and
+over-admission are neutral in those scenarios (all agent jobs of similar
+length) and stay at their defaults for the cases they protect.

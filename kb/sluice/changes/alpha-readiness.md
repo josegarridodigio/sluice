@@ -378,3 +378,47 @@ Decisions:
 - Supersede was deferred by ADR-0011 (no stale queued work under these
   defaults) and is not implemented; a candidate for beta if timelines from
   real use show stale queued jobs.
+
+## L2 — ablation on the low-core and normal variants
+
+The same one-switch-at-a-time ablation on the other two E2 variants
+(defaults from round 3: low-core 0.56x / 0.94x / 5.5 %, normal 0.64x /
+1.14x / 5.0 %). Columns: wall vs baseline, p95 vs baseline, idle CPU while
+jobs wait.
+
+| Single change | Low-core (6 CPUs) | Normal (20 CPUs) |
+|---|---|---|
+| `scheduler.fairness = "off"` | 0.57x / 0.97x / 3.8 % | 0.64x / 1.18x / 2.7 % |
+| `scheduler.human_first = false` | 0.57x / 0.92x / 4.0 % | 0.63x / 1.17x / 2.4 % |
+| `scheduler.order = "sjf"` | 0.59x / 0.97x / 5.4 % | 0.64x / 1.19x / 3.3 % |
+| `mcp.verify_parallel = false` | 0.61x / 1.05x / 6.6 % | 0.67x / 1.03x / 2.1 % |
+| `scheduler.learned_weights = false` | 0.64x / 1.19x / **16.4 % (miss)** | 0.66x / 1.10x / 8.3 % |
+| `admission.overcommit = 1.0` | 0.58x / 0.98x / 5.0 % | 0.67x / 1.15x / 4.2 % |
+
+Across the three variants (18 runs) every configuration meets all five
+targets except learned weights off, which misses idle-while-waiting in
+low-core and overload. Parallel `verify` gives the lower wall time in all
+three variants and the lower p95 under overload and on six CPUs; on the
+normal variant serial verify has the lower p95 (1.03x vs 1.14x) because
+each call competes less, so the trade-off is documented and parallel stays
+the default (`mcp.verify_parallel = false` is the knob for latency-first
+setups). The other switches are neutral; the decisions of the overload
+ablation stand.
+
+## Definition-of-done audit per task (2026-10-23)
+
+For every task of the plan, the integrating commit was checked for tests,
+a change note under `kb/sluice/changes/`, design or user-doc updates and a
+changelog entry. Every task that changed code carries all four
+(C f546729, A1 220d178, D1 813dc89, H3 39a9332 + 4ec981b, A2 4cf4081, X1
+b7ab73f, H5 844e95f, H2 7a719ad, B1+L1 5ddae6c, L3 round 2 ca35df7, R2
+afe2802, plus F fcdb810, H1 75ea186, E1 20a0e17, E3 d7d813e, E4 cb42bf1,
+E5 02d1475 with harness or workflow tests). Tasks without tests are the
+ones that change no code: designs and ADRs (a63f5d5, a752eb3), G (cookbook,
+examples validated by parsing), H4 (verified by the dry run itself), R1
+and R3 (documents), L2 (measurements) and R4 (release). Every task was
+done by a sub-agent on the model the plan assigns (Opus for C, A0, B0, D0,
+A1, A2, B1/L1, D1, H5, H2, X1, R1, R2 and the round-2 change; Sonnet for F,
+G, E1, E3, E4, H1, H3, H4 and R3), each in its own git worktree whose base
+commit the brief told it to check and reset; integration happened in a
+separate integration worktree.
