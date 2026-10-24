@@ -576,12 +576,24 @@ fn status_and_doctor_show_a_real_session() {
     };
     let session_check = find("session");
     assert_eq!(session_check["group"], "containment");
-    assert_eq!(session_check["status"], "ok", "{session_check}");
     let detail = session_check["detail"].as_str().unwrap();
-    assert!(
-        detail.contains("this shell is in tools (s-obsv/tools)"),
-        "{detail}"
-    );
+    // A shell can move itself into `tools` only from inside the user manager's
+    // tree (the kernel's common-ancestor rule). CI runners start tests from a
+    // system service; there doctor must say so instead.
+    let own = fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    if own.contains("/user@") {
+        assert_eq!(session_check["status"], "ok", "{session_check}");
+        assert!(
+            detail.contains("this shell is in tools (s-obsv/tools)"),
+            "{detail}"
+        );
+    } else {
+        assert_eq!(session_check["status"], "warn", "{session_check}");
+        assert!(
+            detail.contains("this shell is outside the session"),
+            "{detail}"
+        );
+    }
     assert!(
         detail.contains(&format!("agent (pid {agent}) is in ui")),
         "{detail}"

@@ -395,13 +395,12 @@ fn cg_exec_runs_the_command_even_when_the_move_fails() {
         .unwrap();
     assert_eq!(missing.status.code(), Some(7));
 
-    // Unwritable leaf (what a read-only cgroupfs looks like to a non-root user).
+    // Unwritable leaf. A 0444 file is still writable for root (CI containers
+    // run tests as root), so the target is a directory named `cgroup.procs`:
+    // opening it for writing fails for everyone.
     let dir = tempfile::tempdir().unwrap();
     let procs_file = dir.path().join("cgroup.procs");
-    fs::write(&procs_file, "").unwrap();
-    let mut perms = fs::metadata(&procs_file).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o444);
-    fs::set_permissions(&procs_file, perms).unwrap();
+    fs::create_dir(&procs_file).unwrap();
     let out = Command::new(SLUICE)
         .arg("cg-exec")
         .arg(dir.path())
@@ -410,9 +409,8 @@ fn cg_exec_runs_the_command_even_when_the_move_fails() {
         .unwrap();
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ran");
-    assert_eq!(
-        fs::read_to_string(&procs_file).unwrap(),
-        "",
+    assert!(
+        procs_file.is_dir() && fs::read_dir(&procs_file).unwrap().next().is_none(),
         "nothing written"
     );
 

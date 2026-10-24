@@ -448,6 +448,17 @@ fn without_containment_the_hook_fails_open_and_adds_no_cgroup_line() {
     assert!(client_log(&sb).contains("contained=off"));
 }
 
+/// True when `/sys/fs/cgroup` is mounted read-only (as in Docker containers).
+fn cgroupfs_read_only() -> bool {
+    fs::read_to_string("/proc/self/mountinfo")
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>())
+        .find(|f| f.get(4) == Some(&"/sys/fs/cgroup"))
+        .and_then(|f| f.get(5).map(|o| o.split(',').any(|x| x == "ro")))
+        .unwrap_or(false)
+}
+
 #[test]
 fn where_cpu_cannot_be_weighted_the_line_only_renices() {
     // No `systemctl` in PATH: containment is off but `nice` still applies.
@@ -455,6 +466,14 @@ fn where_cpu_cannot_be_weighted_the_line_only_renices() {
     let nopath = [("PATH", "/nonexistent")];
     context(&hook(&sb, &input(&sb.repo, "startup"), &nopath));
     let env = fs::read_to_string(env_file(&sb)).unwrap();
+    if cgroupfs_read_only() {
+        // Containers mount the cgroup filesystem read-only: detection says
+        // off (read-only cgroup filesystem) and, by design (S4 matrix), the
+        // hook adds no renice line there either.
+        assert_eq!(env.lines().count(), 1, "{env}");
+        assert!(!env.contains("renice"), "{env}");
+        return;
+    }
     assert_eq!(env.lines().count(), 2, "{env}");
     assert_eq!(env.lines().nth(1), Some("renice -n 19 $$ >/dev/null 2>&1"));
     // Twice: still once.
