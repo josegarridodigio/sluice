@@ -4,7 +4,7 @@
 # Usage: scripts/plugin-e2e.sh
 #   SLUICE_E2E_MODEL  model of the agent sessions (default haiku)
 #   SLUICE_BIN        use this sluice binary instead of building one
-#   SLUICE_E2E_CASES  comma-separated cases to run (default a,c,b,d,e,f,g,h,i,j)
+#   SLUICE_E2E_CASES  comma-separated cases to run (default a,c,b,d,e,f,g,h,i,j,k,l,m,n)
 #
 # Needs the `claude` CLI (logged in), git and python3. Everything happens in a
 # temporary directory: validation of the marketplace and the plugin, a scratch
@@ -34,6 +34,18 @@
 #       install command is run
 #   (j) the first Bash command sees the shim dir first in PATH and the model
 #       can list the gates from the additionalContext
+# Containment cases (task E2 of kb/sluice/plan/containment-plan.md). They run on the
+# real systemd user manager but in units named `sluice-test-e2e-<pid>*`
+# (SLUICE_TEST_CONTAINMENT_PREFIX), never `sluice.slice`; the session gets its
+# own runtime dir (symlinks to the manager's sockets), state dir and daemon;
+# tiny commands only, no CPU or memory load. A /proc poller outside the
+# session records where every process of the test units lives.
+#   (k) agent (`claude`) and the plugin's `sluice mcp` in the session's `ui`
+#       leaf, the Bash shell in `tools` (seen from inside and from outside)
+#   (l) a subagent's Bash command is in `tools` of the same session
+#   (m) Bash sandbox on (allowAllUnixSockets workaround for Ubuntu 24.04+):
+#       the shell stays in `ui` at nice 19
+#   (n) `--resume`: the new agent process is moved again, one env line
 # Each case is asserted and the run ends with a table case -> PASS/FAIL (exit 1
 # on any FAIL). A real heavy build is replaced by a fake `make` that records
 # SLUICE_JOB, so the marker proves the command ran inside a daemon job.
@@ -70,7 +82,27 @@ ln -s "/home/jose/.claude" "$HOME/.claude" 2>/dev/null || true
 cp /home/jose/.claude.json "$HOME/.claude.json" 2>/dev/null || true
 ln -s "$SLUICE" "$TMP/bin/sluice"
 export PATH="$TMP/bin:$PATH"
-trap 'sluice daemon stop --force >/dev/null 2>&1 || true' EXIT INT TERM
+trap 'if type contain_cleanup >/dev/null 2>&1; then contain_cleanup; fi; sluice daemon stop --force >/dev/null 2>&1 || true' EXIT INT TERM
+POLLER=""; CONTAIN_DIRS=""
+PREFIX="sluice-test-e2e-$$"
+# Stops the poller and every unit of this run's prefix (never anything else).
+contain_cleanup() {
+    [ -n "$POLLER" ] && { kill "$POLLER" 2>/dev/null || true; wait "$POLLER" 2>/dev/null || true; POLLER=""; }
+    for d in $CONTAIN_DIRS; do
+        XDG_RUNTIME_DIR="$d" XDG_STATE_HOME="$TMP/state-${d##*rt-}" sluice daemon stop --force >/dev/null 2>&1 || true
+    done
+    CONTAIN_DIRS=""
+    _rt="/run/user/$(id -u)"
+    for u in $(XDG_RUNTIME_DIR="$_rt" systemctl --user list-units --all --plain --no-legend "${PREFIX}*" 2>/dev/null | awk '{print $1}'); do
+        XDG_RUNTIME_DIR="$_rt" systemctl --user stop "$u" >/dev/null 2>&1 || true
+    done
+    XDG_RUNTIME_DIR="$_rt" systemctl --user reset-failed "${PREFIX}*" >/dev/null 2>&1 || true
+    # The implicit parent slice of the prefix outlives its children: stop it
+    # too, unless another run still has units under it.
+    if [ -z "$(XDG_RUNTIME_DIR="$_rt" systemctl --user list-units --all --plain --no-legend 'sluice-test-e2e-*' 2>/dev/null | awk '$3 != "inactive"')" ]; then
+        XDG_RUNTIME_DIR="$_rt" systemctl --user stop sluice-test-e2e.slice >/dev/null 2>&1 || true
+    fi
+}
 
 # Scratch repository with a fast gate whose command is a raw runner.
 git clone -q "$ROOT" "$TMP/repo"
@@ -98,7 +130,7 @@ git fetch -q origin
 git remote set-head origin main >/dev/null 2>&1 || git remote set-head origin -a >/dev/null
 
 # Cases selected by SLUICE_E2E_CASES (default: all).
-CASES="${SLUICE_E2E_CASES:-a,c,b,d,e,f,g,h,i,j}"
+CASES="${SLUICE_E2E_CASES:-a,c,b,d,e,f,g,h,i,j,k,l,m,n}"
 want() { case ",$CASES," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 RESULTS="$TMP/results.txt"; : > "$RESULTS"
 FAILED=0
@@ -127,11 +159,12 @@ mkdir -p "$TMP/repo-gates" "$TMP/repo-noconf"
 
 TOOLS='Bash mcp__plugin_sluice_sluice__verify mcp__plugin_sluice_sluice__status mcp__plugin_sluice_sluice__gate_list mcp__plugin_sluice_sluice__queue_status mcp__plugin_sluice_sluice__queue_enqueue mcp__plugin_sluice_sluice__logs Skill Task Agent'
 
+SESSION_ENV=""; SESSION_ARGS=""
 session() { # session <label> <prompt> [dir] [max-turns] [path]
     label="$1"; prompt="$2"; dir="${3:-$TMP/repo}"; turns="${4:-4}"; spath="${5:-$PATH}"
     # shellcheck disable=SC2086
     ( cd "$dir" && env -u CLAUDECODE -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ID PATH="$spath" \
-        claude -p "$prompt" --model "$MODEL" --max-turns "$turns" \
+        $SESSION_ENV claude -p "$prompt" --model "$MODEL" --max-turns "$turns" $SESSION_ARGS \
           --output-format stream-json --verbose \
           --plugin-dir "$ROOT/plugin" \
           --allowedTools $TOOLS \
@@ -186,12 +219,14 @@ import json, os, re, sys
 
 case, path = sys.argv[1], sys.argv[2]
 extra = sys.argv[3:]
-calls, results, final = [], {}, ""
+calls, results, final, sids = [], {}, "", []
 for line in open(path):
     try:
         ev = json.loads(line)
     except ValueError:
         continue
+    if ev.get("type") == "system" and ev.get("subtype") == "init" and ev.get("session_id"):
+        sids.append(ev["session_id"])
     if ev.get("type") == "result":
         final = ev.get("result") or ""
     msg = ev.get("message")
@@ -199,7 +234,7 @@ for line in open(path):
         continue
     for b in msg["content"]:
         if b.get("type") == "tool_use":
-            calls.append({"id": b.get("id"), "name": b["name"], "input": b.get("input") or {}})
+            calls.append({"id": b.get("id"), "name": b["name"], "input": b.get("input") or {}, "parent": ev.get("parent_tool_use_id")})
         elif b.get("type") == "tool_result":
             c = b.get("content")
             if isinstance(c, list):
@@ -281,6 +316,79 @@ elif case == "j":
     need(not any(re.search(r"__(gate_list|status|logs|verify)$", c["name"]) for c in calls) and len(bash()) <= 1,
          "the model queried Sluice instead of using the session note")
 
+# ---- containment cases (k, l, m, n) ----
+def marks(name, calls_=None):
+    """Values of NAME=<value> printed by Bash calls (value without the `0::` prefix)."""
+    out = []
+    for c in (calls_ if calls_ is not None else bash()):
+        for m in re.finditer(r"(?<![A-Z_])" + name + r"=(?:0::)?(\S*)", res(c)[1]):
+            out.append(m.group(1))
+    return out
+
+def poll_rows(pfile):
+    try:
+        return list(json.load(open(pfile)).values())
+    except (OSError, ValueError):
+        return []
+
+def in_leaf(row, sid, leaf):
+    return row["cg"].endswith("/s-%s/%s" % (sid, leaf))
+
+if case in ("k", "l", "m", "n"):
+    pfile, full_lines, prefix = extra[0], int(extra[1]), extra[2]
+    rows = poll_rows(pfile)
+    sid = sids[0] if sids else ""
+    need(bool(sid), "no session id in the stream")
+    need(bool(rows), "the /proc poller saw no process in the %s units" % prefix)
+    need(all(prefix in r["cg"] for r in rows), "poller rows outside the test units")
+    need(full_lines >= 1, "the hook's client.log has no `contained=full` line")
+    seen = "; ".join("%s[%s] %s %s ni=%s" % (r["comm"], r["pid"], r["cg"].rsplit("/", 2)[-2] + "/" + r["cg"].rsplit("/", 1)[-1], r["cmd"][:40], r["ni"]) for r in rows if r["comm"] != "sleep" or "sleep 86400" not in r["cmd"])
+    print("  poller saw:", seen[:1500], file=sys.stderr)
+
+if case == "k":
+    shell, agent = marks("SHELL_CG"), marks("AGENT_CG")
+    need(bool(shell and agent), "the agent did not print SHELL_CG/AGENT_CG (model did not follow the prompt)")
+    need(all(x.endswith("/s-%s/tools" % sid) and prefix in x for x in shell), "Bash shell not in .../s-<session>/tools (inside view): %r" % shell)
+    need(all(x.endswith("/s-%s/ui" % sid) and prefix in x for x in agent), "agent (/proc/$CLAUDE_PID) not in .../s-<session>/ui (inside view): %r" % agent)
+    need(any(r["comm"] == "claude" and in_leaf(r, sid, "ui") for r in rows), "outside view: no `claude` process in ui")
+    need(any("sluice" in r["cmd"].split(" ")[0] and r["cmd"].rstrip().endswith("mcp") and in_leaf(r, sid, "ui") for r in rows),
+         "outside view: the plugin's `sluice mcp` is not in ui")
+    need(any(r["cmd"] == "sleep 7" and in_leaf(r, sid, "tools") for r in rows), "outside view: the Bash command's `sleep 7` is not in tools")
+    need(not any(r["comm"] == "claude" and in_leaf(r, sid, "tools") for r in rows), "the agent process is in tools")
+elif case == "l":
+    need(any(c["name"] in ("Task", "Agent") for c in calls), "no subagent (Task/Agent) call (model did not follow the prompt)")
+    sub = [c for c in bash() if c["parent"]]
+    if sub:
+        sc = marks("SHELL_CG", sub)
+        need(bool(sc) and all(x.endswith("/s-%s/tools" % sid) for x in sc), "subagent shell not in tools (inside view): %r" % sc)
+    else:
+        print("  note: the stream carries no subagent Bash call; relying on the outside view", file=sys.stderr)
+    need(any(r["cmd"] == "sleep 9" and in_leaf(r, sid, "tools") for r in rows), "outside view: the subagent's `sleep 9` is not in tools of session %s" % sid)
+    need(any(r["comm"] == "claude" and in_leaf(r, sid, "ui") for r in rows), "outside view: no `claude` process in ui")
+elif case == "m":
+    need(bool(marks("INIT")), "the command did not run (sandbox failed to start?): model did not follow the prompt or the sandbox is unusable")
+    need(all(x == "bwrap" for x in marks("INIT")), "the command did not run inside the Bash sandbox (pid 1 is %r)" % marks("INIT"))
+    shell, ni = marks("SHELL_CG"), marks("NI")
+    need(bool(shell) and all(x.endswith("/s-%s/ui" % sid) for x in shell), "sandboxed shell not in ui: %r" % shell)
+    need(bool(ni) and all(x == "19" for x in ni), "sandboxed shell nice is %r, expected 19" % ni)
+    need(any(r["cmd"] == "sleep 11" and in_leaf(r, sid, "ui") and r["ni"] == "19" for r in rows), "outside view: `sleep 11` is not in ui at nice 19")
+    need(not any(r["cmd"] == "sleep 11" and in_leaf(r, sid, "tools") for r in rows), "the sandboxed command reached tools (self-move should be impossible)")
+elif case == "n":
+    pids, shell, agent = marks("AGENT_PID"), marks("SHELL_CG"), marks("AGENT_CG")
+    need(len(pids) == 2 and len(set(pids)) == 2, "expected two different agent pids, got %r" % pids)
+    need(len(shell) == 2 and len(agent) == 2, "expected two SHELL_CG and two AGENT_CG lines (model did not follow the prompt): %r %r" % (shell, agent))
+    need(all("/tools" in x and prefix in x for x in shell), "a shell is not in tools: %r" % shell)
+    need(all(x.rstrip("/").endswith("/ui") and prefix in x for x in agent), "an agent is not in ui: %r" % agent)
+    cl = sorted({r["pid"] for r in rows if r["comm"] == "claude" and r["cg"].endswith("/ui")})
+    need(len(cl) >= 2, "outside view: expected two claude processes seen in a ui leaf, saw %r" % cl)
+    # extra[3:] = env-file line counts per session, "<sid>=<lines>:<max-per-file>"
+    for item in extra[3:]:
+        k_, v_ = item.split("=")
+        total, per_file = v_.split(":")
+        need(int(per_file) <= 1, "env line duplicated inside one env file of %s (%s)" % (k_, v_))
+        print("  env file lines of session %s: total=%s max-per-file=%s" % (k_, total, per_file), file=sys.stderr)
+    need(sids == [] or len(sids) == 2, "expected two init events, got %r" % sids)
+
 print("; ".join(problems) if problems else "ok")
 sys.exit(1 if problems else 0)
 PYEOF
@@ -295,6 +403,59 @@ record() {
     fi
 }
 timeline_count() { ( cd "$TMP/repo" && sluice logs --timeline --since 1h 2>/dev/null | grep -c . || true ); }
+
+
+# ---- containment cases: helpers ----
+cat > "$TMP/poll.py" <<'PYEOF2'
+import json, os, sys, time
+prefix, out = sys.argv[1], sys.argv[2]
+seen = {}
+def read(path):
+    with open(path, "rb") as f:
+        return f.read()
+while True:
+    for p in os.listdir("/proc"):
+        if not p.isdigit():
+            continue
+        try:
+            cg = read("/proc/%s/cgroup" % p).decode("utf8", "replace").strip()
+            if prefix not in cg:
+                continue
+            comm = read("/proc/%s/comm" % p).decode("utf8", "replace").strip()
+            cmd = read("/proc/%s/cmdline" % p).replace(b"\0", b" ").decode("utf8", "replace").strip()[:200]
+            ni = read("/proc/%s/stat" % p).decode("utf8", "replace").rsplit(")", 1)[1].split()[16]
+        except (OSError, IndexError):
+            continue
+        seen[p] = {"pid": int(p), "comm": comm, "cmd": cmd, "cg": cg.split("::")[-1], "ni": ni}
+    tmp = out + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(seen, f)
+    os.replace(tmp, out)
+    time.sleep(0.3)
+PYEOF2
+# Starts a containment case: private runtime dir with symlinks to the real user
+# manager's sockets (so the hook can reach the manager while the daemon, its lock
+# and socket stay private), own state dir, /proc poller. Unit names carry the
+# case letter (sluice-test-e2e-<pid>-<case>*), so a case never restarts units
+# its predecessor has just stopped (see kb/sluice/changes/containment-e2e.md).
+contain_begin() { # contain_begin <case>
+    cc="$1"; CRT="$TMP/rt-$cc"; CST="$TMP/state-$cc"; POLLFILE="$TMP/poll-$cc.json"
+    real="/run/user/$(id -u)"
+    mkdir -p "$CRT" "$CST"; chmod 700 "$CRT"
+    ln -s "$real/systemd" "$CRT/systemd"
+    [ -S "$real/bus" ] && ln -s "$real/bus" "$CRT/bus"
+    CONTAIN_DIRS="$CONTAIN_DIRS $CRT"
+    SESSION_ENV="XDG_RUNTIME_DIR=$CRT XDG_STATE_HOME=$CST SLUICE_TEST_CONTAINMENT_PREFIX=$PREFIX-$cc"
+    python3 -I "$TMP/poll.py" "$PREFIX" "$POLLFILE" &
+    POLLER=$!
+}
+contain_end() { # stop the poller, the daemon and the units; forget the case environment
+    contain_cleanup
+    SESSION_ENV=""; SESSION_ARGS=""
+}
+full_lines() { grep -s -c 'contained=full' "$CST/sluice/logs/client.log" || true; }
+# The assertions are about the poller's view; the units are listed for the record.
+show_units() { XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user list-units --all --plain --no-legend "${PREFIX}*" 2>/dev/null | awk '{print "    unit: " $1 " " $3 "/" $4}'; }
 
 if want a; then
 echo "== (a) run the tests (model $MODEL)"
@@ -391,6 +552,82 @@ if want j; then
 echo "== (j) shim dir first in PATH and the session note reaches the model (model $MODEL)"
 session scenario-j "First run echo \$PATH with the Bash tool. Then, without calling any Sluice tool and without running any other command, tell me the names of the Sluice gates you were told about at the start of this session. Reply with the first entry of PATH and the gate names." "$TMP/repo-gates" 4
 summarise scenario-j; record j "$SHIM_DIR"
+fi
+
+
+if want k; then
+echo "== (k) agent, MCP and Bash shell placement in the session cgroup (model $MODEL)"
+contain_begin k
+session scenario-k 'Run this exact command once with the Bash tool, then reply "done" and nothing else: echo SHELL_CG=$(cat /proc/$$/cgroup); echo AGENT_PID=$CLAUDE_PID; echo AGENT_CG=$(cat /proc/$CLAUDE_PID/cgroup); sleep 7' "$TMP/repo" 4
+sleep 1
+summarise scenario-k; show_units
+record k "$POLLFILE" "$(full_lines)" "$PREFIX"
+contain_end
+fi
+
+if want l; then
+echo "== (l) a subagent's Bash command is in tools of the same session (model $MODEL)"
+contain_begin l
+session scenario-l 'Use the Task tool to start a subagent. The subagent must run this exact command once with its Bash tool and report the lines it prints: echo SHELL_CG=$(cat /proc/$$/cgroup); sleep 9. Do not run it yourself. Be brief.' "$TMP/repo" 6
+sleep 1
+summarise scenario-l; show_units
+record l "$POLLFILE" "$(full_lines)" "$PREFIX"
+contain_end
+fi
+
+if want m; then
+echo "== (m) Bash sandbox on: the shell stays in ui at nice 19 (model $MODEL)"
+contain_begin m
+# allowAllUnixSockets: the default sandbox cannot start on Ubuntu 24.04+ without a root-owned AppArmor profile (S1, finding 0).
+printf '%s\n' '{"sandbox":{"enabled":true,"autoAllowBashIfSandboxed":true,"network":{"allowAllUnixSockets":true}}}' > "$TMP/sandbox-settings.json"
+SESSION_ARGS="--settings $TMP/sandbox-settings.json"
+session scenario-m 'Run this exact command once with the Bash tool, then reply "done" and nothing else: echo INIT=$(cat /proc/1/comm); echo SHELL_CG=$(cat /proc/$$/cgroup); echo NI=$(ps -o ni= -p $$ | tr -d " "); sleep 11' "$TMP/repo" 4
+sleep 1
+summarise scenario-m; show_units
+record m "$POLLFILE" "$(full_lines)" "$PREFIX"
+contain_end
+fi
+
+if want n; then
+echo "== (n) --resume: the new agent process is moved again, one env line (model $MODEL)"
+contain_begin n
+PROMPT_N='Run this exact command once with the Bash tool, then reply "done" and nothing else: echo SHELL_CG=$(cat /proc/$$/cgroup); echo AGENT_PID=$CLAUDE_PID; echo AGENT_CG=$(cat /proc/$CLAUDE_PID/cgroup); sleep 6'
+session scenario-n1 "$PROMPT_N" "$TMP/repo" 4
+sid1="$(python3 -I - "$TMP/scenario-n1.jsonl" <<'PYEOF3'
+import json, sys
+for l in open(sys.argv[1]):
+    try:
+        e = json.loads(l)
+    except ValueError:
+        continue
+    if e.get("type") == "system" and e.get("subtype") == "init":
+        print(e["session_id"])
+        break
+PYEOF3
+)"
+echo "  first session id: ${sid1:-none}"
+SESSION_ARGS="--resume $sid1"
+session scenario-n2 "$PROMPT_N" "$TMP/repo" 4
+sleep 1
+cat "$TMP/scenario-n1.jsonl" "$TMP/scenario-n2.jsonl" > "$TMP/scenario-n.jsonl"
+summarise scenario-n1; summarise scenario-n2; show_units
+envinfo=""
+sd="$HOME/.claude/session-env/$sid1"
+if [ -d "$sd" ]; then
+    total="$(cat "$sd"/* 2>/dev/null | grep -c 'SLUICE_SESSION_LEAF=' || true)"
+    maxf=0
+    for f in "$sd"/*; do
+        [ -f "$f" ] || continue
+        n="$(grep -c 'SLUICE_SESSION_LEAF=' "$f" || true)"
+        [ "$n" -gt "$maxf" ] && maxf="$n"
+    done
+    envinfo="$sid1=$total:$maxf"
+    ls -l "$sd" | sed 's/^/    env file: /'
+else
+    echo "  no env dir $sd"
+fi
+record n "$POLLFILE" "$(full_lines)" "$PREFIX" $envinfo
+contain_end
 fi
 
 echo
