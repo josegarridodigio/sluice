@@ -161,6 +161,7 @@ fn config(dir: &Path) -> DaemonConfig {
         log: server::LogSettings::default(),
         extensions: Vec::new(),
         reaper: None,
+        containment: None,
     }
 }
 

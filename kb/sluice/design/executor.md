@@ -215,6 +215,17 @@ finding 7).
   half falls back to `renice`/`ionice -p <pid>` from `Running::wait`
   (debug log). The command in the log header and the cache key do not
   include the wrapper.
+- Containment placement (ADR-0017): with containment active, `launch` puts
+  `sluice cg-exec <daemon-scope>/jobs/<job-id> --` in front of that chain
+  (`ExecSpec::wrapper`), so the argv is `sluice cg-exec <leaf> -- [nice ...]
+  [ionice ...] <sh -c cmd | program args>`. `cg-exec` writes its own pid to
+  the leaf's `cgroup.procs` and `exec`s the rest, so, exactly like the
+  `nice`/`ionice` wrappers, the PID, the process group, the reaper
+  registration and `proc_start_ticks` are those of the job and every
+  descendant starts inside the leaf. The leaf is created before the spawn and
+  removed when the job ends (a leaf still holding a stray background process
+  stays for the minute pruning). Without containment (off, disabled, or any
+  setup error) the wrapper is empty and the chain is the 0.4.1 one.
 - Output: both pipes drained concurrently into one append-only log
   `<state>/logs/<job-id>.log` (interleaved, 8 KiB chunks) with a header
   line (`# sluice job …`) and footer (`# exit: …`). `log_bytes` is reported

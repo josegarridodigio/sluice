@@ -30,6 +30,7 @@ use sluice_gate_core::config::{IonicClass, UserConfig, resolve_log_level};
 use sluice_gate_core::dirs;
 use sluice_gate_core::git::EnvMap;
 use sluice_gate_core::logfile;
+use sluice_gate_daemon::containment::ContainmentSetup;
 use sluice_gate_daemon::executor::{IoClass, IoPriority};
 use sluice_gate_daemon::server::{self, DaemonConfig, LogSettings, ReaperCommand};
 use sluice_gate_queue::{QueueExtension, QueueOptions};
@@ -86,7 +87,58 @@ fn daemon_config(env: &EnvMap, user: &UserConfig, detached: bool) -> Result<Daem
         },
         extensions: vec![Arc::new(QueueExtension::new(QueueOptions::default()))],
         reaper: Some(reaper_command()),
+        containment: containment_setup(env, user),
     })
+}
+
+/// Test-only: the runtime directory where the systemd user manager's socket
+/// lives, when the test runs the daemon with a private `XDG_RUNTIME_DIR`
+/// (so that its lock and socket never collide with the real daemon's).
+pub const TEST_MANAGER_RUNTIME_ENV: &str = "SLUICE_TEST_MANAGER_RUNTIME_DIR";
+
+/// Containment for the daemon: `None` when `[containment] enabled = false`.
+/// Detection and unit creation happen later, inside the detached daemon.
+fn containment_setup(env: &EnvMap, user: &UserConfig) -> Option<ContainmentSetup> {
+    if !user.containment.enabled {
+        return None;
+    }
+    // Test-only prefix, shared with the session hook: it must start with
+    // `sluice-test-`, so a test never touches the real `sluice-*` units.
+    let unit_prefix = env
+        .get(crate::session_contain::TEST_PREFIX_VAR)
+        .filter(|p| {
+            p.starts_with("sluice-test-")
+                && p.len() <= 64
+                && p.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+        .cloned();
+    let mut tool_env = env.clone();
+    if let Some(runtime) = env.get(TEST_MANAGER_RUNTIME_ENV).filter(|v| !v.is_empty()) {
+        tool_env.insert("XDG_RUNTIME_DIR".to_owned(), runtime.clone());
+    }
+    Some(ContainmentSetup {
+        env: tool_env,
+        unit_prefix,
+        exe: PathBuf::from("/proc/self/exe"),
+        holder: self_command(&["daemon", "holder"]),
+    })
+}
+
+/// `sluice daemon holder`: keeps `sluice-agents.scope` alive. Blocks reading
+/// its stdin, whose write end the daemon holds for its whole life (the
+/// kernel closes it when the daemon exits, however it exits), then returns.
+pub fn holder() -> ExitCode {
+    let mut stdin = std::io::stdin().lock();
+    let mut buf = [0_u8; 64];
+    loop {
+        match std::io::Read::read(&mut stdin, &mut buf) {
+            Ok(0) => return ExitCode::SUCCESS,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return ExitCode::SUCCESS,
+        }
+    }
 }
 
 /// `sluice daemon reaper` through `/proc/self/exe`, so it still starts

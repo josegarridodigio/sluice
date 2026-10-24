@@ -195,6 +195,36 @@ fails and never uses the network (it does not look for new releases;
   starts a new daemon, which also kills any gate group a dead daemon left
   behind and records those jobs as `killed`.
 
+## Where the daemon lives (containment)
+
+On a host with systemd 252 or later and a reachable user manager, the daemon
+puts itself in its own transient unit and runs each gate or `exec` job in a
+leaf of it (ADR-0017):
+
+```
+sluice.slice
+|-- sluice-daemon.scope     daemon/ (the daemon and its reaper), jobs/<job-id>/
+`-- sluice-agents.scope     holder/, s-<session-id>/{ui,tools}
+```
+
+See the units with `systemctl --user status sluice-daemon.scope
+sluice-agents.scope`, or `systemd-cgls --user-unit sluice-daemon.scope`.
+`sluice daemon holder` is the small process that keeps the agents scope alive
+while the daemon runs. If anything fails (no user manager, cgroup files not
+writable, a unit that cannot be created) the daemon logs one line in
+`daemon.log` (`containment: off (<reason>)` or `cannot place the daemon`) and
+runs exactly as before; `[containment] enabled = false` does the same.
+
+Kills by the kernel OOM killer or `systemd-oomd` on those cgroups are
+recorded by the daemon and shown in the `status` reply (`interventions`).
+
+Test-only environment variables (not for users): the integration tests start
+a daemon with `SLUICE_TEST_CONTAINMENT_PREFIX=sluice-test-<pid>-<case>` so its
+units are `<prefix>.slice`, `<prefix>-daemon.scope` and
+`<prefix>-agents.scope` (the value must start with `sluice-test-`), and with
+`SLUICE_TEST_MANAGER_RUNTIME_DIR` pointing at the real runtime directory while
+the daemon's own lock and socket stay private.
+
 ## Socket path too long
 
 A Unix socket path can be at most 107 bytes on Linux (108 with the

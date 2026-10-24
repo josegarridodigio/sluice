@@ -115,6 +115,7 @@ fn config(dir: &Path, budget: u32, policy: LastSubscriberGone) -> DaemonConfig {
         log: sluice_gate_daemon::server::LogSettings::default(),
         extensions: Vec::new(),
         reaper: None,
+        containment: None,
     }
 }
 

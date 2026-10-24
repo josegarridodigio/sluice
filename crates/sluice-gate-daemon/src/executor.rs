@@ -154,6 +154,11 @@ pub struct ExecSpec {
     /// with its output kept in memory for the tail ([`Finished::log_error`]);
     /// a spool ([`Sink::Spool`]) is required.
     pub log_path: PathBuf,
+    /// Command prefix placed before the `nice`/`ionice` chain, normally
+    /// `sluice cg-exec <leaf> --` (containment): it moves itself into the
+    /// job's cgroup and `exec`s the rest, so the pid, the process group and
+    /// `proc_start_ticks` stay those of the job. Empty: no placement.
+    pub wrapper: Vec<std::ffi::OsString>,
 }
 
 /// I/O scheduling priority for `ionice`.
@@ -590,7 +595,7 @@ fn command(
     }
 
     let tools = priority_tools();
-    let mut prefix: Vec<std::ffi::OsString> = Vec::new();
+    let mut prefix: Vec<std::ffi::OsString> = spec.wrapper.clone();
     let mut fallback_nice = 0;
     let mut fallback_ionice = None;
     if spec.nice > 0 {
@@ -910,6 +915,7 @@ mod tests {
                 level: 7,
             }),
             log_path: dir.join("logs").join("j1.log"),
+            wrapper: Vec::new(),
         }
     }
 

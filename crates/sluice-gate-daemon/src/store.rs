@@ -355,6 +355,15 @@ impl Store {
         };
         let fresh = store.init_schema()?;
         store.migrate(fresh, migrations)?;
+        // Additive only (one new table): no backup, and released binaries
+        // ignore the table and its version row.
+        crate::migrate::apply(
+            &store.conn,
+            crate::migrate::CONTAINMENT_TABLE,
+            crate::migrate::CONTAINMENT_MIGRATIONS,
+            crate::migrate::CONTAINMENT_SCHEMA_VERSION,
+        )
+        .map_err(db)?;
         crate::meta::record_writer(&store.conn).map_err(db)?;
         Ok(store)
     }
@@ -790,6 +799,57 @@ impl Store {
             .map_err(db)?;
         tx.commit().map_err(db)?;
         Ok((killed, orphaned))
+    }
+
+    // ---- Interventions (containment_schema 1) ----
+
+    /// Stores an intervention; a row with the same time, leaf and cause is
+    /// kept once. Returns whether a new row was written.
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn record_intervention(&self, row: &crate::interventions::InterventionRow) -> Result<bool> {
+        let n = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO interventions (at_ms, session, leaf, cause, detail) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![i(row.at_ms), row.session, row.leaf, row.cause, row.detail],
+            )
+            .map_err(db)?;
+        Ok(n > 0)
+    }
+
+    /// The most recent interventions at or after `since_ms`, newest first.
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn recent_interventions(
+        &self,
+        since_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<crate::interventions::InterventionRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT at_ms, session, leaf, cause, detail FROM interventions \
+                 WHERE at_ms >= ?1 ORDER BY at_ms DESC, id DESC LIMIT ?2",
+            )
+            .map_err(db)?;
+        let rows = stmt
+            .query_map(params![i(since_ms), i(limit as u64)], |r| {
+                Ok(crate::interventions::InterventionRow {
+                    at_ms: u64::try_from(r.get::<_, i64>(0)?).unwrap_or(0),
+                    session: r.get(1)?,
+                    leaf: r.get(2)?,
+                    cause: r.get(3)?,
+                    detail: r.get(4)?,
+                })
+            })
+            .map_err(db)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db)?;
+        Ok(rows)
     }
 
     // ---- Timeline (sched_schema 1) ----
@@ -1411,6 +1471,43 @@ mod tests {
         conn.execute_batch(SCHEMA_SQL).unwrap();
         conn.execute("INSERT INTO schema (version) VALUES (1)", [])
             .unwrap();
+    }
+
+    #[test]
+    fn interventions_are_stored_once_and_listed_newest_first() {
+        use crate::interventions::InterventionRow;
+        let (_d, p) = tmp();
+        let s = Store::open(&p).unwrap();
+        assert_eq!(
+            crate::migrate::version(&s.conn, crate::migrate::CONTAINMENT_TABLE).unwrap(),
+            crate::migrate::CONTAINMENT_SCHEMA_VERSION
+        );
+        let row = |at_ms: u64, leaf: &str| InterventionRow {
+            at_ms,
+            session: Some("abc".into()),
+            leaf: leaf.into(),
+            cause: "oom_kill".into(),
+            detail: Some("1 process(es) killed by the kernel OOM killer".into()),
+        };
+        assert!(s.record_intervention(&row(1000, "s-abc/tools")).unwrap());
+        assert!(
+            !s.record_intervention(&row(1000, "s-abc/tools")).unwrap(),
+            "the same event is kept once"
+        );
+        assert!(s.record_intervention(&row(3000, "jobs/j1")).unwrap());
+        assert!(s.record_intervention(&row(2000, "s-abc/ui")).unwrap());
+        let all = s.recent_interventions(0, 10).unwrap();
+        assert_eq!(
+            all.iter().map(|r| r.at_ms).collect::<Vec<_>>(),
+            [3000, 2000, 1000]
+        );
+        assert_eq!(all[2], row(1000, "s-abc/tools"));
+        assert_eq!(s.recent_interventions(1500, 10).unwrap().len(), 2);
+        assert_eq!(s.recent_interventions(0, 1).unwrap().len(), 1);
+        // A reopen applies nothing again and keeps the rows.
+        drop(s);
+        let s = Store::open(&p).unwrap();
+        assert_eq!(s.recent_interventions(0, 10).unwrap().len(), 3);
     }
 
     #[test]

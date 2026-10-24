@@ -56,6 +56,7 @@ use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, interval_at, sleep, timeout};
 
+use crate::containment::{Containment, ContainmentSetup};
 use crate::executor::{
     self, ExecSpec, ExecStatus, Finished, IoPriority, Launch, ProcessInfo, RunningHandle, Sink,
 };
@@ -141,6 +142,11 @@ pub struct DaemonConfig {
     /// The gate reaper to start ([`crate::reaper`]); `None` leaves gates of
     /// a daemon that dies to the next daemon's start-up reconciliation.
     pub reaper: Option<ReaperCommand>,
+    /// Resource containment (cgroups through the systemd user manager,
+    /// ADR-0017); `None` runs as 0.4.1 without detection. The CLI sets it
+    /// when `[containment] enabled` is true; the daemon still falls back to
+    /// no containment when the machine does not allow it.
+    pub containment: Option<ContainmentSetup>,
 }
 
 /// How many rotated generations of `daemon.log` are kept (`.1` to `.3`).
@@ -355,6 +361,8 @@ struct Shared {
     next_conn: AtomicU64,
     /// The gate reaper, when it could be started.
     reaper: Option<Reaper>,
+    /// The daemon's cgroups, when containment is on and available.
+    containment: Option<Containment>,
 }
 
 /// Extensions after start-up.
@@ -731,6 +739,7 @@ fn daemon_cpus(proc_root: &Path) -> (Option<std::collections::BTreeSet<u32>>, u3
 ///
 /// [`Error::AlreadyRunning`] when another daemon holds the lock or the
 /// lease; store, schema and I/O errors during start-up.
+#[allow(clippy::too_many_lines, reason = "the daemon lifecycle, in order")]
 pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send) -> Result<()> {
     let _lock = take_lock(&config.lock_path)?;
     let pid = std::process::id();
@@ -749,7 +758,22 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
         tracing::warn!("orphan reconciliation failed: {e}");
     }
 
+    // Containment first, so the reaper (and every job) is born in the
+    // daemon's cgroup. Detection and unit creation shell out to `systemctl`
+    // and `busctl`: off the async threads.
+    let containment = match config.containment.clone() {
+        Some(setup) => {
+            let cfg = config.user.containment.clone();
+            tokio::task::spawn_blocking(move || Containment::start(&setup, &cfg))
+                .await
+                .unwrap_or(None)
+        }
+        None => None,
+    };
     let reaper = start_reaper(&config);
+    if let (Some(c), Some(pid)) = (&containment, reaper.as_ref().and_then(Reaper::pid)) {
+        c.adopt_reaper(pid);
+    }
 
     let (stop, _) = watch::channel(None);
     let (shutting_down, _) = watch::channel(false);
@@ -777,6 +801,7 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
         extensions: OnceLock::new(),
         next_conn: AtomicU64::new(1),
         reaper,
+        containment,
         config,
     });
     prune_logs(&shared);
@@ -800,6 +825,10 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
     let scheduling = tokio::spawn(scheduling_loop(Arc::clone(&shared)));
     let heartbeat = tokio::spawn(heartbeat_loop(Arc::clone(&shared), token.clone()));
     let sampler = tokio::spawn(sampler_loop(Arc::clone(&shared)));
+    let containment_task = shared
+        .containment
+        .is_some()
+        .then(|| tokio::spawn(containment_loop(Arc::clone(&shared))));
     let mut runners = JoinSet::new();
     for e in &shared.extensions().active {
         let handle = DaemonHandle {
@@ -827,6 +856,9 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
     scheduling.abort();
     heartbeat.abort();
     sampler.abort();
+    if let Some(t) = &containment_task {
+        t.abort();
+    }
     release_lease(&shared, &token);
     let _ = timeout(CONNECTION_DRAIN, async {
         while conns.join_next().await.is_some() {}
@@ -834,6 +866,10 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
     .await;
     conns.abort_all();
     close_reaper(&shared);
+    if let Some(c) = &shared.containment {
+        // Bounded to one second; the holder exits as its pipe closes.
+        c.shutdown();
+    }
     tracing::info!(instance = %shared.instance, "daemon stopped");
     Ok(())
 }
@@ -1053,6 +1089,80 @@ async fn sampler_loop(shared: Arc<Shared>) {
             shared.wake.notify_one();
         }
     }
+}
+
+/// How often the daemon looks for interventions on its cgroups.
+const CONTAINMENT_EVERY: Duration = Duration::from_secs(10);
+/// Every this many ticks of [`CONTAINMENT_EVERY`] the empty session and job
+/// cgroups are pruned (once a minute).
+const PRUNE_EVERY_TICKS: u64 = 6;
+/// Interventions older than this are not shown by `status`.
+const INTERVENTION_WINDOW_MS: u64 = 24 * 3600 * 1000;
+/// Most interventions a `status` reply carries.
+const INTERVENTIONS_SHOWN: usize = 20;
+
+/// Containment housekeeping: pruning and recording of kills.
+async fn containment_loop(shared: Arc<Shared>) {
+    let mut tick = tokio::time::interval(CONTAINMENT_EVERY);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut n = 0_u64;
+    loop {
+        // The first tick is immediate: it takes the baseline of the counters.
+        tick.tick().await;
+        let prune = n > 0 && n.is_multiple_of(PRUNE_EVERY_TICKS);
+        n += 1;
+        let s = Arc::clone(&shared);
+        let _ = tokio::task::spawn_blocking(move || containment_tick(&s, prune)).await;
+    }
+}
+
+/// One pass of [`containment_loop`] (blocking: cgroupfs, `journalctl`).
+fn containment_tick(shared: &Shared, prune: bool) {
+    let Some(c) = &shared.containment else { return };
+    if prune {
+        let report = c.prune();
+        if report.sessions + report.jobs > 0 {
+            tracing::debug!(
+                sessions = report.sessions,
+                jobs = report.jobs,
+                "pruned empty cgroups"
+            );
+        }
+    }
+    for row in c.collect_interventions(now_ms()) {
+        let new = shared.store("recording an intervention", |s| s.record_intervention(&row));
+        if new == Some(true) {
+            tracing::warn!(
+                session = row.session.as_deref().unwrap_or("-"),
+                leaf = %row.leaf,
+                cause = %row.cause,
+                "intervention on a Sluice cgroup: {}",
+                row.detail.as_deref().unwrap_or("")
+            );
+        }
+    }
+}
+
+/// Recent interventions for the `status` reply; `None` when there is none.
+fn recent_interventions(shared: &Shared) -> Option<Vec<proto::Intervention>> {
+    let since = now_ms().saturating_sub(INTERVENTION_WINDOW_MS);
+    let rows = shared.store("reading interventions", |s| {
+        s.recent_interventions(since, INTERVENTIONS_SHOWN)
+    })?;
+    if rows.is_empty() {
+        return None;
+    }
+    Some(
+        rows.into_iter()
+            .map(|r| proto::Intervention {
+                at: rfc3339(r.at_ms),
+                session: r.session,
+                leaf: r.leaf,
+                cause: r.cause,
+                detail: r.detail,
+            })
+            .collect(),
+    )
 }
 
 /// CPU `some avg10` below 10 % (the learned-weight fallback needs it at both
@@ -1360,6 +1470,7 @@ fn exec_spec(shared: &Shared, request: &RunRequest, id: &str, log_path: &Path) -
         nice: shared.config.nice,
         ionice: shared.config.ionice,
         log_path: log_path.to_path_buf(),
+        wrapper: Vec::new(),
     }
 }
 
@@ -1376,7 +1487,20 @@ async fn start_job(shared: Arc<Shared>, id: String) {
 /// Spawns a job, records its start, broadcasts `started` and waits for it
 /// with periodic `progress`. `None` when it could not start (the job is
 /// then already finished with an `error` outcome).
-async fn launch(shared: &Shared, id: &str, spec: ExecSpec) -> Option<Finished> {
+async fn launch(shared: &Shared, id: &str, mut spec: ExecSpec) -> Option<Finished> {
+    // Containment: the job starts through `sluice cg-exec <leaf> --` in its
+    // own leaf of the daemon scope, and the leaf goes away with the job.
+    if let Some(c) = &shared.containment {
+        spec.wrapper = c.job_prefix(id);
+    }
+    let finished = launch_placed(shared, id, spec).await;
+    if let Some(c) = &shared.containment {
+        c.release_job(id);
+    }
+    finished
+}
+
+async fn launch_placed(shared: &Shared, id: &str, spec: ExecSpec) -> Option<Finished> {
     let name = spec.gate.clone();
     let log_path = spec.log_path.clone();
     let spool = (spec.sink == Sink::Spool).then(|| log_path.clone());
@@ -1497,6 +1621,7 @@ async fn start_exec(shared: Arc<Shared>, id: String, request: Arc<ExecRequest>) 
         nice: shared.config.nice,
         ionice: shared.config.ionice,
         log_path: shared.config.logs_dir.join(format!("{id}.exec")),
+        wrapper: Vec::new(),
     };
     let Some(finished) = launch(&shared, &id, spec).await else {
         return;
@@ -2151,6 +2276,7 @@ fn status_report(shared: &Shared) -> StatusReport {
         queued,
         totals,
         queue: None,
+        interventions: recent_interventions(shared),
     }
 }
 

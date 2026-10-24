@@ -34,6 +34,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tools` leaf (`SLUICE_SESSION_LEAF`) before running a heavy tool. Fails open;
   nothing is ever killed.
 
+- Daemon containment (ADR-0017): the daemon adopts itself into
+  `sluice-daemon.scope` (`daemon/` leaf, with its reaper), creates (or reuses)
+  `sluice-agents.scope` around a `sluice daemon holder` process, sets the slice
+  weight and the derived `systemd-oomd` policy, and runs every gate and `exec`
+  job in its own `jobs/<job-id>` leaf through `sluice cg-exec` placed before
+  the `nice`/`ionice` chain. Empty session and job cgroups are pruned every
+  minute. Any failure is logged once and the daemon runs as before.
+- Interventions: the daemon records kills by the kernel OOM killer
+  (`memory.events`) and by `systemd-oomd` (journal) on its cgroups in a new
+  `interventions` table (`containment_schema`, additive) and reports them in
+  the `status` reply as an optional `interventions` field (protocol 1).
+
 ### Changed
 
 ### Fixed

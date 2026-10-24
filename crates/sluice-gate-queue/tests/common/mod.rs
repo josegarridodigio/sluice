@@ -298,6 +298,7 @@ pub fn daemon_config_with(
             push_program,
         }))],
         reaper: None,
+        containment: None,
     }
 }
 

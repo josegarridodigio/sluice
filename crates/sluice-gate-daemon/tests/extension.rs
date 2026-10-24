@@ -133,6 +133,7 @@ fn config(dir: &Path, extensions: Vec<Arc<dyn Extension>>) -> DaemonConfig {
         log: sluice_gate_daemon::server::LogSettings::default(),
         extensions,
         reaper: None,
+        containment: None,
     }
 }
 

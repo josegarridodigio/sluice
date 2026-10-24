@@ -30,6 +30,7 @@ pub struct TestTree {
 impl TestTree {
     /// The tree with its agents scope, or `None` (after printing why).
     pub fn new() -> Option<Self> {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let env = process_env();
         let caps = detect::detect(&env);
         if caps.outcome != Outcome::Full || caps.placement != Placement::SelfMoveOk {
@@ -41,7 +42,10 @@ impl TestTree {
             return None;
         }
         let uid = caps.facts.uid;
-        let prefix = format!("sluice-test-{}", std::process::id());
+        // One prefix per tree: tests of one process run in parallel and must
+        // not share (or stop) each other's units.
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let prefix = format!("sluice-test-{}-t{n}", std::process::id());
         let cfg = ContainmentConfig::default();
         let pressure = detect::pressure_policy(&env, &cfg, uid).ok()?;
         let settings = TreeSettings::from_config(&cfg, &caps, pressure, 4);

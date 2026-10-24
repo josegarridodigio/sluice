@@ -428,6 +428,38 @@ pub fn list_units(env: &EnvMap, pattern: &str) -> CgResult<Vec<String>> {
         .collect())
 }
 
+/// Arguments of the `journalctl` call of [`journal_oomd`].
+#[must_use]
+pub fn journal_oomd_args(since_unix: u64, user: bool) -> Vec<String> {
+    let mut args = Vec::new();
+    if user {
+        args.push("--user".to_owned());
+    }
+    args.extend(
+        ["--no-pager", "--quiet", "-o", "short-unix", "--since"]
+            .iter()
+            .map(|s| (*s).to_owned()),
+    );
+    args.push(format!("@{since_unix}"));
+    args.push("SYSLOG_IDENTIFIER=systemd-oomd".to_owned());
+    args
+}
+
+/// Lines `systemd-oomd` logged since `since_unix` (seconds), in the
+/// `short-unix` format, from the user journal (`user`) or the system journal.
+/// Both are read-only; an unreadable journal yields no lines, not an error
+/// (non-members of `adm`/`systemd-journal` cannot read the system journal).
+///
+/// # Errors
+///
+/// [`CgroupError::ToolMissing`] without `journalctl`, or a timeout.
+pub fn journal_oomd(env: &EnvMap, since_unix: u64, user: bool) -> CgResult<String> {
+    let args = journal_oomd_args(since_unix, user);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = run_output("journalctl", &refs, env, TOOL_TIMEOUT)?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Reads a `sluice` readable file to a string, mapping errors (shared helper
 /// of the detection code).
 pub(crate) fn read_to_string(path: &std::path::Path) -> CgResult<String> {

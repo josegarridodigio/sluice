@@ -523,7 +523,17 @@ impl Tree {
         }
         let leaf = scope_dir.join(first_leaf);
         make_dir(&leaf)?;
-        write_pid(&leaf, pid)?;
+        // A process that is not in the scope yet (a second start finding the
+        // scope alive) may live where a direct write is refused, for example
+        // a login session scope: `move_pid` then asks the manager.
+        self.move_pid(
+            &Leaf {
+                dir: leaf,
+                unit: spec.name.clone(),
+                rel: format!("/{first_leaf}"),
+            },
+            pid,
+        )?;
         enable_controllers(scope_dir)?;
         for node in nodes {
             let dir = scope_dir.join(node);

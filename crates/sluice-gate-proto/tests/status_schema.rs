@@ -76,6 +76,7 @@ fn report() -> StatusReport {
             ..Totals::default()
         },
         queue: None,
+        interventions: None,
     }
 }
 

@@ -455,6 +455,11 @@ enum DaemonCommand {
         #[arg(long, value_name = "PID")]
         daemon: Option<u32>,
     },
+    /// Internal: the holder process of `sluice-agents.scope` (containment). It
+    /// blocks reading its stdin, which the daemon keeps open, and exits when
+    /// the daemon is gone.
+    #[command(hide = true)]
+    Holder,
 }
 
 #[derive(Debug, Subcommand)]
@@ -482,6 +487,7 @@ enum HookCommand {
     },
 }
 
+#[allow(clippy::too_many_lines, reason = "one arm per subcommand")]
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
@@ -554,6 +560,10 @@ fn main() -> ExitCode {
             command: Some(DaemonCommand::Reaper { detach, .. }),
             ..
         } => daemon_cmd::reaper(detach),
+        Command::Daemon {
+            command: Some(DaemonCommand::Holder),
+            ..
+        } => daemon_cmd::holder(),
         Command::Doctor { json, bundle } => doctor::run(&doctor::DoctorArgs { json, bundle }),
         Command::Daemon {
             foreground,

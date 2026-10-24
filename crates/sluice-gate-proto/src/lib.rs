@@ -722,6 +722,32 @@ pub struct StatusReport {
     /// Merge-queue summary; absent when the daemon serves no queue.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue: Option<QueueSummary>,
+    /// Recent interventions of the kernel or `systemd-oomd` on Sluice's
+    /// cgroups (containment). Optional and additive: absent from the JSON
+    /// when there is none or the daemon does not record them, and ignored by
+    /// older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interventions: Option<Vec<Intervention>>,
+}
+
+/// One kill of a process group of an agent session or a job by the kernel
+/// OOM killer or by `systemd-oomd`, recorded by the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Intervention {
+    /// When it happened (RFC 3339).
+    pub at: String,
+    /// Agent session id (the `s-<id>` directory without its prefix) when the
+    /// cgroup belongs to a session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Cgroup path inside the Sluice scope (`s-abc/tools`, `jobs/<job-id>`).
+    pub leaf: String,
+    /// `oom_kill`, `oom_group_kill`, `oomd_memory_pressure` or `oomd_swap`.
+    pub cause: String,
+    /// Human-readable detail, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// Merge-queue counters in a status report.
@@ -1377,6 +1403,13 @@ mod tests {
                 ready: 1,
                 needs_reconcile: 0,
             }),
+            interventions: Some(vec![Intervention {
+                at: "2026-10-24T10:00:00Z".into(),
+                session: Some("abc".into()),
+                leaf: "s-abc/tools".into(),
+                cause: "oom_kill".into(),
+                detail: None,
+            }]),
         }
     }
 

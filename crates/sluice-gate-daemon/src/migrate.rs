@@ -32,6 +32,29 @@ pub struct Migration {
     pub sql: &'static str,
 }
 
+/// Version table of the containment additions (its own table, so the
+/// `sched_schema` that released binaries check does not move).
+pub const CONTAINMENT_TABLE: &str = "containment_schema";
+
+/// `containment_schema` version this build reads and writes.
+pub const CONTAINMENT_SCHEMA_VERSION: u32 = 1;
+
+/// Migration 0 -> 1 of the containment group: the `interventions` table
+/// (kills by the kernel OOM killer or `systemd-oomd` on Sluice's cgroups).
+const CONTAINMENT_1: &str = "
+CREATE TABLE interventions (
+  id INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL, session TEXT,
+  leaf TEXT NOT NULL, cause TEXT NOT NULL, detail TEXT);
+CREATE UNIQUE INDEX interventions_once ON interventions(at_ms, leaf, cause);
+";
+
+/// The `containment_schema` migrations, in order.
+pub const CONTAINMENT_MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    name: "containment interventions",
+    sql: CONTAINMENT_1,
+}];
+
 /// Version table of the scheduler additions.
 pub const SCHED_TABLE: &str = "sched_schema";
 
