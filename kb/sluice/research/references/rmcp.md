@@ -1,6 +1,6 @@
 # rmcp (modelcontextprotocol/rust-sdk) — reference notes for Sluice
 
-Source tree studied: `/home/jose/Escritorio/Proyectos/sluice/refs/rust-sdk`
+Source tree studied: `<repo>/refs/rust-sdk`
 (commit `b11a40d`, 2026-10-22). All paths below are relative to that root unless
 absolute. Nothing in that repo was modified.
 

@@ -30,11 +30,12 @@ SLUICE="$ROOT/target/release/sluice"
 
 TMP="$(mktemp -d)"
 echo "work dir: $TMP"
+REAL_HOME="${SLUICE_E2E_REAL_HOME:-$HOME}"  # the real login, reused below
 export HOME="$TMP/home" XDG_RUNTIME_DIR="$TMP/home/runtime" XDG_STATE_HOME="$TMP/home/state" XDG_CONFIG_HOME="$TMP/home/config"
 mkdir -p "$HOME" "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME"
 # Claude Code keeps its own state under HOME; reuse the real login.
-ln -s "/home/jose/.claude" "$HOME/.claude" 2>/dev/null || true
-cp /home/jose/.claude.json "$HOME/.claude.json" 2>/dev/null || true
+ln -s "$REAL_HOME/.claude" "$HOME/.claude" 2>/dev/null || true
+cp "$REAL_HOME/.claude.json" "$HOME/.claude.json" 2>/dev/null || true
 COUNTER="$TMP/counter"; : > "$COUNTER"
 mkdir -p "$XDG_CONFIG_HOME/sluice"
 printf 'version = 1\n[mcp]\nprogress_interval = "%s"\n' "$PROGRESS" > "$XDG_CONFIG_HOME/sluice/config.toml"

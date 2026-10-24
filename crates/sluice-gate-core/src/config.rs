@@ -1627,7 +1627,7 @@ tail_lines = 40
 env_any_set = ["CLAUDECODE", "SLUICE_AGENT"]
 env_any_equals = { CLAUDE_CODE_ENTRYPOINT = "cli" }
 
-[repos."/home/jose/Escritorio/Proyectos/foo"]
+[repos."/home/alice/src/foo"]
 budget_share_max = 4
 "#;
 
@@ -1681,7 +1681,7 @@ budget_share_max = 4
             c.agent_detection.env_any_equals["CLAUDE_CODE_ENTRYPOINT"],
             "cli"
         );
-        let r = &c.repos[Path::new("/home/jose/Escritorio/Proyectos/foo")];
+        let r = &c.repos[Path::new("/home/alice/src/foo")];
         assert_eq!(r.budget_share_max, Some(4));
     }
 

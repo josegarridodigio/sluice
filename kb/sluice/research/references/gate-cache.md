@@ -1,6 +1,6 @@
 # gate-cache (natelandau/gate-cache) — research note
 
-Source studied: `/home/jose/Escritorio/Proyectos/sluice/refs/gate-cache` at version 0.6.0
+Source studied: `<repo>/refs/gate-cache` at version 0.6.0
 (`src/gate_cache/__init__.py:3`, `CHANGELOG.md:3`). All `file:line` cites below are relative
 to that directory. Nothing in the repo was modified.
 

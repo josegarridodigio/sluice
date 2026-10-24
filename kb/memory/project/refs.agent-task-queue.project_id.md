@@ -9,4 +9,4 @@ expires_at: 2027-04-20T13:20:58.856271349Z
 importance: 0.5
 source: memory
 ---
-Pando code project id for block/agent-task-queue (reference repo for Sluice): ref-agent-task-queue, path /home/jose/Escritorio/Proyectos/sluice/refs/agent-task-queue
+Pando code project id for block/agent-task-queue (reference repo for Sluice): ref-agent-task-queue, path <repo>/refs/agent-task-queue

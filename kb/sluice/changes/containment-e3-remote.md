@@ -11,7 +11,7 @@ a release build of `main` at `179e230` copied with the harness and the plugin
 to a private directory; private XDG dirs; nothing installed system-wide;
 everything removed afterwards (no unit, file or state dir left).
 
-Machine: Ubuntu 26.04.1, systemd 259, kernel 7.0.0-38, Intel i7-9750H
+Machine: Ubuntu 26.04.1, systemd 259, kernel 7.0.0-38, an Intel laptop CPU
 (6 cores, 12 threads), 31 GB RAM, 8 GB swap, `systemd-oomd` active, user
 manager delegating `cpu memory pids`; a desktop session was logged in.
 

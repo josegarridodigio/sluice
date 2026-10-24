@@ -1,6 +1,6 @@
 # Reference: mergetrain (yongjip/mergetrain)
 
-Source studied: `/home/jose/Escritorio/Proyectos/sluice/refs/mergetrain` at commit `dd0316f`
+Source studied: `<repo>/refs/mergetrain` at commit `dd0316f`
 (2026-10-19, "release: prepare mergetrain 3.7.0"). Paths below are relative to that root.
 
 ## 1. What it is

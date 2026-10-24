@@ -1,6 +1,6 @@
 # Reference: block/agent-task-queue
 
-Source studied: `/home/jose/Escritorio/Proyectos/sluice/refs/agent-task-queue` (shallow clone, single
+Source studied: `<repo>/refs/agent-task-queue` (shallow clone, single
 commit `48d16da`, 2026-08-28, "Merge pull request #36 ... Add inline progress for long-running queued
 tasks"; version 0.4.1 per `pyproject.toml:3`). All line numbers below refer to that checkout.
 

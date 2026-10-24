@@ -14,6 +14,12 @@
   `sluice-gate-core`; never use a git library.
 - Never modify the user's index or working tree from product code.
 - Do not push or publish anything without the user's approval.
+- Never commit personal or environment data: no home paths (`/home/<user>/...`;
+  write `~/`, `$HOME` or `<repo>`), user names, host names, IP addresses or
+  private project/client names, in code, scripts, docs, the KB, commit
+  messages or GitHub issues. Scripts take paths from the environment
+  (`$HOME`, `$ROOT`), never hard-coded. Describe other machines generically
+  (for example "a second machine, 6 cores, 12 threads").
 - Reference repositories live in `refs/` (gitignored); query them through
   Pando's code index (`ref-gate-cache`, `ref-agent-task-queue`, `ref-rmcp`,
   `ref-mergetrain`) instead of reading them file by file.

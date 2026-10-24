@@ -75,11 +75,12 @@ sh "$ROOT/plugin/hooks/test-guard.sh" | tail -n 1
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 TMP="$(mktemp -d)"
 echo "work dir: $TMP"
+REAL_HOME="${SLUICE_E2E_REAL_HOME:-$HOME}"  # the real login, reused below
 export HOME="$TMP/home" XDG_RUNTIME_DIR="$TMP/home/runtime" XDG_STATE_HOME="$TMP/home/state" XDG_CONFIG_HOME="$TMP/home/config"
 mkdir -p "$HOME" "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" "$TMP/bin"
 # Claude Code keeps its own state under HOME; reuse the real login.
-ln -s "/home/jose/.claude" "$HOME/.claude" 2>/dev/null || true
-cp /home/jose/.claude.json "$HOME/.claude.json" 2>/dev/null || true
+ln -s "$REAL_HOME/.claude" "$HOME/.claude" 2>/dev/null || true
+cp "$REAL_HOME/.claude.json" "$HOME/.claude.json" 2>/dev/null || true
 ln -s "$SLUICE" "$TMP/bin/sluice"
 export PATH="$TMP/bin:$PATH"
 trap 'if type contain_cleanup >/dev/null 2>&1; then contain_cleanup; fi; sluice daemon stop --force >/dev/null 2>&1 || true' EXIT INT TERM

@@ -187,7 +187,7 @@ env_any_equals = {}               # e.g. { CLAUDE_CODE_ENTRYPOINT = "cli" }
 heavy_commands_extra = []         # appended to the (default or replaced) list, e.g. ["bazel build"]
 exec_weight = 0                   # default `sluice exec` weight (ceiling, learned down since 0.4.0); 0 = ceil(budget / 2)
 
-[repos."/home/jose/Escritorio/Proyectos/foo"]
+[repos."/home/alice/src/foo"]
 budget_share_max = 4       # optional per-repo cap
 ```
 
