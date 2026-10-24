@@ -63,6 +63,7 @@ developer. Mechanism: cgroup v2 through the systemd user manager (ADR-0017).
 | C5 status, doctor, interventions | done | [[sluice/changes/containment-observability.md]] |
 | E1 harness s9 | done: 30/30, escapes contained, bounds met within 3 attempts; open: ui stalls under outside load (investigated in S6), 8-core rerun | [[sluice/changes/containment-proof.md]] |
 | E2 plugin e2e (cases k-n) | done: 4 cases PASS with real haiku sessions, one unreproduced flake fixed in C5 | [[sluice/changes/containment-e2e.md]] |
+| S6 ui stalls | done: stalls come from oversubscription and hit any sleeping task; layout kept; s9 judged by p95 and share over 10 ms | [[sluice/research/containment-s6-ui-stalls.md]] |
 | E3 user checks | pending (user) | |
 | R1–R4 | pending | |
 

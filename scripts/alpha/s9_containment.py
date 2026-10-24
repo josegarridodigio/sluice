@@ -18,8 +18,8 @@ with the release binary, a sandbox HOME/XDG tree and a throw-away unit tree
      ends up in the session's `tools` leaf (`/proc/<pid>/cgroup`).
   3. CPU behaviour with the measured weights (S2 method): a latency probe in
      `ui`, busy loops in `tools` (2x the CPU count, then 1x), a probe outside
-     as the desktop; bound of `containment-s2-weights.md`: ui p99 < 5 ms and
-     desktop p99 < 2 ms at 2x. Then 1x loops in a gate job (daemon scope) against
+     as the desktop; bound of `containment-s6-ui-stalls.md`: p95 < 1 ms and at
+     most 1 % of wake-ups over 10 ms, for ui and desktop, at 2x. Then 1x loops in a gate job (daemon scope) against
      1x loops of the agents scope: the gates scope's CPU share must win.
   4. Sandbox-like fallback: the env line pointed at a read-only directory
      leaves the shell in `ui` at nice 19, silently.
@@ -54,8 +54,11 @@ from lib import REPO_ROOT, Report, Sandbox, wait_until
 ROUND_SECONDS = 15  # hard cap of a load round
 PROBE_SECONDS = 12  # samples are taken while every loop is surely running
 PERIOD = 0.010  # probe wake-up period
-UI_P99_BOUND_US = 5000
-DESKTOP_P99_BOUND_US = 2000
+# Bounds from containment-s6-ui-stalls.md: a single-window p99 is decided by one
+# oversubscription stall that hits any sleeping task (the control probe too), so
+# judge the p95 and the share of samples over 10 ms instead.
+P95_BOUND_US = 1000
+OVER_10MS_MAX_SHARE = 0.01
 ABORT_US = 1_000_000  # desktop stall that aborts the run
 SESSION = "alpha-s9"
 NCPU = os.cpu_count() or 1
@@ -486,6 +489,9 @@ def phase_cpu(rep: Report, w: World, ui: Path, tools: Path, nums: dict) -> None:
     nums["idle"] = {"ui": stats(sink.get("ui", [])), "desktop": stats(sink.get("desktop", []))}
     print(f"   idle: ui {fmt(nums['idle']['ui'])}; desktop {fmt(nums['idle']['desktop'])}", flush=True)
 
+    def within(st: dict) -> bool:
+        return st["p95"] < P95_BOUND_US and st["over_10ms"] <= OVER_10MS_MAX_SHARE * max(st["n"], 1)
+
     def bounded(loops: int, name: str) -> tuple[dict, int]:
         tries = 0
         while True:
@@ -494,20 +500,20 @@ def phase_cpu(rep: Report, w: World, ui: Path, tools: Path, nums: dict) -> None:
             r = latency_round(rep, w, ui, tools, loops, label, nums)
             print(f"   {label}: ui {fmt(r['ui'])}; desktop {fmt(r['desktop'])}; "
                   f"other processes used {r['other_cpu_pct_of_machine']}% of the machine", flush=True)
-            if (r["ui"]["p99"] < UI_P99_BOUND_US and r["desktop"]["p99"] < DESKTOP_P99_BOUND_US) or tries == 3:
+            if (within(r["ui"]) and within(r["desktop"])) or tries == 3:
                 return r, tries
             time.sleep(3)
 
     loops2 = 2 * NCPU
     last, n2 = bounded(loops2, "2x")
-    rep.check(f"C: ui probe p99 < {UI_P99_BOUND_US // 1000} ms at 2x oversubscription ({loops2} loops on {NCPU} CPUs)",
-              last["ui"]["p99"] < UI_P99_BOUND_US, fmt(last["ui"]), attempts=n2)
-    rep.check(f"C: desktop probe p99 < {DESKTOP_P99_BOUND_US // 1000} ms at 2x oversubscription",
-              last["desktop"]["p99"] < DESKTOP_P99_BOUND_US, fmt(last["desktop"]), attempts=n2)
+    rep.check(f"C: ui probe p95 < 1 ms and <= 1% of wake-ups over 10 ms at 2x oversubscription ({loops2} loops on {NCPU} CPUs)",
+              within(last["ui"]), fmt(last["ui"]), attempts=n2)
+    rep.check("C: desktop probe p95 < 1 ms and <= 1% of wake-ups over 10 ms at 2x oversubscription",
+              within(last["desktop"]), fmt(last["desktop"]), attempts=n2)
     r1, n1 = bounded(NCPU, "1x")
-    rep.check(f"C: ui and desktop p99 within the same bounds at 1x ({NCPU} loops)",
-              r1["ui"]["p99"] < UI_P99_BOUND_US and r1["desktop"]["p99"] < DESKTOP_P99_BOUND_US,
-              f"ui {r1['ui']['p99']}us desktop {r1['desktop']['p99']}us", attempts=n1)
+    rep.check(f"C: ui and desktop within the same bounds at 1x ({NCPU} loops)",
+              within(r1["ui"]) and within(r1["desktop"]),
+              f"ui {fmt(r1['ui'])}; desktop {fmt(r1['desktop'])}", attempts=n1)
     rep.check("C: sanity: the idle probe itself wakes within 2 ms at p99",
               nums["idle"]["ui"]["p99"] < 2000, f"idle ui p99 {nums['idle']['ui']['p99']}us")
 
