@@ -69,11 +69,21 @@ about 2 ms). Never `AttachProcessesToUnit` from the shell: in the sandbox
   `memory.peak` per session.
 - Own policy on `sluice-agents.scope`, set at creation, only when
   `systemd-oomd` is active and systemd ≥ 257:
-  `ManagedOOMMemoryPressure=kill`, `ManagedOOMMemoryPressureLimit=30%`,
-  `ManagedOOMMemoryPressureDurationSec=5s` (must stay below the user
-  manager's limit and duration; config `[containment] memory_pressure_limit`,
-  `memory_pressure_duration`). S5 live T3 showed the kill lands on the
-  offending leaf inside the scope only.
+  `ManagedOOMMemoryPressure=kill` with a limit and duration DERIVED from the
+  policy that actually watches the user manager on this machine (vendors
+  differ: Ubuntu 50 %/20 s, Fedora raised it to 80 %; administrators can
+  change it): read the monitored ancestor's limit and duration (`systemctl
+  show user@UID.service -p ManagedOOMMemoryPressureLimit -p
+  ManagedOOMMemoryPressureDurationUSec`, falling back to `oomctl dump` and to
+  oomd's defaults 60 %/20 s from `oomd.conf`), then
+  `limit = min(30 %, 0.6 × ancestor limit)` and
+  `duration = min(5 s, ancestor duration / 4)`, never below 1 s. Config
+  `[containment] memory_pressure_limit` / `memory_pressure_duration` default
+  to `"auto"` (this rule) and accept an explicit value as an override. S5 live
+  T3 showed the kill lands on the offending leaf inside the scope only.
+  Principle: no absolute threshold is on by default; CPU uses weights
+  (proportions), memory pressure is a share of time, `pids.max` is a generous
+  safety cap. Users never have to tune values for their machine.
 - Opt-in per-session `memory_high`/`memory_max` in config; documented with the
   incident and only advised together with swap.
 - Never touch units Sluice did not create; `ManagedOOMPreference`/`MemoryLow`
@@ -115,8 +125,8 @@ sandbox_nice = 19              # layout B
 cpu_ceiling = ""               # e.g. "80%" of all CPUs; empty = none
 pids_max = 4096
 memory_policy = "oomd"         # "oomd" | "none"
-memory_pressure_limit = "30%"
-memory_pressure_duration = "5s"
+memory_pressure_limit = "auto"     # derived from the system's oomd policy (§4); or e.g. "30%"
+memory_pressure_duration = "auto"  # derived (§4); or e.g. "5s"
 memory_high = ""               # opt-in per session, e.g. "8G"
 memory_max = ""                # opt-in per session
 ```
