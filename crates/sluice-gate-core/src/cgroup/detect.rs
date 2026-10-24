@@ -252,6 +252,24 @@ impl Capabilities {
         cfg.memory_policy == MemoryPolicy::Oomd && self.oomd_policy_supported()
     }
 
+    /// The summary split as `sluice status` shows it: `("full", None)`,
+    /// `("partial", Some("memory, pids; cpu by nice"))` or
+    /// `("off", Some("<reason>"))`.
+    #[must_use]
+    pub fn level_detail(&self) -> (&'static str, Option<String>) {
+        let text = self.summary();
+        let detail = |level: &str| {
+            text.strip_prefix(&format!("containment: {level} ("))
+                .and_then(|r| r.strip_suffix(')'))
+                .map(str::to_owned)
+        };
+        match &self.outcome {
+            Outcome::Full => ("full", None),
+            Outcome::Partial { .. } => ("partial", detail("partial")),
+            Outcome::Off { .. } => ("off", detail("off")),
+        }
+    }
+
     /// `containment: full`, `containment: partial (memory, pids; cpu by nice)`
     /// or `containment: off (<reason>)`.
     #[must_use]
@@ -864,8 +882,41 @@ pub fn derive_pressure_policy(ancestor: &AncestorPolicy) -> PressurePolicy {
     }
 }
 
-/// Reads the system's policy (read-only: `systemctl show`, `oomctl dump`,
-/// `oomd.conf`) and applies the config overrides (`"auto"` derives).
+/// The policy `systemd-oomd` applies to the user manager on this machine
+/// (read-only: `systemctl show`, `oomctl dump`, `oomd.conf`, then the
+/// built-ins), the input of the derived thresholds.
+#[must_use]
+pub fn system_ancestor_policy(env: &EnvMap, uid: u32) -> AncestorPolicy {
+    let unit = format!("user@{uid}.service");
+    let show = systemd::show(
+        env,
+        &unit,
+        &[
+            "ManagedOOMMemoryPressureLimit",
+            "ManagedOOMMemoryPressureDurationUSec",
+        ],
+    )
+    .map(|m| {
+        ancestor_from_show(&format!(
+            "ManagedOOMMemoryPressureLimit={}\nManagedOOMMemoryPressureDurationUSec={}\n",
+            m.get("ManagedOOMMemoryPressureLimit")
+                .map_or("0", String::as_str),
+            m.get("ManagedOOMMemoryPressureDurationUSec")
+                .map_or("[not set]", String::as_str)
+        ))
+    })
+    .unwrap_or_default();
+    let manager_path = format!("/user.slice/user-{uid}.slice/user@{uid}.service");
+    let oomctl = parse_oomctl_dump(&systemd::oomctl_dump(env), &manager_path);
+    let conf = ["/etc/systemd/oomd.conf", "/usr/lib/systemd/oomd.conf"]
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+        .map_or((None, None), |t| parse_oomd_conf(&t));
+    resolve_ancestor_policy(&show, &oomctl, conf)
+}
+
+/// Reads the system's policy ([`system_ancestor_policy`]) and applies the
+/// config overrides (`"auto"` derives).
 ///
 /// # Errors
 ///
@@ -880,34 +931,7 @@ pub fn pressure_policy(
         if cfg.pressure_limit_override().is_some() && cfg.pressure_duration_override().is_some() {
             None
         } else {
-            let unit = format!("user@{uid}.service");
-            let show = systemd::show(
-                env,
-                &unit,
-                &[
-                    "ManagedOOMMemoryPressureLimit",
-                    "ManagedOOMMemoryPressureDurationUSec",
-                ],
-            )
-            .map(|m| {
-                ancestor_from_show(&format!(
-                    "ManagedOOMMemoryPressureLimit={}\nManagedOOMMemoryPressureDurationUSec={}\n",
-                    m.get("ManagedOOMMemoryPressureLimit")
-                        .map_or("0", String::as_str),
-                    m.get("ManagedOOMMemoryPressureDurationUSec")
-                        .map_or("[not set]", String::as_str)
-                ))
-            })
-            .unwrap_or_default();
-            let manager_path = format!("/user.slice/user-{uid}.slice/user@{uid}.service");
-            let oomctl = parse_oomctl_dump(&systemd::oomctl_dump(env), &manager_path);
-            let conf = ["/etc/systemd/oomd.conf", "/usr/lib/systemd/oomd.conf"]
-                .iter()
-                .find_map(|p| std::fs::read_to_string(p).ok())
-                .map_or((None, None), |t| parse_oomd_conf(&t));
-            Some(derive_pressure_policy(&resolve_ancestor_policy(
-                &show, &oomctl, conf,
-            )))
+            Some(derive_pressure_policy(&system_ancestor_policy(env, uid)))
         };
     let base = derived.unwrap_or(PressurePolicy {
         limit_percent: 30,

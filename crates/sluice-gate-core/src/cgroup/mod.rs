@@ -4,6 +4,7 @@
 //! - [`detect`]: what the machine allows (`Full`, `Partial`, `Off` with the
 //!   reason `doctor` prints) and the memory pressure policy derived from the
 //!   system's own `systemd-oomd` configuration.
+//! - [`explain`]: the intervention log and the once-only notes to the agent.
 //! - [`systemd`]: the only place that shells out to `busctl`, `systemctl` and
 //!   `oomctl` (like [`crate::git`] for git; no D-Bus library).
 //! - [`tree`]: the layout of `sluice.slice`, creation and pruning of session
@@ -16,6 +17,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub mod detect;
+pub mod explain;
 pub mod systemd;
 pub mod tree;
 

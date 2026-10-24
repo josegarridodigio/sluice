@@ -19,9 +19,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use sluice_gate_core::cgroup::detect::{self, Missing, OffReason, Outcome};
+use sluice_gate_core::cgroup::systemd;
 use sluice_gate_core::cgroup::tree::{Tree, TreeSettings, write_pid};
 use sluice_gate_core::cgroup::{CGROUP_MOUNT, Layout, PressurePolicy, session_dir_name};
 use sluice_gate_core::config::{EnvMap, UserConfig};
+use sluice_gate_daemon::containment::stopgap_holder_args;
 
 use crate::shim;
 
@@ -32,10 +34,6 @@ pub const LEAF_VAR: &str = "SLUICE_SESSION_LEAF";
 /// `<prefix>-agents.scope`), so tests never touch the real `sluice.slice`.
 /// It must start with `sluice-test-`. Not part of the user interface.
 pub const TEST_PREFIX_VAR: &str = "SLUICE_TEST_CONTAINMENT_PREFIX";
-
-/// How long the holder of a scope the hook had to create sleeps (one day).
-/// The scope ends with its last process, and the next session recreates it.
-const HOLDER_SLEEP: &str = "86400";
 
 /// The tree layout: standard, or the test prefix.
 #[must_use]
@@ -179,11 +177,26 @@ pub fn with_descendants(pid: u32) -> Vec<u32> {
     out
 }
 
-/// Starts a process that keeps a new agents scope alive; it is adopted by the
-/// scope and lives in the scope's `holder/` leaf. `None` when it cannot start.
+/// `true` when `/proc/<pid>/cgroup` is inside the unit `scope`.
+fn in_scope(pid: u32, scope: &str) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .ok()
+        .and_then(|t| detect::parse_proc_cgroup(&t))
+        .is_some_and(|p| p.split('/').any(|c| c == scope))
+}
+
+/// Starts a process that keeps a new agents scope alive until the sessions'
+/// own processes do; it is adopted by the scope and lives in the scope's
+/// `holder/` leaf. It is `sluice daemon holder --lifetime <secs>`, which ends
+/// by itself after `STOPGAP_LIFETIME_SECS` (the scope ends with its last
+/// process and the next session recreates it), so it never outlives its
+/// purpose whatever happens to the scope; the daemon retires it when it takes
+/// the scope over. `None` when it cannot start.
 fn spawn_holder() -> Option<std::process::Child> {
-    Command::new("sleep")
-        .arg(HOLDER_SLEEP)
+    Command::new("/proc/self/exe")
+        .arg0("sluice")
+        .args(stopgap_holder_args())
+        .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -236,9 +249,15 @@ pub fn contain_session(
 
     if !scope_there {
         let mut holder = spawn_holder();
-        let made = holder
-            .as_ref()
-            .is_some_and(|h| tree.ensure_agents_scope(h.id()).is_ok());
+        // Created is not enough: units with the same names may have been
+        // stopped moments ago (the scope can end up `failed`), so the scope
+        // must be active and the holder inside it, or the holder is killed
+        // and the session simply runs uncontained.
+        let made = holder.as_ref().is_some_and(|h| {
+            tree.ensure_agents_scope(h.id()).is_ok()
+                && systemd::is_unit_active(env, &layout.agents_scope, true)
+                && in_scope(h.id(), &layout.agents_scope)
+        });
         if !made && let Some(h) = holder.as_mut() {
             let _ = h.kill();
             let _ = h.wait();

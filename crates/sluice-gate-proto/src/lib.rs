@@ -728,6 +728,108 @@ pub struct StatusReport {
     /// older clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interventions: Option<Vec<Intervention>>,
+    /// Containment state of the machine (`full`, `partial`, `off`) and the
+    /// agents' CPU outside Sluice jobs. Absent from daemons without
+    /// containment support or started without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containment: Option<ContainmentInfo>,
+    /// Usage of the live agent sessions (from cgroupfs). Absent when
+    /// containment is not on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions: Option<Vec<SessionUsage>>,
+}
+
+/// Containment state in a status report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ContainmentInfo {
+    /// `full`, `partial` or `off`.
+    pub level: String,
+    /// What is missing (`partial`) or why it is off (`off`), as in
+    /// `containment: off (<detail>)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// CPU the agents' sessions used over the last sampling window, as a
+    /// percentage of all CPUs: CPU not spent in Sluice jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outside_jobs_cpu_percent: Option<f64>,
+    /// Length of that window in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_ms: Option<u64>,
+}
+
+/// Usage of one live agent session cgroup (`s-<id>`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SessionUsage {
+    /// Session id (the directory name without `s-`).
+    pub id: String,
+    /// CPU time used by the session since its cgroup was created, seconds.
+    pub cpu_seconds: f64,
+    /// `memory.current`, bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
+    /// `memory.peak`, bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_peak_bytes: Option<u64>,
+    /// `pids.current`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub procs: Option<u64>,
+}
+
+impl StatusReport {
+    /// The containment part of the text status: the `containment:` line,
+    /// the per-session lines, `outside jobs:` and `interventions:`. Empty
+    /// when the daemon reports none of them. Shared by `sluice status` and
+    /// the MCP `status` tool.
+    #[must_use]
+    pub fn containment_text(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        if let Some(c) = &self.containment {
+            let _ = match c.detail.as_deref().filter(|d| !d.is_empty()) {
+                Some(d) => writeln!(out, "containment: {} ({d})", c.level),
+                None => writeln!(out, "containment: {}", c.level),
+            };
+        }
+        for s in self.sessions.iter().flatten() {
+            let mem = s
+                .memory_bytes
+                .map_or_else(|| "n/a".to_owned(), |b| format!("{} MB", b / (1024 * 1024)));
+            let procs = s.procs.map_or_else(|| "n/a".to_owned(), |p| p.to_string());
+            let _ = writeln!(
+                out,
+                "  s-{}  cpu {:.1}s  mem {mem}  procs {procs}",
+                s.id, s.cpu_seconds
+            );
+        }
+        if let Some(p) = self
+            .containment
+            .as_ref()
+            .and_then(|c| c.outside_jobs_cpu_percent)
+        {
+            let _ = writeln!(out, "outside jobs: {p:.1}% CPU");
+        }
+        if let Some(rows) = self.interventions.as_ref().filter(|r| !r.is_empty()) {
+            let _ = writeln!(out, "interventions:");
+            for i in rows {
+                let session = i
+                    .session
+                    .as_deref()
+                    .map_or_else(|| "-".to_owned(), |s| format!("s-{s}"));
+                let detail = i
+                    .detail
+                    .as_deref()
+                    .map_or_else(String::new, |d| format!(" ({d})"));
+                let _ = writeln!(
+                    out,
+                    "  {}  {session}  {}  {}{detail}",
+                    i.at, i.leaf, i.cause
+                );
+            }
+        }
+        out
+    }
 }
 
 /// One kill of a process group of an agent session or a job by the kernel
@@ -1409,6 +1511,19 @@ mod tests {
                 leaf: "s-abc/tools".into(),
                 cause: "oom_kill".into(),
                 detail: None,
+            }]),
+            containment: Some(ContainmentInfo {
+                level: "partial".into(),
+                detail: Some("memory, pids; cpu by nice".into()),
+                outside_jobs_cpu_percent: Some(3.25),
+                window_ms: Some(10_000),
+            }),
+            sessions: Some(vec![SessionUsage {
+                id: "abc".into(),
+                cpu_seconds: 12.5,
+                memory_bytes: Some(432_013_312),
+                memory_peak_bytes: Some(500_000_000),
+                procs: Some(18),
             }]),
         }
     }

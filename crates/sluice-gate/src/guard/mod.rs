@@ -137,6 +137,24 @@ pub fn context_note(rewritten: &str, gate: Option<&str>) -> String {
     }
 }
 
+/// Appends, once per new intervention, the line telling the agent that
+/// Sluice stopped something in its own session (design section 5). Reads the
+/// small log file the daemon keeps (the guard never contacts the daemon) and
+/// the per-session marks of what was already told; silent on any problem.
+fn with_interventions(note: String, env: &EnvMap, session_id: Option<&str>) -> String {
+    use sluice_gate_core::cgroup::explain;
+    let events = explain::read_events(&explain::log_path(env));
+    if events.is_empty() {
+        return note;
+    }
+    let own = explain::own_cgroup();
+    match explain::take_note(env, &events, own.as_deref(), session_id) {
+        // One line: the hook's context note is a single line.
+        Some(extra) => format!("{note} {}", extra.replace('\n', " ")),
+        None => note,
+    }
+}
+
 fn deny(reason: &str) -> String {
     json!({
         "hookSpecificOutput": {
@@ -166,6 +184,7 @@ impl std::fmt::Debug for dyn World + '_ {
 }
 
 /// The hook's answer to `input`, or `None` for "no output".
+#[allow(clippy::too_many_lines)]
 pub fn respond(input: &str, inputs: &Inputs<'_>) -> Option<String> {
     let mode = Mode::from_env(inputs.env);
     if mode == Mode::Off {
@@ -262,7 +281,11 @@ pub fn respond(input: &str, inputs: &Inputs<'_>) -> Option<String> {
                     "Sluice rewrote this command to run through its shared CPU queue: {rewritten}"
                 ),
                 "updatedInput": Value::Object(updated),
-                "additionalContext": context_note(&rewritten, gate),
+                "additionalContext": with_interventions(
+                    context_note(&rewritten, gate),
+                    inputs.env,
+                    value.get("session_id").and_then(Value::as_str),
+                ),
             }
         })
         .to_string(),

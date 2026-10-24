@@ -429,6 +429,25 @@ fn result<T: Serialize>(
     Ok(r)
 }
 
+/// The line telling this session about interventions it has not heard of
+/// yet (design section 5), from `events` (the daemon's recent interventions
+/// or the log file). Marks them as told. Blocking: reads and writes small
+/// files.
+fn intervention_note(
+    env: &EnvMap,
+    events: &[sluice_gate_core::cgroup::explain::Event],
+) -> Option<String> {
+    let own = sluice_gate_core::cgroup::explain::own_cgroup();
+    sluice_gate_core::cgroup::explain::take_note(env, events, own.as_deref(), None)
+}
+
+/// The recorded interventions from the daemon's log file.
+fn logged_interventions(env: &EnvMap) -> Vec<sluice_gate_core::cgroup::explain::Event> {
+    sluice_gate_core::cgroup::explain::read_events(&sluice_gate_core::cgroup::explain::log_path(
+        env,
+    ))
+}
+
 /// Converts the shared run material into the protocol request (caller `agent`).
 fn to_request(m: RunMaterial) -> RunRequest {
     RunRequest {
@@ -1102,7 +1121,15 @@ impl Server {
             .iter()
             .any(|g| g.result.status == GateStatus::Cancelled && !g.early);
         let all_passed = !cancelled && lines.iter().all(|g| g.result.status == GateStatus::Pass);
-        let text = verify_text(&lines, cancelled);
+        let mut text = verify_text(&lines, cancelled);
+        let note_env = Arc::clone(&self.env);
+        let note = blocking(move || intervention_note(&note_env, &logged_interventions(&note_env)))
+            .await
+            .ok()
+            .flatten();
+        if let Some(note) = note {
+            let _ = write!(text, "\n{note}\n");
+        }
         let report = VerifyReport {
             repository: repo.paths.toplevel.clone(),
             results: lines.into_iter().map(|g| g.result).collect(),
@@ -1149,6 +1176,33 @@ impl Server {
             Some(r) => text::render_status(r, this_repo.as_deref()),
             None => "sluice: no daemon running\n".to_owned(),
         };
+        if let Some(r) = &report {
+            let mut events: Vec<sluice_gate_core::cgroup::explain::Event> = r
+                .interventions
+                .iter()
+                .flatten()
+                .map(|i| sluice_gate_core::cgroup::explain::Event {
+                    at: i.at.clone(),
+                    session: i.session.clone(),
+                    leaf: i.leaf.clone(),
+                    cause: i.cause.clone(),
+                    detail: i.detail.clone(),
+                })
+                .collect();
+            let note_env = Arc::clone(&self.env);
+            // The daemon's recent rows and the log file it keeps (the same
+            // interventions; each is told once by its identity).
+            if let Some(note) = blocking(move || {
+                events.extend(logged_interventions(&note_env));
+                intervention_note(&note_env, &events)
+            })
+            .await
+            .ok()
+            .flatten()
+            {
+                let _ = write!(out, "\n{note}\n");
+            }
+        }
         let mut value = match &report {
             Some(r) => serde_json::to_value(r).map_err(|e| internal(e.to_string()))?,
             None => serde_json::json!({"schema": STATUS_SCHEMA_VERSION, "daemon": null}),

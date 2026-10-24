@@ -198,6 +198,7 @@ fn render(r: &StatusReport, log_path: &Path, socket_fallback: Option<&str>) -> S
                 .map_or_else(String::new, |n| format!(", {n} over-admitted"))
         );
     }
+    out.push_str(&r.containment_text());
     out
 }
 
@@ -324,6 +325,46 @@ mod tests {
         assert!(text.contains("(budget: lane)  expected 12.0s"), "{text}");
         assert!(
             text.contains("waiting:  1m00s with jobs queued, 6.0s of it CPU-idle, 2 over-admitted"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn render_shows_containment_sessions_and_interventions() {
+        use sluice_gate_proto::{ContainmentInfo, Intervention, SessionUsage};
+        let mut r = StatusReport::default();
+        let plain = render(&r, Path::new("/l"), None);
+        assert!(!plain.contains("containment"), "{plain}");
+        r.containment = Some(ContainmentInfo {
+            level: "full".into(),
+            outside_jobs_cpu_percent: Some(12.34),
+            ..ContainmentInfo::default()
+        });
+        r.sessions = Some(vec![SessionUsage {
+            id: "7f3a".into(),
+            cpu_seconds: 61.25,
+            memory_bytes: Some(900 * 1024 * 1024),
+            procs: Some(31),
+            ..SessionUsage::default()
+        }]);
+        r.interventions = Some(vec![Intervention {
+            at: "2026-10-24T10:00:00Z".into(),
+            session: Some("7f3a".into()),
+            leaf: "s-7f3a/tools".into(),
+            cause: "oomd_memory_pressure".into(),
+            detail: None,
+        }]);
+        let text = render(&r, Path::new("/l"), None);
+        assert!(text.contains("containment: full\n"), "{text}");
+        assert!(
+            text.contains("  s-7f3a  cpu 61.2s  mem 900 MB  procs 31\n"),
+            "{text}"
+        );
+        assert!(text.contains("outside jobs: 12.3% CPU\n"), "{text}");
+        assert!(
+            text.contains(
+                "interventions:\n  2026-10-24T10:00:00Z  s-7f3a  s-7f3a/tools  oomd_memory_pressure\n"
+            ),
             "{text}"
         );
     }

@@ -30,6 +30,16 @@ pub struct TestTree {
 impl TestTree {
     /// The tree with its agents scope, or `None` (after printing why).
     pub fn new() -> Option<Self> {
+        Self::build(true)
+    }
+
+    /// The tree without its agents scope: the session hook has to create it
+    /// (and its stopgap holder) itself.
+    pub fn bare() -> Option<Self> {
+        Self::build(false)
+    }
+
+    fn build(with_scope: bool) -> Option<Self> {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let env = process_env();
         let caps = detect::detect(&env);
@@ -59,8 +69,10 @@ impl TestTree {
             runtime_dir,
             kids: Vec::new(),
         };
-        let holder = this.sleeper().id();
-        this.tree.ensure_agents_scope(holder).expect("agents scope");
+        if with_scope {
+            let holder = this.sleeper().id();
+            this.tree.ensure_agents_scope(holder).expect("agents scope");
+        }
         Some(this)
     }
 
@@ -120,7 +132,109 @@ impl Drop for TestTree {
             let _ = c.kill();
             let _ = c.wait();
         }
+        // Whatever is still in the test's own tree now outlived its unit.
+        let left = kill_leftovers(&self.layout);
+        if !left.is_empty() {
+            eprintln!(
+                "cleanup: processes outlived {}: {left:?}",
+                self.layout.slice
+            );
+        }
     }
+}
+
+/// Every `(cgroup dir, pid)` listed in `cgroup.procs` of `root` and its
+/// descendants.
+pub fn procs_under(root: &Path) -> Vec<(PathBuf, u32)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if let Ok(text) = fs::read_to_string(dir.join("cgroup.procs")) {
+            out.extend(
+                text.lines()
+                    .filter_map(|l| l.trim().parse::<u32>().ok())
+                    .map(|p| (dir.clone(), p)),
+            );
+        }
+        if let Ok(entries) = fs::read_dir(&dir) {
+            stack.extend(
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                    .map(|e| e.path()),
+            );
+        }
+    }
+    out
+}
+
+/// `true` for a zombie (it only waits for its parent; nothing to kill).
+fn is_zombie(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|t| {
+            t.rfind(')')
+                .map(|i| t[i + 1..].trim_start().starts_with('Z'))
+        })
+        .unwrap_or(true)
+}
+
+/// The command line of a process, words joined by spaces.
+pub fn cmdline_of(pid: u32) -> String {
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|b| {
+            String::from_utf8_lossy(&b)
+                .trim_end_matches('\0')
+                .replace('\0', " ")
+        })
+        .unwrap_or_default()
+}
+
+/// Kills (SIGKILL) the live processes left in the test's own tree (only a
+/// layout named `sluice-test-*` is ever touched, and only paths below its
+/// slice directory) and waits for them to go. Returns what it had to kill as
+/// `"<pid> <command line>"`.
+pub fn kill_leftovers(layout: &Layout) -> Vec<String> {
+    assert!(
+        layout.slice.starts_with("sluice-test-"),
+        "never clean up a production tree: {}",
+        layout.slice
+    );
+    let root = layout.slice_dir();
+    let mut killed = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let alive: Vec<u32> = procs_under(&root)
+            .into_iter()
+            .map(|(_, p)| p)
+            .filter(|p| !is_zombie(*p))
+            .collect();
+        if alive.is_empty() || Instant::now() >= deadline {
+            return killed;
+        }
+        for pid in alive {
+            let line = format!("{pid} {}", cmdline_of(pid));
+            if let Ok(raw) = i32::try_from(pid) {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(raw),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            if !killed.contains(&line) {
+                killed.push(line);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Live processes still in the test's tree (nothing is killed).
+pub fn live_leftovers(layout: &Layout) -> Vec<String> {
+    procs_under(&layout.slice_dir())
+        .into_iter()
+        .filter(|(_, p)| !is_zombie(*p))
+        .map(|(d, p)| format!("{p} {} in {}", cmdline_of(p), d.display()))
+        .collect()
 }
 
 /// `/proc/<pid>/cgroup` without the `0::` prefix.

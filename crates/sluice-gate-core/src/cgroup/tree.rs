@@ -520,6 +520,18 @@ impl Tree {
                     std::io::Error::new(std::io::ErrorKind::NotFound, "cgroup did not appear"),
                 ));
             }
+            // The manager creates the cgroup first and attaches the process
+            // after: moving it into its leaf before that attach would let the
+            // manager pull it back into the scope's root, where the "no
+            // internal processes" rule then refuses the controllers (EBUSY).
+            let procs = scope_dir.join("cgroup.procs");
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline
+                && !fs::read_to_string(&procs)
+                    .is_ok_and(|t| t.lines().any(|l| l.trim().parse::<u32>() == Ok(pid)))
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
         let leaf = scope_dir.join(first_leaf);
         make_dir(&leaf)?;

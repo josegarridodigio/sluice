@@ -22,9 +22,12 @@ use std::time::{Duration, Instant};
 
 use sluice_gate_core::cgroup::detect::{self, PressurePolicy};
 use sluice_gate_core::cgroup::systemd;
-use sluice_gate_core::cgroup::tree::{Layout, PruneReport, Tree, TreeSettings, write_pid};
+use sluice_gate_core::cgroup::tree::{
+    Layout, PruneReport, Tree, TreeSettings, read_usage, write_pid,
+};
 use sluice_gate_core::cgroup::{CGROUP_MOUNT, CgroupError};
 use sluice_gate_core::config::{ContainmentConfig, EnvMap};
+use sluice_gate_proto as proto;
 
 use crate::interventions::{InterventionRow, MemoryWatcher, parse_oomd_journal, watch_targets};
 use crate::reaper::ReaperCommand;
@@ -63,6 +66,18 @@ pub struct Containment {
     holder: Mutex<Option<Child>>,
     watcher: Mutex<MemoryWatcher>,
     journal: Mutex<JournalState>,
+    /// `full` or `partial`, with what is missing, for `status`.
+    level: &'static str,
+    detail: Option<String>,
+    cpu: Mutex<CpuWindow>,
+}
+
+/// The agents scope's CPU over the last two samples.
+#[derive(Debug, Default)]
+struct CpuWindow {
+    last: Option<(Instant, u64)>,
+    /// `(percent of all CPUs, window length in ms)`.
+    percent: Option<(f64, u64)>,
 }
 
 #[derive(Debug, Default)]
@@ -104,14 +119,27 @@ impl Containment {
     /// runs as in 0.4.1.
     #[must_use]
     pub fn start(setup: &ContainmentSetup, cfg: &ContainmentConfig) -> Option<Self> {
+        Self::start_reporting(setup, cfg).ok()
+    }
+
+    /// Same as [`Containment::start`], but says why containment is off
+    /// (the text shown as `containment: off (<reason>)`).
+    ///
+    /// # Errors
+    ///
+    /// The reason containment is not on.
+    pub fn start_reporting(
+        setup: &ContainmentSetup,
+        cfg: &ContainmentConfig,
+    ) -> Result<Self, String> {
         if !cfg.enabled {
             tracing::debug!("containment disabled by [containment] enabled = false");
-            return None;
+            return Err("disabled by [containment] enabled = false".to_owned());
         }
         let caps = detect::detect(&setup.env);
         if !caps.usable() {
             tracing::info!("{}; the daemon runs as without containment", caps.summary());
-            return None;
+            return Err(caps.level_detail().1.unwrap_or_default());
         }
         let uid = caps.facts.uid;
         let pressure = if caps.oomd_policy_enabled(cfg) {
@@ -145,7 +173,7 @@ impl Containment {
             tracing::warn!(
                 "containment: cannot place the daemon ({e}); running as without containment"
             );
-            return None;
+            return Err(format!("cannot place the daemon: {e}"));
         }
         let (holder, agents_ready) = match spawn_holder(&setup.holder) {
             Ok(child) => {
@@ -185,7 +213,12 @@ impl Containment {
                 "unavailable"
             }
         );
-        Some(Self {
+        let (mut level, mut detail) = caps.level_detail();
+        if !agents_ready && level == "full" {
+            level = "partial";
+            detail = Some("agents scope unavailable".to_owned());
+        }
+        Ok(Self {
             tree,
             exe: setup.exe.clone(),
             agents_ready,
@@ -193,7 +226,53 @@ impl Containment {
             holder: Mutex::new(holder),
             watcher: Mutex::new(MemoryWatcher::new()),
             journal: Mutex::new(JournalState::default()),
+            level,
+            detail,
+            cpu: Mutex::new(CpuWindow::default()),
         })
+    }
+
+    /// Takes one CPU sample of the agents scope (the daemon calls it every
+    /// tick): the CPU the agents used since the previous sample, which no
+    /// Sluice job spent (jobs live in the daemon scope), as a percentage of
+    /// `cpus` CPUs.
+    pub fn sample(&self, cpus: u32) {
+        let Some(usec) = read_usage(&self.tree.layout.agents_scope_dir()).cpu_usec else {
+            return;
+        };
+        let now = Instant::now();
+        let mut w = lock(&self.cpu);
+        if let Some((then, before)) = w.last {
+            let wall = now.duration_since(then);
+            if let Some(percent) = window_percent(before, usec, wall, cpus) {
+                let ms = u64::try_from(wall.as_millis()).unwrap_or(u64::MAX);
+                w.percent = Some((percent, ms));
+            }
+        }
+        w.last = Some((now, usec));
+    }
+
+    /// The containment state and the live sessions for the `status` reply.
+    #[must_use]
+    pub fn status(&self) -> (proto::ContainmentInfo, Vec<proto::SessionUsage>) {
+        let (percent, window) = match lock(&self.cpu).percent {
+            Some((p, ms)) => (Some((p * 10.0).round() / 10.0), Some(ms)),
+            None => (None, None),
+        };
+        let info = proto::ContainmentInfo {
+            level: self.level.to_owned(),
+            detail: self.detail.clone(),
+            outside_jobs_cpu_percent: percent,
+            window_ms: window,
+        };
+        (info, self.sessions())
+    }
+
+    /// Usage of the live session cgroups (`s-*` under the agents scope that
+    /// still hold a process), by name.
+    #[must_use]
+    pub fn sessions(&self) -> Vec<proto::SessionUsage> {
+        session_usages(&self.tree.layout.agents_scope_dir())
     }
 
     /// The tree (unit names and directories).
@@ -313,10 +392,86 @@ impl Containment {
     }
 }
 
-/// The stopgap holder the session hook starts when it has to create the
-/// agents scope before any daemon runs: `sleep 86400`.
+/// CPU used between two readings of `usage_usec`, as a percentage of `cpus`
+/// CPUs over `wall`. `None` for a zero window or a counter that went back.
+#[must_use]
+pub fn window_percent(before_usec: u64, after_usec: u64, wall: Duration, cpus: u32) -> Option<f64> {
+    let wall_us = u64::try_from(wall.as_micros()).unwrap_or(u64::MAX);
+    if wall_us == 0 || after_usec < before_usec {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let percent =
+        (after_usec - before_usec) as f64 * 100.0 / (wall_us as f64 * f64::from(cpus.max(1)));
+    Some(percent)
+}
+
+/// Usage of every `s-*` session cgroup below `scope` that holds a process
+/// (cgroups with `pids.current = 0` are waiting to be pruned), sorted by name.
+#[must_use]
+pub fn session_usages(scope: &Path) -> Vec<proto::SessionUsage> {
+    let Ok(entries) = std::fs::read_dir(scope) else {
+        return Vec::new();
+    };
+    let mut out: Vec<proto::SessionUsage> = entries
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let id = name.strip_prefix("s-")?.to_owned();
+            let usage = read_usage(&e.path());
+            if usage.pids_current == Some(0) {
+                return None;
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let cpu_seconds = usage.cpu_usec.unwrap_or(0) as f64 / 1_000_000.0;
+            Some(proto::SessionUsage {
+                id,
+                cpu_seconds,
+                memory_bytes: usage.memory_current,
+                memory_peak_bytes: usage.memory_peak,
+                procs: usage.pids_current,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// How long the stopgap holder lives (seconds). The agents scope needs a
+/// live process to be created; after that the sessions' own processes (the
+/// agent in `ui`) keep it alive, so the holder only bridges the first
+/// moments. A bounded life means a holder can never outlive its purpose (it
+/// leaked from a test once, as a `sleep 86400`).
+pub const STOPGAP_LIFETIME_SECS: u64 = 600;
+
+/// Arguments (after the executable) of the stopgap holder the session hook
+/// starts when it has to create the agents scope before any daemon runs:
+/// `sluice daemon holder --lifetime <secs>`.
+#[must_use]
+pub fn stopgap_holder_args() -> [String; 4] {
+    [
+        "daemon".to_owned(),
+        "holder".to_owned(),
+        "--lifetime".to_owned(),
+        STOPGAP_LIFETIME_SECS.to_string(),
+    ]
+}
+
+/// The stopgap holder of the session hook: `sluice daemon holder --lifetime
+/// <secs>` (arg0 `sluice`), or the `sleep 86400` an earlier build used.
 fn is_stopgap_holder(cmdline: &[u8]) -> bool {
-    cmdline == b"sleep\x0086400\x00"
+    if cmdline == b"sleep\x0086400\x00" {
+        return true;
+    }
+    let Some(body) = cmdline.strip_suffix(b"\x00") else {
+        return false;
+    };
+    let parts: Vec<&[u8]> = body.split(|b| *b == 0).collect();
+    matches!(
+        parts.as_slice(),
+        [_, b"daemon", b"holder", b"--lifetime", secs]
+            if !secs.is_empty() && secs.iter().all(u8::is_ascii_digit)
+    )
 }
 
 /// With the daemon up, its own holder owns the agents scope: ends the hook's
@@ -346,11 +501,64 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_stopgap_holder;
+    use super::{is_stopgap_holder, session_usages, window_percent};
+    use std::time::Duration;
 
     #[test]
-    fn only_the_hooks_sleep_is_a_stopgap_holder() {
+    fn outside_jobs_cpu_is_a_share_of_all_cpus() {
+        // 2 CPU-seconds in 10 s on 4 CPUs: 5 %.
+        let p = window_percent(1_000_000, 3_000_000, Duration::from_secs(10), 4).unwrap();
+        assert!((p - 5.0).abs() < 1e-9, "{p}");
+        assert_eq!(window_percent(5, 4, Duration::from_secs(1), 4), None);
+        assert_eq!(window_percent(1, 2, Duration::ZERO, 4), None);
+        // Zero CPUs never divide by zero.
+        assert!(window_percent(0, 1_000_000, Duration::from_secs(1), 0).is_some());
+    }
+
+    #[test]
+    fn live_sessions_are_read_from_their_cgroup_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |session: &str, procs: &str| {
+            let d = dir.path().join(session);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("cpu.stat"), "usage_usec 12500000\nuser_usec 1\n").unwrap();
+            std::fs::write(d.join("memory.current"), "432013312\n").unwrap();
+            std::fs::write(d.join("memory.peak"), "500000000\n").unwrap();
+            std::fs::write(d.join("pids.current"), format!("{procs}\n")).unwrap();
+        };
+        write("s-bbb", "18");
+        write("s-aaa", "3");
+        write("s-empty", "0");
+        std::fs::create_dir_all(dir.path().join("holder")).unwrap();
+        let sessions = session_usages(dir.path());
+        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["aaa", "bbb"],
+            "the empty session and holder/ are left out"
+        );
+        assert!((sessions[0].cpu_seconds - 12.5).abs() < 1e-9);
+        assert_eq!(sessions[1].memory_bytes, Some(432_013_312));
+        assert_eq!(sessions[1].memory_peak_bytes, Some(500_000_000));
+        assert_eq!(sessions[1].procs, Some(18));
+        assert_eq!(session_usages(&dir.path().join("missing")).len(), 0);
+    }
+
+    #[test]
+    fn only_the_hooks_holder_is_a_stopgap_holder() {
         assert!(is_stopgap_holder(b"sleep\x0086400\x00"));
+        assert!(is_stopgap_holder(
+            b"sluice\x00daemon\x00holder\x00--lifetime\x00600\x00"
+        ));
+        assert!(!is_stopgap_holder(
+            b"sluice\x00daemon\x00holder\x00--lifetime\x00x\x00"
+        ));
+        let mut line = b"sluice\x00".to_vec();
+        for a in &super::stopgap_holder_args() {
+            line.extend_from_slice(a.as_bytes());
+            line.push(0);
+        }
+        assert!(is_stopgap_holder(&line));
         assert!(!is_stopgap_holder(b"sleep\x00600\x00"));
         assert!(!is_stopgap_holder(b"sluice\x00daemon\x00holder\x00"));
         assert!(!is_stopgap_holder(b""));

@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `sluice status` shows `containment: full|partial (...)|off (<reason>)`, one
+  line per live agent session (`s-<id>  cpu  mem  procs`, from cgroupfs),
+  `outside jobs: <x>% CPU` (the agents' CPU over the last sampling window) and
+  the last interventions. `status --json` gains the optional `containment`,
+  `sessions[]` and `interventions[]` (schema 1, additive).
+- `sluice doctor` gains the `containment` group (cgroup v2, user manager, own
+  cgroup, delegated controllers by `cpu.weight` presence, `systemd-oomd` and
+  the derived memory thresholds, cgroupfs writable) and the `session` check
+  (where this shell and the agent are, and why).
+- The agent is told once about an intervention in its own session: the MCP
+  `verify` and `status` results and the guard's context note append a short
+  line. The daemon keeps `interventions.jsonl` for the guard.
+
 - `[containment]` table of the user config (ADR-0017): weights, `pids_max`,
   optional CPU ceiling, `memory_policy`, `memory_pressure_limit` and
   `memory_pressure_duration` (`"auto"` derives them from the system's
@@ -46,9 +59,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `interventions` table (`containment_schema`, additive) and reports them in
   the `status` reply as an optional `interventions` field (protocol 1).
 
-### Changed
-
 ### Fixed
+
+- The session hook's stopgap holder is `sluice daemon holder --lifetime 600`
+  instead of `sleep 86400`: it ends by itself, when its scope is no longer
+  active, or when no scope adopted it; the hook verifies the scope is active
+  and holds the holder, else kills it and fails open. A holder once stayed
+  alive inside a dead scope.
+- `plugin/hooks/test-session-start.sh` ran the real binary against the
+  developer's real user manager; it now uses an empty runtime directory.
 
 ## [0.4.1] - 2026-10-23
 

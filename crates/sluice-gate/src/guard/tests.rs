@@ -1511,3 +1511,47 @@ fn approval_is_found_through_quotes_paths_and_wrappers() {
         assert!(!matcher::runs_approve(cmd), "{cmd}");
     }
 }
+
+/// Containment (C5): a heavy rewrite carries, once, the line about an
+/// intervention in the caller's own session (matched by the hook's
+/// `session_id`), and never one about another session.
+#[test]
+fn the_context_note_tells_about_an_intervention_of_the_session_once() {
+    let fx = Fx::new();
+    let state = fx.path("home/.local/state/sluice");
+    fs::create_dir_all(&state).unwrap();
+    let at = humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string();
+    let event = |session: &str, cause: &str| {
+        json!({"at": at, "session": session, "leaf": format!("s-{session}/tools"), "cause": cause})
+            .to_string()
+    };
+    fs::write(
+        state.join("interventions.jsonl"),
+        format!(
+            "{}\n{}\n",
+            event("s", "oomd_memory_pressure"),
+            event("other", "oom_kill")
+        ),
+    )
+    .unwrap();
+    let note = |fx: &Fx| -> String {
+        let out = fx
+            .respond_raw(&fx.input("repo", "make", BYPASS), &[])
+            .expect("a rewrite");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let first = note(&fx);
+    assert!(
+        first.contains("Sluice stopped s-s/tools in your session at"),
+        "{first}"
+    );
+    assert!(first.contains("systemd-oomd, memory pressure"), "{first}");
+    assert!(!first.contains("s-other"), "{first}");
+    assert!(!first.contains('\n'), "one line: {first}");
+    let second = note(&fx);
+    assert!(!second.contains("Sluice stopped"), "told once: {second}");
+}

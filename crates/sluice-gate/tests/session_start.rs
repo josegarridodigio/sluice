@@ -465,3 +465,59 @@ fn where_cpu_cannot_be_weighted_the_line_only_renices() {
         "19"
     );
 }
+
+/// The leak the lead found: the hook's stopgap holder must never outlive its
+/// scope or the test. The hook creates the scope (and a bounded
+/// `sluice daemon holder --lifetime` inside `holder/`); after the tree is
+/// dropped nothing may be left under the test's prefix.
+#[test]
+fn the_hooks_stopgap_holder_is_bounded_and_leaves_nothing_behind() {
+    let Some(mut tree) = TestTree::bare() else {
+        return;
+    };
+    let layout = tree.layout.clone();
+    let sb = Sandbox::standard();
+    let (agent, _) = tree.fake_agent();
+    context(&contained_hook(&sb, &tree, "sess-leak", agent));
+    let holders: Vec<String> = common::cgtree::procs_under(&layout.holder_dir())
+        .into_iter()
+        .map(|(_, p)| common::cgtree::cmdline_of(p))
+        .collect();
+    assert_eq!(
+        holders,
+        vec![format!(
+            "sluice {}",
+            sluice_gate_daemon::containment::stopgap_holder_args().join(" ")
+        )],
+        "the stopgap is the bounded holder, not a bare sleep"
+    );
+    drop(tree);
+    let left = common::cgtree::live_leftovers(&layout);
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// The stopgap holder ends by itself at the end of its lifetime.
+#[test]
+fn a_stopgap_holder_exits_when_its_lifetime_is_over() {
+    let sb = Sandbox::standard();
+    let mut child = StdCommand::new(Sandbox::binary())
+        .args(["daemon", "holder", "--lifetime", "1"])
+        .env_clear()
+        .envs(sb.env())
+        .stdin(Stdio::null())
+        .spawn()
+        .expect("holder starts");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "{status:?}");
+            return;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the holder outlived its lifetime");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

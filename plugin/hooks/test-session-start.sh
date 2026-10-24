@@ -130,10 +130,14 @@ if [ -z "$BIN" ]; then
 fi
 if [ -n "$BIN" ] && "$BIN" agent session-start --help >/dev/null 2>&1; then
     echo "== real binary ($BIN)"
-    mkdir -p "$TMP/real/bin" "$TMP/real/dir"
+    # A private, empty runtime directory: without it the real binary would
+    # find the developer's systemd user manager (/run/user/UID) and create or
+    # touch real cgroups and holder processes. There is no manager here, so
+    # containment is off and nothing outside this script's TMP is touched.
+    mkdir -p "$TMP/real/bin" "$TMP/real/dir" "$TMP/real/run"
     ln -s "$BIN" "$TMP/real/bin/sluice"
     out=$(printf '{"cwd":"%s","source":"startup"}' "$TMP/real/dir" |
-        env -i PATH="$TMP/real/bin:$NOSLUICE_PATH" HOME="$TMP/real/home" XDG_STATE_HOME="$TMP/real/state" \
+        env -i PATH="$TMP/real/bin:$NOSLUICE_PATH" HOME="$TMP/real/home" XDG_STATE_HOME="$TMP/real/state" XDG_RUNTIME_DIR="$TMP/real/run" \
             CLAUDE_ENV_FILE="$TMP/real/env.sh" sh "$HOOK" 2>/dev/null)
     RC=$?
     expect "end to end outside git" "not a git repository"

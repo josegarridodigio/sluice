@@ -457,9 +457,14 @@ enum DaemonCommand {
     },
     /// Internal: the holder process of `sluice-agents.scope` (containment). It
     /// blocks reading its stdin, which the daemon keeps open, and exits when
-    /// the daemon is gone.
+    /// the daemon is gone. With `--lifetime` (the session hook's stopgap when
+    /// no daemon runs) it ignores stdin and exits after that many seconds.
     #[command(hide = true)]
-    Holder,
+    Holder {
+        /// Exit after this many seconds instead of following the daemon.
+        #[arg(long, value_name = "SECONDS")]
+        lifetime: Option<u64>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -561,9 +566,9 @@ fn main() -> ExitCode {
             ..
         } => daemon_cmd::reaper(detach),
         Command::Daemon {
-            command: Some(DaemonCommand::Holder),
+            command: Some(DaemonCommand::Holder { lifetime }),
             ..
-        } => daemon_cmd::holder(),
+        } => daemon_cmd::holder(lifetime),
         Command::Doctor { json, bundle } => doctor::run(&doctor::DoctorArgs { json, bundle }),
         Command::Daemon {
             foreground,

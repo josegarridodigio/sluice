@@ -363,6 +363,9 @@ struct Shared {
     reaper: Option<Reaper>,
     /// The daemon's cgroups, when containment is on and available.
     containment: Option<Containment>,
+    /// Why containment is off, when it was configured but is not running
+    /// (shown by `status`; `None` when it runs or was never set up).
+    containment_off: Option<String>,
 }
 
 /// Extensions after start-up.
@@ -761,14 +764,23 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
     // Containment first, so the reaper (and every job) is born in the
     // daemon's cgroup. Detection and unit creation shell out to `systemctl`
     // and `busctl`: off the async threads.
-    let containment = match config.containment.clone() {
+    let (containment, containment_off) = match config.containment.clone() {
         Some(setup) => {
             let cfg = config.user.containment.clone();
-            tokio::task::spawn_blocking(move || Containment::start(&setup, &cfg))
+            match tokio::task::spawn_blocking(move || Containment::start_reporting(&setup, &cfg))
                 .await
-                .unwrap_or(None)
+            {
+                Ok(Ok(c)) => (Some(c), None),
+                Ok(Err(reason)) => (None, Some(reason)),
+                Err(_) => (None, Some("containment start-up failed".to_owned())),
+            }
         }
-        None => None,
+        // `enabled = false` leaves no setup at all.
+        None if !config.user.containment.enabled => (
+            None,
+            Some("disabled by [containment] enabled = false".to_owned()),
+        ),
+        None => (None, None),
     };
     let reaper = start_reaper(&config);
     if let (Some(c), Some(pid)) = (&containment, reaper.as_ref().and_then(Reaper::pid)) {
@@ -802,6 +814,7 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
         next_conn: AtomicU64::new(1),
         reaper,
         containment,
+        containment_off,
         config,
     });
     prune_logs(&shared);
@@ -1129,9 +1142,25 @@ fn containment_tick(shared: &Shared, prune: bool) {
             );
         }
     }
+    c.sample(shared.cpus);
     for row in c.collect_interventions(now_ms()) {
         let new = shared.store("recording an intervention", |s| s.record_intervention(&row));
         if new == Some(true) {
+            // The file the guard and the MCP server read to tell the agent
+            // (they never ask the daemon, and the guard may not).
+            if let Some(dir) = shared.config.db_path.parent() {
+                let event = sluice_gate_core::cgroup::explain::Event {
+                    at: rfc3339(row.at_ms),
+                    session: row.session.clone(),
+                    leaf: row.leaf.clone(),
+                    cause: row.cause.clone(),
+                    detail: row.detail.clone(),
+                };
+                sluice_gate_core::cgroup::explain::append_event(
+                    &dir.join(sluice_gate_core::cgroup::explain::LOG_FILE),
+                    &event,
+                );
+            }
             tracing::warn!(
                 session = row.session.as_deref().unwrap_or("-"),
                 leaf = %row.leaf,
@@ -2246,6 +2275,21 @@ fn status_report(shared: &Shared) -> StatusReport {
             u.waiting_wall_ms(),
         )
     };
+    let (containment, sessions) = match (&shared.containment, &shared.containment_off) {
+        (Some(c), _) => {
+            let (info, sessions) = c.status();
+            (Some(info), Some(sessions))
+        }
+        (None, Some(reason)) => (
+            Some(proto::ContainmentInfo {
+                level: "off".to_owned(),
+                detail: Some(reason.clone()).filter(|r| !r.is_empty()),
+                ..proto::ContainmentInfo::default()
+            }),
+            None,
+        ),
+        (None, None) => (None, None),
+    };
     let mut totals = shared
         .store("reading totals", |s| s.totals(None))
         .unwrap_or_default();
@@ -2277,6 +2321,8 @@ fn status_report(shared: &Shared) -> StatusReport {
         totals,
         queue: None,
         interventions: recent_interventions(shared),
+        containment,
+        sessions,
     }
 }
 

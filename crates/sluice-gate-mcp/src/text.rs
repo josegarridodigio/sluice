@@ -179,6 +179,7 @@ pub(crate) fn render_status(r: &StatusReport, this_repo: Option<&Path>) -> Strin
         t.coalesced,
         dur(t.time_saved_ms)
     );
+    out.push_str(&r.containment_text());
     out
 }
 

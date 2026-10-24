@@ -77,6 +77,8 @@ fn report() -> StatusReport {
         },
         queue: None,
         interventions: None,
+        containment: None,
+        sessions: None,
     }
 }
 
@@ -242,4 +244,107 @@ fn weight_effective_and_auto_are_additive_optional_fields() {
     let old: StatusReport = serde_json::from_str(FIXTURE).unwrap();
     assert_eq!(old.running[0].weight_auto, None);
     assert_eq!(STATUS_SCHEMA_VERSION, 1);
+}
+
+/// Containment (C5): `containment`, `sessions` and `interventions` are
+/// optional and additive; schema 1 is unchanged and old reports still parse.
+#[test]
+fn containment_fields_are_additive_optional_fields() {
+    use sluice_gate_proto::{ContainmentInfo, Intervention, SessionUsage};
+    let mut with = report();
+    with.containment = Some(ContainmentInfo {
+        level: "partial".into(),
+        detail: Some("memory, pids; cpu by nice".into()),
+        outside_jobs_cpu_percent: Some(3.5),
+        window_ms: Some(10_000),
+    });
+    with.sessions = Some(vec![SessionUsage {
+        id: "abc".into(),
+        cpu_seconds: 12.5,
+        memory_bytes: Some(432_013_312),
+        memory_peak_bytes: None,
+        procs: Some(18),
+    }]);
+    with.interventions = Some(vec![Intervention {
+        at: "2026-10-24T10:00:00Z".into(),
+        session: Some("abc".into()),
+        leaf: "s-abc/tools".into(),
+        cause: "oom_kill".into(),
+        detail: None,
+    }]);
+    let mut actual = serde_json::to_value(&with).unwrap();
+    let o = actual.as_object_mut().unwrap();
+    assert_eq!(
+        o.remove("containment").unwrap(),
+        serde_json::json!({
+            "level": "partial",
+            "detail": "memory, pids; cpu by nice",
+            "outside_jobs_cpu_percent": 3.5,
+            "window_ms": 10000
+        })
+    );
+    assert_eq!(
+        o.remove("sessions").unwrap(),
+        serde_json::json!([{
+            "id": "abc", "cpu_seconds": 12.5, "memory_bytes": 432_013_312_u64, "procs": 18
+        }])
+    );
+    assert_eq!(
+        o.remove("interventions").unwrap(),
+        serde_json::json!([{
+            "at": "2026-10-24T10:00:00Z", "session": "abc",
+            "leaf": "s-abc/tools", "cause": "oom_kill"
+        }])
+    );
+    let expected: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+    assert_eq!(actual, expected);
+    let back: StatusReport = serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
+    assert_eq!(back, with);
+    let old: StatusReport = serde_json::from_str(FIXTURE).unwrap();
+    assert!(old.containment.is_none() && old.sessions.is_none());
+    assert_eq!(STATUS_SCHEMA_VERSION, 1);
+}
+
+#[test]
+fn containment_text_lists_state_sessions_outside_cpu_and_interventions() {
+    use sluice_gate_proto::{ContainmentInfo, Intervention, SessionUsage};
+    assert_eq!(report().containment_text(), "");
+    let mut r = report();
+    r.containment = Some(ContainmentInfo {
+        level: "partial".into(),
+        detail: Some("memory, pids; cpu by nice".into()),
+        outside_jobs_cpu_percent: Some(3.24),
+        window_ms: None,
+    });
+    r.sessions = Some(vec![SessionUsage {
+        id: "abc".into(),
+        cpu_seconds: 12.34,
+        memory_bytes: Some(412 * 1024 * 1024),
+        procs: Some(18),
+        ..SessionUsage::default()
+    }]);
+    r.interventions = Some(vec![Intervention {
+        at: "2026-10-24T10:00:00Z".into(),
+        session: Some("abc".into()),
+        leaf: "s-abc/tools".into(),
+        cause: "oom_kill".into(),
+        detail: None,
+    }]);
+    assert_eq!(
+        r.containment_text(),
+        "containment: partial (memory, pids; cpu by nice)\n\
+         \x20 s-abc  cpu 12.3s  mem 412 MB  procs 18\n\
+         outside jobs: 3.2% CPU\n\
+         interventions:\n\
+         \x20 2026-10-24T10:00:00Z  s-abc  s-abc/tools  oom_kill\n"
+    );
+    r.containment = Some(ContainmentInfo {
+        level: "off".into(),
+        detail: Some("user manager not reachable".into()),
+        ..ContainmentInfo::default()
+    });
+    assert!(
+        r.containment_text()
+            .starts_with("containment: off (user manager not reachable)\n")
+    );
 }

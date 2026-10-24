@@ -181,6 +181,77 @@ async fn tools_list_verify_status_and_logs() {
     client.cancel().await.expect("shutdown");
 }
 
+/// Containment (C5): an intervention in the caller's own session (named by
+/// `SLUICE_SESSION_LEAF`) is appended once to a `verify` result and once to a
+/// `status` result; one of another session never is. Fixture rows in the log
+/// the daemon keeps; no cgroup is touched.
+#[tokio::test(flavor = "multi_thread")]
+async fn interventions_of_the_callers_session_are_told_once() {
+    let sb = Sandbox::standard();
+    let state = sb.home.join("state/sluice");
+    fs::create_dir_all(&state).unwrap();
+    let at = humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string();
+    let row = |session: &str, cause: &str| {
+        json!({"at": at, "session": session, "leaf": format!("s-{session}/tools"), "cause": cause})
+            .to_string()
+    };
+    fs::write(
+        state.join("interventions.jsonl"),
+        format!(
+            "{}\n{}\n",
+            row("mcp1", "oomd_memory_pressure"),
+            row("other", "oom_kill")
+        ),
+    )
+    .unwrap();
+    let client = connect_with(
+        &sb,
+        Counter::default(),
+        &[(
+            "SLUICE_SESSION_LEAF",
+            "/sys/fs/cgroup/fixture/sluice-agents.scope/s-mcp1/tools",
+        )],
+    )
+    .await;
+    let dir = repo_arg(&sb);
+    let verify = json!({"working_directory": dir, "gates": ["test"]});
+
+    let first = text(&call(&client, "verify", &verify).await);
+    assert!(
+        first.contains("Sluice stopped s-mcp1/tools in your session at"),
+        "{first}"
+    );
+    assert!(first.contains("the machine was protected"), "{first}");
+    assert!(first.contains("`verify`/the queue"), "{first}");
+    assert!(!first.contains("s-other"), "{first}");
+    // Told once: neither another verify nor status repeats it.
+    let again = text(&call(&client, "verify", &verify).await);
+    assert!(!again.contains("Sluice stopped"), "{again}");
+    let status = text(&call(&client, "status", &json!({})).await);
+    assert!(!status.contains("Sluice stopped"), "{status}");
+
+    // A new intervention is told once, by `status` this time.
+    let later =
+        humantime::format_rfc3339_seconds(std::time::SystemTime::now() + Duration::from_secs(1))
+            .to_string();
+    let mut log = fs::read_to_string(state.join("interventions.jsonl")).unwrap();
+    log.push_str(
+        &json!({"at": later, "session": "mcp1", "leaf": "s-mcp1/ui", "cause": "oom_kill"})
+            .to_string(),
+    );
+    log.push('\n');
+    fs::write(state.join("interventions.jsonl"), log).unwrap();
+    let status = text(&call(&client, "status", &json!({})).await);
+    assert!(
+        status.contains("Sluice stopped s-mcp1/ui in your session"),
+        "{status}"
+    );
+    assert!(status.contains("kernel OOM killer"), "{status}");
+    let status = text(&call(&client, "status", &json!({})).await);
+    assert!(!status.contains("Sluice stopped"), "{status}");
+    client.cancel().await.expect("shutdown");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn bad_requests_are_mcp_errors() {
     let sb = Sandbox::standard();

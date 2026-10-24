@@ -21,6 +21,8 @@ use sluice_gate_core::cgroup::tree::{
 use sluice_gate_core::cgroup::{Capabilities, CgroupError, Layout};
 use sluice_gate_core::config::{ContainmentConfig, EnvMap, process_env};
 
+mod common;
+
 const SLUICE: &str = env!("CARGO_BIN_EXE_sluice");
 
 /// Kills and reaps the processes this test started.
@@ -61,6 +63,11 @@ struct UnitGuard {
 impl Drop for UnitGuard {
     fn drop(&mut self) {
         let _ = self.tree.stop_all();
+        // Nothing the test started may outlive its units.
+        let left = common::cgtree::kill_leftovers(&self.tree.layout);
+        if !left.is_empty() {
+            eprintln!("cleanup: processes outlived their units: {left:?}");
+        }
     }
 }
 

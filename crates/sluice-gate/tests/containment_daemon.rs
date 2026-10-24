@@ -16,6 +16,7 @@
 mod common;
 
 use std::fs;
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Child, Command as StdCommand, Stdio};
 use std::thread;
@@ -239,6 +240,11 @@ impl Drop for Stack {
                     layout.slice.as_str(),
                 ],
             );
+            // Nothing the test started may outlive its units.
+            let left = common::cgtree::kill_leftovers(&layout);
+            if !left.is_empty() {
+                eprintln!("cleanup: processes outlived {}: {left:?}", layout.slice);
+            }
         }
         // The implicit parent slice named after this process is shared by
         // the cases running in parallel: the last one out stops it (under
@@ -434,6 +440,12 @@ fn without_a_user_manager_the_daemon_runs_as_before() {
         "no leaf without containment: {seen}"
     );
     assert!(stack.units().is_empty(), "{:?}", stack.units());
+    // `status` says so, with the reason.
+    let status = stack.status().expect("status");
+    assert_eq!(status["containment"]["level"], "off", "{status}");
+    assert!(status.get("sessions").is_none(), "{status}");
+    let text = String::from_utf8_lossy(&stack.run(&["status"]).stdout).into_owned();
+    assert!(text.contains("containment: off ("), "{text}");
 }
 
 #[test]
@@ -442,12 +454,15 @@ fn the_daemon_adopts_a_scope_the_hook_created_and_retires_its_stopgap_holder() {
         return;
     };
     let layout = stack.layout();
-    // What the session hook does when no daemon runs: a `sleep 86400` holder.
-    let stopgap = StdCommand::new("sleep")
-        .arg("86400")
-        .stdin(Stdio::null())
-        .spawn()
-        .expect("sleep starts");
+    // What the session hook does when no daemon runs: a bounded holder,
+    // `sluice daemon holder --lifetime <secs>`.
+    let mut hook_holder = StdCommand::new(Sandbox::binary());
+    hook_holder
+        .arg0("sluice")
+        .args(sluice_gate_daemon::containment::stopgap_holder_args())
+        .env_clear()
+        .stdin(Stdio::null());
+    let stopgap = hook_holder.spawn().expect("the stopgap holder starts");
     let stopgap_pid = stopgap.id();
     stack.kids.push(stopgap);
     stack
@@ -494,4 +509,94 @@ fn containment_can_be_switched_off_in_the_config() {
     let seen = fs::read_to_string(format!("{}.cg", stack.sb.counter.display())).unwrap();
     assert!(!seen.contains("/jobs/"), "no leaf when disabled: {seen}");
     assert!(stack.units().is_empty(), "{:?}", stack.units());
+    let text = String::from_utf8_lossy(&stack.run(&["status"]).stdout).into_owned();
+    assert!(
+        text.contains("containment: off (disabled by [containment] enabled = false)"),
+        "{text}"
+    );
+}
+
+/// `status` shows the state and the live sessions from cgroupfs, and `doctor`
+/// run from the session's `tools` leaf says where the shell and the agent
+/// are. Only `sleep`s and the doctor's own shell are moved; no load.
+#[test]
+fn status_and_doctor_show_a_real_session() {
+    let Some(mut stack) = Stack::new("obs", "", true) else {
+        return;
+    };
+    let layout = stack.layout();
+    stack.start_daemon();
+    let tree = stack.tree();
+    let session = tree.ensure_session("s-obsv").expect("session");
+    let agent = stack.sleeper();
+    let report = tree.move_pids(&session.ui, &[agent]);
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+
+    let status = stack.status().expect("status");
+    assert_eq!(status["containment"]["level"], "full", "{status}");
+    let sessions = status["sessions"].as_array().expect("sessions");
+    let mine = sessions
+        .iter()
+        .find(|s| s["id"] == "obsv")
+        .unwrap_or_else(|| panic!("{status}"));
+    assert_eq!(mine["procs"], 1, "{mine}");
+    assert!(mine["memory_bytes"].as_u64().is_some(), "{mine}");
+    assert!(mine["cpu_seconds"].as_f64().is_some(), "{mine}");
+    let text = String::from_utf8_lossy(&stack.run(&["status"]).stdout).into_owned();
+    assert!(text.contains("containment: full\n"), "{text}");
+    assert!(text.contains("  s-obsv  cpu "), "{text}");
+    assert!(text.contains("procs 1\n"), "{text}");
+
+    // doctor, run by a shell that first enters `tools` like the env line does.
+    let tools = session.tools.dir.display().to_string();
+    let mut cmd = StdCommand::new("sh");
+    cmd.arg("-c")
+        .arg(format!(
+            "echo $$ > '{tools}/cgroup.procs'; exec '{}' doctor --json",
+            Sandbox::binary().display()
+        ))
+        .current_dir(&stack.sb.repo)
+        .env_clear()
+        .envs(stack.envs())
+        .env(
+            "XDG_RUNTIME_DIR",
+            stack.manager_runtime.clone().expect("manager"),
+        )
+        .env("CLAUDE_PID", agent.to_string())
+        .env("SLUICE_SESSION_LEAF", &tools)
+        .stdin(Stdio::null());
+    let out = cmd.output().expect("doctor");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    let checks = report["checks"].as_array().expect("checks");
+    let find = |name: &str| {
+        checks
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("no {name}: {checks:?}"))
+    };
+    let session_check = find("session");
+    assert_eq!(session_check["group"], "containment");
+    assert_eq!(session_check["status"], "ok", "{session_check}");
+    let detail = session_check["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("this shell is in tools (s-obsv/tools)"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains(&format!("agent (pid {agent}) is in ui")),
+        "{detail}"
+    );
+    assert_eq!(find("containment")["detail"], "full");
+    assert!(
+        find("slice")["detail"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("{} present", layout.slice))
+    );
+    assert!(
+        find("memory-policy")["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("memory policy")
+    );
 }

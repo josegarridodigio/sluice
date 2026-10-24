@@ -128,7 +128,13 @@ fn containment_setup(env: &EnvMap, user: &UserConfig) -> Option<ContainmentSetup
 /// `sluice daemon holder`: keeps `sluice-agents.scope` alive. Blocks reading
 /// its stdin, whose write end the daemon holds for its whole life (the
 /// kernel closes it when the daemon exits, however it exits), then returns.
-pub fn holder() -> ExitCode {
+/// With `lifetime` (the session hook's stopgap, started with no stdin to
+/// follow) it sleeps that many seconds instead and returns, so it can never
+/// outlive its purpose.
+pub fn holder(lifetime: Option<u64>) -> ExitCode {
+    if let Some(secs) = lifetime {
+        return bounded_holder(secs);
+    }
     let mut stdin = std::io::stdin().lock();
     let mut buf = [0_u8; 64];
     loop {
@@ -137,6 +143,50 @@ pub fn holder() -> ExitCode {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => return ExitCode::SUCCESS,
+        }
+    }
+}
+
+/// How long a stopgap holder may wait to be adopted by a Sluice scope.
+const ADOPTION_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often the stopgap holder looks at its scope.
+const LIVENESS_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The Sluice scope unit named in a cgroup path of `/proc/self/cgroup`
+/// (`.../sluice-agents.scope/holder` gives `sluice-agents.scope`).
+fn own_sluice_scope(cgroup: &str) -> Option<String> {
+    cgroup
+        .split('/')
+        .find(|c| c.starts_with("sluice") && c.strip_suffix(".scope").is_some())
+        .map(str::to_owned)
+}
+
+/// The stopgap holder: lives at most `secs` seconds, and ends earlier when
+/// it has no purpose left: it was never adopted by a Sluice scope within
+/// [`ADOPTION_GRACE`], or its scope is no longer active (`failed`,
+/// `inactive`: systemd then leaves a process behind in the dead cgroup).
+fn bounded_holder(secs: u64) -> ExitCode {
+    use std::time::Instant;
+    let started = Instant::now();
+    let limit = std::time::Duration::from_secs(secs);
+    loop {
+        let left = limit.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return ExitCode::SUCCESS;
+        }
+        std::thread::sleep(left.min(LIVENESS_EVERY));
+        let env: EnvMap = sluice_gate_core::config::process_env();
+        let own = std::fs::read_to_string("/proc/self/cgroup")
+            .ok()
+            .and_then(|t| sluice_gate_core::cgroup::detect::parse_proc_cgroup(&t));
+        match own.as_deref().and_then(own_sluice_scope) {
+            Some(unit) => {
+                if !sluice_gate_core::cgroup::systemd::is_unit_active(&env, &unit, true) {
+                    return ExitCode::SUCCESS;
+                }
+            }
+            None if started.elapsed() > ADOPTION_GRACE => return ExitCode::SUCCESS,
+            None => {}
         }
     }
 }
@@ -459,5 +509,19 @@ pub fn restart(debug: bool, force: bool) -> ExitCode {
             eprintln!("sluice: error: {e:#}");
             ExitCode::from(EXIT_ERROR)
         }
+    }
+}
+
+#[cfg(test)]
+mod holder_tests {
+    use super::own_sluice_scope;
+
+    #[test]
+    fn the_scope_is_found_in_a_cgroup_path() {
+        let p =
+            "/user.slice/user-1000.slice/user@1000.service/sluice.slice/sluice-agents.scope/holder";
+        assert_eq!(own_sluice_scope(p).as_deref(), Some("sluice-agents.scope"));
+        assert_eq!(own_sluice_scope("/user.slice/app.slice/vte.scope"), None);
+        assert_eq!(own_sluice_scope("/"), None);
     }
 }

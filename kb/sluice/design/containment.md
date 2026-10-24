@@ -67,8 +67,11 @@ writes no cgroup line, only `renice -n 19 $$ >/dev/null 2>&1` where §6 says
 nice applies (cgroup v1/hybrid, no systemd, no controller delegated, `cpu`
 missing) and nothing for an unreachable user manager, a read-only cgroupfs or
 `enabled = false`. Agents scope creation: the hook uses it when it exists
-(daemon, C2); otherwise it creates it with a `sleep 86400` holder (C1
-`ensure_agents_scope`), which the daemon later adopts.
+(daemon, C2); otherwise it creates it with a bounded `sluice daemon holder --lifetime 600`
+(C1 `ensure_agents_scope`; it exits after its lifetime, when its scope stops
+being active, or when no scope adopted it; the hook checks the scope is active
+and holds it, else kills the holder and fails open), which the daemon later
+retires.
 
 No output in any branch (S1: `2>/dev/null` alone still printed under zsh and
 `|| echo` adds noise). Inside the Bash sandbox the test is false (cgroupfs is

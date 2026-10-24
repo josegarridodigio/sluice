@@ -218,6 +218,36 @@ runs exactly as before; `[containment] enabled = false` does the same.
 Kills by the kernel OOM killer or `systemd-oomd` on those cgroups are
 recorded by the daemon and shown in the `status` reply (`interventions`).
 
+### Interventions
+
+`sluice status` lists the last interventions (time, session, leaf, cause) and
+`sluice doctor` explains why a session is or is not contained (`session`,
+`memory-policy`, `slice`). Causes: `oom_kill` and `oom_group_kill` (the kernel
+OOM killer acted inside that cgroup), `oomd_memory_pressure` and `oomd_swap`
+(`systemd-oomd` killed it). The daemon also appends each one to
+`interventions.jsonl` in the state directory (kept to the newest 200 lines).
+The agent is told about an intervention in its own session once: the next MCP
+`verify` or `status` result and the next context note of the guard add the
+line
+
+```text
+Sluice stopped s-abc/tools in your session at 2026-10-24 10:02:11 UTC: memory pressure on the machine (systemd-oomd, memory pressure); the machine was protected. Re-run the command; if it is heavy, run it through `verify`/the queue.
+```
+
+Which interventions were told is remembered per session in
+`interventions-seen/<session>` under the state directory; delete the file to
+hear them again. Nothing is told after six hours.
+
+### The stopgap holder
+
+The session hook creates `sluice-agents.scope` itself when no daemon runs. It
+needs a live process for that, `sluice daemon holder --lifetime 600`, which
+exits by itself after ten minutes, when its scope is no longer `active`, or
+when no Sluice scope adopted it within 30 seconds; the hook checks that the
+scope is active and holds the process, and otherwise kills the holder and
+leaves the session uncontained. The daemon retires it when it takes the scope
+over.
+
 Test-only environment variables (not for users): the integration tests start
 a daemon with `SLUICE_TEST_CONTAINMENT_PREFIX=sluice-test-<pid>-<case>` so its
 units are `<prefix>.slice`, `<prefix>-daemon.scope` and

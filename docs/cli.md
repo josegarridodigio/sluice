@@ -390,6 +390,29 @@ Options:
 
 Show the daemon, budget, system pressure (PSI), running and queued jobs, and totals.
 
+With containment (ADR-0017) the output ends with the containment block:
+
+```text
+containment: full
+  s-7f3a9c  cpu 61.2s  mem 900 MB  procs 31
+  s-b21e04  cpu 3.4s  mem 412 MB  procs 18
+outside jobs: 3.2% CPU
+interventions:
+  2026-10-24T10:02:11Z  s-7f3a9c  s-7f3a9c/tools  oomd_memory_pressure
+```
+
+`containment:` is `full`, `partial (memory, pids; cpu by nice)` or
+`off (<reason>)`. Each live agent session has one line (CPU seconds, memory
+and process count read from its cgroup). `outside jobs` is the CPU the agents'
+sessions used over the last sampling window (10 s), as a share of all CPUs:
+CPU not spent in Sluice jobs, which run in their own scope. `interventions`
+lists the last kills by the kernel OOM killer or `systemd-oomd` on Sluice's
+cgroups (time, session, leaf, cause). With `--json` the optional fields
+`containment` (`level`, `detail`, `outside_jobs_cpu_percent`, `window_ms`),
+`sessions[]` (`id`, `cpu_seconds`, `memory_bytes`, `memory_peak_bytes`,
+`procs`) and `interventions[]` (`at`, `session`, `leaf`, `cause`, `detail`)
+are present when the daemon reports them (schema 1, additive).
+
 <details>
 <summary>Full help</summary>
 
@@ -852,11 +875,26 @@ Besides the basics, the zero-config checks are:
 | `cache` | In a repository: `warn` when the index has skip-worktree or assume-unchanged entries (it names up to 5 paths): the tree cannot be hashed, so the cache is disabled for this worktree. The detail gives `git update-index --no-skip-worktree <path>` / `--no-assume-unchanged <path>`. `ok` otherwise. |
 | `init` | In a git repository without `.sluice.toml`: `ok`, with the hint `run 'sluice init --dry-run'`. |
 
+The `containment` group (JSON `group: "containment"`; the S4 messages of
+ADR-0017) explains what the machine allows: `containment` (the summary,
+`full`, `partial (...)` or `off (...)`), `cg-v2`, `cg-writable`, `systemd`,
+`user-manager`, `delegate-cpu`, `delegate-memory-pids`, `own-cgroup` (and
+`system-bus` in a login scope), `controller-files` (`cpu.weight`,
+`memory.current` and `pids.max` present in the agents scope or the user
+manager's cgroup), `slice`, `memory-policy` (on or off, with the thresholds
+derived from the system's `systemd-oomd` policy shown when on) and, when the
+CPU cannot be weighted, `fallback`. Inside an agent shell `session` says where
+this shell and the agent are (`in ui`, `in tools` or outside the session) and
+why. None of them fails the run.
+
 ```text
 [ok  ] shims          27 shim(s) current in /home/u/.local/share/sluice/shims; first in PATH
 [ok  ] plugin         agent plugin and binary are 0.4.0
 [warn] weights        'test' needs about 9 but declares weight = 4: raise the number or use weight = "auto" (...)
 [ok  ] init           this repository has no .sluice.toml; run 'sluice init --dry-run' to see what Sluice would propose
+[ok  ] containment    full
+[ok  ] memory-policy  memory policy on: systemd-oomd acts on the agents scope at 30% memory pressure for 5s (derived from the system policy on user@UID.service, 50% / 20s; systemd 259, systemd-oomd active)
+[ok  ] session        this shell is in tools (s-7f3a9c/tools); agent (pid 4242) is in ui
 ```
 
 (`weights` and `init` never appear together: the first needs a

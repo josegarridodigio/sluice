@@ -35,6 +35,8 @@ use sluice_gate_proto::{ClientMessage, FEATURE_QUEUE, ServerMessage};
 
 use crate::run::EXIT_ERROR;
 
+mod containment;
+
 /// Lines kept from the tail of each log in the bundle.
 const BUNDLE_LOG_LINES: usize = 2000;
 /// Newest MCP logs included in the bundle.
@@ -87,6 +89,9 @@ pub struct Check {
     pub status: Status,
     /// One-line explanation.
     pub detail: String,
+    /// Group of related checks (`containment`); absent for the others.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<&'static str>,
 }
 
 fn check(name: &'static str, status: Status, detail: impl Into<String>) -> Check {
@@ -95,6 +100,7 @@ fn check(name: &'static str, status: Status, detail: impl Into<String>) -> Check
         name,
         status,
         detail: detail.replace('\n', " "),
+        group: None,
     }
 }
 
@@ -179,6 +185,7 @@ fn collect(env: &EnvMap, cwd: &Path) -> Vec<Check> {
         )),
     }
     out.push(check_path(env));
+    out.extend(containment::checks(env));
     out
 }
 
