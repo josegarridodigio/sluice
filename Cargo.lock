@@ -1143,6 +1143,7 @@ dependencies = [
  "humantime",
  "humantime-serde",
  "nix",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

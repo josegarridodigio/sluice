@@ -13,6 +13,7 @@ use sluice_gate_core::config::{REPO_CONFIG_FILE, RepoConfig};
 
 mod budget;
 mod cache;
+mod cg_exec;
 mod clientlog;
 mod daemon_cmd;
 mod dirs;
@@ -175,6 +176,16 @@ enum Command {
     /// tools `queue_enqueue`, `queue_status`, `queue_approve`, `queue_retry`,
     /// `queue_cancel`. Logs go to stderr only. Register `sluice mcp` as a stdio MCP server in the agent's config.
     Mcp,
+    /// Internal: write this process's pid to `<LEAF>/cgroup.procs`, then exec the
+    /// command (containment placement helper; runs the command even when the move fails).
+    #[command(hide = true)]
+    CgExec {
+        /// Cgroup directory to move into.
+        leaf: std::path::PathBuf,
+        /// The command and its arguments (after `--`).
+        #[arg(last = true, required = true)]
+        argv: Vec<std::ffi::OsString>,
+    },
     /// Start the per-user daemon (detached unless --foreground), or stop it.
     ///
     /// Exits 75 when another daemon still holds the daemon lock.
@@ -529,6 +540,7 @@ fn main() -> ExitCode {
             ShimCommand::Exec { name, args } => shim::exec(&name, &args),
         },
         Command::Mcp => mcp(),
+        Command::CgExec { leaf, argv } => cg_exec::run(&leaf, &argv),
         Command::Daemon {
             command: Some(DaemonCommand::Stop { force }),
             ..

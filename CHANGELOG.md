@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `[containment]` table of the user config (ADR-0017): weights, `pids_max`,
+  optional CPU ceiling, `memory_policy`, `memory_pressure_limit` and
+  `memory_pressure_duration` (`"auto"` derives them from the system's
+  `systemd-oomd` policy), opt-in `memory_high` and `memory_max`. Configs
+  without the table load unchanged.
+- `sluice-gate-core::cgroup`: detection of cgroup v2, the user manager, the
+  delegated controllers and `systemd-oomd` (`full`, `partial`, `off` with the
+  reason `doctor` will print); the Sluice cgroup tree created through the
+  systemd user manager (`busctl`, `systemctl`); session leaves with weights and
+  `pids.max`; placement of processes (direct write, `AttachProcessesToUnit`
+  fallback); pruning of empty cgroups; usage readings. Not wired into the
+  daemon yet.
+- Hidden `sluice cg-exec <leaf> -- <argv>`: moves itself into a cgroup and
+  `exec`s, running the command even when the move fails.
+
 ### Changed
 
 ### Fixed
