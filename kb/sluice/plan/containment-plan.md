@@ -5,7 +5,7 @@ tags: [sluice, plan, containment, cgroups]
 
 # Plan: agent resource containment (v0.5.0)
 
-Status: approved in principle by the user on 2026-10-24; S-wave next.
+Status: S-wave done (2026-10-24); ADR-0017 accepted; design [[sluice/design/containment.md]]; implementation in progress (section 5a). The user granted freedom to change earlier decisions when evidence requires it (the memory policy changed after S2/S5).
 Decision record: [[sluice/design/adr/0017-agent-resource-containment.md]]
 (proposed until the S-wave closes). Parent: [[sluice/plan/master-plan.md]].
 
@@ -47,6 +47,22 @@ developer. Mechanism: cgroup v2 through the systemd user manager (ADR-0017).
 6. Rules of [[sluice/plan/zero-config-plan.md]] section 4 apply (dogfooding,
    no AI attribution, merge queue, KB notes, haiku for real sessions, never
    name client projects); release v0.5.0 waits for the user.
+
+## 5a. Progress
+
+| Task | State | Evidence |
+|---|---|---|
+| S1 sandbox | done: self-move impossible in the Bash sandbox; hook move works; layout B with nice 19 | [[sluice/research/containment-s1-sandbox.md]] |
+| S2 weights | done (CPU only, rerun after the incident) | [[sluice/research/containment-s2-weights.md]], [[sluice/research/containment-s2-incident.md]] |
+| S3 agent tree | done: `CLAUDE_PID`, direct write 5–13 ms, inheritance, resume | [[sluice/research/containment-s3-agent-tree.md]] |
+| S4 fallbacks | done: matrix and doctor messages | [[sluice/research/containment-s4-fallbacks.md]] |
+| S5 memory | done: oomd-based policy, live T0/T3/T5/T6/T7 | [[sluice/research/containment-s5-memory-oomd.md]] |
+| C1 core cgroup module + config | in progress | |
+| C2 daemon placement + cg-exec | pending (after C1) | |
+| C3 session hook + env line, C4 shims | pending (after C1) | |
+| C5 status, doctor, interventions | pending (after C2, C3) | |
+| E1 harness s9, E2 plugin e2e, E3 user checks | pending | |
+| R1–R4 | pending | |
 
 ## 4. Waves
 
