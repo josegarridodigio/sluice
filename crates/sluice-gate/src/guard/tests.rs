@@ -1512,6 +1512,62 @@ fn approval_is_found_through_quotes_paths_and_wrappers() {
     }
 }
 
+/// Issue #2: when the tokenizer gives up (heredocs, loops, substitutions),
+/// the fallback compares whole words, so prose that mentions approval is not
+/// denied, while every real approval, however it is wrapped, still is. The
+/// table is the one measured in the parser spike (38 cases).
+#[test]
+fn approval_detection_compares_whole_words_issue_2() {
+    let allow = [
+        "python3 - <<EOF\nprint(\"approved\")\nEOF\nsluice queue status",
+        "for f in a b; do echo $f; done; echo approved; sluice queue status",
+        "echo \"$(date) approved\"; sluice queue status",
+        "cat > notes.md <<EOF\nThe train was approved by a human.\nEOF\ngit add notes.md && sluice queue enqueue",
+        "git commit -m \"docs: queue approve flow\"",
+        "grep -rn 'sluice queue approve' docs/",
+        "echo sluice queue approve",
+        "cat > plan.md <<EOF\nStatus: approved by the user; the queue landed it.\nEOF\nsluice queue enqueue",
+        "for t in a b; do echo \"queue approval for $t\"; done",
+    ];
+    for cmd in allow {
+        assert!(!matcher::runs_approve(cmd), "false positive: {cmd:?}");
+    }
+    let deny = [
+        "sluice queue approve t-1",
+        "/usr/local/bin/sluice queue approve t-1 --yes",
+        "sluice --quiet queue approve t-1",
+        "for t in t-1; do sluice queue approve $t; done",
+        "echo \"$(sluice queue approve t-1)\"",
+        "echo `sluice queue approve t-1`",
+        "sh -c 'sluice queue approve t-1'",
+        "bash -c \"cd /repo && sluice queue approve t-1\"",
+        "eval sluice queue approve t-1",
+        "env FOO=1 sluice queue approve t-1",
+        "timeout 30 sluice queue approve t-1",
+        "sudo -E sluice queue approve t-1",
+        "'sluice' \"queue\" approve t-1",
+        "sl\\uice queue approve t-1",
+        "x=sluice; $x queue approve t-1",
+        "if true; then sluice queue approve t-1; fi",
+        "(cd /repo && sluice queue approve t-1)",
+        "sluice exec -- sluice queue approve t-1",
+        "FOO=1 sluice queue approve t-1 | tee log",
+        "sluice queue approve t-1 <<EOF\nyes",
+        "[[ -n x ]] && sluice queue approve t-1",
+        "diff <(sluice queue approve t-1) x",
+        "sluice queue approve t-1 &",
+        "f(){ sluice queue approve t-1; }; f",
+        "case x in x) sluice queue approve t-1;; esac",
+        "sluice queue app\\\nrove t-1",
+        "sluice queue 'appr'ove t-1",
+        "while read t; do sluice queue approve \"$t\"; done < trains",
+        "echo \"unterminated sluice queue approve",
+    ];
+    for cmd in deny {
+        assert!(matcher::runs_approve(cmd), "missed approval: {cmd:?}");
+    }
+}
+
 /// Containment (C5): a heavy rewrite carries, once, the line about an
 /// intervention in the caller's own session (matched by the hook's
 /// `session_id`), and never one about another session.

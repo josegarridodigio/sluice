@@ -542,9 +542,10 @@ fn naive_pieces(command: &str) -> Vec<String> {
 /// that run their arguments as a command (`env` with its assignments,
 /// `command`, `builtin`, `exec`, `nohup`, `time`, `setsid`, `sluice exec
 /// --`). A wrapper whose arguments the guard does not parse (`sh -c`,
-/// `eval`, `xargs`, `sudo`, `timeout`, ...) and a command the tokenizer
-/// refuses count as approving when the text mentions both `queue` and
-/// `approve`.
+/// `eval`, `xargs`, `sudo`, `timeout`, ...), a program name the shell
+/// computes (`$x`) and a command the tokenizer refuses count as approving
+/// when the text holds the word `queue` followed by the word `approve` (see
+/// [`mentions_approve`]).
 pub fn runs_approve(command: &str) -> bool {
     if naive_pieces(command)
         .iter()
@@ -565,9 +566,26 @@ pub fn runs_approve(command: &str) -> bool {
     }
 }
 
-/// The text names both `queue` and `approve`.
+/// The text may run `queue … approve`: after the shell's own joins (a
+/// backslash-newline continues the word; quotes and backslashes concatenate
+/// rather than split), some word is exactly `queue` and a later one is
+/// exactly `approve`. Whole words only, so prose such as "approved" or
+/// "queue approval" does not count (issue #2), while concatenations such as
+/// `'appr'ove` or `appr\ove` still do.
 fn mentions_approve(text: &str) -> bool {
-    text.contains("approve") && text.contains("queue")
+    let joined: String = text
+        .replace("\\\n", "")
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .collect();
+    let words: Vec<&str> = joined
+        .split(|c: char| c.is_whitespace() || ";&|()<>{}$`".contains(c))
+        .filter(|w| !w.is_empty())
+        .collect();
+    words
+        .iter()
+        .position(|w| *w == "queue")
+        .is_some_and(|q| words[q + 1..].contains(&"approve"))
 }
 
 /// Wrappers that run the rest of their words as a command, after their own
@@ -626,6 +644,9 @@ fn words_approve(words: &[&str], text: &str) -> bool {
                 }
             }
             _ if OPAQUE_WRAPPERS.contains(&program) => return mentions_approve(text),
+            // A program name the shell computes (`$x queue approve`) may be
+            // `sluice`: decide by the words that follow.
+            _ if program.starts_with('$') => return mentions_approve(text),
             _ => return false,
         }
     }

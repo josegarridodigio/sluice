@@ -61,6 +61,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The agent plugin's guard no longer denies harmless commands that mention
+  approval: when it cannot parse a command (heredocs, loops, `$(...)`) or
+  meets an opaque wrapper, it now needs the whole word `queue` followed by
+  the whole word `approve` (after the shell's joins of quotes, backslashes
+  and line continuations), instead of the substrings anywhere in the text.
+  "approved" in a commit message or a heredoc is allowed again; every real
+  approval, wrapped or not, is still denied, and a computed program name
+  (`$x queue approve`) now is too (#2).
 - The session hook's stopgap holder is `sluice daemon holder --lifetime 600`
   instead of `sleep 86400`: it ends by itself, when its scope is no longer
   active, or when no scope adopted it; the hook verifies the scope is active
