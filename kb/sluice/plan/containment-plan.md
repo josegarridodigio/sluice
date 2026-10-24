@@ -65,7 +65,8 @@ developer. Mechanism: cgroup v2 through the systemd user manager (ADR-0017).
 | E2 plugin e2e (cases k-n) | done: 4 cases PASS with real haiku sessions, one unreproduced flake fixed in C5 | [[sluice/changes/containment-e2e.md]] |
 | S6 ui stalls | done: stalls come from oversubscription and hit any sleeping task; layout kept; s9 judged by p95 and share over 10 ms | [[sluice/research/containment-s6-ui-stalls.md]] |
 | E3 user checks | pending (user) | |
-| R1–R4 | pending | |
+| R1 review, R2 fixes, R3 reconciliation | done | [[sluice/changes/containment-reconciliation.md]] |
+| R4 release v0.5.0 | pending: E3 user checks, then the user's approval | |
 
 ## 4. Waves
 

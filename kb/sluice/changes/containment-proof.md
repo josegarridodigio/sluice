@@ -140,3 +140,14 @@ tree. `run_all.sh` limited to s8 and s9 (scratch directory with symlinks to
 those two scripts and the helpers): s8 37/37, s9 30/30, "2 scenario(s)
 passed". After every run: no `sluice-test*` unit, no process in a
 `sluice-test*` cgroup.
+
+## Rerun with the S6 criteria (2026-10-24, lead)
+
+After [[sluice/research/containment-s6-ui-stalls.md]] the latency checks
+judge p95 < 1 ms and at most 1 % of wake-ups over 10 ms, for the `ui` probe
+and for the desktop control, instead of a single-window p99. Result: 30/30.
+2x (40 loops): ui p95 80 µs, 0 of 1 200 wake-ups over 10 ms; desktop p95
+83 µs, 2 over 10 ms. 1x (20 loops): the first round failed on the DESKTOP
+control (p95 1 151 µs while other processes used about 7 % of the machine),
+the `ui` probe passed (p95 260 µs); the retry passed both (ui p95 112 µs, 0
+over 10 ms). Gates against agents: 63.6 % / 1.75x. Load 81 s in total.
