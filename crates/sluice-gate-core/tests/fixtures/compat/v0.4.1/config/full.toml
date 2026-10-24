@@ -1,0 +1,28 @@
+version = 1
+
+[defaults]
+# Behaviour when a hook invoked by an agent misses the cache.
+agent_hook_policy = "fail-fast"     # fail-fast | wait | run-unqueued
+# Behaviour when a hook invoked by a human misses the cache.
+human_hook_policy = "wait"          # wait | run-unqueued
+# Lines of log shown on failure.
+tail_lines = 40
+
+[gates.lint]
+cmd = "npm run lint"
+weight = 1
+timeout = "5m"
+hooks = ["pre-commit"]              # which hooks this gate belongs to (used by `verify` defaults and `sluice hook print`)
+
+[gates.test]
+cmd = "npm test -- --maxWorkers=2"
+weight = 4
+timeout = "20m"
+hooks = ["pre-commit", "pre-push"]
+key_inputs = ["node --version"]     # stdout of each command is folded into the cache key
+key_files  = [".env.test"]          # ignored/untracked files whose content must invalidate the cache
+env        = { NODE_ENV = "test" }
+depends_on = ["lint"]               # optional: reserved, validated but not scheduled in v1
+paths        = ["src/**", "package.json", "package-lock.json"]  # optional, >= 0.3.0: key only these
+paths_ignore = ["src/**/*.md"]      # optional, >= 0.3.0: minus these
+

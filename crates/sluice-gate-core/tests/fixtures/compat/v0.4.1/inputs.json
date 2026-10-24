@@ -1,0 +1,89 @@
+[
+  {
+    "file": "164648fa15cea6980e8624482e27505fb36257507417c324d69e1fa17eaa7ce6.miss.json",
+    "key": "164648fa15cea6980e8624482e27505fb36257507417c324d69e1fa17eaa7ce6",
+    "tree": "1e67c0033bbf0b817b030c3633465f4d0a8226c6",
+    "gate": "fail",
+    "cmd": "false",
+    "env": {},
+    "key_inputs": [],
+    "key_files": []
+  },
+  {
+    "file": "2cfefd3a87eab347057f5676912a5ffcfb374e47b5fb2fe93623f58315a74819.miss.json",
+    "key": "2cfefd3a87eab347057f5676912a5ffcfb374e47b5fb2fe93623f58315a74819",
+    "tree": "1e67c0033bbf0b817b030c3633465f4d0a8226c6",
+    "gate": "timeout",
+    "cmd": "sleep 5",
+    "env": {},
+    "key_inputs": [],
+    "key_files": []
+  },
+  {
+    "file": "327cec8351e86dd071118eec00ffc190dd1b2810065304f375266859b7dad976.json",
+    "key": "327cec8351e86dd071118eec00ffc190dd1b2810065304f375266859b7dad976",
+    "tree": "1e67c0033bbf0b817b030c3633465f4d0a8226c6",
+    "gate": "test",
+    "cmd": "true",
+    "env": {},
+    "key_inputs": [],
+    "key_files": []
+  },
+  {
+    "file": "34cc796e62a83409d95dfcd8d9a56c5b1b0b3a253e7ca91553b825db8f1f9a2d.miss.json",
+    "key": "34cc796e62a83409d95dfcd8d9a56c5b1b0b3a253e7ca91553b825db8f1f9a2d",
+    "tree": "1e67c0033bbf0b817b030c3633465f4d0a8226c6",
+    "gate": "modify",
+    "cmd": "echo x >> a.txt",
+    "env": {},
+    "key_inputs": [],
+    "key_files": []
+  },
+  {
+    "file": "431a8de686d4fb3e703af92fb3cefebdabff11b9575c9887571b01bc19b89f78.json",
+    "key": "431a8de686d4fb3e703af92fb3cefebdabff11b9575c9887571b01bc19b89f78",
+    "tree": "1e67c0033bbf0b817b030c3633465f4d0a8226c6",
+    "gate": "keyed",
+    "cmd": "true # key material",
+    "env": {
+      "A": "1",
+      "B": "2"
+    },
+    "key_inputs": [
+      [
+        "echo hi",
+        "98ea6e4f216f2fb4b69fff9b3a44842c38686ca685f3f55dc48c5d3fb1107be4"
+      ]
+    ],
+    "key_files": [
+      [
+        "a.txt",
+        "b6a98d9ce9a2d9149288fa3df42d377c3e42737afdcdaf714e33c0a100b51060"
+      ],
+      [
+        "missing.txt",
+        "absent"
+      ]
+    ]
+  },
+  {
+    "file": "65b7e8e5ff35b99357a43c43831d66b52ed466bbad6b427633b400ee086cc444.json",
+    "key": "65b7e8e5ff35b99357a43c43831d66b52ed466bbad6b427633b400ee086cc444",
+    "tree": "1e67c0033bbf0b817b030c3633465f4d0a8226c6",
+    "gate": "slow",
+    "cmd": "sleep 6",
+    "env": {},
+    "key_inputs": [],
+    "key_files": []
+  },
+  {
+    "file": "b9e4286c0d38385dc2cceaa6866511d3d4ab05af5a4a8423456084c1cbdd48d6.json",
+    "key": "b9e4286c0d38385dc2cceaa6866511d3d4ab05af5a4a8423456084c1cbdd48d6",
+    "tree": "fa439108b6aaac0486bceab1386e11c72556c2c4",
+    "gate": "test",
+    "cmd": "true",
+    "env": {},
+    "key_inputs": [],
+    "key_files": []
+  }
+]

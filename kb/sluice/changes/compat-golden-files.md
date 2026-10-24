@@ -218,3 +218,19 @@ four `tests/compat.rs` files. The generator needed one change: since 0.4.0
 runs `git init` in its scratch directory first (older releases are not
 affected: they never look for a repository). Verified with `sluice run fmt`,
 `clippy` and `test`.
+
+## v0.4.1 and v0.5.0 recordings (2026-10-24)
+
+Fixtures recorded from the published v0.4.1 and v0.5.0 release binaries with
+`scripts/compat/generate.sh` and added to the `RELEASES` lists of the four
+`tests/compat.rs` files (six releases now). The generator now replaces a
+developer's home in the user-config example of older docs with a neutral
+path before feeding it to the binary (the value is only an example key, so
+the recording stays equivalent); v0.4.1's doc still had a personal path.
+Fixtures of v0.1.0–v0.4.0 keep theirs: they are records of those releases and
+are never edited. Verified with `sluice run fmt`, `clippy`, `test`.
+
+Test hygiene noted while recording: each full test run leaves its empty
+implicit `sluice-test-<pid>.slice` parents active in the user manager (no
+process, gone at logout). The test guards should stop the parent slice when
+the last case of the process ends.

@@ -156,7 +156,11 @@ gen_version() {
 
   # 2. repository configs: doc example of the tag, minimal, init output, recorded
   mkdir -p "$W/doc"
-  gitq -C "$ROOT" show "$V:kb/sluice/design/config-format.md" > "$W/doc/config-format.md"
+  # Older docs used a developer's home in an example path; feed the binary a
+  # neutral one instead (the value is only an example key, so the recording
+  # stays equivalent and no personal path enters the fixtures).
+  gitq -C "$ROOT" show "$V:kb/sluice/design/config-format.md" \
+    | sed -E 's#/home/[A-Za-z0-9._-]+/Escritorio/Proyectos/#/home/alice/src/#g' > "$W/doc/config-format.md"
   py "$TOOLS" extract-config "$W/doc/config-format.md" repo > "$W/doc/repo-example.toml"
   py "$TOOLS" extract-config "$W/doc/config-format.md" user > "$CORE/user-config/full.toml"
   printf 'version = 1\n\n[gates.test]\ncmd = "true"\n' > "$CORE/config/minimal.toml"

@@ -15,7 +15,7 @@ use sluice_gate_proto::{
     StatusReport, decode_client, decode_server,
 };
 
-const RELEASES: [&str; 4] = ["v0.1.0", "v0.2.0", "v0.3.0", "v0.4.0"];
+const RELEASES: [&str; 6] = ["v0.1.0", "v0.2.0", "v0.3.0", "v0.4.0", "v0.4.1", "v0.5.0"];
 
 fn fixtures(release: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -1,0 +1,4 @@
+{"conn":1,"dir":"c2s","msg":{"type":"hello","protocol":1,"client":"sluice-gate 0.5.0","pid":2408794}}
+{"conn":1,"dir":"s2c","msg":{"type":"welcome","protocol":1,"daemon":"sluice-gate 0.5.0","instance":"2408527-1792842865360","pid":2408527,"started_at":"2026-10-24T11:54:25Z","features":["exec","queue-only","queue"]}}
+{"conn":1,"dir":"c2s","msg":{"type":"logs","id":1,"job_id":null,"tail":5}}
+{"conn":1,"dir":"s2c","msg":{"type":"log","id":1,"job_id":"1792842870041-2408527-7fbc22","path":"{{HOME}}/.state/sluice/logs/1792842870041-2408527-7fbc22.log","lines":["# sluice job 1792842870041-2408527-7fbc22: gate 'slow' in {{REPO}}","# command: sleep 6","","","# exit: 0 after 6.0s"]}}

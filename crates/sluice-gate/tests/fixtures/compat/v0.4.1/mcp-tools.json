@@ -1,0 +1,1364 @@
+{
+  "tools": [
+    {
+      "description": "List the gates of the repository's .sluice.toml: name, command, weight,\ntimeout, hooks and cache flag.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "working_directory": {
+            "description": "Absolute path inside the repository (worktree).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "working_directory"
+        ],
+        "type": "object"
+      },
+      "name": "gate_list",
+      "outputSchema": {
+        "$defs": {
+          "GateInfo": {
+            "properties": {
+              "cache": {
+                "description": "Whether passes are cached.",
+                "type": "boolean"
+              },
+              "cmd": {
+                "description": "Command, as configured.",
+                "type": "string"
+              },
+              "hooks": {
+                "description": "Git hooks the gate belongs to.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "name": {
+                "description": "Gate name.",
+                "type": "string"
+              },
+              "timeout_seconds": {
+                "description": "Execution timeout in seconds (0 = none).",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "weight": {
+                "description": "Budget units the gate occupies while running.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "name",
+              "cmd",
+              "weight",
+              "timeout_seconds",
+              "hooks",
+              "cache"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "gates": {
+            "description": "Gates of `.sluice.toml`, by name.",
+            "items": {
+              "$ref": "#/$defs/GateInfo"
+            },
+            "type": "array"
+          },
+          "repository": {
+            "description": "Repository root.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "gates"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Show the last lines of a job log (default: the newest job). Output is\ncapped at 64 KiB; the full log stays on disk at the returned path.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "job_id": {
+            "default": null,
+            "description": "Job id (as printed by `verify` or `status`). Default: the newest job.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tail": {
+            "default": null,
+            "description": "Number of trailing lines (default 100, max 2000).",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "logs",
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "job_id": {
+            "description": "Job id.",
+            "type": "string"
+          },
+          "lines": {
+            "description": "Trailing lines, oldest first.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "omitted_bytes": {
+            "description": "Bytes dropped from the front to keep the output under 64 KiB.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "path": {
+            "description": "Log file (the full output stays there).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "path",
+          "lines",
+          "omitted_bytes"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Approve a ready train (its members land on the target). Humans normally\napprove with `sluice queue approve`; this tool is refused with\n`not-allowed` unless the user enabled `[queue] allow_agent_approval =\ntrue` in the user config. Do not call it unless the user told you to.\nWhen allowed, it waits until the train landed, failed or needs a human\nto reconcile (up to the base's `push_timeout` plus its\n`network_timeout` and a margin), sending progress notifications when\nthe request carries a progressToken.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "train_id": {
+            "description": "Train to approve, as shown by `queue_status`.",
+            "type": "string"
+          },
+          "working_directory": {
+            "description": "Absolute path inside the repository (worktree).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "working_directory",
+          "train_id"
+        ],
+        "type": "object"
+      },
+      "name": "queue_approve",
+      "outputSchema": {
+        "$defs": {
+          "GateSchema": {
+            "description": "One gate of a train.",
+            "properties": {
+              "duration_ms": {
+                "description": "Run time in milliseconds.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "gate": {
+                "description": "Gate name.",
+                "type": "string"
+              },
+              "job_id": {
+                "description": "Sluice job id of the run.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "key": {
+                "description": "Cache key on the train's tree.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "description": "`pending`, `running`, `pass`, `cached`, `fail`, `timeout`, `killed`, `error`.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "gate",
+              "status"
+            ],
+            "type": "object"
+          },
+          "TrainSchema": {
+            "description": "One merge-queue train.",
+            "properties": {
+              "approved_at": {
+                "description": "Approval time.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "approved_via": {
+                "description": "`cli` or `mcp`.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "base_sha": {
+                "description": "Commit the members were merged onto.",
+                "type": "string"
+              },
+              "created_at": {
+                "description": "Creation time.",
+                "type": "string"
+              },
+              "gates": {
+                "description": "Gates of the train.",
+                "items": {
+                  "$ref": "#/$defs/GateSchema"
+                },
+                "type": "array"
+              },
+              "landed_at": {
+                "description": "Landing time.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "members": {
+                "description": "Member job ids, in merge order.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "merge_sha": {
+                "description": "Landing commit.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "network_timeout_ms": {
+                "description": "`[queue] network_timeout` of the base, in milliseconds.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "note": {
+                "description": "Free-form note.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "push_timeout_ms": {
+                "description": "`[queue] push_timeout` of the base, in milliseconds.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "remote": {
+                "description": "Remote of the target; empty for a local target.",
+                "type": "string"
+              },
+              "repo": {
+                "description": "Git common dir of the repository.",
+                "type": "string"
+              },
+              "state": {
+                "description": "`building`, `verifying`, `ready`, `approved`, `pushing`, `landed`,\n`dissolved`, `needs_reconcile`.",
+                "type": "string"
+              },
+              "target": {
+                "description": "Target branch.",
+                "type": "string"
+              },
+              "train_hash": {
+                "description": "Hash that approves the train.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "train_id": {
+                "description": "Train id.",
+                "type": "string"
+              },
+              "updated_at": {
+                "description": "Last state change.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "train_id",
+              "repo",
+              "remote",
+              "target",
+              "base_sha",
+              "state",
+              "members",
+              "gates",
+              "created_at",
+              "updated_at"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "landed": {
+            "description": "True when the train landed on its target.",
+            "type": "boolean"
+          },
+          "state": {
+            "description": "Last known train state (`landed`, `dissolved`, `needs_reconcile`, or\n`approved`/`pushing` when the wait timed out).",
+            "type": "string"
+          },
+          "train": {
+            "$ref": "#/$defs/TrainSchema",
+            "description": "Last known view of the train."
+          },
+          "train_id": {
+            "description": "Train that was approved.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "train_id",
+          "state",
+          "landed",
+          "train"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Cancel a merge-queue job of this repository. A job that is pushing or\nwaiting for reconcile only records the request (it is cancelled once\nnothing landed is proven). Errors start with their code.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "job_id": {
+            "description": "Merge-queue job id, as returned by `queue_enqueue` or shown by\n`queue_status`.",
+            "type": "string"
+          },
+          "working_directory": {
+            "description": "Absolute path inside the repository (worktree) the job belongs to.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "working_directory",
+          "job_id"
+        ],
+        "type": "object"
+      },
+      "name": "queue_cancel",
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "attempts": {
+            "description": "Attempts so far.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "branch": {
+            "description": "Queued branch.",
+            "type": "string"
+          },
+          "caller": {
+            "description": "`agent` or `human`.",
+            "type": "string"
+          },
+          "cancel_requested": {
+            "description": "A cancel was requested while pushing.",
+            "type": "boolean"
+          },
+          "detail": {
+            "description": "Structured detail (conflicting paths, failing gate, ...)."
+          },
+          "enqueued_at": {
+            "description": "Enqueue time (RFC 3339).",
+            "type": "string"
+          },
+          "finished_at": {
+            "description": "Terminal time (RFC 3339).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "head_sha": {
+            "description": "Commit captured at enqueue.",
+            "type": "string"
+          },
+          "job_id": {
+            "description": "Job id.",
+            "type": "string"
+          },
+          "position": {
+            "description": "1-based position among the queued jobs of its target.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Machine-readable reason of the last side exit.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "remote": {
+            "description": "Remote of the target; empty for a local target.",
+            "type": "string"
+          },
+          "repo": {
+            "description": "Git common dir of the repository.",
+            "type": "string"
+          },
+          "session": {
+            "description": "Agent session identifier.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "`queued`, `merging`, `verifying`, `ready`, `approved`, `pushing`,\n`landed`, `conflict`, `failed`, `cancelled`, `needs_reconcile`.",
+            "type": "string"
+          },
+          "target": {
+            "description": "Target branch.",
+            "type": "string"
+          },
+          "train_id": {
+            "description": "Train the job belongs to, once claimed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "description": "Last state change (RFC 3339).",
+            "type": "string"
+          },
+          "worktree": {
+            "description": "Worktree the job was enqueued from.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "repo",
+          "worktree",
+          "branch",
+          "head_sha",
+          "remote",
+          "target",
+          "state",
+          "caller",
+          "cancel_requested",
+          "attempts",
+          "enqueued_at",
+          "updated_at"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Put a committed branch in the local merge queue (default: the current\nbranch of the worktree). Call it only after `verify` passed on the\ncommitted branch; refuses a detached HEAD and tracked uncommitted\nchanges. Returns the job; then stop and tell the human, who approves the\ntrain with `sluice queue approve`. After a conflict or a failure, fix\nthe branch and call `queue_retry` with the job id (the job keeps the\nbranch). Errors start with their code (`duplicate-branch`,\n`not-supported`, ...).",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "base": {
+            "default": null,
+            "description": "Landing target as `<remote>/<branch>` or a local branch. Default: the\nrepository's configured target.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "branch": {
+            "default": null,
+            "description": "Branch to queue. Default: the current branch of the worktree\n(a detached HEAD is refused).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "working_directory": {
+            "description": "Absolute path inside the repository (worktree) whose branch is queued.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "working_directory"
+        ],
+        "type": "object"
+      },
+      "name": "queue_enqueue",
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "attempts": {
+            "description": "Attempts so far.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "branch": {
+            "description": "Queued branch.",
+            "type": "string"
+          },
+          "caller": {
+            "description": "`agent` or `human`.",
+            "type": "string"
+          },
+          "cancel_requested": {
+            "description": "A cancel was requested while pushing.",
+            "type": "boolean"
+          },
+          "detail": {
+            "description": "Structured detail (conflicting paths, failing gate, ...)."
+          },
+          "enqueued_at": {
+            "description": "Enqueue time (RFC 3339).",
+            "type": "string"
+          },
+          "finished_at": {
+            "description": "Terminal time (RFC 3339).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "head_sha": {
+            "description": "Commit captured at enqueue.",
+            "type": "string"
+          },
+          "job_id": {
+            "description": "Job id.",
+            "type": "string"
+          },
+          "position": {
+            "description": "1-based position among the queued jobs of its target.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Machine-readable reason of the last side exit.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "remote": {
+            "description": "Remote of the target; empty for a local target.",
+            "type": "string"
+          },
+          "repo": {
+            "description": "Git common dir of the repository.",
+            "type": "string"
+          },
+          "session": {
+            "description": "Agent session identifier.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "`queued`, `merging`, `verifying`, `ready`, `approved`, `pushing`,\n`landed`, `conflict`, `failed`, `cancelled`, `needs_reconcile`.",
+            "type": "string"
+          },
+          "target": {
+            "description": "Target branch.",
+            "type": "string"
+          },
+          "train_id": {
+            "description": "Train the job belongs to, once claimed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "description": "Last state change (RFC 3339).",
+            "type": "string"
+          },
+          "worktree": {
+            "description": "Worktree the job was enqueued from.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "repo",
+          "worktree",
+          "branch",
+          "head_sha",
+          "remote",
+          "target",
+          "state",
+          "caller",
+          "cancel_requested",
+          "attempts",
+          "enqueued_at",
+          "updated_at"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Re-queue a merge-queue job that ended `conflict` or `failed`, with the\ncurrent head of its branch (re-read in the repository, like `sluice\nqueue retry`). Rebase or fix the branch, commit and `verify` first.\nErrors start with their code (`conflict-state` for a job in another\nstate, `not-found`, ...).",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "job_id": {
+            "description": "Merge-queue job id, as returned by `queue_enqueue` or shown by\n`queue_status`.",
+            "type": "string"
+          },
+          "working_directory": {
+            "description": "Absolute path inside the repository (worktree) the job belongs to.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "working_directory",
+          "job_id"
+        ],
+        "type": "object"
+      },
+      "name": "queue_retry",
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "attempts": {
+            "description": "Attempts so far.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "branch": {
+            "description": "Queued branch.",
+            "type": "string"
+          },
+          "caller": {
+            "description": "`agent` or `human`.",
+            "type": "string"
+          },
+          "cancel_requested": {
+            "description": "A cancel was requested while pushing.",
+            "type": "boolean"
+          },
+          "detail": {
+            "description": "Structured detail (conflicting paths, failing gate, ...)."
+          },
+          "enqueued_at": {
+            "description": "Enqueue time (RFC 3339).",
+            "type": "string"
+          },
+          "finished_at": {
+            "description": "Terminal time (RFC 3339).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "head_sha": {
+            "description": "Commit captured at enqueue.",
+            "type": "string"
+          },
+          "job_id": {
+            "description": "Job id.",
+            "type": "string"
+          },
+          "position": {
+            "description": "1-based position among the queued jobs of its target.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Machine-readable reason of the last side exit.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "remote": {
+            "description": "Remote of the target; empty for a local target.",
+            "type": "string"
+          },
+          "repo": {
+            "description": "Git common dir of the repository.",
+            "type": "string"
+          },
+          "session": {
+            "description": "Agent session identifier.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "`queued`, `merging`, `verifying`, `ready`, `approved`, `pushing`,\n`landed`, `conflict`, `failed`, `cancelled`, `needs_reconcile`.",
+            "type": "string"
+          },
+          "target": {
+            "description": "Target branch.",
+            "type": "string"
+          },
+          "train_id": {
+            "description": "Train the job belongs to, once claimed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "description": "Last state change (RFC 3339).",
+            "type": "string"
+          },
+          "worktree": {
+            "description": "Worktree the job was enqueued from.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "repo",
+          "worktree",
+          "branch",
+          "head_sha",
+          "remote",
+          "target",
+          "state",
+          "caller",
+          "cancel_requested",
+          "attempts",
+          "enqueued_at",
+          "updated_at"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Show the merge queue of the repository: trains, their members and\nstate, conflicts with paths, and which trains are ready for a human to\napprove. The structured content is the `queue-status` payload\n(`sluice queue status --json`, `schema: 1`).",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "working_directory": {
+            "description": "Absolute path inside the repository (worktree).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "working_directory"
+        ],
+        "type": "object"
+      },
+      "name": "queue_status",
+      "outputSchema": {
+        "$defs": {
+          "GateSchema": {
+            "description": "One gate of a train.",
+            "properties": {
+              "duration_ms": {
+                "description": "Run time in milliseconds.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "gate": {
+                "description": "Gate name.",
+                "type": "string"
+              },
+              "job_id": {
+                "description": "Sluice job id of the run.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "key": {
+                "description": "Cache key on the train's tree.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "description": "`pending`, `running`, `pass`, `cached`, `fail`, `timeout`, `killed`, `error`.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "gate",
+              "status"
+            ],
+            "type": "object"
+          },
+          "JobSchema": {
+            "description": "One merge-queue job.",
+            "properties": {
+              "attempts": {
+                "description": "Attempts so far.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "branch": {
+                "description": "Queued branch.",
+                "type": "string"
+              },
+              "caller": {
+                "description": "`agent` or `human`.",
+                "type": "string"
+              },
+              "cancel_requested": {
+                "description": "A cancel was requested while pushing.",
+                "type": "boolean"
+              },
+              "detail": {
+                "description": "Structured detail (conflicting paths, failing gate, ...)."
+              },
+              "enqueued_at": {
+                "description": "Enqueue time (RFC 3339).",
+                "type": "string"
+              },
+              "finished_at": {
+                "description": "Terminal time (RFC 3339).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "head_sha": {
+                "description": "Commit captured at enqueue.",
+                "type": "string"
+              },
+              "job_id": {
+                "description": "Job id.",
+                "type": "string"
+              },
+              "position": {
+                "description": "1-based position among the queued jobs of its target.",
+                "format": "uint",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "reason": {
+                "description": "Machine-readable reason of the last side exit.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "remote": {
+                "description": "Remote of the target; empty for a local target.",
+                "type": "string"
+              },
+              "repo": {
+                "description": "Git common dir of the repository.",
+                "type": "string"
+              },
+              "session": {
+                "description": "Agent session identifier.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "state": {
+                "description": "`queued`, `merging`, `verifying`, `ready`, `approved`, `pushing`,\n`landed`, `conflict`, `failed`, `cancelled`, `needs_reconcile`.",
+                "type": "string"
+              },
+              "target": {
+                "description": "Target branch.",
+                "type": "string"
+              },
+              "train_id": {
+                "description": "Train the job belongs to, once claimed.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "updated_at": {
+                "description": "Last state change (RFC 3339).",
+                "type": "string"
+              },
+              "worktree": {
+                "description": "Worktree the job was enqueued from.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "job_id",
+              "repo",
+              "worktree",
+              "branch",
+              "head_sha",
+              "remote",
+              "target",
+              "state",
+              "caller",
+              "cancel_requested",
+              "attempts",
+              "enqueued_at",
+              "updated_at"
+            ],
+            "type": "object"
+          },
+          "TrainSchema": {
+            "description": "One merge-queue train.",
+            "properties": {
+              "approved_at": {
+                "description": "Approval time.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "approved_via": {
+                "description": "`cli` or `mcp`.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "base_sha": {
+                "description": "Commit the members were merged onto.",
+                "type": "string"
+              },
+              "created_at": {
+                "description": "Creation time.",
+                "type": "string"
+              },
+              "gates": {
+                "description": "Gates of the train.",
+                "items": {
+                  "$ref": "#/$defs/GateSchema"
+                },
+                "type": "array"
+              },
+              "landed_at": {
+                "description": "Landing time.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "members": {
+                "description": "Member job ids, in merge order.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "merge_sha": {
+                "description": "Landing commit.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "network_timeout_ms": {
+                "description": "`[queue] network_timeout` of the base, in milliseconds.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "note": {
+                "description": "Free-form note.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "push_timeout_ms": {
+                "description": "`[queue] push_timeout` of the base, in milliseconds.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "remote": {
+                "description": "Remote of the target; empty for a local target.",
+                "type": "string"
+              },
+              "repo": {
+                "description": "Git common dir of the repository.",
+                "type": "string"
+              },
+              "state": {
+                "description": "`building`, `verifying`, `ready`, `approved`, `pushing`, `landed`,\n`dissolved`, `needs_reconcile`.",
+                "type": "string"
+              },
+              "target": {
+                "description": "Target branch.",
+                "type": "string"
+              },
+              "train_hash": {
+                "description": "Hash that approves the train.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "train_id": {
+                "description": "Train id.",
+                "type": "string"
+              },
+              "updated_at": {
+                "description": "Last state change.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "train_id",
+              "repo",
+              "remote",
+              "target",
+              "base_sha",
+              "state",
+              "members",
+              "gates",
+              "created_at",
+              "updated_at"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "jobs": {
+            "description": "Jobs, in queue order.",
+            "items": {
+              "$ref": "#/$defs/JobSchema"
+            },
+            "type": "array"
+          },
+          "schema": {
+            "description": "Schema version (1).",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "trains": {
+            "description": "Trains, oldest first.",
+            "items": {
+              "$ref": "#/$defs/TrainSchema"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "schema",
+          "trains",
+          "jobs"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "description": "Show the Sluice daemon: budget, running and queued jobs, totals (same\nschema as `sluice status --json`; `daemon` is null when none runs). With\n`working_directory`, also the cache state of that tree per gate.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "working_directory": {
+            "default": null,
+            "description": "Absolute path inside a repository: adds the cache state of its\ncurrent tree per gate and marks that repository's jobs.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "status"
+    },
+    {
+      "description": "Verify the working tree: run the selected gates (cache hit in milliseconds,\notherwise queued in the shared Sluice daemon) and block until they\nfinished. The gates run concurrently; by default (`fail_fast`) the call\nreturns at the first gate that fails and cancels the others. Call this\nbefore committing instead of running test, lint or type-check commands\nyourself. Sends a progress notification every 15 s (configurable) when\nthe request carries a progressToken; without one, the client's idle\ntimeout (30 minutes in Claude Code) is the effective limit. The result\nlists one line per gate and, on failure, the tail of the first failing\nlog; `is_error` is set when any gate did not pass.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "extra_args": {
+            "default": null,
+            "description": "Arguments appended to every selected gate's command.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "fail_fast": {
+            "default": null,
+            "description": "Stop at the first failing gate (default true): the call returns as\nsoon as one gate fails, times out or errors, and the gates still\npending are cancelled (a job another client also waits for keeps\nrunning). `false` waits for every gate and reports every failure.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "gates": {
+            "default": null,
+            "description": "Gate names, run in this order. Default: the gates whose `hooks`\ncontain `pre-commit`; when none is tagged, every gate.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "timeout_seconds": {
+            "default": null,
+            "description": "Execution time limit per gate in seconds, overriding the gate's\n`timeout`. Time spent waiting in the queue does not count.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "working_directory": {
+            "description": "Absolute path inside the repository (worktree) to verify.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "working_directory"
+        ],
+        "type": "object"
+      },
+      "name": "verify",
+      "outputSchema": {
+        "$defs": {
+          "GateResult": {
+            "properties": {
+              "cached": {
+                "description": "True when answered from the cache (nothing ran for this call).",
+                "type": "boolean"
+              },
+              "coalesced": {
+                "description": "True when this call joined a job another client had already queued.",
+                "type": "boolean"
+              },
+              "duration_ms": {
+                "description": "Wall-clock run time in milliseconds (absent for cached passes).",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "exit_code": {
+                "description": "Exit code, when the process exited normally.",
+                "format": "int32",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "gate": {
+                "description": "Gate name.",
+                "type": "string"
+              },
+              "job_id": {
+                "description": "Job id (for a cached pass, the job that produced the marker).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "log_path": {
+                "description": "Path of the job log.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "message": {
+                "description": "Human-readable detail (errors, cancellation).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "not_cached_reason": {
+                "description": "Why a pass was not cached, if it was not.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "queue_wait_ms": {
+                "description": "Time this call waited in the queue before the gate started, in\nmilliseconds (absent for cached passes and gates that never started).",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "status": {
+                "$ref": "#/$defs/GateStatus",
+                "description": "Outcome category."
+              },
+              "tail": {
+                "description": "Last lines of the log of a failing gate (absent when empty).",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "wait_reason": {
+                "description": "Dominant reason the job waited: `budget`, `psi`, `repo-cap`,\n`head-reserved` or `order` (absent when it did not wait).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "gate",
+              "status",
+              "cached",
+              "coalesced"
+            ],
+            "type": "object"
+          },
+          "GateStatus": {
+            "description": "Final state of one gate in a `verify` call.",
+            "oneOf": [
+              {
+                "const": "pass",
+                "description": "Passed (or a cached pass).",
+                "type": "string"
+              },
+              {
+                "const": "fail",
+                "description": "Non-zero exit or killed by a foreign signal.",
+                "type": "string"
+              },
+              {
+                "const": "timeout",
+                "description": "Exceeded its execution timeout.",
+                "type": "string"
+              },
+              {
+                "const": "killed",
+                "description": "Killed by Sluice (daemon stop, last subscriber gone).",
+                "type": "string"
+              },
+              {
+                "const": "error",
+                "description": "Sluice itself failed to run the gate.",
+                "type": "string"
+              },
+              {
+                "const": "cancelled",
+                "description": "The `verify` call was cancelled while this gate was pending.",
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "all_passed": {
+            "description": "True when every gate passed.",
+            "type": "boolean"
+          },
+          "cancelled": {
+            "description": "True when the call was cancelled before every gate finished.",
+            "type": "boolean"
+          },
+          "repository": {
+            "description": "Repository root.",
+            "type": "string"
+          },
+          "results": {
+            "description": "One entry per gate, in the requested order.",
+            "items": {
+              "$ref": "#/$defs/GateResult"
+            },
+            "type": "array"
+          },
+          "wall_ms": {
+            "description": "Wall time of the whole call, in milliseconds.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "repository",
+          "results",
+          "all_passed"
+        ],
+        "type": "object"
+      }
+    }
+  ]
+}

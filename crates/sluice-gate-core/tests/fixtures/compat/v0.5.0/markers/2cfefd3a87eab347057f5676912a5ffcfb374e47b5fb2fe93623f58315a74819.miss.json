@@ -1,0 +1,10 @@
+{
+  "format": 1,
+  "key": "2cfefd3a87eab347057f5676912a5ffcfb374e47b5fb2fe93623f58315a74819",
+  "gate": "timeout",
+  "exit_code": null,
+  "reason": "timed out",
+  "job_id": "1792842867714-2408527-9b535a",
+  "log_path": "/tmp/sa-compat.o1RPWO/v0.5.0/home/.state/sluice/logs/1792842867714-2408527-9b535a.log",
+  "recorded_at": "2026-10-24T11:54:28Z"
+}

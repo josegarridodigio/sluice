@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "daemon": {
+    "instance": "2409997-1792842912700",
+    "pid": 2409997,
+    "started_at": "2026-10-24T11:55:12Z",
+    "version": "0.4.1",
+    "socket": "/tmp/sa-compat.bmTA3Q/v0.4.1/run/real.sock",
+    "log_level": "info"
+  },
+  "budget": {
+    "total": 20,
+    "used": 1,
+    "psi": {
+      "enabled": true,
+      "cpu_some_avg10": 0.0,
+      "memory_some_avg10": 0.0,
+      "blocking": false
+    },
+    "cap": 30,
+    "cpus": 20,
+    "idle_cpus": 19.5
+  },
+  "running": [
+    {
+      "job_id": "1792842917384-2409997-eedae7",
+      "repo": "/tmp/sa-compat.bmTA3Q/v0.4.1/repo",
+      "gate": "slow",
+      "weight": 1,
+      "started_at": "2026-10-24T11:55:17Z",
+      "elapsed_ms": 1493,
+      "subscribers": 1,
+      "caller": "human",
+      "weight_cfg": 1,
+      "weight_effective": 1,
+      "waited_ms": 1,
+      "admission": "nominal",
+      "demand": 0.0
+    }
+  ],
+  "queued": [],
+  "totals": {
+    "since": "2026-10-24T11:55:13Z",
+    "runs": 5,
+    "passes": 3,
+    "failures": 1,
+    "timeouts": 1,
+    "hits": 1,
+    "coalesced": 0,
+    "wait_ms_total": 6,
+    "run_ms_total": 1053,
+    "time_saved_ms": 2,
+    "psi_blocked_ms_total": 0,
+    "idle_while_waiting_ms": 0,
+    "waiting_wall_ms": 0,
+    "over_admissions": 0
+  },
+  "queue": {
+    "active": 0,
+    "ready": 0,
+    "needs_reconcile": 0
+  }
+}

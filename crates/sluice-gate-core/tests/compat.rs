@@ -19,7 +19,7 @@ use sluice_gate_core::key::{self, CacheKey, KeyMaterial};
 use sluice_gate_core::marker::{Lookup, MarkerStore};
 use sluice_gate_core::tree::TreeHash;
 
-const RELEASES: [&str; 4] = ["v0.1.0", "v0.2.0", "v0.3.0", "v0.4.0"];
+const RELEASES: [&str; 6] = ["v0.1.0", "v0.2.0", "v0.3.0", "v0.4.0", "v0.4.1", "v0.5.0"];
 
 /// Longer than any marker can be old.
 const CENTURY: Duration = Duration::from_hours(100 * 365 * 24);

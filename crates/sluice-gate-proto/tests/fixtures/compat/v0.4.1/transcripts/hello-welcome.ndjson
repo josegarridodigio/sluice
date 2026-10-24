@@ -1,0 +1,2 @@
+{"conn":1,"dir":"c2s","msg":{"type":"hello","protocol":1,"client":"compat-raw 0","pid":2410039}}
+{"conn":1,"dir":"s2c","msg":{"type":"welcome","protocol":1,"daemon":"sluice-gate 0.4.1","instance":"2409997-1792842912700","pid":2409997,"started_at":"2026-10-24T11:55:12Z","features":["exec","queue-only","queue"]}}

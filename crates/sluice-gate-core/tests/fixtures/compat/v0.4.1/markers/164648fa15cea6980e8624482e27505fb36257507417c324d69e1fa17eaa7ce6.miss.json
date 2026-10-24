@@ -1,0 +1,10 @@
+{
+  "format": 1,
+  "key": "164648fa15cea6980e8624482e27505fb36257507417c324d69e1fa17eaa7ce6",
+  "gate": "fail",
+  "exit_code": 1,
+  "reason": "gate failed",
+  "job_id": "1792842914628-2409997-7a8344",
+  "log_path": "/tmp/sa-compat.bmTA3Q/v0.4.1/home/.state/sluice/logs/1792842914628-2409997-7a8344.log",
+  "recorded_at": "2026-10-24T11:55:14Z"
+}
