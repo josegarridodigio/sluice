@@ -398,3 +398,12 @@ policy on the agents scope, with a lower limit and a short duration than the
 user manager's, makes `systemd-oomd` act inside the agents scope first and
 kill only the offending leaf. Open: systemd 255 (no per-unit duration), the
 `user.oomd_avoid` ranking effect, and machines without swap.
+
+Desktop side effect observed in T3: GNOME (`gnome-settings-daemon`) showed a
+generic notification "Application stopped: the device memory is almost full;
+an application was using a large amount of memory and was forced to stop" at
+the moment `systemd-oomd` killed the test leaf (journal: one kill only, the
+`tools` leaf, 10:59:27). Any containment kill will raise this notification
+without naming the agent or the command, so Sluice must report its own
+explanation (session, command, reason) in `sluice status`, `doctor` and the
+agent's tool result.
