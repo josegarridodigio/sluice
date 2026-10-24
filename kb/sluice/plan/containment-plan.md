@@ -58,6 +58,11 @@ S3 MCP tree, attach in session     (cg-exec helper)           C5 status, doctor 
 S4 fallback matrix                                                                        (IDE, team)         R4 release 0.5.0
 ```
 
+Rule for every spike and test: only move processes the spike itself started.
+Never move, signal or re-parent an existing process of the system or the
+desktop (S4 moved an idle `gnome-session-init-worker` out of its login scope
+while testing; moving it back needs root).
+
 ### S1 — sandbox and cgroupfs (Sonnet, real session with haiku)
 
 Does Claude Code's Bash sandbox (bubblewrap on Linux) leave
