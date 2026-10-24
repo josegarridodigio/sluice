@@ -63,6 +63,12 @@ Never move, signal or re-parent an existing process of the system or the
 desktop (S4 moved an idle `gnome-session-init-worker` out of its login scope
 while testing; moving it back needs root).
 
+Rule after the 2026-10-24 incident
+([[sluice/research/containment-s2-incident.md]]): no spike or test creates
+memory pressure on a developer's machine (no `MemoryHigh` or `MemoryMax`
+experiments, no memory hogs). Memory behaviour is studied from documentation
+and in a disposable VM or container with its own systemd.
+
 ### S1 — sandbox and cgroupfs (Sonnet, real session with haiku)
 
 Does Claude Code's Bash sandbox (bubblewrap on Linux) leave
@@ -82,6 +88,14 @@ Output: recommended weights for `sluice-agents.scope`, `sluice-gates.scope`,
 `ui`, `tools`; whether a CPU ceiling is needed by default; `MemoryHigh` and
 `pids.max` defaults from observed session sizes (agent about 0.5 GB, MCP
 servers about 0.4 GB here).
+
+### S5 — memory policy with systemd-oomd (documentation and a disposable VM only)
+
+Design the memory side so that, under pressure, the agent session causing it
+is the one acted on, never the desktop: `ManagedOOMMemoryPressure=` and its
+limit on Sluice's units (below the user manager's 50 %), `ManagedOOMPreference=`
+and who may set it, swap interaction, and whether any memory limit should be
+on by default. Never run on the developer's machine.
 
 ### S3 — moving the agent and its MCP servers (Sonnet, real session with haiku)
 

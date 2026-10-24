@@ -57,8 +57,12 @@ A spike on the user's machine (Ubuntu, systemd 259, cgroup v2) showed:
    contained. Shims do the same self-move before running a heavy tool, which
    covers agents other than Claude Code.
 4. **Limits.** CPU by weight (work-conserving: no slowdown on an idle
-   machine), with an optional ceiling; memory by `MemoryHigh` (throttling),
-   never `MemoryMax`; `pids.max` per session. Defaults come from the S-wave.
+   machine), with an optional ceiling; `pids.max` per session. Memory: NOT
+   `MemoryHigh` alone — the S2 incident showed that throttling a cgroup
+   creates pressure that `systemd-oomd` attributes to the whole user manager
+   and answers by killing an unrelated cgroup (the desktop session). The
+   memory policy is decided by spike S5 around `systemd-oomd`. Defaults come
+   from the S-wave.
 5. **Fail open.** If the cgroup cannot be created or joined (no systemd user
    manager, no delegated `cpu`, a sandbox that makes `/sys/fs/cgroup`
    read-only), nothing breaks: the session runs as today and `sluice doctor`
