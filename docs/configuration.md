@@ -184,6 +184,22 @@ env_any_equals = {}
 heavy_commands_extra = []                    # appended to it
 exec_weight = 0                              # 0 = ceil(budget / 2)
 
+[containment]
+enabled = true                 # false: no cgroups (0.4.1 behaviour)
+slice_cpu_weight = 50
+gates_cpu_weight = 100
+agents_cpu_weight = 30
+ui_cpu_weight = 400
+tools_cpu_weight = 25
+sandbox_nice = 19
+cpu_ceiling = ""               # e.g. "80%" of all CPUs; empty = none
+pids_max = 4096
+memory_policy = "oomd"         # oomd | none
+memory_pressure_limit = "auto" # or "30%"
+memory_pressure_duration = "auto"   # or "5s"
+memory_high = ""               # opt-in per session, e.g. "8G"
+memory_max = ""                # opt-in per session
+
 [repos."/path/to/repo"]
 budget_share_max = 4
 ```
@@ -226,6 +242,20 @@ budget_share_max = 4
 | `agent.heavy_commands` | built-in list | Replaces the list of commands that the plugin guard rewrites to `sluice exec` and that the shell shims route through the queue. Entries are command words (`cargo build`, `docker compose build`), compared after package-manager equivalences (`pnpm build`, `npm run build` and `yarn build` are all `run build`). The built-in list is in [Heavy commands](#heavy-commands-with-no-config). Entries must not be empty, contain control characters or have more than 8 words; at most 256 entries with `heavy_commands_extra`. |
 | `agent.heavy_commands_extra` | `[]` | Appended to the built-in (or replaced) list. |
 | `agent.exec_weight` | `0` | Default weight (ceiling) of `sluice exec` when `--weight` is absent; `0` means `ceil(budget / 2)`. Since 0.4.0 the daemon lowers it after 3 runs of the same repository and label, from the measured demand (never below a quarter of it). |
+| `containment.enabled` | `true` | Agent resource containment in cgroup v2 through the systemd user manager (ADR-0017). `false` keeps the 0.4.1 behaviour. Where cgroup v2, a reachable user manager or the delegated controllers are missing, containment degrades by itself and `sluice doctor` says why. |
+| `containment.slice_cpu_weight` | `50` | `CPUWeight` of `sluice.slice` against the rest of the user's session. 1 to 10000. |
+| `containment.gates_cpu_weight` | `100` | `CPUWeight` of the scope holding the daemon and the gate jobs. 1 to 10000. |
+| `containment.agents_cpu_weight` | `30` | `CPUWeight` of the scope holding the agent sessions. 1 to 10000. |
+| `containment.ui_cpu_weight` | `400` | `cpu.weight` of a session's `ui` leaf (the agent and its MCP servers). 1 to 10000. |
+| `containment.tools_cpu_weight` | `25` | `cpu.weight` of a session's `tools` leaf (the commands the agent runs). 1 to 10000. |
+| `containment.sandbox_nice` | `19` | `nice` for shells that cannot be moved to `tools` (cgroupfs read-only in a sandbox). 0 to 19. |
+| `containment.cpu_ceiling` | `""` | Optional hard CPU ceiling of the agents scope, a percentage of all CPUs (`"80%"`, 1% to 100%). Empty means none: weights already give the CPU back when it is idle. |
+| `containment.pids_max` | `4096` | `pids.max` of a session. Must be >= 1. |
+| `containment.memory_policy` | `"oomd"` | `oomd`: where `systemd-oomd` is active and systemd is 257 or newer, the agents scope gets its own memory pressure policy, so `systemd-oomd` acts inside it first and kills only the offending leaf. `none`: memory is only accounted. Never a `MemoryHigh` or `MemoryMax` by default. |
+| `containment.memory_pressure_limit` | `"auto"` | `ManagedOOMMemoryPressureLimit` of the agents scope: `"auto"` or `"1%"` to `"99%"`. `auto` reads the policy that watches your user manager (`systemctl show user@UID.service`, then `oomctl dump`, then `oomd.conf`, then oomd's built-in 60%) and uses `min(30%, 0.6 x its limit)`, so it always stays below it. |
+| `containment.memory_pressure_duration` | `"auto"` | `ManagedOOMMemoryPressureDurationUSec` of the agents scope: `"auto"` or a duration above zero. `auto` is `min(5s, the user manager's duration / 4)`, never below 1s. |
+| `containment.memory_high` | `""` | Opt-in `memory.high` per session, a size (`"8G"`, `"512M"`). Empty means none. Throttling without swap can raise pressure that `systemd-oomd` attributes to the whole user manager: advised only together with swap. |
+| `containment.memory_max` | `""` | Opt-in `memory.max` per session (the kernel kills inside the session when it is hit). Empty means none. |
 | `repos."<path>".budget_share_max` | unset | Optional cap on the budget one repository may use at once. Must be >= 1. |
 
 ### Heavy commands with no config

@@ -4,6 +4,8 @@
 //! path of `sluice run` must stay fast and must never need the daemon.
 //!
 //! Modules:
+//! - [`cgroup`]: agent resource containment in cgroup v2 through the systemd
+//!   user manager (detection, tree, placement, usage).
 //! - [`config`]: `.sluice.toml` (repository gates) and the user config.
 //! - [`cpus`]: CPUs available to the process (affinity mask, cgroup limit).
 //! - [`git`]: the only place that spawns the `git` binary.
@@ -21,6 +23,7 @@
 //! - [`pkgscripts`]: `package.json` scripts as heavy-command sources.
 
 pub mod agent;
+pub mod cgroup;
 pub mod config;
 pub mod cpus;
 pub mod dirs;

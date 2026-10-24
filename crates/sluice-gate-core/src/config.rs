@@ -681,9 +681,16 @@ pub struct UserConfig {
     pub debug: DebugConfig,
     /// Agent command control (guard rewrite, shims, `sluice exec` weight).
     pub agent: AgentConfig,
+    /// Agent resource containment in cgroups.
+    pub containment: ContainmentConfig,
     /// Per-repository overrides keyed by repository path.
     pub repos: BTreeMap<PathBuf, RepoOverride>,
 }
+
+mod containment;
+pub use containment::{
+    AUTO, ContainmentConfig, MAX_CPU_WEIGHT, MemoryPolicy, parse_percent, parse_size_bytes,
+};
 
 /// Most entries `[agent] heavy_commands` plus `heavy_commands_extra` may hold.
 pub const MAX_HEAVY_COMMANDS: usize = 256;
@@ -965,6 +972,7 @@ impl Default for UserConfig {
             queue: UserQueueConfig::default(),
             debug: DebugConfig::default(),
             agent: AgentConfig::default(),
+            containment: ContainmentConfig::default(),
             repos: BTreeMap::new(),
         }
     }
@@ -1144,6 +1152,7 @@ impl UserConfig {
                 }
             }
         }
+        cfg.containment.validate(path)?;
         for (repo, over) in &cfg.repos {
             if over.budget_share_max == Some(0) {
                 return Err(config_err(
