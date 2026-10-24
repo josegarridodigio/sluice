@@ -60,9 +60,10 @@ developer. Mechanism: cgroup v2 through the systemd user manager (ADR-0017).
 | C1 core cgroup module + config | in progress | |
 | C2 daemon placement + cg-exec | pending (after C1) | |
 | C3 session hook + env line, C4 shims | done on branch | [[sluice/changes/containment-session.md]] |
-| C5 status, doctor, interventions | done on branch | [[sluice/changes/containment-observability.md]] |
-| E2 plugin e2e (cases k-n) | done on branch: 4 cases PASS with real haiku sessions, one unreproduced flake noted | [[sluice/changes/containment-e2e.md]] |
-| E1 harness s9, E3 user checks | pending | |
+| C5 status, doctor, interventions | done | [[sluice/changes/containment-observability.md]] |
+| E1 harness s9 | done: 30/30, escapes contained, bounds met within 3 attempts; open: ui stalls under outside load (investigated in S6), 8-core rerun | [[sluice/changes/containment-proof.md]] |
+| E2 plugin e2e (cases k-n) | done: 4 cases PASS with real haiku sessions, one unreproduced flake fixed in C5 | [[sluice/changes/containment-e2e.md]] |
+| E3 user checks | pending (user) | |
 | R1–R4 | pending | |
 
 ## 4. Waves
