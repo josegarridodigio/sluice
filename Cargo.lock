@@ -1107,7 +1107,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "sluice-gate"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1136,7 +1136,7 @@ dependencies = [
 
 [[package]]
 name = "sluice-gate-core"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "directories",
  "hex",
@@ -1155,7 +1155,7 @@ dependencies = [
 
 [[package]]
 name = "sluice-gate-daemon"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "humantime",
@@ -1174,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "sluice-gate-mcp"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "humantime",
@@ -1193,7 +1193,7 @@ dependencies = [
 
 [[package]]
 name = "sluice-gate-proto"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "nix",
@@ -1206,7 +1206,7 @@ dependencies = [
 
 [[package]]
 name = "sluice-gate-queue"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "hex",
