@@ -650,6 +650,9 @@ enum Route {
     Gate { gate: String },
 }
 
+/// Reason of the direct route for a command that is not heavy.
+const NOT_HEAVY: &str = "not a heavy command";
+
 /// Chooses the route of `name args` run in `dir` (design section 5, step
 /// 2). The user config is not read inside a job or with `SLUICE_SHIMS=0`.
 fn route(
@@ -689,7 +692,7 @@ fn route(
         .classify(&words, dir, world.scripts())
         .is_none()
     {
-        return Route::Direct("not a heavy command".to_owned());
+        return Route::Direct(NOT_HEAVY.to_owned());
     }
     let label = words.iter().take(2).cloned().collect::<Vec<_>>().join(" ");
     Route::Queue { label }
@@ -715,7 +718,18 @@ pub fn exec(name: &str, args: &[String]) -> ExitCode {
             return ExitCode::from(e.exit_code());
         }
     };
-    match route(&env, || load_user(&env, false), &Fs, &cwd, name, args) {
+    let routed = route(&env, || load_user(&env, false), &Fs, &cwd, name, args);
+    // Containment (C4): a heavy tool of an agent session runs in the session's
+    // `tools` leaf. Not inside a Sluice job (the job has its own leaf) and not
+    // for light commands. Failing to place never fails the command.
+    let place = match &routed {
+        Route::Direct(why) => why != NOT_HEAVY && !why.starts_with("inside a Sluice job"),
+        _ => true,
+    };
+    if place {
+        crate::session_contain::place_self(&env);
+    }
+    match routed {
         Route::Direct(why) => {
             tracing::debug!(%name, %why, "shim: direct");
             let err = Command::new(&real).arg0(name).args(args).exec();

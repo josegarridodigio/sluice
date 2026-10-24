@@ -90,6 +90,21 @@ session-start`. Within a 300 ms watchdog it:
   commands, subshells, `$(...)`, `sh -c`, scripts and subagents. This is what
   catches the heavy commands the guard never rewrites (inside subshells,
   `$(...)`, `sh -c` and scripts);
+- contains the session in cgroups when the machine allows it (Linux with
+  cgroup v2, a systemd user manager and delegated controllers; see
+  `[containment]` in [configuration.md](configuration.md)). It creates the
+  session's cgroup under `sluice-agents.scope` with two leaves, `ui` (more CPU
+  weight) and `tools`; moves the agent process and everything it has already
+  started (MCP servers included) into `ui`, where whatever they start later
+  stays; and adds one more guarded line to `CLAUDE_ENV_FILE` that moves each
+  shell command into `tools` and exports `SLUICE_SESSION_LEAF` so the shims can
+  do the same before a heavy tool. The line prints nothing in any case: where
+  the cgroup files are not writable (the agent's Bash sandbox mounts them
+  read-only) the shell keeps the agent's leaf and runs at `nice` 19. Where the
+  CPU cannot be weighted (no systemd, no `cpu` delegated) the line only
+  `renice`s the shell. `contained=full|partial|off` appears in the hook's log
+  line. Containment never kills or blocks anything and is skipped silently when
+  unavailable;
 - gives the agent the rules as context (at most about 1,500 characters): verify
   before every commit with the `verify` tool, never retry a queued command
   without Sluice, do not wrap builds or tests in subshells or scripts, do not

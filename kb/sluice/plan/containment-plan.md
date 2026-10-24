@@ -59,7 +59,7 @@ developer. Mechanism: cgroup v2 through the systemd user manager (ADR-0017).
 | S5 memory | done: oomd-based policy, live T0/T3/T5/T6/T7 | [[sluice/research/containment-s5-memory-oomd.md]] |
 | C1 core cgroup module + config | in progress | |
 | C2 daemon placement + cg-exec | pending (after C1) | |
-| C3 session hook + env line, C4 shims | pending (after C1) | |
+| C3 session hook + env line, C4 shims | done on branch | [[sluice/changes/containment-session.md]] |
 | C5 status, doctor, interventions | pending (after C2, C3) | |
 | E1 harness s9, E2 plugin e2e, E3 user checks | pending | |
 | R1–R4 | pending | |

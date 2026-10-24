@@ -25,6 +25,7 @@ mod logging;
 mod logs;
 mod queue;
 mod run;
+mod session_contain;
 mod session_start;
 mod shim;
 mod snippets;

@@ -24,6 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hidden `sluice cg-exec <leaf> -- <argv>`: moves itself into a cgroup and
   `exec`s, running the command even when the move fails.
 
+- Session containment (ADR-0017): the plugin's session hook creates the
+  session's cgroup (`ui` and `tools` leaves under `sluice-agents.scope`), moves
+  the agent process and its current descendants into `ui`, and appends one
+  guarded, silent line to `CLAUDE_ENV_FILE` that moves each shell into `tools`
+  (nice 19 when the cgroup files are not writable, as in the Bash sandbox).
+  Where the CPU cannot be weighted the line only renices. The hook's log line
+  gains `contained=full|partial|off`. Shims place themselves in the session's
+  `tools` leaf (`SLUICE_SESSION_LEAF`) before running a heavy tool. Fails open;
+  nothing is ever killed.
+
 ### Changed
 
 ### Fixed

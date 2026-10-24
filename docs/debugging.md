@@ -68,7 +68,7 @@ what it did:
   with `hook=session-start`, `caller=agent`, `gate=-`, the session's `cwd` and a
   `decision`: `rules` (the repository has a `.sluice.toml`; the rules were given
   as context), `init-offer` (a git repository without one; the agent was told to
-  propose `sluice init`) or `non-git`. No such line after starting a session
+  propose `sluice init`) or `non-git`, followed by `contained=full`, `partial`, `off` or `timeout` (cgroup containment of the session; `timeout` means it did not finish in the hook's budget). No such line after starting a session
   means the hook did not run (plugin not installed or disabled), the binary was
   not found or is older than the plugin (the wrapper script then only tells the
   agent, and writes nothing), or Sluice failed open.

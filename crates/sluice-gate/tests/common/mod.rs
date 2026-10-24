@@ -1,6 +1,8 @@
 //! Throwaway repositories for the `sluice run` acceptance tests.
 #![allow(dead_code)]
 
+pub mod cgtree;
+
 use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

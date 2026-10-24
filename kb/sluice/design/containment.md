@@ -54,8 +54,21 @@ for others).
 One guarded line, written once per session (idempotent like the PATH line):
 
 ```sh
-if [ -w '<agents>/s-<id>/tools/cgroup.procs' ]; then echo $$ > '<agents>/s-<id>/tools/cgroup.procs'; else renice -n 19 $$ >/dev/null 2>&1; fi
+export SLUICE_SESSION_LEAF='<agents>/s-<id>/tools'; if [ -w '<agents>/s-<id>/tools/cgroup.procs' ]; then echo $$ > '<agents>/s-<id>/tools/cgroup.procs'; else renice -n 19 $$ >/dev/null 2>&1; fi
 ```
+
+`SLUICE_SESSION_LEAF` (added by C3/C4) is the `tools` leaf of the session; the
+shims read it to place themselves before a heavy tool (never inside a Sluice
+job, which has its own leaf, and only for paths under `/sys/fs/cgroup`). When
+CPU cannot be weighted but the cgroups are usable (`partial` with `cpu`
+missing) the line ends with `; renice -n 19 $$ >/dev/null 2>&1` so the shell is
+niced after a successful move too. When containment is unavailable the hook
+writes no cgroup line, only `renice -n 19 $$ >/dev/null 2>&1` where §6 says
+nice applies (cgroup v1/hybrid, no systemd, no controller delegated, `cpu`
+missing) and nothing for an unreachable user manager, a read-only cgroupfs or
+`enabled = false`. Agents scope creation: the hook uses it when it exists
+(daemon, C2); otherwise it creates it with a `sleep 86400` holder (C1
+`ensure_agents_scope`), which the daemon later adopts.
 
 No output in any branch (S1: `2>/dev/null` alone still printed under zsh and
 `|| echo` adds noise). Inside the Bash sandbox the test is false (cgroupfs is

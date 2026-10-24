@@ -11,10 +11,13 @@
 //! 2. appends to `$CLAUDE_ENV_FILE` a guarded line that puts that directory
 //!    first in `PATH`, unless the file already holds that exact line (the hook
 //!    fires again on resume and the env file is reused);
-//! 3. prints the `additionalContext` for the agent: the rules and the gate
+//! 3. contains the session in cgroups when `[containment]` allows it (the
+//!    agent and its descendants into `ui`, the self-move line for the shells
+//!    in the env file; see [`crate::session_contain`]), within the same budget;
+//! 4. prints the `additionalContext` for the agent: the rules and the gate
 //!    names in a repository with `.sluice.toml`, an offer to set Sluice up in
 //!    a git repository without it, a one-liner elsewhere;
-//! 4. logs one line to `logs/client.log`.
+//! 5. logs one line to `logs/client.log`.
 //!
 //! It never fails closed: any error, a panic or a run over the limit prints
 //! nothing and exits 0.
@@ -30,10 +33,13 @@ use serde_json::{Value, json};
 use sluice_gate_core::config::{EnvMap, REPO_CONFIG_FILE, RepoConfig, UserConfig};
 use sluice_gate_core::heavy::HeavyMatcher;
 
-use crate::{clientlog, shim};
+use crate::{clientlog, session_contain, shim};
 
 /// Longest the hook may take before it gives up silently.
 const WATCHDOG: Duration = Duration::from_millis(300);
+/// Time after which containment is abandoned so the answer is still printed
+/// before the watchdog fires.
+const BUDGET: Duration = Duration::from_millis(230);
 /// Largest hook input read from stdin.
 const MAX_INPUT: u64 = 1 << 20;
 /// Most gate names listed in the context.
@@ -152,7 +158,12 @@ pub fn env_line(dir: &Path) -> String {
 /// Appends [`env_line`] to `file` unless a line equal to it is already there.
 /// Returns whether it was appended.
 pub fn ensure_env_line(file: &Path, dir: &Path) -> std::io::Result<bool> {
-    let line = env_line(dir);
+    ensure_line(file, &env_line(dir))
+}
+
+/// Appends `line` to `file` unless a line equal to it is already there.
+/// Returns whether it was appended.
+pub fn ensure_line(file: &Path, line: &str) -> std::io::Result<bool> {
     let existing = match fs::read_to_string(file) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -172,6 +183,44 @@ pub fn ensure_env_line(file: &Path, dir: &Path) -> std::io::Result<bool> {
         .open(file)?;
     f.write_all(format!("{lead}{line}\n").as_bytes())?;
     Ok(true)
+}
+
+/// The hook's `session_id`, when it is a non-empty string.
+fn input_session(value: &Value) -> Option<String> {
+    value
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_owned)
+}
+
+/// Containment of the session (see [`session_contain`]) in a worker thread
+/// that may use what is left of the hook's budget; a late worker is left
+/// behind (every step is idempotent) and the label is `timeout`. Appends the
+/// env-file line when there is one. Returns the log label.
+fn contain(
+    session: Option<String>,
+    env: &EnvMap,
+    user: &UserConfig,
+    env_file: Option<&Path>,
+    start: Instant,
+) -> &'static str {
+    if !user.containment.enabled {
+        return "off";
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (env, user) = (env.clone(), user.clone());
+    let file = env_file.map(Path::to_path_buf);
+    std::thread::spawn(move || {
+        let agent = session_contain::agent_pid(&env);
+        let done = session_contain::contain_session(&env, &user, session.as_deref(), agent);
+        if let (Some(file), Some(line)) = (&file, &done.line) {
+            let _ = ensure_line(file, line);
+        }
+        let _ = tx.send(done.label);
+    });
+    let left = BUDGET.saturating_sub(start.elapsed());
+    rx.recv_timeout(left).unwrap_or("timeout")
 }
 
 /// What the hook does for `input`; the JSON to print, or `None`.
@@ -194,15 +243,23 @@ pub fn respond(input: &str, env: &EnvMap) -> Option<String> {
     let dir = shim::default_dir(env, &here).ok()?;
     let sluice = shim::current_binary().ok()?;
     let done = shim::install_into(&dir, &sluice, &names, false).ok()?;
-    if let Some(file) = env
+    let env_file = env
         .get("CLAUDE_ENV_FILE")
         .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-    {
-        ensure_env_line(&file, &done.dir).ok()?;
+        .map(PathBuf::from);
+    if let Some(file) = &env_file {
+        ensure_env_line(file, &done.dir).ok()?;
     }
+    let contained = contain(
+        input_session(&value),
+        env,
+        &user,
+        env_file.as_deref(),
+        start,
+    );
 
     let (text, decision) = context(&locate(&cwd));
+    let decision = format!("{decision} contained={contained}");
     let _ = clientlog::record(
         env,
         &clientlog::Entry {
@@ -212,7 +269,7 @@ pub fn respond(input: &str, env: &EnvMap) -> Option<String> {
             gate: "-",
             tree: None,
             reason: None,
-            decision,
+            decision: &decision,
             exit: 0,
             duration_ms: start.elapsed().as_millis(),
             cwd: &cwd,

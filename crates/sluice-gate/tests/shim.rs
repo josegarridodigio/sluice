@@ -62,6 +62,7 @@ fn setup(budget: u32, extra: &str) -> Shims {
   streams) printf out1; printf err1 >&2; printf out2; printf err2 >&2 ;;
   tty) if [ -t 1 ]; then echo tty; else echo notty; fi ;;
   env) echo "job=${SLUICE_JOB:-none}" ;;
+  cgroup) cat /proc/self/cgroup ;;
   recurse) exec make inner ;;
   wait) touch "$2.started"; while [ ! -f "$2.release" ]; do sleep 0.05; done; echo waited ;;
   *) echo "real make $*" ;;
@@ -788,4 +789,54 @@ fn a_shim_call_equal_to_a_gate_command_runs_sluice_run() {
     // Human sessions are untouched.
     let human = s.run(&path, &[], "make", &["gated"]);
     assert_eq!(stdout(&human), "real make gated\n", "{human:?}");
+}
+
+/// Task C4: a heavy tool run by the shim ends up in the session's `tools`
+/// leaf named by `SLUICE_SESSION_LEAF`; not inside a Sluice job, and nothing
+/// fails when the leaf cannot be written.
+#[test]
+fn a_heavy_tool_is_placed_in_the_session_leaf() {
+    let Some(tree) = common::cgtree::TestTree::new() else {
+        return;
+    };
+    let s = setup(4, "");
+    let path = s.default_path();
+    tree.tree.ensure_session("s-shim-c4").unwrap();
+    let leaf = tree.session_dir("shim-c4").join("tools");
+    let leaf_s = leaf.display().to_string();
+    // `-` as an argument makes the run direct (a heavy tool reading stdin).
+    let with_leaf = [
+        ("CLAUDECODE", "1"),
+        ("SLUICE_SESSION_LEAF", leaf_s.as_str()),
+    ];
+    let out = s.run(&path, &with_leaf, "make", &["cgroup", "-"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        stdout(&out).trim_end().ends_with("/s-shim-c4/tools"),
+        "{}",
+        stdout(&out)
+    );
+    // Inside a Sluice job the job's own leaf is kept.
+    let in_job = [
+        ("CLAUDECODE", "1"),
+        ("SLUICE_JOB", "outer-1"),
+        ("SLUICE_SESSION_LEAF", leaf_s.as_str()),
+    ];
+    let out = s.run(&path, &in_job, "make", &["cgroup", "-"]);
+    assert!(
+        !stdout(&out).contains("/s-shim-c4/tools"),
+        "{}",
+        stdout(&out)
+    );
+    // Missing and foreign leaves never fail the command.
+    for bad in [
+        "/sys/fs/cgroup/does/not/exist",
+        "/etc",
+        "/sys/fs/cgroup/../etc",
+    ] {
+        let env = [("CLAUDECODE", "1"), ("SLUICE_SESSION_LEAF", bad)];
+        let out = s.run(&path, &env, "make", &["cgroup", "-"]);
+        assert!(out.status.success(), "{bad}: {out:?}");
+        assert!(!stdout(&out).contains("/s-shim-c4/tools"), "{bad}");
+    }
 }

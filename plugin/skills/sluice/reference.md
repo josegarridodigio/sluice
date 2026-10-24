@@ -71,6 +71,14 @@ in every repository, with or without a `.sluice.toml`. `sluice shim status`
 shows whether they are first in `PATH`. Commands run by absolute path or
 under `env -i` bypass them. A human can turn them off with `SLUICE_SHIMS=0`.
 
+Where the machine allows it (cgroup v2, systemd user manager), the same hook
+also puts the agent, its MCP servers and its shells in a per-session cgroup so
+no runaway process can starve the machine: the agent in a `ui` leaf, each shell
+command in a `tools` leaf with less CPU weight (a guarded, silent line in the
+env file; read-only cgroupfs, as in the Bash sandbox, means `nice` 19 instead).
+Nothing is killed and nothing changes for you; `contained=` in the client log
+says what happened.
+
 Context variants: repository with `.sluice.toml` (rules and gate names); git
 repository without it (propose Sluice once: `sluice init --dry-run`, show
 the output, `sluice init` only after the user agrees); anything else (one
