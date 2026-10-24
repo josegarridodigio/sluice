@@ -138,11 +138,24 @@ Sluice is alpha: complete enough for early adopters, not yet proven by long use.
 - **Linux only**, git 2.31 or newer; other platforms are not planned.
 - **Verdicts, not artifacts.** A hit says a gate passed on this tree; it does
   not restore build outputs.
-- **Only declared gates, `sluice exec` and the heavy command list are
-  controlled.** In agent sessions the plugin's guard and shims queue the
-  heavy commands, but a command run by absolute path, under `env -i` or from
-  a shell that resets `PATH` bypasses the shims; your forge's branch
-  protection is the enforcement.
+- **Queueing covers declared gates, `sluice exec` and the heavy command
+  list.** In agent sessions the plugin's guard and shims queue the heavy
+  commands; a command run by absolute path, under `env -i` or from a shell
+  that resets `PATH` bypasses the queue. Since 0.5.0 such commands are still
+  contained (cgroups) when containment is available, and your forge's branch
+  protection remains the enforcement for what lands.
+- **Containment needs cgroup v2 and a systemd user manager.** CPU weights
+  need systemd 252 or newer (or an administrator's drop-in); the memory
+  policy needs `systemd-oomd` and systemd 257 or newer, otherwise memory is
+  only accounted. In containers, on cgroup v1 or without a user manager
+  Sluice runs uncontained and `sluice doctor` says why. It protects against
+  accidental overload, not against a process that moves itself out.
+- **0.5.0 containment was validated on two Ubuntu 26.04 machines** (20 and
+  12 threads), with real agent sessions on the command line and over SSH.
+  Not yet validated: the agent's Bash sandbox with its default seccomp
+  filter (tested only with `sandbox.network.allowAllUnixSockets`), the
+  interactive terminal UI, IDE integrations, and systems with systemd older
+  than 257. Reports are welcome.
 - **Shims need the agent plugin or setup by hand.** Claude Code gets them
   automatically; other agents need `sluice shim install` and a `PATH` entry.
   A `.sluice.toml` with `weight = "auto"` needs 0.4.0.

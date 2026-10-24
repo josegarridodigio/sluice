@@ -66,7 +66,7 @@ developer. Mechanism: cgroup v2 through the systemd user manager (ADR-0017).
 | S6 ui stalls | done: stalls come from oversubscription and hit any sleeping task; layout kept; s9 judged by p95 and share over 10 ms | [[sluice/research/containment-s6-ui-stalls.md]] |
 | E3 user checks | partial: second machine over SSH (12 threads) — doctor, s9 30/30, SSH login-scope attach; open: sandbox default, TUI, IDEs, systemd < 257 | [[sluice/changes/containment-e3-remote.md]] |
 | R1 review, R2 fixes, R3 reconciliation | done | [[sluice/changes/containment-reconciliation.md]] |
-| R4 release v0.5.0 | pending: E3 user checks, then the user's approval | |
+| R4 release v0.5.0 | user decision 2026-10-24: release with what can be tested now; the rest of E3 is published as known limitations (README) | |
 
 ## 4. Waves
 
