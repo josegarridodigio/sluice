@@ -529,8 +529,10 @@ def init_phase(rep: Report, w: World) -> None:
     rep.check("I: lint is weight 2 and test is weight = \"auto\"", re.search(r"weight\s*=\s*2\b", gates.get("lint", "")) is not None
               and re.search(r'weight\s*=\s*"auto"', gates.get("test", "")) is not None, f"lint: {gates.get('lint', '')!r} test: {gates.get('test', '')[:120]!r}")
     lines = (repo / ".husky" / "pre-commit").read_text().splitlines()
-    rep.check("I: the hook is rewired in place: pretty-quick line kept, ng lint and ng test became `sluice run --hook pre-commit ...`",
-              lines == ["npx pretty-quick --staged", "sluice run --hook pre-commit lint", "sluice run --hook pre-commit test"], f"{lines}")
+    rep.check("I: the hook is rewired in place: pretty-quick line kept, ng lint and ng test became `sluice run --hook pre-commit ...` guarded by `command -v sluice` (0.4.1)",
+              lines == ["npx pretty-quick --staged",
+                        "if command -v sluice >/dev/null 2>&1; then sluice run --hook pre-commit lint; else ng lint; fi",
+                        "if command -v sluice >/dev/null 2>&1; then sluice run --hook pre-commit test; else ng test --watch=false; fi"], f"{lines}")
     rep.check("I: hook file mode kept (executable) and the husky wrapper untouched",
               os.access(repo / ".husky" / "pre-commit", os.X_OK) and (repo / ".husky" / "_" / "h").read_text() == HUSKY_H)
     # Commit the init result so every later tree starts clean.
