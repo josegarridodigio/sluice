@@ -369,3 +369,32 @@ Other open items:
 - Session sizes for any future `memory_high` default come from the CPU rerun of
   S2, not from this spike.
 - Ubuntu 22.04 (systemd 249): keep memory containment off there.
+
+## 9. Live results on the developer's machine (2026-10-24, 10:59)
+
+Run by the lead with the user's consent, after the incident, with hard
+limits: each test at most 8 s of pressure, a watchdog stopping the test at
+user@ `memory.pressure` avg10 ≥ 25 %, only `sluice-s5-*` units created by the
+script, all stopped on exit. Machine: Ubuntu 26.04, systemd 259, kernel
+7.0.0-38, 30.5 GB RAM, 7.9 GB swap, `systemd-oomd` active with the vendor
+policy (user@ 50 % for 20 s). Script and log kept in the session scratchpad.
+
+| Test | Result | user@ peak avg10 |
+|---|---|---|
+| T0: user scope with `ManagedOOMMemoryPressure=kill`, limit 5 %, `ManagedOOMMemoryPressureDurationSec=1s` (no load) | accepted; `oomctl dump` lists it as a monitored cgroup with 5.00 % / 1s, unprivileged | — |
+| T6: `user.oomd_avoid` xattr on a user-created leaf (no load) | accepted and read back (kernel 7.0) | — |
+| T5: `MemoryMax=64M`, swap 0, process asks 200 MB | kernel OOM kill inside the unit only | 0 % |
+| T7: `MemoryHigh=64M` with swap, process asks 200 MB for 6 s | process kept 200 MB (swapped), no kill, harmless | 0.36 % |
+| T3: Sluice-owned scope with own policy (5 %, 1 s); `tools` leaf with `memory.high` 64M and no swap (the incident's throttle); `ui` leaf with `user.oomd_avoid` | `systemd-oomd`: "Killed …/sluice-s5-t3.scope/tools due to memory pressure for …/sluice-s5-t3.scope being 8.51% > 5.00% for > 1s with reclaim activity"; nothing outside the scope was touched | 14.58 % |
+
+Notes: in T3 the `ui` sleeper died because the harness stopped the scope after
+the kill, not because of `systemd-oomd`; whether `user.oomd_avoid` changes the
+ranking is still to be isolated (one candidate leaf with and one without the
+xattr, both under pressure). T1 (reproducing the incident) was deliberately
+not run.
+
+Conclusion: with systemd ≥ 257 (per-unit duration), a Sluice-owned pressure
+policy on the agents scope, with a lower limit and a short duration than the
+user manager's, makes `systemd-oomd` act inside the agents scope first and
+kill only the offending leaf. Open: systemd 255 (no per-unit duration), the
+`user.oomd_avoid` ranking effect, and machines without swap.
