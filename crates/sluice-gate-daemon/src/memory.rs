@@ -14,14 +14,15 @@
 //!   job's process group when the machine gives no leaf ([`read_cgroup`],
 //!   [`read_rss`]);
 //! - the expected peak of a gate, learned from its finished runs
-//!   ([`expected_peak`], [`PeakCache`]).
+//!   ([`expected_peak`], [`PeakCache`]), and the priors it gives the gates
+//!   with no history ([`PeakCache::priors`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
 use sluice_gate_core::config::AdmissionConfig;
 
-use crate::scheduler::{LearnKey, MemoryFacts};
+use crate::scheduler::{LearnKey, MemoryFacts, PeakPriors};
 
 /// Finished runs an expected peak looks at (the newest ones).
 pub const PEAK_WINDOW: usize = 5;
@@ -218,30 +219,58 @@ pub fn expected_peak(samples: &[PeakSample]) -> Option<u64> {
     Some(peak.saturating_add(peak / MARGIN_DIVISOR))
 }
 
-/// Recent finished runs of each key (newest last, at most [`PEAK_WINDOW`]).
+/// Recent finished runs of each key (newest last, at most [`PEAK_WINDOW`])
+/// and the weight each key last ran with.
 #[derive(Debug, Default)]
-pub struct PeakCache(HashMap<LearnKey, VecDeque<PeakSample>>);
+pub struct PeakCache {
+    runs: HashMap<LearnKey, VecDeque<PeakSample>>,
+    /// Effective (admitted) weight of the newest run of a key whose weight
+    /// is known; a key missing here is never used as a prior.
+    weights: HashMap<LearnKey, u32>,
+}
 
 impl PeakCache {
     /// Adds a finished run of `key`.
     pub fn push(&mut self, key: LearnKey, sample: PeakSample) {
-        let runs = self.0.entry(key).or_default();
+        let runs = self.runs.entry(key).or_default();
         runs.push_back(sample);
         while runs.len() > PEAK_WINDOW {
             runs.pop_front();
         }
     }
 
+    /// Records the weight `key` last ran with.
+    pub fn set_weight(&mut self, key: LearnKey, weight: u32) {
+        self.weights.insert(key, weight);
+    }
+
     /// The expected peak of `key`, bytes.
     #[must_use]
     pub fn expected(&self, key: &LearnKey) -> Option<u64> {
-        let runs = self.0.get(key)?;
+        let runs = self.runs.get(key)?;
         expected_peak(&runs.iter().copied().collect::<Vec<_>>())
     }
 
     /// Every key with its expected peak.
     pub fn expectations(&self) -> impl Iterator<Item = (&LearnKey, u64)> {
-        self.0.keys().filter_map(|k| Some((k, self.expected(k)?)))
+        self.runs
+            .keys()
+            .filter_map(|k| Some((k, self.expected(k)?)))
+    }
+
+    /// The largest expected peak of the keys of each weight, for the gates
+    /// with no history (`scheduler::prior_peak`); keys of unknown weight
+    /// are left out.
+    #[must_use]
+    pub fn priors(&self) -> PeakPriors {
+        let mut priors = PeakPriors::new();
+        for (key, bytes) in self.expectations() {
+            if let Some(&weight) = self.weights.get(key) {
+                let slot = priors.entry(weight).or_insert(bytes);
+                *slot = (*slot).max(bytes);
+            }
+        }
+        priors
     }
 }
 
@@ -441,5 +470,24 @@ mod tests {
         all.sort();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].0, "lint");
+    }
+
+    #[test]
+    fn priors_are_the_largest_peak_per_weight_of_the_keys_with_a_known_weight() {
+        let key = |g: &str| (std::path::PathBuf::from("/r"), g.to_owned(), String::new());
+        let mut cache = PeakCache::default();
+        cache.push(key("fmt"), sample(1, false));
+        cache.push(key("lint"), sample(2, false));
+        cache.push(key("test"), sample(10, false));
+        cache.push(key("orphan"), sample(50, false));
+        cache.set_weight(key("fmt"), 1);
+        cache.set_weight(key("lint"), 1);
+        cache.set_weight(key("test"), 8);
+        // A weight without samples teaches nothing; "orphan" has no weight.
+        cache.set_weight(key("never-ran"), 2);
+        let priors = cache.priors();
+        assert_eq!(priors.len(), 2);
+        assert_eq!(priors[&1], 2 * GIB + 2 * GIB / 5, "the larger of the two");
+        assert_eq!(priors[&8], 12 * GIB);
     }
 }

@@ -297,10 +297,12 @@ fn snapshot<'a>(
         queued,
         learned: &NO_LEARNED,
         memory: None,
+        priors: &NO_PRIORS,
     }
 }
 
 static NO_LEARNED: Learned = BTreeMap::new();
+static NO_PRIORS: PeakPriors = BTreeMap::new();
 
 /// A learned-statistics key of repository `/r`.
 fn lk(gate: &str) -> LearnKey {
@@ -1440,6 +1442,102 @@ fn an_unknown_peak_is_guessed_from_the_weight_and_a_learned_one_replaces_it() {
     assert_eq!(expected(&s).bytes, 3 * GIB);
     s.set_learned_peak(lk("test"), None);
     assert!(!expected(&s).learned);
+}
+
+// ------------------------------------- memory cold-start prior (0.6.1)
+
+const MIB: u64 = 1 << 20;
+
+fn with_priors<'a>(s: Snapshot<'a>, priors: &'a PeakPriors) -> Snapshot<'a> {
+    Snapshot { priors, ..s }
+}
+
+#[test]
+fn the_prior_is_the_largest_peak_of_lighter_or_equal_weights() {
+    let priors: PeakPriors = [(1, GIB / 2), (2, 2 * GIB), (8, 13 * GIB)]
+        .into_iter()
+        .collect();
+    assert_eq!(prior_peak(&priors, 1), Some(GIB / 2));
+    assert_eq!(prior_peak(&priors, 2), Some(2 * GIB));
+    assert_eq!(prior_peak(&priors, 7), Some(2 * GIB), "no heavier weight");
+    assert_eq!(prior_peak(&priors, 8), Some(13 * GIB));
+    // A lighter weight that peaks higher still counts for a heavier job.
+    let odd: PeakPriors = [(1, 3 * GIB), (4, GIB)].into_iter().collect();
+    assert_eq!(prior_peak(&odd, 6), Some(3 * GIB));
+    // Nothing at or below the weight, or no data at all: no prior.
+    let heavy: PeakPriors = [(4, GIB)].into_iter().collect();
+    assert_eq!(prior_peak(&heavy, 3), None);
+    assert_eq!(prior_peak(&PeakPriors::new(), 1), None);
+}
+
+#[test]
+fn the_estimate_is_the_prior_capped_by_the_proxy_and_stays_a_guess() {
+    let f = facts(22, 30, 3);
+    let proxy = 27 * GIB / 12;
+    let primed = |learned, prior, w| f.estimate_primed(learned, prior, w, 12);
+    let low = primed(None, Some(20 * MIB), 1);
+    assert_eq!((low.bytes, low.learned), (20 * MIB, false), "still a guess");
+    assert_eq!(primed(None, Some(9 * GIB), 1).bytes, proxy, "capped");
+    assert_eq!(primed(None, None, 1).bytes, proxy, "no data: the proxy");
+    assert_eq!(f.estimate(None, 1, 12).bytes, proxy);
+    let own = primed(Some(GIB), Some(20 * MIB), 1);
+    assert_eq!((own.bytes, own.learned), (GIB, true), "own peak wins");
+}
+
+/// The incident of 2026-10-26: a 13 GiB suite runs, about 1 GiB is free, and
+/// three first-run weight-1 gates (really about 20 MiB each) queue behind it.
+#[test]
+fn first_run_light_gates_start_beside_a_big_suite_with_a_light_prior() {
+    let p = policy(12);
+    let run = [running("suite", 6, 13, 13)];
+    let queued = [
+        q("fmt", "/fmt", 1, 0),
+        q("lint", "/lint", 1, 1),
+        q("sec", "/sec", 1, 2),
+    ];
+    let mem = facts(4, 30, 3);
+    // Free: 4 - 3 reserve = 1 GiB, below the 27/12 GiB proxy of each gate.
+    let s = with_memory(snapshot(10, &p, Pressure::default(), &run, &queued), mem);
+    let without = plan(&s);
+    assert_eq!(started(&without), Vec::new(), "the proxy keeps them out");
+    assert!(waits_of(&without).iter().all(|w| w.1 == WaitCause::Memory));
+    // The heavy suite's own weight (6) must not leak into weight-1 jobs.
+    let priors: PeakPriors = [(1, 20 * MIB), (6, 13 * GIB)].into_iter().collect();
+    let decided = plan(&with_priors(s, &priors));
+    assert_eq!(
+        started(&decided),
+        [
+            ("fmt", Admission::Nominal),
+            ("lint", Admission::Nominal),
+            ("sec", Admission::Nominal)
+        ]
+    );
+    assert!(decided.expected.iter().all(|e| !e.learned));
+    assert!(decided.expected.iter().all(|e| e.bytes == 20 * MIB));
+    // A prior only from heavier gates leaves the proxy in force.
+    let heavy: PeakPriors = [(6, 13 * GIB)].into_iter().collect();
+    let decided = plan(&with_priors(s, &heavy));
+    assert_eq!(started(&decided), Vec::new());
+}
+
+#[test]
+fn a_prior_never_over_admits() {
+    let p = over_policy();
+    let run = [
+        running("a", 6, 1, 1),
+        running("b", 6, 1, 1),
+        running("c", 6, 1, 1),
+    ];
+    let queued = [q("s3", "/r3", 6, 3)];
+    let priors: PeakPriors = [(1, 20 * MIB), (6, 20 * MIB)].into_iter().collect();
+    let s = with_priors(
+        with_memory(
+            snapshot(10_000, &p, calm(8.0), &run, &queued),
+            facts(200, 300, 3),
+        ),
+        &priors,
+    );
+    assert_eq!(plan(&s).start, Vec::new(), "a guess, however small");
 }
 
 // A tiny deterministic generator for the property tests.

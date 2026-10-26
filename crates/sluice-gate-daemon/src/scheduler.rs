@@ -31,6 +31,18 @@ pub type LearnKey = (PathBuf, String, String);
 /// [`LEARN_WINDOW`] runs ([`learned_weight`]), before the per-job clamp.
 pub type Learned = BTreeMap<LearnKey, u32>;
 
+/// The largest expected peak (bytes) among the learned keys of each weight:
+/// what a job with no history of its own is compared to
+/// ([`prior_peak`], ADR-0019 amended in 0.6.1).
+pub type PeakPriors = BTreeMap<u32, u64>;
+
+/// The prior of a job of effective weight `weight`: the largest expected
+/// peak among the learned keys whose weight is at most `weight`; `None`
+/// without such a key (the weight proxy then stands alone).
+pub fn prior_peak(priors: &PeakPriors, weight: u32) -> Option<u64> {
+    priors.range(..=weight).map(|(_, &bytes)| bytes).max()
+}
+
 /// Priority class of a job (ADR-0011 M6): a human always waits for it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Class {
@@ -404,8 +416,16 @@ impl MemoryFacts {
 
     /// The expected peak of a job: the learned one, else a guess from its
     /// weight, `w / B` of [`Self::usable`] (the CPU weight is the only prior
-    /// the user already expressed).
-    pub fn estimate(&self, learned: Option<u64>, weight: u32, budget: u32) -> Expected {
+    /// the user already expressed), lowered to `prior` when the daemon knows
+    /// gates of that weight or lighter that peak below it. Only the learned
+    /// figure is marked [`Expected::learned`].
+    pub fn estimate_primed(
+        &self,
+        learned: Option<u64>,
+        prior: Option<u64>,
+        weight: u32,
+        budget: u32,
+    ) -> Expected {
         if let Some(bytes) = learned {
             return Expected {
                 bytes,
@@ -414,10 +434,16 @@ impl MemoryFacts {
         }
         let share =
             u128::from(self.usable()) * u128::from(weight.min(budget)) / u128::from(budget.max(1));
+        let proxy = u64::try_from(share).unwrap_or(u64::MAX);
         Expected {
-            bytes: u64::try_from(share).unwrap_or(u64::MAX),
+            bytes: prior.map_or(proxy, |p| p.min(proxy)),
             learned: false,
         }
+    }
+
+    /// [`Self::estimate_primed`] without a prior: the weight proxy alone.
+    pub fn estimate(&self, learned: Option<u64>, weight: u32, budget: u32) -> Expected {
+        self.estimate_primed(learned, None, weight, budget)
     }
 }
 
@@ -486,6 +512,9 @@ pub struct Snapshot<'a> {
     /// Memory-aware admission: `None` is the rule off (plans are those of
     /// CPU-only admission, byte for byte).
     pub memory: Option<MemoryFacts>,
+    /// Largest learned peak by weight, the prior of jobs with no learned
+    /// peak of their own.
+    pub priors: &'a PeakPriors,
 }
 
 /// One queued job left waiting by a [`Plan`].
@@ -604,7 +633,9 @@ impl MemPass {
                 .queued
                 .iter()
                 .zip(w)
-                .map(|(j, &w)| facts.estimate(j.expected_peak, w, budget))
+                .map(|(j, &w)| {
+                    facts.estimate_primed(j.expected_peak, prior_peak(s.priors, w), w, budget)
+                })
                 .collect(),
             held,
             busy: !s.running.is_empty(),
@@ -645,8 +676,9 @@ impl MemPass {
 /// (`max(0, expected - current)`, summed).
 fn running_headroom_of(s: &Snapshot<'_>, facts: &MemoryFacts) -> u64 {
     s.running.iter().fold(0, |held, r| {
+        let prior = prior_peak(s.priors, r.weight);
         let e = facts
-            .estimate(r.expected_peak, r.weight, s.policy.budget)
+            .estimate_primed(r.expected_peak, prior, r.weight, s.policy.budget)
             .bytes;
         held.saturating_add(e.saturating_sub(r.current))
     })
@@ -1044,6 +1076,8 @@ pub struct Scheduler {
     learned: Learned,
     /// Learned peak memory (expected working set, bytes) by key.
     learned_peaks: BTreeMap<LearnKey, u64>,
+    /// Largest learned peak by weight ([`prior_peak`]).
+    priors: PeakPriors,
     /// Memory facts of the last [`Scheduler::set_memory`]: `None` is the
     /// memory rule off.
     memory: Option<MemoryFacts>,
@@ -1075,6 +1109,7 @@ impl Scheduler {
             running: Vec::new(),
             learned: Learned::new(),
             learned_peaks: BTreeMap::new(),
+            priors: PeakPriors::new(),
             memory: None,
             currents: BTreeMap::new(),
             last_overcommit_at: None,
@@ -1141,6 +1176,12 @@ impl Scheduler {
                 self.learned_peaks.remove(&key);
             }
         }
+    }
+
+    /// Replaces the priors of jobs with no learned peak (computed by the
+    /// daemon from the learned keys whose weight it knows).
+    pub fn set_peak_priors(&mut self, priors: PeakPriors) {
+        self.priors = priors;
     }
 
     /// Sets what the next passes (and `status`) know about memory: the
@@ -1254,6 +1295,7 @@ impl Scheduler {
             queued,
             learned: &self.learned,
             memory: self.memory,
+            priors: &self.priors,
         }
     }
 
@@ -1460,8 +1502,9 @@ impl Scheduler {
                     .memory
                     .map(|_| self.currents.get(&j.spec.id).copied().unwrap_or(0)),
                 memory_expected: self.memory.map(|f| {
-                    f.estimate(
+                    f.estimate_primed(
                         self.peak_of(j.spec.learn_key.as_ref()),
+                        prior_peak(&self.priors, j.spec.weight),
                         j.spec.weight,
                         self.policy.budget,
                     )

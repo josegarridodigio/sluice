@@ -748,20 +748,33 @@ fn load_peaks(store: &Store) -> PeakCache {
         }
         Err(e) => tracing::warn!("cannot load the gate working sets: {e}"),
     }
+    // Jobs rows can be pruned: a key without a known weight is no prior.
+    match store.gate_memory_weights() {
+        Ok(rows) => {
+            for (repo, gate, cmd_hash, weight) in rows {
+                peaks.set_weight((repo, gate, cmd_hash), weight);
+            }
+        }
+        Err(e) => tracing::warn!("cannot load the weights of the gate working sets: {e}"),
+    }
     peaks
 }
 
-/// Hands the learned peaks of every key to the scheduler (the stats mutex is
-/// never held with the state one).
+/// Hands the learned peaks of every key, and the priors drawn from them, to
+/// the scheduler (the stats mutex is never held with the state one).
 fn seed_peaks(shared: &Shared) {
-    let known: Vec<(StatsKey, u64)> = lock(&shared.peaks)
-        .expectations()
-        .map(|(k, v)| (k.clone(), v))
-        .collect();
+    let (known, priors): (Vec<(StatsKey, u64)>, _) = {
+        let peaks = lock(&shared.peaks);
+        (
+            peaks.expectations().map(|(k, v)| (k.clone(), v)).collect(),
+            peaks.priors(),
+        )
+    };
     let mut st = shared.state();
     for (key, bytes) in known {
         st.sched.set_learned_peak(key, Some(bytes));
     }
+    st.sched.set_peak_priors(priors);
 }
 
 /// The utilisation sampler, bounded by the daemon's cgroup CPU limit.
@@ -1536,6 +1549,8 @@ struct Closed {
     started_at: Option<u64>,
     learned: Option<(StatsKey, GateStat)>,
     memory: Option<(StatsKey, GateMemory)>,
+    /// Effective weight the job ran with (the prior of its key).
+    weight: Option<u32>,
 }
 
 /// The part of [`finish_job`] done under the state lock: the job leaves the
@@ -1563,9 +1578,10 @@ fn close_job(
     };
     let mut outcome = outcome;
     let now = now_ms();
-    let (events, started_at, learned, memory) = {
+    let (events, started_at, learned, memory, weight) = {
         let max = st.sched.subscribers_max(id).unwrap_or(1);
         let record = st.sched.record(id, now);
+        let weight = record.as_ref().map(|r| r.weight);
         if st.sched.finish(id).is_none() {
             st.sched.remove_queued(id);
         }
@@ -1628,7 +1644,7 @@ fn close_job(
             }
             Ok(())
         });
-        (entry.map(|e| e.events), started_at, learned, memory)
+        (entry.map(|e| e.events), started_at, learned, memory, weight)
     };
     Closed {
         label,
@@ -1637,6 +1653,7 @@ fn close_job(
         started_at,
         learned,
         memory,
+        weight,
     }
 }
 
@@ -1714,11 +1731,13 @@ fn announce_closed(shared: &Shared, id: &str, closed: Closed) {
         started_at,
         learned,
         memory,
+        weight,
     } = closed;
     if let Some((key, working_set)) = memory {
         // Never held with the state mutex; queued and running jobs of this
-        // key use the new expected peak at the next admission pass.
-        let expected = {
+        // key use the new expected peak (and the priors drawn from every
+        // key) at the next admission pass.
+        let (expected, priors) = {
             let mut peaks = lock(&shared.peaks);
             peaks.push(
                 key.clone(),
@@ -1727,9 +1746,14 @@ fn announce_closed(shared: &Shared, id: &str, closed: Closed) {
                     killed: working_set.oom_killed,
                 },
             );
-            peaks.expected(&key)
+            if let Some(weight) = weight {
+                peaks.set_weight(key.clone(), weight);
+            }
+            (peaks.expected(&key), peaks.priors())
         };
-        shared.state().sched.set_learned_peak(key, expected);
+        let mut st = shared.state();
+        st.sched.set_learned_peak(key, expected);
+        st.sched.set_peak_priors(priors);
     }
     if let Some((key, stat)) = learned {
         // The stats mutex is never held with the state one: queued jobs of

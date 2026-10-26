@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Memory-aware admission: a gate that has never run is no longer guessed at the
+  weight share of the usable memory alone (2.3 GiB for a weight-1 gate on a 30 GiB
+  machine, which kept first-run `fmt`/`lint` gates of about 20 MB waiting behind a
+  test suite). The guess is capped by the largest peak learned on this daemon for
+  gates of the same or a lighter weight, when there is one. Still a guess: it never
+  allows over-admission.
+
 ### Fixed
 
 - Merge trains depended on the `PATH` of whoever started the daemon: a daemon

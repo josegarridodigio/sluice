@@ -151,7 +151,16 @@ needs no average). A failing run that is not a memory kill teaches nothing; the
 weight's `learns_from` is unchanged (passing runs only). An unknown peak is
 guessed as `w / B × (MemTotal − reserve)` with the job's effective weight `w`
 (for `auto` on a budget of 12, half of the usable memory), marked `guessed` in
-`status` until a run replaces it.
+`status` until a run replaces it. *Amended in 0.6.1:* the guess is
+`min(w / B × usable, prior(w))`, where `prior(w)` is the largest expected peak
+(same formula as above) among the learned keys of this daemon whose weight is
+`≤ w`; with no such key the proxy stands alone (the 0.6.0 behaviour). The
+weight of a key is the effective weight its newest recorded run was admitted
+with (`PeakCache` in memory; at start `gate_memory.job_id` joined with
+`jobs.weight`, a key whose job row was pruned is no prior). The daemon hands
+the scheduler a table `weight → largest peak` (`Snapshot.priors`,
+`prior_peak`), so `plan` stays pure. The figure is still `guessed`:
+over-admission needs the gate's own learned peak.
 
 **Rule.**
 
@@ -195,6 +204,8 @@ blocking still comes first (a blocked pass reports `psi`).
 - A memory-blocked job that is not overdue still lets smaller jobs backfill.
 - `plan` stays a pure function of the snapshot; `jobs` and `gate_stats` are
   unchanged and `sched_schema` stays 1.
+- A prior never raises an estimate (`min` with the proxy) and never makes a job
+  "learned": the `alone` exemption and the over-admission rule are as before.
 
 ## Learned weights (ADR-0011 M2)
 

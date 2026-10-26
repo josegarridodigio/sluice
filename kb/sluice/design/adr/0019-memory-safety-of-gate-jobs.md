@@ -104,6 +104,18 @@ on by default; never kill the agent; memory experiments only bounded or in a VM.
    without systemd-oomd or below systemd 257.
    *Implemented in W6e* ([[sluice/changes/queue-trust-w6e-memory-guard.md]]).
 
+**Amended in 0.6.1 (first-run estimate).** Measured on a 12-thread, 30 GiB machine:
+three first-run gates (`fmt`, `lint`, `secrets`) that really used about 20 MB each
+waited more than 5 minutes behind a test suite, because the weight proxy guessed 2.3 GiB
+for each. Learned peaks on two machines: weight 1 gates 0.02-1.3 GiB, weight 2 gates
+0.2-2.2 GiB, weight 6-16 suites 4-13 GiB. A gate with no learned peak is now estimated
+at `min(proxy, prior(w))`, `prior(w)` being the largest expected peak among the learned
+keys of the daemon whose weight is at most the job's effective weight; without such a
+key the proxy is used as before. The figure stays `guessed`, so over-admission still
+needs the gate's own learned peak. No schema change: the weight of a key comes from
+`jobs.weight` of the runs in `gate_memory`
+([[sluice/changes/memory-cold-start-prior.md]]).
+
 ## Consequences
 
 - Two 18 GiB suites never start together on a 30 GiB machine; the second waits with

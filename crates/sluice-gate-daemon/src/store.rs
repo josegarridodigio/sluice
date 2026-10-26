@@ -1252,6 +1252,48 @@ impl Store {
         Ok(out)
     }
 
+    /// The weight each `gate_memory` key last ran with: `jobs.weight` (the
+    /// effective weight, see [`Store::set_weight`]) of the newest run whose
+    /// job row still exists. Keys whose jobs were pruned are absent.
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn gate_memory_weights(&self) -> Result<Vec<(PathBuf, String, String, u32)>> {
+        if !self.memory {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT m.repo, m.gate, m.cmd_hash, j.weight FROM gate_memory m \
+                 JOIN jobs j ON j.id = m.job_id \
+                 ORDER BY m.finished_at, m.rowid",
+            )
+            .map_err(db)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    PathBuf::from(r.get::<_, String>(0)?),
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, u32>(3)?,
+                ))
+            })
+            .map_err(db)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db)?;
+        // Oldest first: a later row of the same key wins.
+        let mut newest: std::collections::BTreeMap<(PathBuf, String, String), u32> =
+            std::collections::BTreeMap::new();
+        for (repo, gate, cmd_hash, weight) in rows {
+            newest.insert((repo, gate, cmd_hash), weight);
+        }
+        Ok(newest
+            .into_iter()
+            .map(|((repo, gate, cmd_hash), w)| (repo, gate, cmd_hash, w))
+            .collect())
+    }
+
     /// Deletes the working sets of keys with no run since `unseen_since_ms`
     /// (the same rule as [`Store::prune_gate_stats`]); returns the rows deleted.
     ///
@@ -1948,6 +1990,56 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|m| m.cmd_hash == "aaaa")
+        );
+    }
+
+    #[test]
+    fn gate_memory_weights_come_from_the_jobs_and_skip_pruned_ones() {
+        let (_d, p) = tmp();
+        let s = Store::open(&p).unwrap();
+        let run = |id: &str, gate: &str, weight: u32, at: u64| {
+            let mut row = job(id, "x", at);
+            row.weight = weight;
+            s.insert_job(&row).unwrap();
+            s.insert_gate_memory(&GateMemory {
+                repo: PathBuf::from("/repo"),
+                gate: gate.into(),
+                cmd_hash: "aaaa".into(),
+                job_id: id.into(),
+                finished_at: at,
+                outcome: "pass".into(),
+                anon_peak_bytes: 1,
+                peak_bytes: None,
+                oom_killed: false,
+            })
+            .unwrap();
+        };
+        run("a1", "lint", 2, 1);
+        run("a2", "lint", 1, 2);
+        run("b1", "test", 8, 3);
+        // A run whose job row is gone (pruned) has no weight.
+        s.insert_gate_memory(&GateMemory {
+            repo: PathBuf::from("/repo"),
+            gate: "fmt".into(),
+            cmd_hash: "aaaa".into(),
+            job_id: "pruned".into(),
+            finished_at: 4,
+            outcome: "pass".into(),
+            anon_peak_bytes: 1,
+            peak_bytes: None,
+            oom_killed: false,
+        })
+        .unwrap();
+        let weights: Vec<(String, u32)> = s
+            .gate_memory_weights()
+            .unwrap()
+            .into_iter()
+            .map(|(_, gate, _, w)| (gate, w))
+            .collect();
+        assert_eq!(
+            weights,
+            [("lint".to_owned(), 1), ("test".to_owned(), 8)],
+            "the newest run of a key sets its weight; no job row, no weight"
         );
     }
 
