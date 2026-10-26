@@ -33,6 +33,10 @@ pub struct QueueOptions {
     /// Program spawned for the push instead of `git` (tests inject a spawn
     /// failure). `None` in production.
     pub push_program: Option<PathBuf>,
+    /// Login shell resolved for the train tool environment instead of the
+    /// user's (tests; with `base_env` set the login shell is otherwise not
+    /// resolved, see [`crate::toolenv`]). `None` in production.
+    pub login_shell: Option<PathBuf>,
 }
 
 /// The merge queue as a daemon extension.
@@ -170,11 +174,20 @@ impl Extension for QueueExtension {
             handle
                 .store_tx(store::init)
                 .map_err(|e| anyhow!(store_msg(&e)))?;
-            let core = Arc::new(Core::with_push_program(
+            // The login shell may take seconds: resolve it off the async
+            // threads, before the runner starts.
+            let (h, base, push, shell) = (
                 handle.clone(),
                 self.options.base_env.clone(),
                 self.options.push_program.clone(),
-            )?);
+                self.options.login_shell.clone(),
+            );
+            let core = tokio::task::spawn_blocking(move || {
+                Core::with_push_program(h, base, push, shell.as_deref())
+            })
+            .await
+            .map_err(|e| anyhow!("tool environment resolution failed: {e}"))??;
+            let core = Arc::new(core);
             start_recovery(&core).context("parking interrupted trains")?;
             // Retention prune and sweep of `<state>/merge/` leftovers (then
             // once per hour from the runner).
@@ -294,6 +307,7 @@ impl Extension for QueueExtension {
                         .iter()
                         .filter(|t| t.state == T::NeedsReconcile)
                         .count(),
+                    tool_env: Some(crate::toolenv::view(&core.tool_env, &core.tool_env_source)),
                 })
             })
             .ok()

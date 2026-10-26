@@ -83,7 +83,7 @@ Reasons, with what you do:
 | `prepare_dirty` | the prepare leaves files the tree does not have (not in the commit, not git-ignored) | fix `.gitignore` or the prepare |
 | `gate_failed` | a gate failed, timed out, was killed or errored (a memory kill says so and has `killed_by: "memory"` in the detail) | read the log, fix, `queue_retry`; never retry a memory kill unchanged |
 | `gate_modified_tree` | the gates passed but edited tracked files (a formatter, for example) | commit the result or fix the gate |
-| `key_input_failed` | a gate's `key_inputs` command failed in the train's worktree; the job waits and fails after 3 tries | tell the human |
+| `key_input_failed` | a gate's `key_inputs` command failed in the train's worktree (exit 127 = a tool missing in the trains' `PATH`); the job waits and fails after 3 tries | tell the human; do not work around it |
 | `member_config_invalid` | the `.sluice.toml` your branch changes does not parse once merged | fix the file, `queue_retry` |
 | `hook_gate_unverified`, `config_changed` | the branch changes `.sluice.toml`; the target's configuration judges the train, so a gate the `pre-push` hook asks for may not be verified. `config_changed` is the warning shown on the member | tell the human: land the configuration change first, or the human runs `sluice queue retry <job> --trust-member-config` |
 | `pre_push_hook` | the repository's `pre-push` hook declined during the push | read its output in the detail |

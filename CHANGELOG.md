@@ -9,9 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `[queue] tool_env` (`"login-shell"`, the default, or `"daemon"`) and `[queue]
+  tool_path` in the user config: where merge trains get the environment of their
+  tools. `sluice status` shows `tool env: login shell` or `daemon (<reason>)`
+  (and the optional `queue.tool_env` field of the status JSON), and `sluice
+  doctor` warns when a `key_inputs` command of the repository is not in the
+  `PATH` trains use. One-way keys: 0.6.0 and older reject them.
+
 ### Changed
 
 ### Fixed
+
+- Merge trains depended on the `PATH` of whoever started the daemon: a daemon
+  restarted from a non-interactive shell made every train fail with
+  `key_input_failed` (exit 127) while agents' gates passed. Trains now run their
+  gates, `prepare` and `key_inputs` in the user's login environment, resolved
+  once at daemon start (ADR-0020).
 
 ## [0.6.0] - 2026-10-26
 

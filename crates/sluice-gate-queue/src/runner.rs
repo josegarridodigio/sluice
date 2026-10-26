@@ -14,6 +14,7 @@ use anyhow::{Context as _, Result, anyhow};
 use rusqlite::Transaction;
 use serde_json::json;
 use sluice_gate_core::config::{Gate, REPO_CONFIG_FILE, RepoConfig};
+use sluice_gate_core::env::LOGIN_ENV_DEADLINE;
 use sluice_gate_core::git::RepoPaths;
 use sluice_gate_core::key::CacheKey;
 use sluice_gate_core::lookup;
@@ -36,6 +37,7 @@ use crate::store::{
     self, Actor, JobEdit, JobRow, MarkerRow, NewTrain, TrainEdit, TrainRow, TrainSettings, Writer,
 };
 use crate::target::endpoint;
+use crate::toolenv::{self, ToolEnvSource};
 
 /// Shared state of the queue inside one daemon.
 #[derive(Debug)]
@@ -44,8 +46,14 @@ pub struct Core {
     pub handle: DaemonHandle,
     /// Git runner (daemon env without `GIT_*`).
     pub git: Git,
-    /// Environment of gate processes and `key_inputs` (the daemon's sanitised env).
+    /// The daemon's sanitised env (the base of `git`; the tool environment is
+    /// built on it).
     pub child_env: EnvMap,
+    /// Environment of train gates, `prepare`, base probe and `key_inputs`
+    /// (ADR-0020): resolved once at start, never the enqueuer's.
+    pub tool_env: EnvMap,
+    /// Where `tool_env` came from (status, doctor).
+    pub tool_env_source: ToolEnvSource,
     /// Wakes the runner.
     pub notify: Notify,
     busy: Mutex<HashSet<String>>,
@@ -90,11 +98,12 @@ impl Core {
     ///
     /// No usable scratch directory.
     pub fn new(handle: DaemonHandle, base_env: Option<EnvMap>) -> Result<Self> {
-        Self::with_push_program(handle, base_env, None)
+        Self::with_push_program(handle, base_env, None, None)
     }
 
     /// Like [`Core::new`], spawning `push_program` instead of `git` for the
-    /// push (tests inject a spawn failure this way).
+    /// push (tests inject a spawn failure this way) and resolving the train
+    /// tool environment through `login_shell` instead of the user's (tests).
     ///
     /// # Errors
     ///
@@ -103,8 +112,22 @@ impl Core {
         handle: DaemonHandle,
         base_env: Option<EnvMap>,
         push_program: Option<PathBuf>,
+        login_shell: Option<&Path>,
     ) -> Result<Self> {
+        let test_env = base_env.is_some();
         let child_env = base_env.unwrap_or_else(|| handle.sanitised_env());
+        // Blocks for up to the login-shell deadline: the extension builds the
+        // core off the async threads, before the runner starts.
+        let tools = toolenv::resolve(
+            &handle.config().queue,
+            &toolenv::Inputs {
+                daemon_env: &child_env,
+                test_env,
+                login_shell,
+                detection: &handle.config().agent_detection,
+                deadline: LOGIN_ENV_DEADLINE,
+            },
+        );
         let git = Git::new(&child_env);
         let scratch = tree::scratch_root(&child_env).context("scratch directory")?;
         let merge_dir = handle.state_dir().join("merge");
@@ -112,6 +135,8 @@ impl Core {
             handle,
             git,
             child_env,
+            tool_env: tools.env,
+            tool_env_source: tools.source,
             notify: Notify::new(),
             busy: Mutex::new(HashSet::new()),
             watched: Mutex::new(HashMap::new()),
@@ -1152,7 +1177,7 @@ async fn build_inner(core: &Arc<Core>, train: &TrainRow, config: Option<RepoConf
                 cmd: gate.cmd.trim().to_owned(),
                 extra: Vec::new(),
                 cwd: train.worktree.clone(),
-                child_env: core.child_env.clone(),
+                child_env: core.tool_env.clone(),
                 probe_env: core.git.env().clone(),
                 caller: Caller::Human,
                 session: Some(format!("queue:{}", train.id)),
@@ -1339,7 +1364,7 @@ async fn derive_views(
             let (g2, wt, env, tr, n, es) = (
                 gate.clone(),
                 train.worktree.clone(),
-                core.child_env.clone(),
+                core.tool_env.clone(),
                 tree_hash.clone(),
                 name.clone(),
                 Arc::clone(entries),

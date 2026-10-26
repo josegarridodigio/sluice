@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use sluice_gate_core::dirs;
 use sluice_gate_core::git::EnvMap;
-use sluice_gate_proto::{PsiInfo, StatusReport, WaitReason};
+use sluice_gate_proto::{PsiInfo, QueueToolEnv, StatusReport, WaitReason};
 
 use crate::run::{EXIT_ERROR, age};
 use sluice_gate_proto::client::{self, ClientError};
@@ -136,6 +136,17 @@ fn render_jobs(out: &mut String, r: &StatusReport) {
     }
 }
 
+/// The `tool env:` line: where merge trains get their tools' environment.
+fn tool_env_text(t: &QueueToolEnv) -> String {
+    match (t.source.as_str(), &t.reason) {
+        ("login-shell", _) => "login shell".to_owned(),
+        ("tool-path", _) => "tool_path".to_owned(),
+        ("daemon", Some(reason)) => format!("daemon ({reason})"),
+        ("daemon", None) => "daemon".to_owned(),
+        (other, _) => other.to_owned(),
+    }
+}
+
 /// Renders the text form of a status report; `socket_fallback` is the
 /// reason the short socket fallback is in use, if it is.
 fn render(r: &StatusReport, log_path: &Path, socket_fallback: Option<&str>) -> String {
@@ -179,6 +190,9 @@ fn render(r: &StatusReport, log_path: &Path, socket_fallback: Option<&str>) -> S
     let _ = writeln!(out, "pressure: {}", pressure(&r.budget.psi));
     if let Some(m) = &r.budget.memory {
         let _ = writeln!(out, "{}", m.status_line());
+    }
+    if let Some(tools) = r.queue.as_ref().and_then(|q| q.tool_env.as_ref()) {
+        let _ = writeln!(out, "tool env: {}", tool_env_text(tools));
     }
     render_jobs(&mut out, r);
     let t = &r.totals;
@@ -421,6 +435,30 @@ mod tests {
                 "interventions:\n  2026-10-24T10:00:00Z  s-7f3a  s-7f3a/tools  oomd_memory_pressure\n"
             ),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn render_shows_the_train_tool_environment() {
+        use sluice_gate_proto::QueueSummary;
+        let mut r = StatusReport::default();
+        assert!(!render(&r, Path::new("/l"), None).contains("tool env"));
+        let mut tool = |source: &str, reason: Option<&str>| {
+            r.queue = Some(QueueSummary {
+                tool_env: Some(QueueToolEnv {
+                    source: source.into(),
+                    reason: reason.map(Into::into),
+                    path: None,
+                }),
+                ..QueueSummary::default()
+            });
+            render(&r, Path::new("/l"), None)
+        };
+        assert!(tool("login-shell", None).contains("tool env: login shell\n"));
+        assert!(tool("daemon", None).contains("tool env: daemon\n"));
+        assert!(
+            tool("daemon", Some("sh exited with exit status: 1"))
+                .contains("tool env: daemon (sh exited with exit status: 1)\n")
         );
     }
 

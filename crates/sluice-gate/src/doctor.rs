@@ -572,6 +572,9 @@ fn check_repo(env: &EnvMap, paths: &RepoPaths) -> Vec<Check> {
     if let Some(w) = warning {
         out.push(check("queue-only-hooks", Status::Warn, w));
     }
+    if let Ok(cfg) = &config {
+        out.extend(check_train_tools(env, cfg));
+    }
     out.push(check_hooks(env, paths));
     out.push(check_markers(paths));
     out.push(check_cache(env, paths));
@@ -589,6 +592,78 @@ fn check_repo(env: &EnvMap, paths: &RepoPaths) -> Vec<Check> {
         Err(_) => {}
     }
     out
+}
+
+/// Words `sh` runs without looking in `PATH`.
+const SHELL_BUILTINS: [&str; 8] = ["echo", "printf", "test", "true", "false", "cd", "exit", ":"];
+
+/// The first word of each command that names a program `sh` would look up in
+/// `path` and does not find there (ADR-0020). Words with a slash or an
+/// assignment, and shell builtins, are not looked up.
+fn missing_tools(commands: &[&str], path: &str) -> Vec<String> {
+    let mut missing: Vec<String> = Vec::new();
+    for word in commands.iter().filter_map(|c| c.split_whitespace().next()) {
+        if word.contains(['/', '=']) || SHELL_BUILTINS.contains(&word) {
+            continue;
+        }
+        let found = std::env::split_paths(path).any(|dir| {
+            fs::metadata(dir.join(word))
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        });
+        if !found && !missing.iter().any(|m| m == word) {
+            missing.push(word.to_owned());
+        }
+    }
+    missing
+}
+
+/// The `PATH` the running daemon's merge trains use for their tools, when a
+/// daemon with the merge queue answers (it reports only the `PATH`).
+fn train_tool_path(env: &EnvMap) -> Option<String> {
+    let socket = socket_to_contact(env)
+        .ok()
+        .flatten()
+        .filter(|s| s.exists())?;
+    let report = client::connect(&socket)
+        .and_then(client::Client::status)
+        .ok()?;
+    report.queue?.tool_env?.path
+}
+
+/// `train-tools`: warns when a `key_inputs` command of this repository's
+/// gates is not in the `PATH` the daemon's merge trains run their tools with
+/// (the train would fail with `key_input_failed`, exit 127). Silent without a
+/// daemon or without `key_inputs`.
+fn check_train_tools(env: &EnvMap, cfg: &RepoConfig) -> Option<Check> {
+    let commands: Vec<&str> = cfg
+        .gates
+        .values()
+        .filter(|g| g.cache)
+        .flat_map(|g| g.key_inputs.iter().map(String::as_str))
+        .collect();
+    if commands.is_empty() {
+        return None;
+    }
+    let path = train_tool_path(env)?;
+    let missing = missing_tools(&commands, &path);
+    Some(if missing.is_empty() {
+        check(
+            "train-tools",
+            Status::Ok,
+            "the key_inputs tools are in the PATH of merge trains",
+        )
+    } else {
+        check(
+            "train-tools",
+            Status::Warn,
+            format!(
+                "{} not in the PATH merge trains use ({path}): trains will fail with \
+                 key_input_failed (exit 127); fix your login shell's PATH and restart the \
+                 daemon, or set [queue] tool_path",
+                missing.join(", ")
+            ),
+        )
+    })
 }
 
 /// Learned weight over this share of the declared ceiling (in percent)
@@ -1612,6 +1687,28 @@ mod tests {
         let c = check_shims(&env("0", plain), tmp.path());
         assert_eq!(c.status, Status::Warn, "{}", c.detail);
         assert!(c.detail.contains("stale"), "{}", c.detail);
+    }
+
+    #[test]
+    fn missing_tools_looks_up_the_first_word_in_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("pnpm");
+        fs::write(&tool, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(dir.path().join("plain"), "data").unwrap();
+        let path = dir.path().display().to_string();
+        let commands = [
+            "pnpm --version",
+            "node --version",
+            "node -p 1",
+            "plain x",
+            "./local tool",
+            "FOO=1 other",
+            "echo hi",
+            "",
+        ];
+        assert_eq!(missing_tools(&commands, &path), ["node", "plain"]);
+        assert_eq!(missing_tools(&["pnpm i"], &path), Vec::<String>::new());
     }
 
     #[test]

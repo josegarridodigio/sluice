@@ -23,7 +23,10 @@ run at once, and it makes identical simultaneous requests share one run.
   variables that describe that client's own invocation (`GIT_*`, `CLAUDE*`, `SLUICE_JOB`,
   `SLUICE_AGENT`, `SLUICE_CACHE`, `SLUICE_DISABLE`, `SLUICE_SESSION_LEAF`, `SLUICE_SHIM_DIR`,
   `SLUICE_SHIMS`, `SLUICE_GUARD`, your `[agent_detection]` variables and the shim
-  directory in `PATH`) are removed; `CI`, `LC_*` and the rest are kept. It starts itself the first time a miss needs it and
+  directory in `PATH`) are removed; `CI`, `LC_*` and the rest are kept. Merge trains do not
+  depend on whoever started it: the tools of a train (its gates, `prepare` and `key_inputs`)
+  run in your login environment, which the daemon resolves once at start by running your
+  login shell (`[queue] tool_env`, `tool_path`; see [the merge queue](merge-queue.md)). It starts itself the first time a miss needs it and
   keeps running until `sluice daemon stop`. If it cannot be reached or started,
   `sluice run` runs the gate in-process under a file-lock semaphore instead, so
   a broken daemon never blocks a commit.

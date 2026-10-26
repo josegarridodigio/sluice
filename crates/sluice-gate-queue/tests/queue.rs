@@ -1987,3 +1987,112 @@ async fn an_invalid_member_config_fails_the_trusted_job_once() {
     assert_eq!(st.trains.len(), trains_before, "{st:#?}");
     d.shutdown().await;
 }
+
+/// A repository whose gate needs the program `sluice-fake-tool` for its
+/// `key_inputs`, installed in a directory that is not in the daemon's `PATH`
+/// (ADR-0020). Returns the fixture, the tool directory and a fake login
+/// shell that puts it in `PATH` (the user's toolchain, set by an rc file).
+fn tool_fixture() -> (Fixture, std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let toml = "version = 1\n[gates.test]\ncmd = \"true\"\nhooks = [\"pre-push\"]\n\
+                key_inputs = [\"sluice-fake-tool --version\"]\n";
+    let fx = Fixture::new(toml);
+    let bin = fx.root.join("toolbin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let write_exec = |path: &std::path::Path, body: &str| {
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    write_exec(&bin.join("sluice-fake-tool"), "#!/bin/sh\necho v1\n");
+    let shell = fx.root.join("fake-login-shell");
+    write_exec(
+        &shell,
+        &format!(
+            "#!/bin/sh\necho 'rc noise'\nexport PATH={}:\"$PATH\"\neval \"$4\"\n",
+            bin.display()
+        ),
+    );
+    (fx, bin, shell)
+}
+
+/// The daemon's own `PATH` lacks the tool a `key_inputs` command needs but
+/// the user's login environment has it: the train reaches `ready`, and the
+/// status reports where the trains' tools come from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trains_find_the_tools_of_the_login_shell() {
+    let (fx, bin, shell) = tool_fixture();
+    let (wa, a) = fx.branch("feat/a", "main", &[("n.txt", "n\n")]);
+    let d = Daemon::start_login_shell(&fx, user_config(false), shell).await;
+    let j = d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    let train = d.wait_train("ready train", ready).await;
+    assert_eq!(train.members, vec![j.job_id.clone()]);
+    assert_eq!(train.gates[0].status, "pass");
+    let tools = d.daemon_status().await.queue.unwrap().tool_env.unwrap();
+    assert_eq!(tools.source, "login-shell");
+    assert!(
+        tools.path.unwrap().starts_with(&bin.display().to_string()),
+        "the login PATH leads"
+    );
+    d.shutdown().await;
+}
+
+/// The same setup with `tool_env = "daemon"` fails: the switch is real, and
+/// the failure is `key_input_failed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tool_env_daemon_does_not_use_the_login_shell() {
+    let (fx, _bin, shell) = tool_fixture();
+    let (wa, a) = fx.branch("feat/a", "main", &[("n.txt", "n\n")]);
+    let mut user = user_config(false);
+    user.queue.tool_env = sluice_gate_core::config::ToolEnv::Daemon;
+    let d = Daemon::start_login_shell(&fx, user, shell).await;
+    let j = d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    d.wait_for("key_input_failed recorded", |s| {
+        s.jobs
+            .iter()
+            .any(|x| x.job_id == j.job_id && x.reason.as_deref() == Some("key_input_failed"))
+    })
+    .await;
+    let tools = d.daemon_status().await.queue.unwrap().tool_env.unwrap();
+    assert_eq!((tools.source.as_str(), tools.reason), ("daemon", None));
+    d.shutdown().await;
+}
+
+/// `[queue] tool_path` wins: the trains' `PATH` is that string, with no login
+/// shell involved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tool_path_gives_the_trains_their_tools() {
+    let (fx, bin, _shell) = tool_fixture();
+    let (wa, a) = fx.branch("feat/a", "main", &[("n.txt", "n\n")]);
+    let mut user = user_config(false);
+    user.queue.tool_path = Some(format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    ));
+    let d = Daemon::start(&fx, user).await;
+    d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    let train = d.wait_train("ready train", ready).await;
+    assert_eq!(train.gates[0].status, "pass");
+    let tools = d.daemon_status().await.queue.unwrap().tool_env.unwrap();
+    assert_eq!(tools.source, "tool-path");
+    d.shutdown().await;
+}
+
+/// A login shell that fails is not fatal: the trains fall back to the
+/// daemon's environment and the status says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failing_login_shell_falls_back_to_the_daemon_env() {
+    let fx = Fixture::new(GATE_TRUE);
+    let shell = fx.root.join("failing-shell");
+    std::fs::write(&shell, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&shell, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let (wa, a) = fx.branch("feat/a", "main", &[("n.txt", "n\n")]);
+    let d = Daemon::start_login_shell(&fx, user_config(false), shell).await;
+    d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    d.wait_train("ready train", ready).await;
+    let tools = d.daemon_status().await.queue.unwrap().tool_env.unwrap();
+    assert_eq!(tools.source, "daemon");
+    assert!(tools.reason.unwrap().contains("exited"), "reason");
+    d.shutdown().await;
+}

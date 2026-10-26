@@ -193,6 +193,34 @@ is split first, as for a failing gate). Nothing is remembered: every prepare fai
 checks the target again, because an environment failure (registry down, timeout, out of
 memory) must never be blamed on a member just because the target prepared fine earlier.
 
+## Where trains get their tools
+
+A train runs in the daemon's process, not in your terminal or your agent's session, so
+its tools (the gates' commands, `prepare`, the base probe and the `key_inputs` commands)
+need an environment of their own. It is **your login environment**: when the daemon starts
+it runs your login shell once (`$SHELL`, else your passwd entry, else `/bin/sh`, as
+`<shell> -l -i -c '...; env -0'`, with a 10 s deadline) and keeps the result, so a daemon
+restarted from a non-interactive SSH session, cron or a script finds the same `node`,
+`pnpm` or `python` as your terminal. It is never the environment of whoever enqueued: that
+would let a branch's author choose the binaries that judge the branch.
+
+```toml
+[queue]
+tool_env = "login-shell"   # default; "daemon" = the daemon's own environment
+tool_path = "/opt/node/bin:/usr/bin:/bin"   # optional: an explicit PATH, wins
+```
+
+If the login shell cannot be resolved (it times out because an rc file waits for input,
+exits non-zero, or prints nothing) the trains fall back to the daemon's own environment
+and say so: `sluice status` shows `tool env: daemon (<reason>)` and the daemon log has a
+warning. `sluice doctor` checks that the first word of each `key_inputs` command of the
+current repository is in the `PATH` trains use. Restart the daemon (`sluice daemon
+restart`) after installing a toolchain so it is picked up.
+
+A train that fails with `key_input_failed: node --version: exit status 127` is this
+problem: the tool is not in the trains' `PATH`. Fix your login shell's `PATH` (or set
+`tool_path`) and restart the daemon.
+
 ## Fixing the queue's own configuration
 
 The train runs the gates and the `[queue]` settings of the **target's** `.sluice.toml`,

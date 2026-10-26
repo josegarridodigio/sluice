@@ -981,7 +981,7 @@ pub struct Intervention {
 }
 
 /// Merge-queue counters in a status report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct QueueSummary {
     /// Jobs not in a terminal state (`landed`, `cancelled`, `conflict`, `failed`).
@@ -990,6 +990,26 @@ pub struct QueueSummary {
     pub ready: usize,
     /// Trains waiting for `sluice queue reconcile`.
     pub needs_reconcile: usize,
+    /// Where merge trains get the environment of their tools (ADR-0020).
+    /// Optional and additive: absent from the JSON when the daemon does not
+    /// report it, and ignored by older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_env: Option<QueueToolEnv>,
+}
+
+/// The environment merge trains run their tools in (ADR-0020), as reported
+/// by the daemon. Only the `PATH` is reported, never the whole environment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct QueueToolEnv {
+    /// `login-shell`, `daemon` or `tool-path`.
+    pub source: String,
+    /// Why the login environment is not in use (`daemon` source only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The `PATH` trains run their tools with, when it is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// Daemon identity in a status report.
@@ -1724,6 +1744,7 @@ mod tests {
                 active: 3,
                 ready: 1,
                 needs_reconcile: 0,
+                tool_env: None,
             }),
             interventions: Some(vec![Intervention {
                 at: "2026-10-24T10:00:00Z".into(),

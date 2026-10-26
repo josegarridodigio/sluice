@@ -327,7 +327,12 @@ dissolves an unfinished build and parks an unfinished push).
    there (no extra arguments; a gate with `cache = false` has no key, always runs and enters
    the hash as `<gate>=-`). A `key_inputs` command (or `key_files` entry) that fails in the
    merge worktree is reason `key_input_failed`, an environment failure (section 7), never
-   `internal`. Markers live in the repo's common dir, so keys computed by agents' `verify` calls
+   `internal`. `key_inputs`, like the gates, `prepare` and the base probe, run in the
+   **train tool environment** (ADR-0020): the user's login environment resolved once at
+   daemon start (`toolenv`, `env::login_env`), the daemon's own variables underneath;
+   `[queue] tool_env = "daemon"` or a failed resolution use the daemon's environment,
+   `tool_path` replaces `PATH`. Never the enqueuer's environment: it would let a branch
+   choose the binaries that judge it. Markers live in the repo's common dir, so keys computed by agents' `verify` calls
    on the same tree hit: a fast-forwarded single-member train that the agent already
    verified needs no run at all.
    *Hook gates (step 5b, `runner::reject_hook_gates`, `hookcheck`).* Right after the snapshot

@@ -1,0 +1,9 @@
+# Written for 0.6.1 (ADR-0020): `[queue] tool_env` ("login-shell" or "daemon")
+# and `tool_path`, the `PATH` merge trains run their tools with. Not a recording
+# of a released binary; 0.6.0 and older reject this file because the user
+# `[queue]` table refuses unknown keys.
+version = 1
+
+[queue]
+tool_env = "daemon"
+tool_path = "/opt/tools/bin:/usr/bin"

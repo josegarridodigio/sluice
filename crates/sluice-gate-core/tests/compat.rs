@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use sluice_gate_core::config::{RepoConfig, UserConfig};
+use sluice_gate_core::config::{RepoConfig, ToolEnv, UserConfig};
 use sluice_gate_core::key::KeyTree;
 use sluice_gate_core::key::{self, CacheKey, KeyMaterial};
 use sluice_gate_core::marker::{Lookup, MarkerStore};
@@ -554,6 +554,24 @@ fn queue_prepare_fixture_parses() {
     let plain = RepoConfig::parse("version = 1\n", &path).unwrap();
     assert!(plain.queue.prepare.is_none());
     assert!(plain.queue.prepare_weight.is_auto());
+}
+
+/// ADR-0020: `[queue] tool_env` and `tool_path` parse; a user config without
+/// them resolves trains' tools in the login environment.
+#[test]
+fn queue_tool_env_fixture_parses() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/unreleased/queue-tool-env.toml");
+    let text = fs::read_to_string(&path).unwrap();
+    let cfg = UserConfig::parse(&text, &path).unwrap();
+    assert_eq!(cfg.queue.tool_env, ToolEnv::Daemon);
+    assert_eq!(
+        cfg.queue.tool_path.as_deref(),
+        Some("/opt/tools/bin:/usr/bin")
+    );
+    let plain = UserConfig::parse("version = 1\n", &path).unwrap();
+    assert_eq!(plain.queue.tool_env, ToolEnv::LoginShell);
+    assert!(plain.queue.tool_path.is_none());
 }
 
 /// ADR-0019: `[containment] gates_oom_score_adj` parses as `"auto"` or a

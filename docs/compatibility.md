@@ -136,6 +136,12 @@ daemon simply creates it without the policy. The opt-in `[admission]
 memory_guard` and its `sluice_memory_guard` interventions are one-way like the
 other 0.6.0 keys (fixture `crates/sluice-gate-core/tests/fixtures/unreleased/admission-memory-guard.toml`).
 
+0.6.1 adds the user config keys `[queue] tool_env` and `[queue] tool_path` (ADR-0020).
+They are one-way like the 0.6.0 keys: 0.6.0 and older binaries reject a user config that
+has them (fixture `crates/sluice-gate-core/tests/fixtures/unreleased/queue-tool-env.toml`).
+The status JSON gains the optional `queue.tool_env` (`source`, `reason`, `path`), which
+older clients ignore.
+
 ### The database
 
 `$XDG_STATE_HOME/sluice/sluice.db` holds the daemon's job history and the merge

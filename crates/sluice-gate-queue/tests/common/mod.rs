@@ -270,6 +270,20 @@ pub fn daemon_config_with(
     base_env: EnvMap,
     push_program: Option<PathBuf>,
 ) -> DaemonConfig {
+    daemon_config_full(state, user, base_env, push_program, None)
+}
+
+/// Like [`daemon_config_with`]; `login_shell` is resolved for the trains' tool
+/// environment (ADR-0020). Without it the harness never starts a login shell:
+/// with a `base_env` the trains' tools run in that environment, so the tests
+/// do not depend on the machine's shell.
+pub fn daemon_config_full(
+    state: &Path,
+    user: UserConfig,
+    base_env: EnvMap,
+    push_program: Option<PathBuf>,
+    login_shell: Option<PathBuf>,
+) -> DaemonConfig {
     DaemonConfig {
         socket_path: state.join("d.sock"),
         lock_path: state.join("daemon.lock"),
@@ -301,6 +315,7 @@ pub fn daemon_config_with(
         extensions: vec![Arc::new(QueueExtension::new(QueueOptions {
             base_env: Some(base_env),
             push_program,
+            login_shell,
         }))],
         reaper: None,
         containment: None,
@@ -331,9 +346,26 @@ impl Daemon {
         push_program: Option<PathBuf>,
         policy: LastSubscriberGone,
     ) -> Self {
+        Self::start_full(fx, user, push_program, policy, None).await
+    }
+
+    /// Like [`Daemon::start`]; the trains' tool environment is resolved through
+    /// the fake login shell `login_shell`.
+    pub async fn start_login_shell(fx: &Fixture, user: UserConfig, login_shell: PathBuf) -> Self {
+        let policy = LastSubscriberGone::Cancel;
+        Self::start_full(fx, user, None, policy, Some(login_shell)).await
+    }
+
+    async fn start_full(
+        fx: &Fixture,
+        user: UserConfig,
+        push_program: Option<PathBuf>,
+        policy: LastSubscriberGone,
+        login_shell: Option<PathBuf>,
+    ) -> Self {
         let state = fx.root.join("state");
         std::fs::create_dir_all(&state).unwrap();
-        let mut cfg = daemon_config_with(&state, user, fx.queue_env(), push_program);
+        let mut cfg = daemon_config_full(&state, user, fx.queue_env(), push_program, login_shell);
         cfg.last_subscriber_gone = policy;
         let socket = cfg.socket_path.clone();
         let _ = std::fs::remove_file(&socket);
@@ -412,6 +444,14 @@ impl Daemon {
         match self.enqueue(fx, wt, branch, sha, base).await {
             ServerMessage::QueueJob { job, .. } => job,
             other => panic!("enqueue failed: {other:?}"),
+        }
+    }
+
+    /// The daemon's general status report (`sluice status`).
+    pub async fn daemon_status(&self) -> sluice_gate_proto::StatusReport {
+        match self.ask(&ClientMessage::Status { id: 3 }).await {
+            ServerMessage::Status { status, .. } => status,
+            other => panic!("unexpected {other:?}"),
         }
     }
 

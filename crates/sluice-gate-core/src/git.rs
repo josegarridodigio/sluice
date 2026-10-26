@@ -100,9 +100,9 @@ pub fn run_output(args: &[&str], cwd: &Path, env: &EnvMap) -> Result<Output> {
 }
 
 /// Grace period between SIGTERM and SIGKILL when a deadline expires.
-const DEADLINE_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const DEADLINE_GRACE: Duration = Duration::from_secs(2);
 /// Polling period while waiting for a process with a deadline.
-const DEADLINE_POLL: Duration = Duration::from_millis(20);
+pub(crate) const DEADLINE_POLL: Duration = Duration::from_millis(20);
 
 /// Reads a pipe to the end on a helper thread; the result arrives on the
 /// returned channel (never, when a stray grandchild keeps the pipe open).
@@ -117,7 +117,7 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static) -> mpsc::Receiver<Vec<u8
 }
 
 /// Sends `signal` to the process group `pgid` (best effort).
-fn signal_group(pgid: u32, signal: nix::sys::signal::Signal) {
+pub(crate) fn signal_group(pgid: u32, signal: nix::sys::signal::Signal) {
     if let Ok(raw) = i32::try_from(pgid)
         && raw > 1
     {

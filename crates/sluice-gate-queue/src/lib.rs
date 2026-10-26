@@ -15,6 +15,7 @@
 //! - [`push`]: push arguments, process handling, porcelain classification.
 //! - [`reconcile`]: the reconcile decision table and its queries.
 //! - [`runner`]: the runner loop, train build, gates, push orchestration.
+//! - [`toolenv`]: the environment trains run their tools in (ADR-0020).
 //! - `prepare`: `[queue] prepare`, the prepare job and the base probe.
 //! - `hookcheck`: a merged config asking the `pre-push` hook for unverified gates.
 //! - `trust`: the member's own configuration for `--trust-member-config`.
@@ -33,6 +34,7 @@ pub mod reconcile;
 pub mod runner;
 pub mod store;
 pub mod target;
+pub mod toolenv;
 mod trust;
 mod vouch;
 

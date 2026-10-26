@@ -117,6 +117,7 @@ impl Extension for FakeQueue {
                 active: 2,
                 ready: 1,
                 needs_reconcile: 0,
+                tool_env: None,
             })
         })
     }
@@ -334,7 +335,8 @@ async fn queue_requests_are_routed_to_the_extension() {
         Some(QueueSummary {
             active: 2,
             ready: 1,
-            needs_reconcile: 0
+            needs_reconcile: 0,
+            tool_env: None,
         })
     );
     assert!(!fake.stopped.load(Ordering::SeqCst));

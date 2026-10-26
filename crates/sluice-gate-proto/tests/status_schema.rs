@@ -7,7 +7,7 @@
 //! meaning bumps [`STATUS_SCHEMA_VERSION`] and gets a new fixture).
 
 use sluice_gate_proto::{
-    BudgetInfo, Caller, DaemonInfo, PsiInfo, QueueSummary, QueuedJob, RunningJob,
+    BudgetInfo, Caller, DaemonInfo, PsiInfo, QueueSummary, QueueToolEnv, QueuedJob, RunningJob,
     STATUS_SCHEMA_VERSION, StatusReport, Totals, WaitReason,
 };
 
@@ -113,6 +113,7 @@ fn queue_summary_is_an_additive_optional_field() {
         active: 4,
         ready: 1,
         needs_reconcile: 2,
+        tool_env: None,
     });
     let mut actual = serde_json::to_value(&with_queue).unwrap();
     let queue = actual.as_object_mut().unwrap().remove("queue").unwrap();
@@ -125,6 +126,39 @@ fn queue_summary_is_an_additive_optional_field() {
     let back: StatusReport =
         serde_json::from_value(serde_json::to_value(&with_queue).unwrap()).unwrap();
     assert_eq!(back, with_queue);
+}
+
+#[test]
+fn queue_tool_env_is_an_additive_optional_field() {
+    let mut with_env = report();
+    with_env.queue = Some(QueueSummary {
+        active: 1,
+        tool_env: Some(QueueToolEnv {
+            source: "daemon".into(),
+            reason: Some("zsh exited with exit status: 1".into()),
+            path: Some("/usr/bin:/bin".into()),
+        }),
+        ..QueueSummary::default()
+    });
+    let mut actual = serde_json::to_value(&with_env).unwrap();
+    let queue = actual.as_object_mut().unwrap().remove("queue").unwrap();
+    assert_eq!(
+        queue["tool_env"],
+        serde_json::json!({
+            "source": "daemon",
+            "reason": "zsh exited with exit status: 1",
+            "path": "/usr/bin:/bin"
+        })
+    );
+    let back: StatusReport =
+        serde_json::from_value(serde_json::to_value(&with_env).unwrap()).unwrap();
+    assert_eq!(back, with_env);
+    // Absent fields stay absent, and an older daemon's summary still parses.
+    let plain = serde_json::to_value(QueueSummary::default()).unwrap();
+    assert!(plain.get("tool_env").is_none(), "{plain}");
+    let old: QueueSummary =
+        serde_json::from_str(r#"{"active": 1, "ready": 0, "needs_reconcile": 0}"#).unwrap();
+    assert_eq!(old.tool_env, None);
 }
 
 #[test]

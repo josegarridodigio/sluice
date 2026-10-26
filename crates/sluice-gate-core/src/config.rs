@@ -790,6 +790,24 @@ pub struct UserQueueConfig {
     /// daemon start and once per hour.
     #[serde(with = "humantime_serde")]
     pub retention: Duration,
+    /// Where merge trains get the environment of their tools (gates,
+    /// `prepare`, `key_inputs`; ADR-0020).
+    pub tool_env: ToolEnv,
+    /// An explicit `PATH` for the trains' tools; wins over `tool_env` for
+    /// `PATH` when set.
+    pub tool_path: Option<String>,
+}
+
+/// `[queue] tool_env`: the environment trains run their tools in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolEnv {
+    /// The user's login environment, resolved once when the daemon starts
+    /// (falls back to the daemon's environment when it cannot be resolved).
+    #[default]
+    LoginShell,
+    /// The daemon's own (sanitised) environment, whoever started it.
+    Daemon,
 }
 
 impl Default for UserQueueConfig {
@@ -799,6 +817,8 @@ impl Default for UserQueueConfig {
             allow_agent_approval: false,
             tick: Duration::from_secs(5),
             retention: Duration::from_hours(30 * 24),
+            tool_env: ToolEnv::default(),
+            tool_path: None,
         }
     }
 }
@@ -1197,6 +1217,14 @@ impl UserConfig {
             return Err(config_err(path, "daemon.ionice_level must be in 0..=7"));
         }
         validate_admission(&cfg.admission, path)?;
+        if cfg
+            .queue
+            .tool_path
+            .as_deref()
+            .is_some_and(|p| p.trim().is_empty())
+        {
+            return Err(config_err(path, "queue.tool_path must not be empty"));
+        }
         if let Err(e) = tracing_subscriber::EnvFilter::try_new(&cfg.debug.level) {
             return Err(config_err(
                 path,
@@ -1636,6 +1664,31 @@ depends_on = ["lint"]
         assert!(!c.queue.enabled && c.queue.allow_agent_approval);
         assert_eq!(c.queue.tick, Duration::from_secs(1));
         assert_eq!(c.queue.retention, Duration::from_hours(7 * 24));
+    }
+
+    #[test]
+    fn user_queue_tool_env_and_tool_path() {
+        let p = Path::new("u.toml");
+        let c = UserConfig::parse("version = 1", p).unwrap();
+        assert_eq!(c.queue.tool_env, ToolEnv::LoginShell);
+        assert!(c.queue.tool_path.is_none());
+        let c = UserConfig::parse(
+            "version = 1\n[queue]\ntool_env = \"daemon\"\ntool_path = \"/opt/bin:/usr/bin\"",
+            p,
+        )
+        .unwrap();
+        assert_eq!(c.queue.tool_env, ToolEnv::Daemon);
+        assert_eq!(c.queue.tool_path.as_deref(), Some("/opt/bin:/usr/bin"));
+        let c = UserConfig::parse("version = 1\n[queue]\ntool_env = \"login-shell\"", p).unwrap();
+        assert_eq!(c.queue.tool_env, ToolEnv::LoginShell);
+        let e = UserConfig::parse("version = 1\n[queue]\ntool_env = \"enqueuer\"", p)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("tool_env") || e.contains("enqueuer"), "{e}");
+        let e = UserConfig::parse("version = 1\n[queue]\ntool_path = \"  \"", p)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("queue.tool_path"), "{e}");
     }
 
     #[test]

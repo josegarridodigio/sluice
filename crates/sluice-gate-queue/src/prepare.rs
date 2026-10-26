@@ -177,7 +177,7 @@ pub(crate) fn submit(
         cmd: spec.cmd.clone(),
         extra: Vec::new(),
         cwd: cwd.to_path_buf(),
-        child_env: core.child_env.clone(),
+        child_env: core.tool_env.clone(),
         probe_env: core.git.env().clone(),
         caller: Caller::Human,
         session: Some(format!("queue:{}", train.id)),
