@@ -9,15 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Fixed
+
+## [0.6.3] - 2026-10-26
+
+### Added
+
 - The daemon log says when a job waits for memory: one `info` line when a job
   first becomes memory-blocked (`waits for memory`, with the expected peak, free
   memory and the running jobs' headroom) and one when it starts after waiting
   (`started after waiting ...s for memory`). Memory waits stay folded into the
   budget columns and wire reason; the log is how to measure them.
-
-### Changed
-
-### Fixed
 
 ## [0.6.2] - 2026-10-26
 
@@ -531,7 +535,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PSI thresholds must be percentages (rejected at config load otherwise).
 - Findings of the Phase 1, 2, 3 and 4 reconciliation passes.
 
-[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.6.3...HEAD
+[0.6.3]: https://github.com/josegarridodigio/sluice/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/josegarridodigio/sluice/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/josegarridodigio/sluice/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/josegarridodigio/sluice/compare/v0.5.0...v0.6.0
