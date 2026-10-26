@@ -138,6 +138,7 @@ if [ -n "$BIN" ] && "$BIN" agent session-start --help >/dev/null 2>&1; then
     ln -s "$BIN" "$TMP/real/bin/sluice"
     out=$(printf '{"cwd":"%s","source":"startup"}' "$TMP/real/dir" |
         env -i PATH="$TMP/real/bin:$NOSLUICE_PATH" HOME="$TMP/real/home" XDG_STATE_HOME="$TMP/real/state" XDG_RUNTIME_DIR="$TMP/real/run" \
+            ${SLUICE_TEST_SESSION_WATCHDOG_MS:+SLUICE_TEST_SESSION_WATCHDOG_MS=$SLUICE_TEST_SESSION_WATCHDOG_MS} \
             CLAUDE_ENV_FILE="$TMP/real/env.sh" sh "$HOOK" 2>/dev/null)
     RC=$?
     expect "end to end outside git" "not a git repository"

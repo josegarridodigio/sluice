@@ -22,7 +22,26 @@ fn env_file(sb: &Sandbox) -> PathBuf {
 }
 
 /// Runs the hook with `input` on stdin and `CLAUDE_ENV_FILE` set.
+/// The hook's watchdog in these tests: what they check is the answer, not
+/// the latency (`a_warm_run_takes_under_300_ms` uses the real limit), and a
+/// loaded CI machine can overrun 300 ms with a debug build.
+const TEST_WATCHDOG_MS: &str = "5000";
+
 fn hook(sb: &Sandbox, input: &str, extra: &[(&str, &str)]) -> Output {
+    hook_with(
+        sb,
+        input,
+        &[
+            &[("SLUICE_TEST_SESSION_WATCHDOG_MS", TEST_WATCHDOG_MS)],
+            extra,
+        ]
+        .concat(),
+    )
+}
+
+/// [`hook`] with exactly `extra` added (the real watchdog unless `extra` sets
+/// the test override).
+fn hook_with(sb: &Sandbox, input: &str, extra: &[(&str, &str)]) -> Output {
     let mut cmd = StdCommand::new(Sandbox::binary());
     cmd.args(["agent", "session-start", "--plugin-version", "0.3.0"])
         .current_dir(&sb.repo)
@@ -249,7 +268,7 @@ fn a_warm_run_takes_under_300_ms() {
     let sb = Sandbox::standard();
     context(&hook(&sb, &input(&sb.repo, "startup"), &[]));
     let start = Instant::now();
-    let out = hook(&sb, &input(&sb.repo, "resume"), &[]);
+    let out = hook_with(&sb, &input(&sb.repo, "resume"), &[]);
     let took = start.elapsed();
     context(&out);
     assert!(took < Duration::from_millis(300), "{took:?}");
@@ -262,6 +281,7 @@ fn plugin_test_session_start_script_passes() {
     let out = StdCommand::new("sh")
         .arg(&script)
         .env("SLUICE_BIN", Sandbox::binary())
+        .env("SLUICE_TEST_SESSION_WATCHDOG_MS", TEST_WATCHDOG_MS)
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);

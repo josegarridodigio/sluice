@@ -40,6 +40,24 @@ const WATCHDOG: Duration = Duration::from_millis(300);
 /// Time after which containment is abandoned so the answer is still printed
 /// before the watchdog fires.
 const BUDGET: Duration = Duration::from_millis(230);
+/// Test-only: replaces [`WATCHDOG`] (milliseconds; the containment budget
+/// keeps the same margin below it). Tests that check what the hook answers
+/// must not depend on how loaded the machine running them is; the latency
+/// itself has its own test with the real limit.
+pub const TEST_WATCHDOG_ENV: &str = "SLUICE_TEST_SESSION_WATCHDOG_MS";
+
+/// The watchdog: [`WATCHDOG`], or the test override.
+fn watchdog(env: &EnvMap) -> Duration {
+    env.get(TEST_WATCHDOG_ENV)
+        .and_then(|v| v.parse().ok())
+        .map_or(WATCHDOG, Duration::from_millis)
+}
+
+/// The containment budget: the watchdog minus the margin the answer needs.
+fn budget(env: &EnvMap) -> Duration {
+    watchdog(env).saturating_sub(WATCHDOG.saturating_sub(BUDGET))
+}
+
 /// Largest hook input read from stdin.
 const MAX_INPUT: u64 = 1 << 20;
 /// Most gate names listed in the context.
@@ -211,6 +229,7 @@ fn contain(
     if !user.containment.enabled {
         return "off";
     }
+    let limit = budget(env);
     let (tx, rx) = std::sync::mpsc::channel();
     let (env, user) = (env.clone(), user.clone());
     let file = env_file.map(Path::to_path_buf);
@@ -222,7 +241,7 @@ fn contain(
         }
         let _ = tx.send(done.label);
     });
-    let left = BUDGET.saturating_sub(start.elapsed());
+    let left = limit.saturating_sub(start.elapsed());
     rx.recv_timeout(left).unwrap_or("timeout")
 }
 
@@ -294,8 +313,9 @@ pub fn respond(input: &str, env: &EnvMap) -> Option<String> {
 pub fn run_hook(plugin_version: &str) -> ExitCode {
     let env: EnvMap = sluice_gate_core::config::process_env();
     tracing::debug!(%plugin_version, "session-start");
-    std::thread::spawn(|| {
-        std::thread::sleep(WATCHDOG);
+    let limit = watchdog(&env);
+    std::thread::spawn(move || {
+        std::thread::sleep(limit);
         let _guard = OUTPUT.lock();
         std::process::exit(0);
     });
