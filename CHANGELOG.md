@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.6.2] - 2026-10-26
+
+### Fixed
+
 - The merge trains' `PATH` keeps the daemon's own directories after the login
   shell's: a login profile that rewrites `PATH` (`/etc/profile` under `bash -l`)
   made 0.6.1 drop every directory only the daemon's starter had (an activated
@@ -521,7 +525,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PSI thresholds must be percentages (rejected at config load otherwise).
 - Findings of the Phase 1, 2, 3 and 4 reconciliation passes.
 
-[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/josegarridodigio/sluice/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/josegarridodigio/sluice/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/josegarridodigio/sluice/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/josegarridodigio/sluice/compare/v0.4.1...v0.5.0
