@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Fixed
+
+## [0.6.0] - 2026-10-26
+
+### Added
+
 - Golden files recorded from the 0.4.1 and 0.5.0 release binaries, read by the
   compatibility tests next to 0.1.0 through 0.4.0.
 - `[queue] prepare` (with `prepare_timeout`, `prepare_weight`): a command run
@@ -478,7 +486,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PSI thresholds must be percentages (rejected at config load otherwise).
 - Findings of the Phase 1, 2, 3 and 4 reconciliation passes.
 
-[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/josegarridodigio/sluice/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/josegarridodigio/sluice/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/josegarridodigio/sluice/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/josegarridodigio/sluice/compare/v0.3.0...v0.4.0
