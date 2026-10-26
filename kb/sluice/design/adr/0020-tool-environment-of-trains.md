@@ -33,7 +33,11 @@ their `key_inputs` therefore work or not depending on who last started the daemo
    removed from `PATH`).
 2. Train gates, the train's `prepare` and base probe, and the train's `key_inputs`
    run in that environment (the daemon's own variables underneath, the login
-   environment on top). Nothing else changes: agents' and hooks' runs still carry
+   environment on top; `PATH` is the login `PATH` followed by the daemon's entries
+   it lacks, amended in 0.6.2: a login profile such as `/etc/profile` rewrites
+   `PATH` from scratch, and the 0.6.1 overlay dropped every directory only the
+   daemon's starter had, which failed CI where the login shell is `bash -l`).
+   Nothing else changes: agents' and hooks' runs still carry
    their client's environment; the push still uses the approver's credentials
    allowlist.
 3. Resolution failure (no shell, timeout, non-zero exit, no marker) falls back to

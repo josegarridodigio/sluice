@@ -201,8 +201,11 @@ need an environment of their own. It is **your login environment**: when the dae
 it runs your login shell once (`$SHELL`, else your passwd entry, else `/bin/sh`, as
 `<shell> -l -i -c '...; env -0'`, with a 10 s deadline) and keeps the result, so a daemon
 restarted from a non-interactive SSH session, cron or a script finds the same `node`,
-`pnpm` or `python` as your terminal. It is never the environment of whoever enqueued: that
-would let a branch's author choose the binaries that judge the branch.
+`pnpm` or `python` as your terminal. The trains' `PATH` is your login `PATH` followed by
+the directories of the daemon's own `PATH` it lacks (so a tool only the daemon's starter
+had, an activated virtualenv for example, is still found, and never shadows yours). It is
+never the environment of whoever enqueued: that would let a branch's author choose the
+binaries that judge the branch.
 
 ```toml
 [queue]

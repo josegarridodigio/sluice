@@ -121,6 +121,27 @@ fn path_entries(env: &EnvMap) -> usize {
         .map_or(0, |p| p.split(':').filter(|e| !e.is_empty()).count())
 }
 
+/// The trains' `PATH`: the login shell's entries first, then the daemon's
+/// entries the login `PATH` lacks. A login profile may rewrite `PATH` from
+/// scratch (`/etc/profile` does), which would drop directories only the
+/// daemon's starter had (an activated virtualenv, a direnv); appending them
+/// keeps those tools, and putting them last means they never shadow a tool the
+/// user's login environment provides.
+fn merged_path(login: Option<&String>, daemon: Option<&String>) -> Option<String> {
+    let mut out: Vec<&str> = Vec::new();
+    for entry in login
+        .into_iter()
+        .chain(daemon)
+        .flat_map(|p| p.split(':'))
+        .filter(|e| !e.is_empty())
+    {
+        if !out.contains(&entry) {
+            out.push(entry);
+        }
+    }
+    (!out.is_empty()).then(|| out.join(":"))
+}
+
 fn compute(queue: &UserQueueConfig, inputs: &Inputs<'_>) -> ResolvedToolEnv {
     let mut env = inputs.daemon_env.clone();
     if let Some(path) = &queue.tool_path {
@@ -148,7 +169,11 @@ fn compute(queue: &UserQueueConfig, inputs: &Inputs<'_>) -> ResolvedToolEnv {
     };
     match resolved {
         Ok(login) => {
+            let path = merged_path(login.get("PATH"), inputs.daemon_env.get("PATH"));
             env.extend(login);
+            if let Some(path) = path {
+                env.insert("PATH".to_owned(), path);
+            }
             ResolvedToolEnv {
                 env,
                 source: ToolEnvSource::LoginShell,
@@ -193,6 +218,18 @@ mod tests {
     }
 
     #[test]
+    fn the_trains_path_is_login_first_then_what_only_the_daemon_had() {
+        let p = |s: &str| Some(s.to_owned());
+        assert_eq!(
+            merged_path(p("/a:/b").as_ref(), p("/b:/c::/a").as_ref()).as_deref(),
+            Some("/a:/b:/c")
+        );
+        assert_eq!(merged_path(None, p("/c").as_ref()).as_deref(), Some("/c"));
+        assert_eq!(merged_path(p("/a").as_ref(), None).as_deref(), Some("/a"));
+        assert_eq!(merged_path(None, None), None);
+    }
+
+    #[test]
     fn login_values_win_over_the_daemon_env() {
         let dir = tempfile::tempdir().unwrap();
         let shell = fake_shell(
@@ -200,16 +237,21 @@ mod tests {
             "export PATH=/login/bin:/usr/bin NVM_DIR=/nvm\neval \"$4\"",
         );
         let det = AgentDetectionConfig::default();
-        let daemon = env(&[("PATH", "/usr/bin"), ("ONLY_DAEMON", "1")]);
+        let daemon = env(&[("PATH", "/venv/bin:/usr/bin"), ("ONLY_DAEMON", "1")]);
         let r = resolve(
             &UserQueueConfig::default(),
             &inputs(&daemon, &det, Some(&shell)),
         );
         assert_eq!(r.source, ToolEnvSource::LoginShell);
-        assert_eq!(r.env["PATH"], "/login/bin:/usr/bin");
+        // Login entries first; the daemon's entries the login PATH lacks after
+        // them (a profile that rewrites PATH must not lose them).
+        assert_eq!(r.env["PATH"], "/login/bin:/usr/bin:/venv/bin");
         assert_eq!(r.env["NVM_DIR"], "/nvm");
         assert_eq!(r.env["ONLY_DAEMON"], "1");
-        assert_eq!(r.view().path.as_deref(), Some("/login/bin:/usr/bin"));
+        assert_eq!(
+            r.view().path.as_deref(),
+            Some("/login/bin:/usr/bin:/venv/bin")
+        );
     }
 
     #[test]

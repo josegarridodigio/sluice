@@ -38,7 +38,8 @@ in the daemon's).
   (`runner.rs`), the train's `derive_key` env, and the prepare job and base probe
   (`prepare.rs`). Not changed: `Core.git` (git env), the push env, agents' and hooks' runs,
   the vouch. Rule: `tool_path` wins; `tool_env = "daemon"` uses the daemon's sanitised env;
-  `login-shell` overlays the login env on it (login values win), falling back with the
+  `login-shell` overlays the login env on it (login values win; `PATH` is merged in
+  0.6.2: login entries first, then the daemon's entries the login `PATH` lacks), falling back with the
   reason. **Tests**: when `QueueOptions.base_env` is given the login shell is not resolved
   (the machine's shell would decide) unless `QueueOptions.login_shell` injects a fake one.
 - Observability: daemon log (`info` with shell/vars/PATH entries, `warn` with the reason on
