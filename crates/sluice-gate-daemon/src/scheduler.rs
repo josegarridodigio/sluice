@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use sluice_gate_core::key::CacheKey;
-use sluice_gate_proto::WaitReason;
+use sluice_gate_proto::{WaitReason, gib_text};
 
 /// Expected run time of a job without history (HRRN), milliseconds.
 pub const DEFAULT_EXPECTED_MS: u64 = 60_000;
@@ -996,6 +996,106 @@ pub fn expected_ms(walls_ms: &[u64]) -> Option<u64> {
     })
 }
 
+/// A memory wait worth a daemon log line: a job first left memory-blocked,
+/// or a job that waited for memory started. The `jobs.wait_*_ms` columns and
+/// the wire reasons fold memory into the budget (ADR-0019), so the log is the
+/// only place the time spent waiting for memory shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryNote {
+    /// The job started (`true`) or was first seen memory-blocked (`false`).
+    pub started: bool,
+    /// Job id.
+    pub job: String,
+    /// Repository of the job.
+    pub repo: PathBuf,
+    /// Gate name.
+    pub gate: String,
+    /// Time spent memory-blocked, milliseconds, as of the note.
+    pub waited_ms: u64,
+    /// The peak the job was expected to reach.
+    pub expected: Option<Expected>,
+    /// `MemAvailable` at the pass, bytes.
+    pub available_bytes: u64,
+    /// Memory kept for everything that is not a gate, bytes.
+    pub reserve_bytes: u64,
+    /// What the running jobs were still expected to grow by, bytes.
+    pub headroom_bytes: u64,
+}
+
+impl MemoryNote {
+    /// `<id> (<repo basename>:<gate>)`.
+    fn who(&self) -> String {
+        let repo = self
+            .repo
+            .file_name()
+            .map_or_else(|| "?".into(), |n| n.to_string_lossy());
+        format!("job {} ({repo}:{})", self.job, self.gate)
+    }
+
+    /// `18.0 GiB learned` / `18.0 GiB guessed`, `unknown` without an estimate.
+    fn expected_text(&self) -> String {
+        self.expected.map_or_else(
+            || "unknown".to_owned(),
+            |e| {
+                let how = if e.learned { "learned" } else { "guessed" };
+                format!("{} {how}", gib_text(e.bytes))
+            },
+        )
+    }
+}
+
+/// The line logged when a job first becomes memory-blocked.
+pub fn memory_blocked_line(n: &MemoryNote) -> String {
+    format!(
+        "{} waits for memory: expected {}, free {}, running headroom {}",
+        n.who(),
+        n.expected_text(),
+        gib_text(n.available_bytes),
+        gib_text(n.headroom_bytes)
+    )
+}
+
+/// The line logged when a job that waited for memory starts.
+pub fn memory_started_line(n: &MemoryNote) -> String {
+    format!(
+        "{} started after waiting {}.{}s for memory (expected {}, free at start {}, reserve {})",
+        n.who(),
+        n.waited_ms / 1000,
+        n.waited_ms % 1000 / 100,
+        n.expected_text(),
+        gib_text(n.available_bytes),
+        gib_text(n.reserve_bytes)
+    )
+}
+
+/// The note of `spec` for this pass; `plan.order` and `plan.expected` are
+/// parallel, so the estimate is the one the pass decided on.
+fn memory_note(
+    started: bool,
+    spec: &JobSpec,
+    waited_ms: u64,
+    plan: &Plan,
+    facts: MemoryFacts,
+    headroom_bytes: u64,
+) -> MemoryNote {
+    let expected = plan
+        .order
+        .iter()
+        .position(|id| *id == spec.id)
+        .and_then(|i| plan.expected.get(i).copied());
+    MemoryNote {
+        started,
+        job: spec.id.clone(),
+        repo: spec.repo.clone(),
+        gate: spec.gate.clone(),
+        waited_ms,
+        expected,
+        available_bytes: facts.available_bytes,
+        reserve_bytes: facts.reserve_bytes,
+        headroom_bytes,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Stateful scheduler
 // ---------------------------------------------------------------------------
@@ -1009,6 +1109,12 @@ struct Job {
     started_at: u64,
     admission: Option<Admission>,
     waits: [u64; 5],
+    /// Time spent with [`WaitCause::Memory`], on top of the budget
+    /// accumulator it is also added to (observability only, never persisted).
+    memory_wait_ms: u64,
+    /// When a pass first left the job memory-blocked: the log line is
+    /// written once.
+    memory_blocked_at: Option<u64>,
     cause: WaitCause,
     detail: Option<&'static str>,
     accounted_at: u64,
@@ -1024,6 +1130,8 @@ impl Job {
             started_at: 0,
             admission: None,
             waits: [0; 5],
+            memory_wait_ms: 0,
+            memory_blocked_at: None,
             cause: WaitCause::Budget,
             detail: None,
             accounted_at,
@@ -1035,6 +1143,9 @@ impl Job {
     fn account(&mut self, now: u64) {
         let dt = now.saturating_sub(self.accounted_at);
         self.waits[self.cause.index()] += dt;
+        if self.cause == WaitCause::Memory {
+            self.memory_wait_ms += dt;
+        }
         self.accounted_at = self.accounted_at.max(now);
     }
 
@@ -1089,6 +1200,8 @@ pub struct Scheduler {
     over_admissions: u64,
     /// `now` of the last pass (orders `position` between passes).
     last_now: u64,
+    /// Memory waits to log, drained by [`Scheduler::take_memory_notes`].
+    notes: Vec<MemoryNote>,
 }
 
 impl Scheduler {
@@ -1116,6 +1229,7 @@ impl Scheduler {
             last_start_at: None,
             over_admissions: 0,
             last_now: 0,
+            notes: Vec::new(),
         }
     }
 
@@ -1203,6 +1317,13 @@ impl Scheduler {
     pub fn memory_headroom(&self) -> Option<u64> {
         let (running, queued) = self.snaps();
         running_headroom(&self.snapshot_at(self.last_now, &running, &queued))
+    }
+
+    /// The memory waits the passes since the last call left to log, oldest
+    /// first (a job first memory-blocked, a job that waited for memory
+    /// started).
+    pub fn take_memory_notes(&mut self) -> Vec<MemoryNote> {
+        std::mem::take(&mut self.notes)
     }
 
     /// Adds a request. The configured weight is clamped to
@@ -1332,6 +1453,8 @@ impl Scheduler {
             job.account(now);
         }
         let plan = self.plan_at(now, pressure);
+        // What the running jobs still hold back, before this pass starts any.
+        let memory = self.memory.zip(self.memory_headroom());
         // Every queued job takes the weight of this pass; a started one keeps
         // it while running (the units `used` and `finish` account).
         for (id, &weight) in plan.order.iter().zip(&plan.weights) {
@@ -1344,6 +1467,12 @@ impl Scheduler {
                 continue;
             };
             let mut job = self.queue.remove(idx);
+            if job.memory_wait_ms > 0
+                && let Some((facts, headroom)) = memory
+            {
+                let note = memory_note(true, &job.spec, job.memory_wait_ms, &plan, facts, headroom);
+                self.notes.push(note);
+            }
             job.started_at = now;
             job.admission = Some(*admission);
             self.last_start_at = Some(now);
@@ -1353,10 +1482,20 @@ impl Scheduler {
             }
             self.running.push(job);
         }
+        // The waiting jobs see the jobs this pass started as running.
+        let memory = self.memory.zip(self.memory_headroom());
         for wait in &plan.waits {
             if let Some(job) = self.queue.iter_mut().find(|j| j.spec.id == wait.id) {
                 job.cause = wait.cause;
                 job.detail = wait.detail;
+                if wait.cause == WaitCause::Memory
+                    && job.memory_blocked_at.is_none()
+                    && let Some((facts, headroom)) = memory
+                {
+                    job.memory_blocked_at = Some(now);
+                    let note = memory_note(false, &job.spec, 0, &plan, facts, headroom);
+                    self.notes.push(note);
+                }
             }
         }
         plan.start

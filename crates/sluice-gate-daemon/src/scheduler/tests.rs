@@ -1357,6 +1357,109 @@ fn a_memory_wait_reports_budget_with_the_memory_detail() {
     assert_eq!(s.admit(4_000, false), vec!["b"]);
 }
 
+/// The memory accumulator grows only under `WaitCause::Memory`; the budget
+/// accumulator is unchanged; one note when first blocked, one at the start.
+#[test]
+fn memory_waits_are_accumulated_apart_and_noted_twice() {
+    let mut s = Scheduler::with_policy(policy(12));
+    s.set_memory(Some(facts(22, 30, 3)), BTreeMap::new());
+    s.set_learned_peak(lk("test"), Some(18 * GIB));
+    for id in ["a", "b"] {
+        let mut j = gate_job(id, 6, 0);
+        j.lane = PathBuf::from(format!("/{id}"));
+        s.enqueue(j);
+    }
+    assert_eq!(s.admit(0, false), vec!["a"]);
+    // Pass 0 saw `b` blocked by memory for the first time: one note. Time
+    // before it was budget (the cause before the first pass).
+    let notes = s.take_memory_notes();
+    assert_eq!(notes.len(), 1);
+    assert!(!notes[0].started);
+    assert_eq!(notes[0].job, "b");
+    assert_eq!(notes[0].expected.map(|e| e.bytes), Some(18 * GIB));
+    assert_eq!(notes[0].headroom_bytes, 18 * GIB);
+    assert_eq!(s.job("b").unwrap().memory_wait_ms, 0);
+    // Later passes: still blocked, no new note, both accumulators grow.
+    s.admit(2_000, false);
+    s.admit(5_000, false);
+    assert_eq!(s.take_memory_notes(), Vec::new(), "never on every tick");
+    assert_eq!(s.job("b").unwrap().memory_wait_ms, 5_000);
+    assert_eq!(
+        s.record("b", 5_000).unwrap().waits[WaitCause::Budget.index()],
+        5_000
+    );
+    // `a` never waited for memory: nothing in its accumulator.
+    assert_eq!(s.job("a").unwrap().memory_wait_ms, 0);
+    // Memory recovers: b starts, and says how long it waited.
+    let held = BTreeMap::from([("a".to_owned(), 18 * GIB)]);
+    s.set_memory(Some(facts(40, 64, 3)), held);
+    assert_eq!(s.admit(6_000, false), vec!["b"]);
+    let notes = s.take_memory_notes();
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].started);
+    assert_eq!(notes[0].waited_ms, 6_000);
+}
+
+/// A job that waits for the budget only leaves no memory trace.
+#[test]
+fn budget_waits_leave_no_memory_note() {
+    let mut s = sched(8);
+    // Two repositories, so the second job waits for the budget, not for the
+    // per-repository cap.
+    for (i, c) in ['a', 'b'].into_iter().enumerate() {
+        s.enqueue(spec(
+            &format!("j{i}"),
+            Some(key(c)),
+            &format!("/r{i}"),
+            8,
+            0,
+        ));
+    }
+    assert_eq!(s.admit(0, false), vec!["j0"]);
+    s.admit(3_000, false);
+    assert_eq!(s.job("j1").unwrap().memory_wait_ms, 0);
+    // The wait is accounted under its own cause (whichever the plan gave),
+    // all of it, and none of it as memory.
+    assert_eq!(
+        s.record("j1", 3_000).unwrap().waits.iter().sum::<u64>(),
+        3_000
+    );
+    assert_eq!(s.take_memory_notes(), Vec::new());
+}
+
+#[test]
+fn the_memory_log_lines_have_a_fixed_format() {
+    let mut note = MemoryNote {
+        started: false,
+        job: "j7".into(),
+        repo: PathBuf::from("/home/someone/work/shop"),
+        gate: "test".into(),
+        waited_ms: 12_345,
+        expected: Some(Expected {
+            bytes: 18 * GIB,
+            learned: true,
+        }),
+        available_bytes: 12 * GIB,
+        reserve_bytes: 3 * GIB,
+        headroom_bytes: 4 * GIB,
+    };
+    assert_eq!(
+        memory_blocked_line(&note),
+        "job j7 (shop:test) waits for memory: expected 18.0 GiB learned, free 12.0 GiB, \
+         running headroom 4.0 GiB"
+    );
+    note.started = true;
+    note.expected = Some(Expected {
+        bytes: 6 * GIB,
+        learned: false,
+    });
+    assert_eq!(
+        memory_started_line(&note),
+        "job j7 (shop:test) started after waiting 12.3s for memory (expected 6.0 GiB guessed, \
+         free at start 12.0 GiB, reserve 3.0 GiB)"
+    );
+}
+
 /// PSI blocking still comes first: a blocked pass reports `psi`, and the
 /// starvation guard does not start a head that does not fit memory.
 #[test]

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The daemon log says when a job waits for memory: one `info` line when a job
+  first becomes memory-blocked (`waits for memory`, with the expected peak, free
+  memory and the running jobs' headroom) and one when it starts after waiting
+  (`started after waiting ...s for memory`). Memory waits stay folded into the
+  budget columns and wire reason; the log is how to measure them.
+
 ### Changed
 
 ### Fixed

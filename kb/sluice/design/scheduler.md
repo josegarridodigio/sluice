@@ -181,6 +181,15 @@ whole `E` to `H`, so two big jobs cannot both start off one stale
 (wire reason `budget`), its wait is added to the budget accumulator, and PSI
 blocking still comes first (a blocked pass reports `psi`).
 
+Memory waits are observable only in the daemon log: each queued job keeps an
+in-memory `memory_wait_ms` (time under `WaitCause::Memory`, added where the other
+accumulators are, besides the budget one) and the first time a pass left it
+memory-blocked. `admit_with` queues a `MemoryNote` for the first block and for the
+start of a job with `memory_wait_ms > 0`; the daemon drains them
+(`take_memory_notes`) and logs one `info` line each (`waits for memory: ...`,
+`started after waiting ...s for memory ...`). Never per tick, no schema or wire
+change, `plan` stays pure.
+
 **Invariants.**
 
 - Never `Σ E > free` unless that job started with nothing else running and

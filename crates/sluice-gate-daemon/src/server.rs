@@ -1437,7 +1437,7 @@ fn admit(shared: &Shared, now: u64) -> Vec<(String, sched::Admission)> {
         (u.idle_cpus(), u.sampled_at())
     };
     let facts = memory::facts(a, gates_memory(shared));
-    let started = {
+    let (started, notes) = {
         let mut st = shared.state();
         // The working set each running job had at its last sample.
         let currents = st
@@ -1446,7 +1446,7 @@ fn admit(shared: &Shared, now: u64) -> Vec<(String, sched::Admission)> {
             .filter_map(|(id, e)| Some((id.clone(), e.usage.memory_now()?)))
             .collect();
         st.sched.set_memory(facts, currents);
-        st.sched.admit_with(
+        let started = st.sched.admit_with(
             now,
             Pressure {
                 blocking,
@@ -1455,8 +1455,21 @@ fn admit(shared: &Shared, now: u64) -> Vec<(String, sched::Admission)> {
                 idle_cpus,
                 sampled_at,
             },
-        )
+        );
+        (started, st.sched.take_memory_notes())
     };
+    // Memory waits are folded into the budget column and reason: the log is
+    // where they show.
+    for note in &notes {
+        tracing::info!(
+            "{}",
+            if note.started {
+                sched::memory_started_line(note)
+            } else {
+                sched::memory_blocked_line(note)
+            }
+        );
+    }
     for (id, admission) in &started {
         match admission {
             sched::Admission::Guard => {

@@ -329,6 +329,21 @@ rule off with `memory_aware = false`. The peak it learns is the working set
 (`anon` + swap), not `memory.peak`, which includes page cache and is shown only
 in a kill message.
 
+To see how long jobs actually waited for memory, grep the daemon log (see
+[Where everything is logged](#where-everything-is-logged)). The columns and the
+wire reason fold memory into the budget, so the log is the only record:
+
+```text
+job j7 (shop:test) waits for memory: expected 18.0 GiB learned, free 12.0 GiB, running headroom 4.0 GiB
+job j7 (shop:test) started after waiting 12.3s for memory (expected 18.0 GiB learned, free at start 20.0 GiB, reserve 3.0 GiB)
+```
+
+`grep "waits for memory"` finds every job that was held back (written once, when
+it first is; a job that never starts, because its client went away, still leaves
+this line) and `grep "after waiting"` gives the time of those that started.
+`free` is `MemAvailable`; `running headroom` is what the running jobs are still
+expected to grow by. Both lines are `info`.
+
 ### The stopgap holder
 
 The session hook creates `sluice-agents.scope` itself when no daemon runs. It
