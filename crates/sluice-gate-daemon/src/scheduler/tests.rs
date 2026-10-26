@@ -257,6 +257,7 @@ fn q(id: &str, lane: &str, weight: u32, queued_at: u64) -> QueuedSnap {
         class: Class::Agent,
         queued_at,
         expected_ms: None,
+        expected_peak: None,
     }
 }
 
@@ -266,6 +267,8 @@ fn r(id: &str, lane: &str, weight: u32) -> RunningSnap {
         repo: PathBuf::from("/repo"),
         lane: PathBuf::from(lane),
         weight,
+        current: 0,
+        expected_peak: None,
     }
 }
 
@@ -293,6 +296,7 @@ fn snapshot<'a>(
         running,
         queued,
         learned: &NO_LEARNED,
+        memory: None,
     }
 }
 
@@ -741,14 +745,15 @@ fn sjf_crossover_between_two_fresh_jobs() {
     assert_eq!(ranked(&s), ["long", "short"]);
 }
 
-/// ADR-0011 section 10: under any switch combination, a weight-B agent job
+/// ADR-0011 section 10: under any switch combination (the four scheduling
+/// switches and, since ADR-0019, memory-aware admission), a weight-B agent job
 /// behind an endless stream of weight-1 human jobs in other lanes starts
 /// within `head_reserve_after` plus the longest running job.
 #[test]
 fn no_starvation_under_any_switch_combination() {
     const RUN_MS: u64 = 1_000;
     const STEP: u64 = 100;
-    for bits in 0u8..16 {
+    for bits in 0u8..32 {
         let p = Policy {
             fairness: bits & 1 != 0,
             human_first: bits & 2 != 0,
@@ -761,6 +766,11 @@ fn no_starvation_under_any_switch_combination() {
             ..policy(4)
         };
         let mut s = Scheduler::with_policy(p);
+        if bits & 16 != 0 {
+            // The guessed peaks: the big job wants all the usable memory,
+            // each human job a quarter of it.
+            s.set_memory(Some(facts(32, 32, 3)), BTreeMap::new());
+        }
         let mut big = spec("big", None, "/r", 4, 0);
         big.lane = PathBuf::from("/agent");
         big.expected_ms = Some(600_000);
@@ -1110,4 +1120,584 @@ fn exec_jobs_learn_from_their_label_and_repository() {
     let weight = |id: &str| queued.iter().find(|v| v.id == id).unwrap().weight;
     assert!(weight("e1") <= 3, "learned: {}", weight("e1"));
     assert_eq!(weight("other"), 10, "another label keeps its own history");
+}
+
+// ------------------------------------------------ ADR-0019: memory admission
+
+const GIB: u64 = 1 << 30;
+
+/// Memory facts in GiB: available, total, reserve.
+fn facts(available: u64, total: u64, reserve: u64) -> MemoryFacts {
+    MemoryFacts {
+        available_bytes: available * GIB,
+        total_bytes: total * GIB,
+        reserve_bytes: reserve * GIB,
+    }
+}
+
+/// A queued job whose peak was learned (in GiB).
+fn peaked(id: &str, weight: u32, gib: u64, queued_at: u64) -> QueuedSnap {
+    QueuedSnap {
+        expected_peak: Some(gib * GIB),
+        ..q(id, &format!("/{id}"), weight, queued_at)
+    }
+}
+
+/// A running job holding `current` GiB and expected to reach `peak` GiB.
+fn running(id: &str, weight: u32, current: u64, peak: u64) -> RunningSnap {
+    RunningSnap {
+        current: current * GIB,
+        expected_peak: Some(peak * GIB),
+        ..r(id, &format!("/{id}"), weight)
+    }
+}
+
+fn with_memory(s: Snapshot<'_>, memory: MemoryFacts) -> Snapshot<'_> {
+    Snapshot {
+        memory: Some(memory),
+        ..s
+    }
+}
+
+fn waits_of(p: &Plan) -> Vec<(&str, WaitCause, Option<&'static str>)> {
+    p.waits
+        .iter()
+        .map(|w| (w.id.as_str(), w.cause, w.detail))
+        .collect()
+}
+
+/// T-W6-1: the incident. Two gates that peak at 18 GiB on a 30 GiB machine
+/// with 22 GiB available and a 3 GiB reserve: only the first starts, the
+/// second waits for memory although the budget (12) has room for both.
+#[test]
+fn two_eighteen_gib_gates_never_start_together() {
+    let p = policy(12);
+    let queued = [peaked("a", 6, 18, 0), peaked("b", 6, 18, 1)];
+    let s = with_memory(
+        snapshot(10, &p, Pressure::default(), &[], &queued),
+        facts(22, 30, 3),
+    );
+    let decided = plan(&s);
+    assert_eq!(started(&decided), [("a", Admission::Nominal)]);
+    assert_eq!(
+        waits_of(&decided),
+        [("b", WaitCause::Memory, Some("memory"))]
+    );
+    assert_eq!(decided.expected.len(), 2);
+    assert!(
+        decided
+            .expected
+            .iter()
+            .all(|e| e.learned && e.bytes == 18 * GIB)
+    );
+    // The same snapshot without the rule starts both: the incident.
+    let off = plan(&snapshot(10, &p, Pressure::default(), &[], &queued));
+    assert_eq!(started(&off).len(), 2);
+    assert_eq!(off.expected, Vec::new(), "no estimate with the rule off");
+}
+
+#[test]
+fn a_running_gate_counts_its_headroom_not_what_it_already_holds() {
+    let p = policy(12);
+    let queued = [peaked("b", 6, 18, 1)];
+    // `a` already holds 2 of its expected 18 GiB: 16 GiB are still to grow.
+    // 22 - 3 - 16 = 3 GiB free: b waits.
+    let run = [running("a", 6, 2, 18)];
+    let s = with_memory(
+        snapshot(10, &p, Pressure::default(), &run, &queued),
+        facts(22, 30, 3),
+    );
+    let decided = plan(&s);
+    assert_eq!(started(&decided), Vec::new());
+    assert_eq!(waits_of(&decided)[0].1, WaitCause::Memory);
+    assert_eq!(running_headroom(&s), Some(16 * GIB));
+    // Once `a` holds its 18 GiB MemAvailable has already paid for it: with
+    // 40 GiB available (and nothing left to grow) b fits.
+    let run = [running("a", 6, 18, 18)];
+    let s = with_memory(
+        snapshot(10, &p, Pressure::default(), &run, &queued),
+        facts(40, 30, 3),
+    );
+    assert_eq!(started(&plan(&s)), [("b", Admission::Nominal)]);
+    assert_eq!(running_headroom(&s), Some(0));
+    // A job that outgrew its expectation has no negative headroom.
+    let run = [running("a", 6, 20, 18)];
+    assert_eq!(
+        running_headroom(&with_memory(
+            snapshot(10, &p, Pressure::default(), &run, &queued),
+            facts(40, 30, 3)
+        )),
+        Some(0)
+    );
+}
+
+#[test]
+fn jobs_started_earlier_in_the_pass_count_in_full() {
+    let p = policy(12);
+    // One heavy job runs (4 of 4 GiB held): 22 - 3 = 19 GiB free. Three 6 GiB
+    // jobs fit (18 GiB); the fourth does not.
+    let run = [running("r", 1, 4, 4)];
+    let queued: Vec<QueuedSnap> = (0..4).map(|n| peaked(&format!("q{n}"), 1, 6, n)).collect();
+    let s = with_memory(
+        snapshot(10, &p, Pressure::default(), &run, &queued),
+        facts(22, 30, 3),
+    );
+    let decided = plan(&s);
+    assert_eq!(
+        started(&decided)
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>(),
+        ["q0", "q1", "q2"]
+    );
+    assert_eq!(
+        waits_of(&decided),
+        [("q3", WaitCause::Memory, Some("memory"))]
+    );
+}
+
+#[test]
+fn a_gate_alone_runs_even_when_it_does_not_fit() {
+    let p = policy(12);
+    // 1 GiB available on a 30 GiB machine, a gate that peaks at 18.
+    let queued = [peaked("big", 6, 18, 0), peaked("small", 1, 1, 1)];
+    let s = with_memory(
+        snapshot(10, &p, Pressure::default(), &[], &queued),
+        facts(1, 30, 3),
+    );
+    let decided = plan(&s);
+    // Nothing runs: progress is always possible, `big` starts. Something
+    // started in this pass now, so `small` (not alone any more) waits.
+    assert_eq!(started(&decided), [("big", Admission::Nominal)]);
+    assert_eq!(
+        waits_of(&decided),
+        [("small", WaitCause::Memory, Some("memory"))]
+    );
+    // Any running job, however light (1 GiB of 30), withdraws the exemption:
+    // `big` waits until the machine is idle.
+    let run = [running("light", 1, 1, 1)];
+    let s = with_memory(
+        snapshot(10, &p, Pressure::default(), &run, &queued[..1]),
+        facts(1, 30, 3),
+    );
+    let decided = plan(&s);
+    assert_eq!(started(&decided), Vec::new());
+    assert_eq!(
+        waits_of(&decided),
+        [("big", WaitCause::Memory, Some("memory"))]
+    );
+}
+
+#[test]
+fn an_overdue_head_blocked_only_by_memory_reserves() {
+    let p = policy(8);
+    let run = [running("r", 2, 10, 18)];
+    // Budget has room for everything; free = 16 - 3 - 8 = 5 GiB.
+    let mut head = peaked("head", 2, 18, 0);
+    head.lane = PathBuf::from("/head");
+    let small = peaked("small", 1, 1, 1);
+    let queued = [head, small];
+    let fresh = with_memory(
+        snapshot(10, &p, Pressure::default(), &run, &queued),
+        facts(16, 30, 3),
+    );
+    let decided = plan(&fresh);
+    assert_eq!(decided.reserved, None, "not overdue: smaller jobs backfill");
+    assert_eq!(started(&decided), [("small", Admission::Nominal)]);
+    // Overdue: the head holds the reservation and nothing behind it starts.
+    let overdue = with_memory(
+        snapshot(RESERVE, &p, Pressure::default(), &run, &queued),
+        facts(16, 30, 3),
+    );
+    let decided = plan(&overdue);
+    assert_eq!(decided.reserved.as_deref(), Some("head"));
+    assert_eq!(started(&decided), Vec::new());
+    assert_eq!(
+        waits_of(&decided),
+        [
+            ("head", WaitCause::Memory, Some("memory")),
+            ("small", WaitCause::Reserved, None)
+        ]
+    );
+}
+
+#[test]
+fn a_memory_wait_reports_budget_with_the_memory_detail() {
+    assert_eq!(WaitCause::Memory.reason(), WaitReason::Budget);
+    assert_eq!(WaitCause::Memory.index(), WaitCause::Budget.index());
+    assert_eq!(WaitCause::Memory.as_str(), "memory");
+    let mut s = Scheduler::with_policy(policy(12));
+    s.set_memory(Some(facts(22, 30, 3)), BTreeMap::new());
+    s.set_learned_peak(lk("test"), Some(18 * GIB));
+    for id in ["a", "b"] {
+        let mut j = gate_job(id, 6, 0);
+        j.lane = PathBuf::from(format!("/{id}"));
+        s.enqueue(j);
+    }
+    assert_eq!(s.admit(0, false), vec!["a"]);
+    assert_eq!(s.admit(1_000, false), Vec::<String>::new());
+    let (running, queued) = s.snapshot(1_000, false);
+    assert_eq!(queued[0].reason, WaitReason::Budget);
+    assert_eq!(queued[0].cause, WaitCause::Memory);
+    assert_eq!(queued[0].detail, Some("memory"));
+    assert_eq!(queued[0].memory_expected.map(|e| e.bytes), Some(18 * GIB));
+    assert_eq!(running[0].memory_current, Some(0));
+    assert!(running[0].memory_expected.is_some_and(|e| e.learned));
+    // The wait lands in the budget accumulator, the frozen column.
+    s.admit(3_000, false);
+    let rec = s.record("b", 3_000).unwrap();
+    assert_eq!(rec.waits[WaitCause::Budget.index()], 3_000);
+    assert_eq!(s.memory_headroom(), Some(18 * GIB));
+    // MemAvailable recovers while `a` runs (it holds its 18 GiB): b starts.
+    let held = BTreeMap::from([("a".to_owned(), 18 * GIB)]);
+    s.set_memory(Some(facts(40, 64, 3)), held);
+    assert_eq!(s.memory_headroom(), Some(0));
+    assert_eq!(s.admit(4_000, false), vec!["b"]);
+}
+
+/// PSI blocking still comes first: a blocked pass reports `psi`, and the
+/// starvation guard does not start a head that does not fit memory.
+#[test]
+fn psi_blocking_comes_before_memory() {
+    let p = policy(12);
+    let run = [running("r", 1, 4, 18)];
+    let queued = [peaked("a", 6, 18, 0)];
+    let blocking = Pressure {
+        blocking: true,
+        guard_due: true,
+        ..Pressure::default()
+    };
+    let s = with_memory(snapshot(10, &p, blocking, &run, &queued), facts(22, 30, 3));
+    let decided = plan(&s);
+    assert_eq!(started(&decided), Vec::new(), "the guard respects memory");
+    assert_eq!(waits_of(&decided), [("a", WaitCause::Psi, None)]);
+    // Memory available: the guard starts it as before.
+    let s = with_memory(snapshot(10, &p, blocking, &run, &queued), facts(60, 30, 3));
+    assert_eq!(started(&plan(&s)), [("a", Admission::Guard)]);
+}
+
+#[test]
+fn over_admission_needs_a_learned_peak_that_fits() {
+    let p = over_policy();
+    // Three suites of 1 GiB each, fully grown.
+    let run = [
+        running("a", 6, 1, 1),
+        running("b", 6, 1, 1),
+        running("c", 6, 1, 1),
+    ];
+    let pressure = calm(8.0);
+    // A fourth suite does not fit the budget nominally; plenty of memory.
+    let learned = |gib| {
+        let mut j = q("s3", "/r3", 6, 3);
+        j.expected_peak = Some(gib * GIB);
+        j
+    };
+    let guessed = q("s3", "/r3", 6, 3);
+    let go = |queued: &[QueuedSnap], mem: MemoryFacts| {
+        let s = with_memory(snapshot(10_000, &p, pressure, &run, queued), mem);
+        plan(&s).start
+    };
+    let roomy = facts(200, 300, 3);
+    assert_eq!(
+        go(&[learned(2)], roomy),
+        [("s3".to_owned(), Admission::Over)],
+        "learned and fits"
+    );
+    assert_eq!(go(&[guessed], roomy), Vec::new(), "never over-admit blind");
+    assert_eq!(
+        go(&[learned(500)], roomy),
+        Vec::new(),
+        "learned but it does not fit"
+    );
+    // The rule off: today's behaviour, a guess over-admits.
+    let queued = [q("s3", "/r3", 6, 3)];
+    let s = snapshot(10_000, &p, pressure, &run, &queued);
+    assert_eq!(plan(&s).start, [("s3".to_owned(), Admission::Over)]);
+}
+
+#[test]
+fn an_unknown_peak_is_guessed_from_the_weight_and_a_learned_one_replaces_it() {
+    let f = facts(22, 30, 3);
+    // `auto` on a budget of 12 is weight 6: half of the 27 GiB usable.
+    let guess = f.estimate(None, 6, 12);
+    assert_eq!(guess.bytes, 27 * GIB / 2);
+    assert!(!guess.learned);
+    // A weight of 1 predicts a twelfth of it, never above the budget share.
+    assert_eq!(f.estimate(None, 1, 12).bytes, 27 * GIB / 12);
+    assert_eq!(f.estimate(None, 99, 12).bytes, 27 * GIB);
+    // One learned sample is enough and replaces the guess.
+    let learned = f.estimate(Some(2 * GIB), 6, 12);
+    assert_eq!((learned.bytes, learned.learned), (2 * GIB, true));
+    // Through the scheduler: the key learns, the next pass uses it.
+    let mut s = Scheduler::with_policy(policy(12));
+    s.set_memory(Some(f), BTreeMap::new());
+    s.enqueue(gate_job("t0", 6, 0));
+    let expected = |s: &Scheduler| s.snapshot(1, false).1[0].memory_expected.unwrap();
+    assert!(!expected(&s).learned);
+    assert_eq!(expected(&s).bytes, 27 * GIB / 2);
+    s.set_learned_peak(lk("test"), Some(3 * GIB));
+    assert!(expected(&s).learned);
+    assert_eq!(expected(&s).bytes, 3 * GIB);
+    s.set_learned_peak(lk("test"), None);
+    assert!(!expected(&s).learned);
+}
+
+// A tiny deterministic generator for the property tests.
+struct Lcg(u64);
+
+impl Lcg {
+    /// A number in `0..n`.
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (self.0 >> 33) % n
+    }
+
+    /// A weight in `1..=max`.
+    fn weight(&mut self, max: u32) -> u32 {
+        u32::try_from(1 + self.below(u64::from(max))).unwrap()
+    }
+}
+
+/// A random snapshot's parts: running jobs, queued jobs and memory facts.
+fn random_case(rng: &mut Lcg) -> (Vec<RunningSnap>, Vec<QueuedSnap>, MemoryFacts) {
+    let running = (0..rng.below(4))
+        .map(|n| {
+            let peak = 1 + rng.below(20);
+            let mut j = running(&format!("r{n}"), rng.weight(4), rng.below(peak + 1), peak);
+            if rng.below(3) == 0 {
+                j.expected_peak = None;
+            }
+            j
+        })
+        .collect();
+    let queued = (0..=rng.below(8))
+        .map(|n| {
+            let mut j = q(
+                &format!("q{n}"),
+                &format!("/l{}", rng.below(3)),
+                rng.weight(4),
+                rng.below(40_000),
+            );
+            if rng.below(3) != 0 {
+                j.expected_peak = Some((1 + rng.below(25)) * GIB);
+            }
+            j
+        })
+        .collect();
+    let total = 8 + rng.below(56);
+    let memory = MemoryFacts {
+        available_bytes: rng.below(total + 1) * GIB,
+        total_bytes: total * GIB,
+        reserve_bytes: rng.below(total / 4 + 1) * GIB,
+    };
+    (running, queued, memory)
+}
+
+fn switch_policy(bits: u8) -> Policy {
+    Policy {
+        fairness: bits & 1 != 0,
+        human_first: bits & 2 != 0,
+        order: if bits & 4 != 0 {
+            Order::Sjf
+        } else {
+            Order::Fifo
+        },
+        cap: if bits & 8 != 0 { 9 } else { 6 },
+        ..policy(6)
+    }
+}
+
+/// T-W6-2: whatever the snapshot, the jobs a pass starts never add up to more
+/// than what is free, unless the job started with nothing else running and
+/// nothing started earlier in the pass (the progress exemption); an
+/// over-admission also needs a learned peak.
+#[test]
+fn started_jobs_never_exceed_free_memory_unless_alone() {
+    let mut rng = Lcg(7);
+    for bits in 0u8..16 {
+        let p = switch_policy(bits);
+        for _ in 0..300 {
+            let (run, queued, memory) = random_case(&mut rng);
+            let s = with_memory(snapshot(40_000, &p, calm(8.0), &run, &queued), memory);
+            let decided = plan(&s);
+            let expected: BTreeMap<&str, Expected> = decided
+                .order
+                .iter()
+                .map(String::as_str)
+                .zip(decided.expected.iter().copied())
+                .collect();
+            let mut held = running_memory_of(&s, &memory);
+            let mut busy = !run.is_empty();
+            for (id, admission) in &decided.start {
+                let e = expected[id.as_str()];
+                let free = memory
+                    .available_bytes
+                    .saturating_sub(memory.reserve_bytes)
+                    .saturating_sub(held);
+                match admission {
+                    Admission::Nominal => assert!(
+                        !busy || e.bytes <= free,
+                        "switches {bits:04b}: {id} needs {} of {free}",
+                        e.bytes
+                    ),
+                    Admission::Over => assert!(
+                        e.learned && e.bytes <= free,
+                        "switches {bits:04b}: over-admitted {id} blind or too big"
+                    ),
+                    Admission::Guard => unreachable!("not blocking"),
+                }
+                held += e.bytes;
+                busy = true;
+            }
+        }
+    }
+}
+
+/// The running side of the oracle, written independently of the pass.
+fn running_memory_of(s: &Snapshot<'_>, memory: &MemoryFacts) -> u64 {
+    s.running
+        .iter()
+        .map(|r| {
+            let e = memory
+                .estimate(r.expected_peak, r.weight, s.policy.budget)
+                .bytes;
+            e.saturating_sub(r.current)
+        })
+        .sum()
+}
+
+/// T-W6-2 (differential): with the rule off every plan is today's plan, under
+/// all 16 switch combinations, whatever the memory figures in the snapshot say;
+/// and with more memory than anything can use the rule changes nothing but the
+/// reported estimates.
+#[test]
+fn memory_off_or_plentiful_plans_like_cpu_only_admission() {
+    let mut rng = Lcg(42);
+    for bits in 0u8..16 {
+        let p = switch_policy(bits);
+        for n in 0..300 {
+            let (run, queued, memory) = random_case(&mut rng);
+            // The same jobs as CPU-only admission knows them.
+            let plain_run: Vec<RunningSnap> = run
+                .iter()
+                .map(|r| RunningSnap {
+                    current: 0,
+                    expected_peak: None,
+                    ..r.clone()
+                })
+                .collect();
+            let plain_queued: Vec<QueuedSnap> = queued
+                .iter()
+                .map(|j| QueuedSnap {
+                    expected_peak: None,
+                    ..j.clone()
+                })
+                .collect();
+            let pressure = if n % 2 == 0 {
+                calm(8.0)
+            } else {
+                Pressure::default()
+            };
+            let today = plan(&snapshot(40_000, &p, pressure, &plain_run, &plain_queued));
+            let off = plan(&snapshot(40_000, &p, pressure, &run, &queued));
+            assert_eq!(off, today, "switches {bits:04b}, case {n}: rule off");
+            let plenty = MemoryFacts {
+                available_bytes: u64::MAX / 4,
+                ..memory
+            };
+            // Over-admission never starts a job blind, so every queued job
+            // has a learned peak here.
+            let known: Vec<QueuedSnap> = queued
+                .iter()
+                .map(|j| QueuedSnap {
+                    expected_peak: j.expected_peak.or(Some(GIB)),
+                    ..j.clone()
+                })
+                .collect();
+            let on = plan(&with_memory(
+                snapshot(40_000, &p, pressure, &run, &known),
+                plenty,
+            ));
+            assert_eq!(
+                Plan {
+                    expected: Vec::new(),
+                    ..on
+                },
+                today,
+                "switches {bits:04b}, case {n}: plenty of memory"
+            );
+        }
+    }
+}
+
+/// A job that fits the budget but never the memory of the jobs running beside
+/// it starts within `head_reserve_after` plus the longest running job, under
+/// every switch combination: the reservation covers memory-blocked heads.
+#[test]
+fn an_overdue_head_blocked_only_by_memory_starts_within_the_bound() {
+    const RUN_MS: u64 = 1_000;
+    const STEP: u64 = 100;
+    // 28 GiB fits an idle machine; 40 GiB never fits and starts only by the
+    // progress exemption, once the reservation has drained the machine.
+    for (bits, peak_gib) in (0u8..16).flat_map(|b| [(b, 28), (b, 40)]) {
+        let p = Policy {
+            cap: if bits & 8 != 0 { 12 } else { 8 },
+            fairness: bits & 1 != 0,
+            human_first: bits & 2 != 0,
+            order: if bits & 4 != 0 {
+                Order::Sjf
+            } else {
+                Order::Fifo
+            },
+            ..policy(8)
+        };
+        let mut s = Scheduler::with_policy(p);
+        s.set_memory(Some(facts(32, 32, 3)), BTreeMap::new());
+        // Weight 1 on a budget of 8, but 28 or 40 GiB learned: with any small job
+        // running (2 GiB each, 29 GiB usable) it never fits.
+        let mut big = spec("big", None, "/r", 1, 0);
+        big.lane = PathBuf::from("/agent");
+        big.learn_key = Some(lk("big"));
+        big.expected_ms = Some(600_000);
+        s.set_learned_peak(lk("big"), Some(peak_gib * GIB));
+        s.enqueue(big);
+        let mut ends: Vec<(u64, String)> = Vec::new();
+        let (mut n, mut now, mut started_at) = (0, 0, None);
+        while now <= 60_000 && started_at.is_none() {
+            ends.retain(|(end, id)| {
+                if *end <= now {
+                    s.finish(id);
+                    false
+                } else {
+                    true
+                }
+            });
+            for lane in ["/h1", "/h2", "/h3"] {
+                let mut h = spec(&format!("h{n}"), None, "/r", 1, now);
+                h.lane = PathBuf::from(lane);
+                h.class = Class::Human;
+                h.expected_ms = Some(RUN_MS);
+                h.learn_key = Some(lk("small"));
+                s.enqueue(h);
+                n += 1;
+            }
+            s.set_learned_peak(lk("small"), Some(2 * GIB));
+            for (id, _) in s.admit_with(now, calm(4.0)) {
+                if id == "big" {
+                    started_at = Some(now);
+                }
+                ends.push((now + RUN_MS, id));
+            }
+            now += STEP;
+        }
+        let at = started_at
+            .unwrap_or_else(|| panic!("switches {bits:04b}, {peak_gib} GiB: big never started"));
+        assert!(
+            at <= RESERVE + RUN_MS + 2 * STEP,
+            "switches {bits:04b}, {peak_gib} GiB: big started at {at}"
+        );
+    }
 }

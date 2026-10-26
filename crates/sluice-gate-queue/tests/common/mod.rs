@@ -287,6 +287,11 @@ pub fn daemon_config_with(
         version: "0.0.0-test".to_owned(),
         admission: AdmissionConfig {
             psi_enabled: false,
+            // With the harness's budget of 2 every first run is estimated at
+            // half the host's usable memory, so whether two gates may run
+            // together would depend on the machine running the tests. Memory
+            // admission has its own deterministic tests in the daemon crate.
+            memory_aware: false,
             ..AdmissionConfig::default()
         },
         psi_root: state.join("pressure"),
@@ -316,9 +321,20 @@ impl Daemon {
 
     /// Like [`Daemon::start`]; `push_program` replaces `git` for the push.
     pub async fn start_with(fx: &Fixture, user: UserConfig, push_program: Option<PathBuf>) -> Self {
+        Self::start_policy(fx, user, push_program, LastSubscriberGone::Cancel).await
+    }
+
+    /// Like [`Daemon::start_with`] under the given `last_subscriber_gone`.
+    pub async fn start_policy(
+        fx: &Fixture,
+        user: UserConfig,
+        push_program: Option<PathBuf>,
+        policy: LastSubscriberGone,
+    ) -> Self {
         let state = fx.root.join("state");
         std::fs::create_dir_all(&state).unwrap();
-        let cfg = daemon_config_with(&state, user, fx.queue_env(), push_program);
+        let mut cfg = daemon_config_with(&state, user, fx.queue_env(), push_program);
+        cfg.last_subscriber_gone = policy;
         let socket = cfg.socket_path.clone();
         let _ = std::fs::remove_file(&socket);
         let (tx, rx) = oneshot::channel::<()>();
@@ -379,6 +395,7 @@ impl Daemon {
                 session: Some("s1".into()),
                 env: fx.client_env(),
                 via: None,
+                trust_member_config: false,
             },
         })
         .await
@@ -440,6 +457,8 @@ impl Daemon {
             job_id: job.into(),
             head_sha: head_sha.into(),
             via: None,
+            trust_member_config: false,
+            env: EnvMap::new(),
         })
         .await
     }

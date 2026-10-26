@@ -603,6 +603,12 @@ fn follow(
     }
 }
 
+/// The headline of an `exec` killed for lack of memory, worded like the one
+/// of `sluice run` and MCP `verify`; the daemon's message follows it.
+fn memory_kill_headline(label: &str, secs: f64, job_id: &str) -> String {
+    format!("sluice: exec '{label}' KILLED for lack of memory after {secs:.1}s (job {job_id})")
+}
+
 /// Maps the daemon's outcome to the exit code (and the few lines worth printing).
 fn report(job: &Job, job_id: &str, outcome: &Outcome, signo: i32) -> ExitCode {
     match outcome.status {
@@ -620,6 +626,20 @@ fn report(job: &Job, job_id: &str, outcome: &Outcome, signo: i32) -> ExitCode {
                 humantime::format_duration(d)
             );
             ExitCode::from(EXIT_TIMEOUT)
+        }
+        // Killed by the kernel or `systemd-oomd` for lack of memory: say so
+        // (an agent must not retry it blindly), not "the daemon stopped".
+        OutcomeStatus::Killed if outcome.killed_for_memory() => {
+            eprintln!(
+                "{}",
+                memory_kill_headline(
+                    &job.label,
+                    Duration::from_millis(outcome.duration_ms).as_secs_f64(),
+                    job_id
+                )
+            );
+            eprintln!("sluice: {}", outcome.message);
+            ExitCode::from(EXIT_KILLED)
         }
         OutcomeStatus::Killed if signo != 0 => signal_code(signo),
         OutcomeStatus::Killed => {
@@ -800,6 +820,14 @@ mod tests {
         assert_eq!(sanitize_label("a;b`c$(d) e:f/g-h.i_j"), "abcd e:f/g-h.i_j");
         assert_eq!(sanitize_label(&"x".repeat(100)).len(), LABEL_MAX);
         assert_eq!(sanitize_label("$$$"), "exec");
+    }
+
+    #[test]
+    fn a_memory_kill_has_the_one_wording_of_every_client() {
+        assert_eq!(
+            memory_kill_headline("cargo build", 41.24, "j1"),
+            "sluice: exec 'cargo build' KILLED for lack of memory after 41.2s (job j1)"
+        );
     }
 
     #[test]

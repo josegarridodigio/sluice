@@ -73,7 +73,19 @@ is refused unless the user enabled agent approval. Never push to the target bran
 failed gate) for your branch, rebase or fix the branch, commit, run `verify` again, and call \
 `queue_retry` with the job id: the job keeps the branch, so `queue_enqueue` would answer \
 `duplicate-branch`. `queue_cancel` withdraws a job. Errors start with a code: \
-`conflict-state`, `stale-plan`, `duplicate-branch`, `not-allowed`, `not-supported`.";
+`conflict-state`, `stale-plan`, `duplicate-branch`, `not-allowed`, `not-supported`. \
+Reasons in `queue_status`: `prepare_failed` on a waiting job (`base: true`) is the target's or \
+the environment's fault: wait or tell the human; with `base: false` the branch broke the \
+prepare (often a lockfile out of sync): fix it, then `queue_retry`. `prepare_dirty` (the prepare \
+leaves files the tree lacks: fix `.gitignore` or the prepare), `gate_modified_tree` (a gate edits \
+tracked files: commit the result or fix the gate) and `member_config_invalid` (the branch's \
+`.sluice.toml` does not parse) are yours to fix; `key_input_failed` is the environment's: tell the \
+human; `pre_push_hook`: the repository's hook declined, read its output. `hook_gate_unverified` and `config_changed` mean the branch changes `.sluice.toml`, which \
+the target's configuration judges: tell the human to land it first or retry with \
+`--trust-member-config`; never use that flag or ask for such a train to be approved. \
+A gate result `KILLED for lack of memory` is not a failure to retry unchanged: reduce the gate's \
+footprint (for example test concurrency) or tell the human; a gate that `status` shows waiting \
+for memory is only queued. Never run a gate through the shell to get around either.";
 
 /// Runs the MCP server on stdin/stdout until the client disconnects.
 ///
@@ -265,9 +277,13 @@ struct GateResult {
     /// Why a pass was not cached, if it was not.
     #[serde(skip_serializing_if = "Option::is_none")]
     not_cached_reason: Option<String>,
-    /// Human-readable detail (errors, cancellation).
+    /// Human-readable detail (errors, cancellation, a memory kill).
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+    /// `memory` when the kernel or `systemd-oomd` killed the gate for lack of
+    /// memory (`status` is `killed`, `message` says how much it used).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    killed_by: Option<String>,
     /// Last lines of the log of a failing gate (absent when empty).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tail: Vec<String>,
@@ -294,6 +310,7 @@ impl GateResult {
             coalesced: false,
             not_cached_reason: None,
             message: None,
+            killed_by: None,
             tail: Vec::new(),
             queue_wait_ms: None,
             wait_reason: None,
@@ -694,6 +711,50 @@ fn error_line(gate: &str, why: &str) -> GateLine {
     }
 }
 
+/// The first words of a gate's summary line (`PASS 12.3s (job …)`,
+/// `FAIL exit=1 …`, …), before the queue-wait suffix.
+fn status_text(
+    outcome: &proto::Outcome,
+    secs: f64,
+    job_id: &str,
+    log: &str,
+    timeout: Duration,
+    not_cached: Option<&str>,
+) -> String {
+    match outcome.status {
+        OutcomeStatus::Cached => "PASS (cached)".to_owned(),
+        OutcomeStatus::Pass => format!(
+            "PASS {secs:.1}s (job {job_id}){}",
+            not_cached.map_or_else(String::new, |r| format!(" (not cached: {r})"))
+        ),
+        OutcomeStatus::Fail => format!(
+            "FAIL exit={} {secs:.1}s (job {job_id}) log={log}",
+            outcome
+                .exit_code
+                .map_or_else(|| "signal".to_owned(), |c| c.to_string())
+        ),
+        OutcomeStatus::Timeout => format!(
+            "TIMEOUT after {} (job {job_id}) log={log}",
+            humantime::format_duration(timeout)
+        ),
+        // Killed by the kernel or `systemd-oomd`: the agent must read that
+        // and change something, not retry a cancel.
+        OutcomeStatus::Killed if outcome.killed_for_memory() => format!(
+            "KILLED for lack of memory after {secs:.1}s (job {job_id}) log={log}: {}",
+            outcome.message
+        ),
+        OutcomeStatus::Killed if outcome.log_path.is_none() => {
+            format!("KILLED before it started (job {job_id}): the daemon stopped")
+        }
+        OutcomeStatus::Killed => format!("KILLED after {secs:.1}s (job {job_id}) log={log}"),
+        OutcomeStatus::Error => format!("ERROR {}", outcome.message),
+        // Never a pass: a status from a newer daemon is reported as an error.
+        OutcomeStatus::Unknown => {
+            format!("ERROR unknown outcome status from the daemon (job {job_id}); update sluice")
+        }
+    }
+}
+
 /// Maps a daemon outcome to the result entry and the Phase 1 summary line.
 fn outcome_line(
     res: &Resolved,
@@ -731,34 +792,14 @@ fn outcome_line(
         .map(str::to_owned)
         .or_else(|| outcome.not_cached_reason.clone())
         .filter(|_| outcome.status == OutcomeStatus::Pass);
-    let line = match outcome.status {
-        OutcomeStatus::Cached => "PASS (cached)".to_owned(),
-        OutcomeStatus::Pass => format!(
-            "PASS {secs:.1}s (job {job_id}){}",
-            not_cached
-                .as_deref()
-                .map_or_else(String::new, |r| format!(" (not cached: {r})"))
-        ),
-        OutcomeStatus::Fail => format!(
-            "FAIL exit={} {secs:.1}s (job {job_id}) log={log}",
-            outcome
-                .exit_code
-                .map_or_else(|| "signal".to_owned(), |c| c.to_string())
-        ),
-        OutcomeStatus::Timeout => format!(
-            "TIMEOUT after {} (job {job_id}) log={log}",
-            humantime::format_duration(timeout)
-        ),
-        OutcomeStatus::Killed if outcome.log_path.is_none() => {
-            format!("KILLED before it started (job {job_id}): the daemon stopped")
-        }
-        OutcomeStatus::Killed => format!("KILLED after {secs:.1}s (job {job_id}) log={log}"),
-        OutcomeStatus::Error => format!("ERROR {}", outcome.message),
-        // Never a pass: a status from a newer daemon is reported as an error.
-        OutcomeStatus::Unknown => {
-            format!("ERROR unknown outcome status from the daemon (job {job_id}); update sluice")
-        }
-    };
+    let line = status_text(
+        &outcome,
+        secs,
+        &job_id,
+        &log,
+        timeout,
+        not_cached.as_deref(),
+    );
     // `(queued 31.0s: budget)` when the job waited for a reason.
     let line = match (&outcome.wait_reason, outcome.queue_wait_ms) {
         (Some(reason), Some(ms)) if ms > 0 && outcome.status != OutcomeStatus::Cached => {
@@ -785,7 +826,12 @@ fn outcome_line(
         exit_code: outcome.exit_code,
         coalesced: coalesced || outcome.coalesced_with.is_some(),
         not_cached_reason: not_cached,
-        message: (status == GateStatus::Error).then(|| outcome.message.clone()),
+        message: (status == GateStatus::Error || outcome.killed_for_memory())
+            .then(|| outcome.message.clone()),
+        killed_by: outcome
+            .killed_by
+            .clone()
+            .filter(|_| outcome.killed_for_memory()),
         tail,
         queue_wait_ms: outcome.queue_wait_ms,
         wait_reason: outcome.wait_reason.clone(),
@@ -1841,6 +1887,7 @@ mod schema_tests {
             "session",
             "push_timeout_ms",
             "network_timeout_ms",
+            "prepare",
         ] {
             assert!(
                 !required.iter().any(|r| r == skipped),
@@ -1887,6 +1934,11 @@ mod schema_tests {
             "queue_retry",
             "queue_cancel",
             "duplicate-branch",
+            "prepare_failed",
+            "gate_modified_tree",
+            "--trust-member-config",
+            "KILLED for lack of memory",
+            "waiting for memory",
         ] {
             assert!(INSTRUCTIONS.contains(needle), "missing '{needle}'");
         }

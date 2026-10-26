@@ -139,16 +139,20 @@ pub(crate) fn render_status(r: &StatusReport, this_repo: Option<&Path>) -> Strin
         r.budget.used, r.budget.total
     );
     let _ = writeln!(out, "running:  {}", r.running.len());
+    if let Some(m) = &r.budget.memory {
+        let _ = writeln!(out, "{}", m.status_line());
+    }
     for j in &r.running {
         let _ = writeln!(
             out,
-            " {}{:<16} {:<20} weight {:<2} {:>8}  {} subscriber(s)  job {}",
+            " {}{:<16} {:<20} weight {:<2} {:>8}  {} subscriber(s){}  job {}",
             mark(&j.repo),
             j.gate,
             basename(&j.repo),
             weight_text(j.weight, j.weight_cfg, j.weight_auto),
             dur(j.elapsed_ms),
             j.subscribers,
+            j.memory_text(),
             j.job_id
         );
     }
@@ -156,7 +160,7 @@ pub(crate) fn render_status(r: &StatusReport, this_repo: Option<&Path>) -> Strin
     for (i, j) in r.queued.iter().enumerate() {
         let _ = writeln!(
             out,
-            " {}#{:<3} {:<16} {:<20} weight {:<2} waiting {:>8}  ({})  job {}",
+            " {}#{:<3} {:<16} {:<20} weight {:<2} waiting {:>8}  ({}{}){}  job {}",
             mark(&j.repo),
             i + 1,
             j.gate,
@@ -164,6 +168,8 @@ pub(crate) fn render_status(r: &StatusReport, this_repo: Option<&Path>) -> Strin
             weight_text(j.weight, j.weight_cfg, j.weight_auto),
             dur(j.waiting_ms),
             reason(j.reason),
+            j.wait_detail_text(),
+            j.memory_text(),
             j.job_id
         );
     }
@@ -235,6 +241,45 @@ mod tests {
         let text = render_status(&r, None);
         assert!(text.contains("weight auto\u{2192}5"), "{text}");
         assert!(text.contains("weight 10\u{2192}3"), "{text}");
+    }
+
+    #[test]
+    fn status_text_shows_the_memory_budget_and_the_wait_detail() {
+        use sluice_gate_proto::{MemoryBudget, QueuedJob, RunningJob};
+        let mut r = StatusReport::default();
+        let plain = render_status(&r, None);
+        assert!(
+            !plain.contains("memory:") && !plain.contains("GiB"),
+            "{plain}"
+        );
+        r.budget.memory = Some(MemoryBudget {
+            available_bytes: 22 << 30,
+            reserve_bytes: 3 << 30,
+            headroom_bytes: 16 << 30,
+        });
+        r.running.push(RunningJob {
+            gate: "test".into(),
+            memory_bytes: Some(3 << 30),
+            memory_expected_bytes: Some(18 << 30),
+            memory_expected_learned: Some(true),
+            ..RunningJob::default()
+        });
+        r.queued.push(QueuedJob {
+            gate: "waiting".into(),
+            wait_detail: Some("memory".into()),
+            memory_expected_bytes: Some(18 << 30),
+            memory_expected_learned: Some(true),
+            ..QueuedJob::default()
+        });
+        let text = render_status(&r, None);
+        assert!(
+            text.contains(
+                "memory:   22.0 GiB available, 3.0 GiB reserved, 16.0 GiB still to grow in running jobs"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("mem 3.0 GiB/18.0 GiB"), "{text}");
+        assert!(text.contains("(budget: memory)  mem 18.0 GiB"), "{text}");
     }
 
     #[test]

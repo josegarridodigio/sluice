@@ -1,0 +1,10 @@
+# Written for 0.6.0 (ADR-0019 piece 5): `[containment] gates_memory_max` and
+# `gates_memory_swap_max`, an optional ceiling on the `jobs/` cgroup (all gate
+# and exec jobs together; sizes, empty = unset). Not a recording of a released
+# binary; 0.5.0 and older reject this file because `[containment]` refuses
+# unknown keys.
+version = 1
+
+[containment]
+gates_memory_max = "20G"
+gates_memory_swap_max = "2G"

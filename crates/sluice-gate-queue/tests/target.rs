@@ -189,3 +189,22 @@ fn an_option_shaped_remote_is_refused_and_never_runs() {
     assert_eq!(e.code, "invalid_remote", "{e}");
     assert!(!witness.exists(), "the injected command ran");
 }
+
+#[test]
+fn defaults_at_reports_an_unparsable_config_instead_of_hiding_it() {
+    let fx = Fixture::new("version = 1\n[queue]\nremote = \"origin\"\n");
+    let git = Git::new(&fx.queue_env());
+    let defaults = target::defaults_at(&git, &fx.common, "HEAD").unwrap();
+    assert_eq!(defaults.remote, "origin");
+    // An invalid file: refused with its own code, never silently defaults.
+    std::fs::write(fx.repo.join(".sluice.toml"), "version = 1\n[queue\n").unwrap();
+    fx.git(&["commit", "-q", "-am", "broken config"]);
+    let e = target::defaults_at(&git, &fx.common, "HEAD").unwrap_err();
+    assert_eq!(e.code, "invalid_config", "{e}");
+    assert!(e.to_string().starts_with("invalid_config:"), "{e}");
+    // No file at that commit: the built-in defaults, as before.
+    fx.git(&["rm", "-q", ".sluice.toml"]);
+    fx.git(&["commit", "-q", "-m", "no config"]);
+    let defaults = target::defaults_at(&git, &fx.common, "HEAD").unwrap();
+    assert_eq!(defaults.remote, QueueConfig::default().remote);
+}

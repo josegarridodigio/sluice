@@ -1,0 +1,9 @@
+# Written for 0.6.0 (ADR-0019): `[admission] memory_aware` and
+# `memory_reserve` (memory-aware admission; "auto" = 10 % of the machine's
+# memory, or a size such as "3G"). Not a recording of a released binary; 0.5.0
+# and older reject this file because `[admission]` refuses unknown keys.
+version = 1
+
+[admission]
+memory_aware = true
+memory_reserve = "3G"

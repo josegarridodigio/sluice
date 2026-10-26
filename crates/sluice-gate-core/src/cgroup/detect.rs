@@ -882,6 +882,26 @@ pub fn derive_pressure_policy(ancestor: &AncestorPolicy) -> PressurePolicy {
     }
 }
 
+/// The policy for the gates' scope (`sluice-daemon.scope`), derived from the
+/// agents' one: the **same limit** (an oomd trigger on the gates' scope must
+/// fire whenever the agents' one would; a laxer limit would let the agents'
+/// policy win the race again, which is the incident) and
+/// `duration = max(1 s, ceil(agents / 2))` in whole seconds, so with both scopes
+/// over their limit oomd acts on the shorter one, the gates' (measured, W6d).
+/// Never equal to or longer than the agents' duration unless that is 1 s (the
+/// documented minimum of the property).
+#[must_use]
+pub fn derive_gates_policy(agents: PressurePolicy) -> PressurePolicy {
+    let half = agents.duration.as_secs().div_ceil(2);
+    let secs = half.max(1);
+    // A sub-second agents duration (a user override) stays above the gates'.
+    let duration = Duration::from_secs(secs).min(agents.duration.max(Duration::from_secs(1)));
+    PressurePolicy {
+        limit_percent: agents.limit_percent,
+        duration,
+    }
+}
+
 /// The policy `systemd-oomd` applies to the user manager on this machine
 /// (read-only: `systemctl show`, `oomctl dump`, `oomd.conf`, then the
 /// built-ins), the input of the derived thresholds.
@@ -1248,6 +1268,39 @@ Memory Pressure Monitored CGroups:\n\
 \tPath: /user.slice/user-1001.slice/user@1001.service\n\
 \t\tMemory Pressure Limit: 90.00%\n\
 \t\tMemory Pressure Duration: 60s\n";
+
+    #[test]
+    fn gates_policy_has_the_same_limit_and_a_shorter_duration() {
+        // 5 s agents (Ubuntu): 3 s, rounded up to whole seconds
+        assert_eq!(derive_gates_policy(pp(30, 5)), pp(30, 3));
+        assert_eq!(derive_gates_policy(pp(24, 2)), pp(24, 1));
+        assert_eq!(derive_gates_policy(pp(30, 20)), pp(30, 10));
+        assert_eq!(derive_gates_policy(pp(30, 4)), pp(30, 2));
+        // never below 1 s, equal to the agents' only when that is 1 s
+        assert_eq!(derive_gates_policy(pp(1, 1)), pp(1, 1));
+        assert_eq!(
+            derive_gates_policy(PressurePolicy {
+                limit_percent: 30,
+                duration: Duration::ZERO
+            })
+            .duration,
+            Duration::from_secs(1)
+        );
+        for secs in 2..=120 {
+            let g = derive_gates_policy(pp(30, secs));
+            assert!(g.duration >= Duration::from_secs(1), "{secs}");
+            assert!(g.duration < Duration::from_secs(secs), "{secs}");
+        }
+    }
+
+    #[test]
+    fn gates_policy_follows_the_agents_override() {
+        // a user override of the agents' duration keeps the ordering
+        let agents = pp(45, 9);
+        let gates = derive_gates_policy(agents);
+        assert_eq!(gates, pp(45, 5));
+        assert!(gates.duration < agents.duration);
+    }
 
     #[test]
     fn oomctl_dump_is_the_second_source() {

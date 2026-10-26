@@ -12,9 +12,11 @@ use sluice_gate_core::cgroup::detect::{
     self, AncestorPolicy, Capabilities, DoctorLine, Level, OOMD_PER_UNIT_DURATION, Outcome,
 };
 use sluice_gate_core::cgroup::explain;
-use sluice_gate_core::cgroup::tree::Layout;
+use sluice_gate_core::cgroup::tree::{self, Layout};
 use sluice_gate_core::cgroup::{CGROUP_MOUNT, PressurePolicy};
-use sluice_gate_core::config::{ContainmentConfig, EnvMap, MemoryPolicy, UserConfig};
+use sluice_gate_core::config::{
+    ContainmentConfig, EnvMap, GatesOomScoreAdj, MemoryPolicy, UserConfig,
+};
 
 use super::{Check, Status, check};
 
@@ -46,6 +48,13 @@ pub(super) fn checks(env: &EnvMap) -> Vec<Check> {
         let manager = detect::manager_cgroup_dir(Path::new(CGROUP_MOUNT), caps.facts.uid);
         out.push(controller_files(&layout, &manager));
         out.push(slice(&layout));
+        if cfg.enabled {
+            out.push(gates_oom(&GatesOomFacts::gather(
+                &layout,
+                cfg,
+                caps.oomd_active,
+            )));
+        }
     }
     let policy = caps.oomd_policy_enabled(cfg).then(|| {
         let ancestor = detect::system_ancestor_policy(env, caps.facts.uid);
@@ -53,6 +62,17 @@ pub(super) fn checks(env: &EnvMap) -> Vec<Check> {
         (ancestor, policy)
     });
     out.push(memory_policy(&caps, cfg, policy.as_ref()));
+    if let Some((_, Some(agents))) = &policy {
+        out.push(gates_policy(&GatesPolicyFacts::gather(&layout, *agents)));
+    }
+    out.push(memory_guard(&GuardFacts {
+        on: user.admission.memory_guard,
+        reserve: user.admission.memory_reserve.clone(),
+        oomd_gap: oomd_gap(&caps, cfg),
+    }));
+    if let Some(c) = gates_ceiling(cfg) {
+        out.push(c);
+    }
     if let Some(c) = cpu_fallback(&caps) {
         out.push(c);
     }
@@ -199,6 +219,106 @@ fn slice(layout: &Layout) -> Check {
     }
 }
 
+/// What the `gates-oom` check needs (ADR-0019 piece 2).
+#[derive(Debug, Clone, Default)]
+pub(super) struct GatesOomFacts {
+    /// `[containment] gates_oom_score_adj` resolved (`auto` is 800).
+    pub adj: u16,
+    /// Whether the config says `auto`.
+    pub auto: bool,
+    /// `oom_score_adj` of this process: the daemon inherits whatever its
+    /// starter had, and a job never gets less than that.
+    pub own_adj: Option<i64>,
+    /// Cgroups from `jobs/` up to the root with `memory.oom.group = 1`.
+    pub group_ancestors: Vec<String>,
+    /// `systemd-oomd` is running.
+    pub oomd_active: bool,
+}
+
+impl GatesOomFacts {
+    fn gather(layout: &Layout, cfg: &ContainmentConfig, oomd_active: bool) -> Self {
+        Self {
+            adj: cfg.gates_oom_score_adj.resolve(),
+            auto: cfg.gates_oom_score_adj == GatesOomScoreAdj::Auto,
+            own_adj: std::fs::read_to_string("/proc/self/oom_score_adj")
+                .ok()
+                .and_then(|t| t.trim().parse().ok()),
+            group_ancestors: ancestors_with_oom_group(&layout.jobs_dir(), Path::new(CGROUP_MOUNT)),
+            oomd_active,
+        }
+    }
+}
+
+/// Directories from `start` up to (and including) `mount` whose
+/// `memory.oom.group` reads `1`, as paths relative to `mount`. The kernel
+/// kills the highest ancestor with the flag, so one above a job leaf would
+/// widen a gate's OOM kill to everything under it.
+pub(super) fn ancestors_with_oom_group(start: &Path, mount: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut dir = Some(start);
+    while let Some(d) = dir {
+        let flagged =
+            std::fs::read_to_string(d.join("memory.oom.group")).is_ok_and(|t| t.trim() == "1");
+        if flagged {
+            let rel = d.strip_prefix(mount).unwrap_or(d);
+            let name = rel.display().to_string();
+            found.push(if name.is_empty() {
+                "/".to_owned()
+            } else {
+                name
+            });
+        }
+        if d == mount {
+            break;
+        }
+        dir = d.parent();
+    }
+    found
+}
+
+/// The `gates-oom` check: the kernel's preference for gate processes and
+/// whether an ancestor would widen a kill.
+pub(super) fn gates_oom(f: &GatesOomFacts) -> Check {
+    let adj = if f.auto {
+        format!("{} (auto)", f.adj)
+    } else {
+        f.adj.to_string()
+    };
+    let inherited = match f.own_adj {
+        Some(own) if own > i64::from(f.adj) => format!(
+            "; this shell runs at {own}, and a job never gets less than what the daemon inherited"
+        ),
+        _ => String::new(),
+    };
+    let oomd = if f.oomd_active {
+        "systemd-oomd is active (it ranks by memory pressure and size, not by oom_score_adj)"
+    } else {
+        "systemd-oomd is not active (only the kernel's OOM killer acts)"
+    };
+    if f.group_ancestors.is_empty() {
+        return grouped(
+            "gates-oom",
+            Status::Ok,
+            format!(
+                "gate jobs run at oom_score_adj >= {adj}{inherited} and each job leaf has \
+                 memory.oom.group = 1 (a killed job dies whole); no ancestor of jobs/ has \
+                 memory.oom.group = 1; {oomd}"
+            ),
+        );
+    }
+    grouped(
+        "gates-oom",
+        Status::Warn,
+        format!(
+            "memory.oom.group = 1 on {}: a kernel OOM kill inside a gate job would be widened \
+             to that whole cgroup (the kernel kills the highest ancestor with the flag); set it \
+             back to 0 (OOMPolicy=continue). Gate jobs run at oom_score_adj >= {adj}{inherited}; \
+             {oomd}",
+            f.group_ancestors.join(", ")
+        ),
+    )
+}
+
 /// Whether the memory policy of the agents scope is on, and why not.
 /// `policy` is `(system policy, derived policy)` when it is on.
 fn memory_policy(
@@ -264,6 +384,162 @@ fn memory_policy(
             p.duration.as_secs()
         ),
     )
+}
+
+/// What the `gates-memory-policy` check needs (ADR-0019 piece 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct GatesPolicyFacts {
+    /// The agents' policy (the derived or configured one).
+    pub agents: PressurePolicy,
+    /// The gates' policy Sluice creates ([`detect::derive_gates_policy`]).
+    pub gates: PressurePolicy,
+    /// `daemon/` carries `user.oomd_omit`: `None` when the leaf does not
+    /// exist (the daemon is not running).
+    pub daemon_omitted: Option<bool>,
+}
+
+impl GatesPolicyFacts {
+    fn gather(layout: &Layout, agents: PressurePolicy) -> Self {
+        let leaf = layout.daemon_leaf_dir();
+        Self {
+            agents,
+            gates: detect::derive_gates_policy(agents),
+            daemon_omitted: leaf.is_dir().then(|| tree::has_oomd_omit(&leaf)),
+        }
+    }
+}
+
+/// The policy of the gates' scope: where oomd looks first, and whether the
+/// daemon itself is protected.
+pub(super) fn gates_policy(f: &GatesPolicyFacts) -> Check {
+    let omit = match f.daemon_omitted {
+        Some(true) => "daemon/ has user.oomd_omit (oomd never picks the daemon)",
+        Some(false) => {
+            return grouped(
+                "gates-memory-policy",
+                Status::Warn,
+                format!(
+                    "{}; but daemon/ has no user.oomd_omit (a filesystem without user extended \
+                     attributes, or a daemon started before this version): oomd could pick the \
+                     daemon and orphan its running jobs",
+                    gates_line(f)
+                ),
+            );
+        }
+        None => "daemon/ does not exist yet (the daemon marks it user.oomd_omit when it starts)",
+    };
+    grouped(
+        "gates-memory-policy",
+        Status::Ok,
+        format!("{}; {omit}", gates_line(f)),
+    )
+}
+
+fn gates_line(f: &GatesPolicyFacts) -> String {
+    format!(
+        "systemd-oomd acts on the gates' scope at {}% for {}s, before the agents' scope ({}s)",
+        f.gates.limit_percent,
+        f.gates.duration.as_secs(),
+        f.agents.duration.as_secs()
+    )
+}
+
+/// Why `systemd-oomd` cannot protect the gates' scope on this machine, or
+/// `None` when its policy applies (the conditions of
+/// [`Capabilities::oomd_policy_enabled`], in words).
+fn oomd_gap(caps: &Capabilities, cfg: &ContainmentConfig) -> Option<String> {
+    if !cfg.enabled {
+        return Some("containment is disabled by [containment] enabled = false".to_owned());
+    }
+    if !caps.usable() {
+        return Some("containment is off".to_owned());
+    }
+    if cfg.memory_policy == MemoryPolicy::None {
+        return Some("[containment] memory_policy = \"none\"".to_owned());
+    }
+    if !caps.controllers.memory {
+        return Some("the memory controller is not delegated".to_owned());
+    }
+    if !caps.oomd_active {
+        return Some("systemd-oomd is not active".to_owned());
+    }
+    match caps.systemd_version {
+        Some(v) if v >= OOMD_PER_UNIT_DURATION => None,
+        Some(v) => Some(format!(
+            "systemd {v} (< {OOMD_PER_UNIT_DURATION}) has no per-unit pressure duration"
+        )),
+        None => Some("the systemd version is unknown".to_owned()),
+    }
+}
+
+/// What the `memory-guard` check needs (ADR-0019 piece 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct GuardFacts {
+    /// `[admission] memory_guard`.
+    pub on: bool,
+    /// `[admission] memory_reserve` as written (`auto` or a size).
+    pub reserve: String,
+    /// Why systemd-oomd does not protect the gates' scope; `None` when it does.
+    pub oomd_gap: Option<String>,
+}
+
+/// The `memory-guard` check: whether Sluice's own guard is on and, when it is
+/// off where systemd-oomd cannot act, a suggestion to turn it on.
+pub(super) fn memory_guard(f: &GuardFacts) -> Check {
+    let reserve = &f.reserve;
+    let detail = match (f.on, &f.oomd_gap) {
+        (true, None) => format!(
+            "memory guard on: after 3 s with MemAvailable below the reserve ({reserve}), \
+             the gates holding more than it and memory stalls, Sluice cancels its own \
+             running job with the largest working set (systemd-oomd also acts on the \
+             gates' scope)"
+        ),
+        (true, Some(why)) => format!(
+            "memory guard on: after 3 s with MemAvailable below the reserve ({reserve}), \
+             the gates holding more than it and memory stalls, Sluice cancels its own \
+             running job with the largest working set; it is the only protection here \
+             ({why})"
+        ),
+        (false, None) => "memory guard off (the default): systemd-oomd acts on the gates' \
+             scope; [admission] memory_guard = true adds Sluice's own last line"
+            .to_owned(),
+        (false, Some(why)) => format!(
+            "memory guard off and systemd-oomd cannot protect the gates here ({why}): \
+             when the machine runs out of memory the kernel picks the victim, not Sluice; \
+             consider [admission] memory_guard = true in the user config"
+        ),
+    };
+    grouped("memory-guard", Status::Ok, detail)
+}
+
+/// The `gates-ceiling` check (ADR-0019 piece 5): shown only when
+/// `[containment] gates_memory_max` or `gates_memory_swap_max` is set.
+pub(super) fn gates_ceiling(cfg: &ContainmentConfig) -> Option<Check> {
+    let max = cfg.gates_memory_max_bytes();
+    let swap = cfg.gates_memory_swap_max_bytes();
+    if max.is_none() && swap.is_none() {
+        return None;
+    }
+    let part = |name: &str, bytes: Option<u64>| {
+        format!(
+            "{name} {}",
+            bytes.map_or_else(
+                || "unset".to_owned(),
+                sluice_gate_daemon::memkill::format_bytes
+            )
+        )
+    };
+    Some(grouped(
+        "gates-ceiling",
+        Status::Ok,
+        format!(
+            "gate jobs together are capped on jobs/ ({}; {}): past it the kernel kills one \
+             job whole, reported as killed for lack of memory; the daemon and the agents are \
+             never inside that limit",
+            part("memory.max", max),
+            part("memory.swap.max", swap)
+        ),
+    ))
 }
 
 /// S4 check 11.
@@ -548,6 +824,72 @@ mod tests {
     }
 
     #[test]
+    fn an_ancestor_with_oom_group_is_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let mount = dir.path();
+        let jobs = mount.join("user.slice/user@1000.service/sluice.slice/daemon.scope/jobs");
+        std::fs::create_dir_all(&jobs).unwrap();
+        // Nothing flagged: no finding, and the check is fine.
+        assert_eq!(ancestors_with_oom_group(&jobs, mount), Vec::<String>::new());
+        std::fs::write(jobs.join("memory.oom.group"), "0\n").unwrap();
+        let ok = gates_oom(&GatesOomFacts {
+            adj: 800,
+            auto: true,
+            own_adj: Some(200),
+            group_ancestors: ancestors_with_oom_group(&jobs, mount),
+            oomd_active: true,
+        });
+        assert_eq!(ok.status, Status::Ok);
+        assert!(
+            ok.detail.contains("oom_score_adj >= 800 (auto)"),
+            "{}",
+            ok.detail
+        );
+        assert!(
+            ok.detail.contains("systemd-oomd is active"),
+            "{}",
+            ok.detail
+        );
+        // Flagged above the leaves, at two levels (jobs/ itself and the user manager).
+        std::fs::write(jobs.join("memory.oom.group"), "1\n").unwrap();
+        let manager = mount.join("user.slice/user@1000.service");
+        std::fs::write(manager.join("memory.oom.group"), "1\n").unwrap();
+        let found = ancestors_with_oom_group(&jobs, mount);
+        assert_eq!(
+            found,
+            [
+                "user.slice/user@1000.service/sluice.slice/daemon.scope/jobs",
+                "user.slice/user@1000.service"
+            ]
+        );
+        let warn = gates_oom(&GatesOomFacts {
+            adj: 600,
+            auto: false,
+            own_adj: Some(900),
+            group_ancestors: found,
+            oomd_active: false,
+        });
+        assert_eq!(warn.status, Status::Warn);
+        assert!(warn.detail.contains("widened"), "{}", warn.detail);
+        assert!(warn.detail.contains("user@1000.service"), "{}", warn.detail);
+        assert!(
+            warn.detail.contains("oom_score_adj >= 600;"),
+            "{}",
+            warn.detail
+        );
+        assert!(
+            warn.detail.contains("this shell runs at 900"),
+            "{}",
+            warn.detail
+        );
+        assert!(
+            warn.detail.contains("systemd-oomd is not active"),
+            "{}",
+            warn.detail
+        );
+    }
+
+    #[test]
     fn controller_files_are_judged_by_their_presence() {
         let dir = tempfile::tempdir().unwrap();
         let mount = dir.path();
@@ -662,5 +1004,131 @@ mod tests {
         assert_eq!(classify(Some("/a/s-x/tools")), Where::Tools);
         assert_eq!(classify(Some("/a/b/ui")), Where::Outside);
         assert_eq!(classify(None), Where::Outside);
+    }
+
+    fn policies() -> (PressurePolicy, PressurePolicy) {
+        let agents = PressurePolicy {
+            limit_percent: 30,
+            duration: std::time::Duration::from_secs(5),
+        };
+        (agents, detect::derive_gates_policy(agents))
+    }
+
+    #[test]
+    fn the_gates_policy_line_names_limit_durations_and_the_omit_mark() {
+        let (agents, gates) = policies();
+        let facts = |daemon_omitted| GatesPolicyFacts {
+            agents,
+            gates,
+            daemon_omitted,
+        };
+        let ok = gates_policy(&facts(Some(true)));
+        assert_eq!(ok.status, Status::Ok);
+        assert_eq!(
+            ok.detail,
+            "systemd-oomd acts on the gates' scope at 30% for 3s, before the agents' scope (5s); \
+             daemon/ has user.oomd_omit (oomd never picks the daemon)"
+        );
+        let missing = gates_policy(&facts(Some(false)));
+        assert_eq!(missing.status, Status::Warn);
+        assert!(
+            missing.detail.contains("no user.oomd_omit"),
+            "{}",
+            missing.detail
+        );
+        let not_running = gates_policy(&facts(None));
+        assert_eq!(not_running.status, Status::Ok);
+        assert!(not_running.detail.contains("does not exist yet"));
+        assert_eq!(ok.group, Some("containment"));
+    }
+
+    #[test]
+    fn the_gates_policy_facts_read_the_daemon_leaf() {
+        let (agents, gates) = policies();
+        let root = tempfile::tempdir().unwrap();
+        let layout = Layout {
+            mount: root.path().to_path_buf(),
+            user_manager: root.path().to_path_buf(),
+            slice: "x.slice".into(),
+            daemon_scope: "x-daemon.scope".into(),
+            agents_scope: "x-agents.scope".into(),
+        };
+        let f = GatesPolicyFacts::gather(&layout, agents);
+        assert_eq!((f.agents, f.gates, f.daemon_omitted), (agents, gates, None));
+        std::fs::create_dir_all(layout.daemon_leaf_dir()).unwrap();
+        let f = GatesPolicyFacts::gather(&layout, agents);
+        assert_eq!(f.daemon_omitted, Some(false));
+    }
+
+    #[test]
+    fn the_guard_line_says_whether_it_is_on_and_suggests_it_where_oomd_cannot_act() {
+        let facts = |on, gap: Option<&str>| GuardFacts {
+            on,
+            reserve: "auto".into(),
+            oomd_gap: gap.map(str::to_owned),
+        };
+        let off_gap = memory_guard(&facts(false, Some("systemd-oomd is not active")));
+        assert_eq!(off_gap.group, Some("containment"));
+        assert!(off_gap.detail.contains("systemd-oomd is not active"));
+        assert!(
+            off_gap
+                .detail
+                .contains("consider [admission] memory_guard = true")
+        );
+        let off_ok = memory_guard(&facts(false, None));
+        assert!(off_ok.detail.starts_with("memory guard off (the default)"));
+        assert!(!off_ok.detail.contains("consider"));
+        let on_alone = memory_guard(&facts(
+            true,
+            Some("systemd 255 (< 257) has no per-unit duration"),
+        ));
+        assert!(on_alone.detail.contains("the only protection here"));
+        assert!(on_alone.detail.contains("reserve (auto)"));
+        let on_both = memory_guard(&facts(true, None));
+        assert!(on_both.detail.contains("systemd-oomd also acts"));
+        assert!(!on_both.detail.contains("only protection"));
+    }
+
+    #[test]
+    fn the_gates_ceiling_is_shown_only_when_set() {
+        assert!(gates_ceiling(&ContainmentConfig::default()).is_none());
+        let cfg = ContainmentConfig {
+            gates_memory_max: "20G".into(),
+            ..ContainmentConfig::default()
+        };
+        let c = gates_ceiling(&cfg).unwrap();
+        assert_eq!(c.group, Some("containment"));
+        assert!(c.detail.contains("memory.max 20.0 GiB"), "{}", c.detail);
+        assert!(c.detail.contains("memory.swap.max unset"));
+    }
+
+    #[test]
+    fn the_oomd_gap_names_the_first_missing_condition() {
+        let cfg = ContainmentConfig::default();
+        let caps = evaluate(facts());
+        assert_eq!(oomd_gap(&caps, &cfg), None);
+        let mut f = facts();
+        f.oomd_active = false;
+        assert_eq!(
+            oomd_gap(&evaluate(f), &cfg).as_deref(),
+            Some("systemd-oomd is not active")
+        );
+        let mut f = facts();
+        f.systemd_version = Some(255);
+        assert!(
+            oomd_gap(&evaluate(f), &cfg)
+                .unwrap()
+                .contains("systemd 255")
+        );
+        let none = ContainmentConfig {
+            memory_policy: MemoryPolicy::None,
+            ..ContainmentConfig::default()
+        };
+        assert!(oomd_gap(&caps, &none).unwrap().contains("memory_policy"));
+        let off = ContainmentConfig {
+            enabled: false,
+            ..ContainmentConfig::default()
+        };
+        assert!(oomd_gap(&caps, &off).unwrap().contains("disabled"));
     }
 }

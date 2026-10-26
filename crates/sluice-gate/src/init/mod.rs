@@ -506,6 +506,36 @@ fn created_hooks(root: &Path, gates: &[GatePlan], notes: &mut Vec<String>) -> Ve
     changes
 }
 
+/// The `.sluice.toml` text `plan` writes and, with no gate detected, the
+/// starter hook snippet; the text is parsed back as a guard against a bug.
+fn config_and_snippet(
+    gates: &[GatePlan],
+    stack: &detect::Stack,
+    config_path: &Path,
+) -> Result<(String, Option<String>), String> {
+    let (config, snippet_text) = if gates.is_empty() {
+        let starter = (
+            vec!["lint".to_owned(), "test".to_owned()],
+            vec!["test".to_owned()],
+        );
+        (
+            starter_repo_config().to_owned(),
+            Some(snippet(HookManager::Plain, &starter.0, &starter.1)),
+        )
+    } else {
+        (
+            render::config_text(gates, &stack.names, &stack.nested, stack.prepare.as_deref()),
+            None,
+        )
+    };
+    if let Err(e) = RepoConfig::parse(&config, config_path) {
+        return Err(format!(
+            "the generated config is invalid (a bug in init): {e}"
+        ));
+    }
+    Ok((config, snippet_text))
+}
+
 fn plan(root: &Path, paths: &RepoPaths, env: &EnvMap, force: bool) -> Result<Plan, String> {
     let config_path = root.join(REPO_CONFIG_FILE);
     if config_path.exists() && !force {
@@ -526,12 +556,12 @@ fn plan(root: &Path, paths: &RepoPaths, env: &EnvMap, force: bool) -> Result<Pla
     });
 
     let mut from_hooks = gates_from_hooks(root, &layout.files, &found, old.as_ref());
-    let stack = detect::detect(root);
+    let mut stack = detect::detect(root);
     let hook_plan = hook_plan(root, &layout, hooks_path.as_deref());
     let mut gates = std::mem::take(&mut from_hooks.gates);
     let mut notes = from_hooks.notes;
     let mut unwired = Vec::new();
-    for mut gate in stack.gates {
+    for mut gate in std::mem::take(&mut stack.gates) {
         if gates.iter().any(|g| g.name == gate.name) {
             continue;
         }
@@ -550,26 +580,7 @@ fn plan(root: &Path, paths: &RepoPaths, env: &EnvMap, force: bool) -> Result<Pla
         ));
     }
 
-    let (config, snippet_text) = if gates.is_empty() {
-        let starter = (
-            vec!["lint".to_owned(), "test".to_owned()],
-            vec!["test".to_owned()],
-        );
-        (
-            starter_repo_config().to_owned(),
-            Some(snippet(HookManager::Plain, &starter.0, &starter.1)),
-        )
-    } else {
-        (
-            render::config_text(&gates, &stack.names, &stack.nested),
-            None,
-        )
-    };
-    if let Err(e) = RepoConfig::parse(&config, &config_path) {
-        return Err(format!(
-            "the generated config is invalid (a bug in init): {e}"
-        ));
-    }
+    let (config, snippet_text) = config_and_snippet(&gates, &stack, &config_path)?;
 
     let mut changes = vec![FileChange {
         rel: REPO_CONFIG_FILE.to_owned(),

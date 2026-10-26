@@ -17,6 +17,7 @@
 //! - [`agent`]: "is this hook invoked by a coding agent?" detection.
 //! - [`semaphore`]: `flock`-based counting semaphore (Phase 1 global guard).
 //! - [`mode`]: `CI` / `SLUICE_CACHE` / `SLUICE_DISABLE` handling.
+//! - [`env`]: the neutral environment of the daemon.
 //! - [`dirs`]: state, runtime and socket paths, job ids.
 //! - [`which`]: `PATH` resolution that skips Sluice's own shims.
 //! - [`heavy`]: the heavy-command list and package-manager equivalences.
@@ -27,6 +28,7 @@ pub mod cgroup;
 pub mod config;
 pub mod cpus;
 pub mod dirs;
+pub mod env;
 pub mod error;
 pub mod git;
 pub mod heavy;

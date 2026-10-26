@@ -15,19 +15,32 @@ All paths are under the state directory, `$XDG_STATE_HOME/sluice` or
 `client.log` lines look like this:
 
 ```
-2026-10-22T10:00:00Z pid=4242 caller=agent hook=pre-commit gate=test tree=0123456789ab decision=hit exit=0 ms=12 cwd=/home/u/repo
+2026-10-22T10:00:00Z pid=4242 caller=agent hook=pre-commit gate=test tree=0123456789ab key=abcdef012345 decision=hit exit=0 ms=12 cwd=/home/u/repo
 ```
 
-`caller` is `agent` or `human`; `hook` and `tree` are `-` when unknown;
+`caller` is `agent` or `human`; `hook`, `tree` and `key` (the first 12 hex digits
+of the cache key the run looked up) are `-` when unknown. Two lines with the
+same `key` asked the same question, so a hook that missed where an earlier
+run hit shows a different `key`;
 `decision` is `hit`, `miss-run` (queued in the daemon), `miss-fail-fast`
 (refused by `agent_hook_policy`, exit 3), `coalesced` (shared a job another
 caller started), `in-process` (ran without the daemon), `disabled`
 (`SLUICE_DISABLE`) or `error`. Writing the line never fails the command.
 
-When the cache was off for the run, `reason=<code>` follows `tree=-`:
+The daemon logs the same facts for every `run` request that comes from a hook,
+at `info`, in `daemon.log`: `hook run request: gate=test hook=pre-push
+tree=0123456789ab key=abcdef012345 caller=agent decision=queued` (`decision` is
+`queued`, `coalesced` or `hit by the double-check`). A hook run by the daemon's
+own push of a merge train is answered from the train and logged as `push hook
+vouched: train=<id> gate=<gate> verdict=verified` (or `verdict=refused: <why>`
+for a gate the train did not verify). Comparing the `key` of a hook that missed
+with the `key` of the run that passed tells whether the two asked the same
+question.
+
+When the cache was off for the run, `reason=<code>` follows `key=-`:
 
 ```
-2026-10-22T10:00:00Z pid=4242 caller=agent hook=- gate=test tree=- reason=skip-worktree decision=miss-run exit=0 ms=9100 cwd=/home/u/repo
+2026-10-22T10:00:00Z pid=4242 caller=agent hook=- gate=test tree=- key=- reason=skip-worktree decision=miss-run exit=0 ms=9100 cwd=/home/u/repo
 ```
 
 The codes are `skip-worktree` (a skip-worktree or assume-unchanged index
@@ -174,7 +187,10 @@ a warning when they differ, never a failure; `weights`: a warning when a gate
 declares a number well below (more than 50 % under) what its measured runs
 need, suggesting a higher number or `weight = "auto"`; `init`: in a git
 repository without `.sluice.toml`, an `ok` that suggests `sluice init
---dry-run`. It exits 1 when any check
+--dry-run`; on a containment host, `gates-memory-policy` (the oomd policy of the
+gates' scope and whether `daemon/` carries `user.oomd_omit`) and `memory-guard`
+(whether the opt-in guard is on, and a suggestion to turn it on where oomd cannot
+act). It exits 1 when any check
 fails and never uses the network (it does not look for new releases;
 `sluice update --check` does).
 
@@ -224,7 +240,8 @@ recorded by the daemon and shown in the `status` reply (`interventions`).
 `sluice doctor` explains why a session is or is not contained (`session`,
 `memory-policy`, `slice`). Causes: `oom_kill` and `oom_group_kill` (the kernel
 OOM killer acted inside that cgroup), `oomd_memory_pressure` and `oomd_swap`
-(`systemd-oomd` killed it). The daemon also appends each one to
+(`systemd-oomd` killed it), `sluice_memory_guard` (Sluice's own opt-in memory
+guard cancelled a gate job, see below). The daemon also appends each one to
 `interventions.jsonl` in the state directory (kept to the newest 200 lines).
 The agent is told about an intervention in its own session once: the next MCP
 `verify` or `status` result and the next context note of the guard add the
@@ -237,6 +254,80 @@ Sluice stopped s-abc/tools in your session at 2026-10-24 10:02:11 UTC: memory pr
 Which interventions were told is remembered per session in
 `interventions-seen/<session>` under the state directory; delete the file to
 hear them again. Nothing is told after six hours.
+
+### A gate killed for lack of memory
+
+When the kernel's OOM killer or `systemd-oomd` ends a gate job, the result is
+not an ordinary failure and not "the daemon stopped": the job is `killed`,
+`killed_by` is `memory`, and every client prints the daemon's message, for
+example
+
+```text
+test was killed for lack of memory after 41.2s (job peak 18.1 GiB; 1.4 GiB available at the end); running it again unchanged is likely to end the same way: lower its concurrency or free memory first
+```
+
+`sluice run` and `sluice exec` print it after the headline `KILLED for lack of
+memory after <secs>s (job <id>)`, MCP `verify` uses the same headline with the
+message on the gate's line and in `message` (with `killed_by: "memory"`), and a
+merge train fails with `gate <name> was killed for lack of memory` and
+`killed_by` in the job's `detail`. The job peak is `memory.peak` of the job's
+cgroup and includes page cache; the available memory is `MemAvailable` when the
+job ended. The decision needs evidence outside the exit code: the job's own OOM
+counters (`oom_kill`, `oom_group_kill` in `memory.events`) or a `systemd-oomd`
+line in the journal naming `jobs/<id>`; a gate that merely exits 137 stays an
+ordinary failure. The same event is an intervention (`sluice status`, leaf
+`jobs/<id>`). Do not retry blindly: lower the suite's parallelism (for example
+fewer test workers) or run it when the machine has more free memory.
+`sluice doctor` (`gates-oom`) shows the `oom_score_adj` the gates run at and
+warns when an ancestor of the jobs' cgroup has `memory.oom.group = 1`, which
+would widen a kill to that whole cgroup.
+
+Where `systemd-oomd` is active and systemd is 257 or newer, it looks at the gates
+before the agents: `sluice-daemon.scope` has its own memory pressure policy (the
+agents' limit, half the duration, rounded up to whole seconds), and `daemon/` has
+`user.oomd_omit=1` so the daemon is never the victim. `sluice doctor`
+(`gates-memory-policy`) prints the figures and warns when `daemon/` lacks the
+attribute; `oomctl` lists both scopes, and `sluice status` shows
+`gates memory policy: systemd-oomd at 30% for 3s`. Without oomd (Debian and Arch
+by default) or below systemd 257 that policy does not exist: the kernel's
+preference and memory admission remain, and `sluice doctor` (`memory-guard`)
+suggests the opt-in guard.
+
+#### The memory guard cancelled my job
+
+With `[admission] memory_guard = true` (off by default) the daemon cancels its own
+running job with the largest working set when, for 3 seconds in a row, `MemAvailable`
+is below `memory_reserve`, the Sluice jobs together hold more than the reserve and
+memory stalls (`full avg10` of 10 % or more, or `MemAvailable` below half the
+reserve). The job ends `killed` with `killed_by = "memory"` and a message starting
+`<gate> was cancelled by Sluice for lack of memory: job working set 18.0 GiB,
+MemAvailable 1.1 GiB below the reserve 3.0 GiB`; `sluice status` lists an
+intervention with cause `sluice_memory_guard` and the daemon log has a warning
+`memory guard: cancelling the running job ...`. After an action the guard rests
+15 seconds. It never acts when the shortage is not the gates' (they hold less than
+the reserve) and never on anything but Sluice's own jobs. If it fires too often,
+lower the suites' parallelism or lower `memory_reserve`; to turn it off, remove
+the key.
+
+### A gate that waits for memory
+
+`sluice status` shows a job that fits the CPU budget but not the memory it is
+expected to use as `(budget: memory)`, with the expected peak next to it
+(`mem 18.0 GiB`; `~18.0 GiB` when it is only a guess from the weight because
+the gate has not run before), and in `--json` as `reason: "budget"` with
+`wait_detail: "memory"` and `memory_expected_bytes` / `memory_expected_learned`.
+Running jobs show `mem 3.1 GiB/18.0 GiB` (working set now over expected peak) and
+a `memory:` line gives what admission sees: `MemAvailable`, the reserve and
+what running jobs are still expected to grow by (`budget.memory` in JSON). The
+job starts when a running job ends or when `MemAvailable` recovers; the wait is
+counted as budget wait in `sluice logs --timeline`. When one job runs alone it
+is never held back for memory, so a wait never lasts longer than the running
+jobs. If a gate waits for memory it does not need, its learned peak may be
+inflated by one huge run (it forgets after 5 runs); if it keeps being killed or
+starved, lower its parallelism, raise `[admission] memory_reserve`, or turn the
+rule off with `memory_aware = false`. The peak it learns is the working set
+(`anon` + swap), not `memory.peak`, which includes page cache and is shown only
+in a kill message.
 
 ### The stopgap holder
 

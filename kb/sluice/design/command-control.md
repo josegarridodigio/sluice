@@ -357,7 +357,8 @@ exec_weight = 0                            # 0 = ceil(budget / 2)
 
 Default (`DEFAULT_HEAVY_COMMANDS`, canonical words): `docker build`, `docker buildx build`, `docker
 compose build`, `run build` (npm/pnpm/yarn/bun build scripts), `cargo build`, `cargo test`, `cargo
-clippy`, `cargo nextest`, `go build`, `go test`, `make`, `gradle`, `mvn`, `tsc`, `vite build`,
+clippy`, `cargo check`, `cargo doc` (W6 addendum: a workspace `cargo check` is about twenty parallel
+`rustc` and starved timing-sensitive gates), `cargo nextest`, `go build`, `go test`, `make`, `gradle`, `mvn`, `tsc`, `vite build`,
 `webpack`, `next build`, `pytest`, `jest`, `vitest`, plus (zero-config, v0.4.0) `ng build|test|lint|e2e`,
 `nx run|run-many|affected|build|test|lint|e2e`, `turbo run|build|test|lint`, `playwright test`,
 `cypress run`, `react-scripts build|test`, `astro build`, `nuxt build`, `dotnet build|test`,

@@ -64,7 +64,7 @@ Gate names match `[a-z0-9][a-z0-9_-]*` and are at most 64 characters.
 | `weight` | int >= 1 or `"auto"` | `1` | Budget units consumed while running, at most: the number is a ceiling that learned weights only lower. Roughly the number of CPU threads the gate uses. `"auto"` (0.4.0) uses `ceil(budget / 2)` of the daemon that admits the job and learns from there, so you need not guess; an omitted `weight` stays `1`. |
 | `timeout` | duration | `30m` | Execution time only; queue wait does not count. Formats such as `90s`, `5m`, `1h`. |
 | `hooks` | list | `[]` | Hook names this gate is meant for. Free-form; `pre-commit` and `pre-push` are recognised by `sluice hook print`. `verify` without an explicit gate list runs the gates whose `hooks` contain `pre-commit`. |
-| `key_inputs` | list of commands | `[]` | The stdout of each command (`sh -c` in the worktree root) is folded into the cache key. They run on every cache consultation, hits included, so keep them fast. A failing command makes the run uncached, never a gate failure. |
+| `key_inputs` | list of commands | `[]` | The stdout of each command (`sh -c` in the worktree root, with exactly the gate's environment and nothing inherited from the process that derives the key) is folded into the cache key. They run on every cache consultation, hits included, so keep them fast. A failing command makes the run uncached, never a gate failure. |
 | `key_files` | list of paths | `[]` | Relative to the repository root, no `..`. The content hash is part of the key. For files git ignores; a missing file counts as "absent". |
 | `env` | table | `{}` | Added to the gate's environment and to the key. |
 | `cache` | bool | `true` | `false` makes the gate always run (still queued). |
@@ -114,11 +114,14 @@ tree; a missing or invalid file at the base yields the defaults. See
 |---|---|---|---|
 | `remote` | string | `origin` | Remote of the default target. Must not be empty, start with `-` or contain whitespace; at enqueue it must be a configured remote. |
 | `target` | string | the remote's HEAD branch | Default target branch for `sluice queue enqueue`. |
-| `gates` | list | gates with a `pre-push` hook, else every gate | Gates a train must pass; each must exist. |
+| `gates` | list | gates with a `pre-push` hook, else every gate | Gates a train must pass; each must exist. The gates whose `hooks` contain `pre-push` are always added to the list (the repository's `pre-push` hook runs them during the train's push and is answered from the train). |
 | `max_train` | int >= 1 | `4` | Jobs combined into one train; `1` disables batching. |
 | `audit_ref` | bool | `true` | Push `refs/sluice/landed/<sha>` atomically with the target. |
 | `push_timeout` | duration | `10m` | Limit for the push, including the repository's `pre-push` hook. |
 | `network_timeout` | duration > 0 | `60s` | Limit of every other network call of the queue (fetch of the base, `ls-remote` checks). |
+| `prepare` | string | unset | Command run once per train in the merge worktree before the gates (install the dependencies a fresh worktree lacks, for example `pnpm install --frozen-lockfile --prefer-offline`). Must not be empty. See "Preparing the merge worktree" in [merge-queue.md](merge-queue.md). Needs 0.6.0 or later; older binaries reject the file. |
+| `prepare_timeout` | duration > 0 | `10m` | Limit of `prepare` (and of the probe that attributes its failure). Needs 0.6.0 or later. |
+| `prepare_weight` | int >= 1 or `"auto"` | `"auto"` | Budget units `prepare` consumes, like a gate's `weight`. Needs 0.6.0 or later. |
 
 The per-user queue keys below are rejected here, and the keys above are
 rejected in the user file.
@@ -149,6 +152,9 @@ overcommit = 1.5               # 1.0 disables over-admission
 cpu_some_avg10_low = 25.0
 memory_some_avg10_low = 5.0
 overcommit_interval = "5s"
+memory_aware = true            # admit by learned memory, not only by CPU
+memory_reserve = "auto"        # "auto" (10 % of the machine's memory) or a size such as "3G"
+memory_guard = false           # opt-in: cancel Sluice's own largest gate job under real memory exhaustion
 
 [scheduler]
 head_reserve_after = "30s"
@@ -199,6 +205,9 @@ memory_pressure_limit = "auto" # or "30%"
 memory_pressure_duration = "auto"   # or "5s"
 memory_high = ""               # opt-in per session, e.g. "8G"
 memory_max = ""                # opt-in per session
+gates_oom_score_adj = "auto"   # "auto" (800) or 0 to 1000
+gates_memory_max = ""          # opt-in ceiling of all gate jobs together, e.g. "20G"
+gates_memory_swap_max = ""     # opt-in swap ceiling of the same
 
 [repos."/path/to/repo"]
 budget_share_max = 4
@@ -222,6 +231,9 @@ budget_share_max = 4
 | `admission.cpu_some_avg10_low` | `25.0` | Percent: over-admission only below this CPU pressure. |
 | `admission.memory_some_avg10_low` | `5.0` | Percent: over-admission only below this memory pressure. |
 | `admission.overcommit_interval` | `5s` | At most one over-admission per interval, and none sooner than this after PSI stopped blocking. Must be > 0. |
+| `admission.memory_aware` | `true` | Memory-aware admission: a job starts only when the memory it is expected to use fits `MemAvailable` minus the reserve and minus what the running jobs are still expected to grow by (jobs started in the same pass count in full), or when nothing else runs (and nothing started earlier in the same pass), so an idle machine always starts the first job. The expectation is the largest working set (`anon` + swap of the job's cgroup, or the resident set without one) of the gate's last 5 finished runs plus 20 %; a run killed for lack of memory counts 25 % more; a gate never run is guessed from its weight (`weight / budget` of the usable memory) until it has run once. Swap never counts as available. A job that waits only for memory shows `wait_detail: memory` in `sluice status`. `false` restores CPU-only admission. Needs 0.6.0: older binaries reject the key. |
+| `admission.memory_guard` | `false` | Opt-in Sluice-side memory guard, for machines where `systemd-oomd` is absent or older than systemd 257. On every sampler tick the daemon looks at `MemAvailable`, the memory pressure (`full avg10` of the gates' scope, or the system's) and the working sets of the running gate and `exec` jobs. When `MemAvailable` is below `memory_reserve`, the jobs together hold more than the reserve, and the machine stalls (`full avg10` of 10 % or more, or `MemAvailable` below half the reserve) for at least 3 seconds (wall time, whatever the sampling period), it cancels the job with the largest working set (`killed`, `killed_by = "memory"`, an `interventions` row with cause `sluice_memory_guard`) and rests 15 seconds. It never touches anything but Sluice's own jobs, and never a single job that holds less than the reserve. Needs 0.6.0: older binaries reject the key. |
+| `admission.memory_reserve` | `"auto"` | Memory this admission leaves for the desktop, the agents and the page cache: `"auto"` is a tenth of the machine's memory (3 GiB on 30 GiB), or a size such as `"3G"` or `"512M"`. Needs 0.6.0. |
 | `scheduler.head_reserve_after` | `30s` | Backfill behind the queue head only this long; also the ageing bound: a job waiting longer goes ahead of everything else, in arrival order. |
 | `scheduler.learned_weights` | `true` | After 3 runs, a gate holds the 75th percentile of its measured CPU demand (CPU plus run-queue wait over wall time, last 10 runs), never more than its `weight` (for `"auto"`, half the budget) and never less than a quarter of it. `sluice exec` jobs learn the same way, per repository and `--label`, starting from their `--weight` or `agent.exec_weight`. |
 | `scheduler.fairness` | `"lane"` | `lane`: at equal priority, worktrees take turns (a worktree with jobs running or several queued goes behind the others). `off`: arrival order. |
@@ -251,11 +263,14 @@ budget_share_max = 4
 | `containment.sandbox_nice` | `19` | `nice` for shells that cannot be moved to `tools` (cgroupfs read-only in a sandbox). 0 to 19. |
 | `containment.cpu_ceiling` | `""` | Optional hard CPU ceiling of the agents scope, a percentage of all CPUs (`"80%"`, 1% to 100%). Empty means none: weights already give the CPU back when it is idle. |
 | `containment.pids_max` | `4096` | `pids.max` of a session. Must be >= 1. |
-| `containment.memory_policy` | `"oomd"` | `oomd`: where `systemd-oomd` is active and systemd is 257 or newer, the agents scope gets its own memory pressure policy, so `systemd-oomd` acts inside it first and kills only the offending leaf. `none`: memory is only accounted. Never a `MemoryHigh` or `MemoryMax` by default. |
-| `containment.memory_pressure_limit` | `"auto"` | `ManagedOOMMemoryPressureLimit` of the agents scope: `"auto"` or `"1%"` to `"99%"`. `auto` reads the policy that watches your user manager (`systemctl show user@UID.service`, then `oomctl dump`, then `oomd.conf`, then oomd's built-in 60%) and uses `min(30%, 0.6 x its limit)`, so it always stays below it. |
-| `containment.memory_pressure_duration` | `"auto"` | `ManagedOOMMemoryPressureDurationUSec` of the agents scope: `"auto"` or a duration above zero. `auto` is `min(5s, the user manager's duration / 4)`, never below 1s. |
+| `containment.memory_policy` | `"oomd"` | `oomd`: where `systemd-oomd` is active and systemd is 257 or newer, the agents scope gets its own memory pressure policy, so `systemd-oomd` acts inside it first and kills only the offending leaf. The gates' scope (`sluice-daemon.scope`) then gets its own policy with the same limit and half the duration (rounded up, at least 1s), so oomd tries the gates before the agents, and `daemon/` is marked `user.oomd_omit` so the daemon itself is never chosen. `none`: memory is only accounted. Never a `MemoryHigh` or `MemoryMax` by default. |
+| `containment.memory_pressure_limit` | `"auto"` | `ManagedOOMMemoryPressureLimit` of the agents scope (and of the gates' scope, see `memory_policy`): `"auto"` or `"1%"` to `"99%"`. `auto` reads the policy that watches your user manager (`systemctl show user@UID.service`, then `oomctl dump`, then `oomd.conf`, then oomd's built-in 60%) and uses `min(30%, 0.6 x its limit)`, so it always stays below it. |
+| `containment.memory_pressure_duration` | `"auto"` | `ManagedOOMMemoryPressureDurationUSec` of the agents scope: `"auto"` or a duration above zero. `auto` is `min(5s, the user manager's duration / 4)`, never below 1s. The gates' scope gets half of it, rounded up to whole seconds and never below 1s (see `memory_policy`). |
 | `containment.memory_high` | `""` | Opt-in `memory.high` per session, a size (`"8G"`, `"512M"`). Empty means none. Throttling without swap can raise pressure that `systemd-oomd` attributes to the whole user manager: advised only together with swap. |
 | `containment.memory_max` | `""` | Opt-in `memory.max` per session (the kernel kills inside the session when it is hit). Empty means none. |
+| `containment.gates_oom_score_adj` | `"auto"` | Floor of the `oom_score_adj` of gate and `exec` jobs: `"auto"` (800) or an integer from 0 to 1000. The kernel's OOM killer then prefers a gate's processes to the agents' (their browsers run at 300). A job never gets less than the daemon itself inherited, because an unprivileged process can only raise the value. Each job also gets `memory.oom.group = 1` on its own cgroup, so a killed job dies whole and is reported as `killed_by = "memory"`. Applied also where cgroups are unavailable. Needs 0.6.0: older binaries reject the key. |
+| `containment.gates_memory_max` | `""` (none) | Optional `memory.max` of the `jobs/` cgroup, the parent of every gate and `exec` job (a size such as `"20G"`). Written on `jobs/` only, never on a job's own cgroup, the daemon scope or above, so the daemon and the agents are never inside the limit. Past it the kernel's OOM killer picks a task in `jobs/`, and because each job cgroup has `memory.oom.group = 1` the whole job dies and is reported as `KILLED for lack of memory`. Empty writes `max`, so removing the key undoes an earlier value. Gate and `exec` jobs only; no `memory.high` counterpart exists on purpose (it throttles instead of killing and builds up memory pressure). Needs 0.6.0: older binaries reject the key. |
+| `containment.gates_memory_swap_max` | `""` (none) | Optional `memory.swap.max` of `jobs/`, same rules. Without it a job that reaches `gates_memory_max` swaps first and is killed later. Needs 0.6.0. |
 | `repos."<path>".budget_share_max` | unset | Optional cap on the budget one repository may use at once. Must be >= 1. |
 
 ### Heavy commands with no config
@@ -266,7 +281,7 @@ With no `[agent]` section at all, the guard and the shims already know these
 | Group | Entries |
 |---|---|
 | Containers and generic builders | `docker build`, `docker buildx build`, `docker compose build`, `make`, `gradle`, `mvn`, `ninja`, `cmake --build`, `bazel build`, `bazel test` |
-| Rust, Go, .NET, Python | `cargo build`, `cargo test`, `cargo clippy`, `cargo nextest`, `go build`, `go test`, `dotnet build`, `dotnet test`, `pytest` |
+| Rust, Go, .NET, Python | `cargo build`, `cargo test`, `cargo clippy`, `cargo check`, `cargo doc`, `cargo nextest`, `go build`, `go test`, `dotnet build`, `dotnet test`, `pytest` |
 | JavaScript tools | `run build` (so `npm run build`, `pnpm build`, `yarn build`), `tsc`, `vite build`, `webpack`, `next build`, `jest`, `vitest`, `react-scripts build\|test`, `astro build`, `nuxt build` |
 | Angular, Nx, Turborepo | `ng build\|test\|lint\|e2e`, `nx run\|run-many\|affected\|build\|test\|lint\|e2e`, `turbo run\|build\|test\|lint` |
 | Browser test runners | `playwright test`, `cypress run` |

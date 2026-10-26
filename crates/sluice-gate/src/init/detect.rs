@@ -450,6 +450,47 @@ pub struct Stack {
     pub gates: Vec<GatePlan>,
     /// Projects below the root that `init` does not configure.
     pub nested: Vec<String>,
+    /// `[queue] prepare`: installs the git-ignored dependencies a fresh merge
+    /// worktree lacks (detected from the lockfiles at the root).
+    pub prepare: Option<String>,
+}
+
+/// The command that restores what a lockfile at `root` pins, for a Node
+/// project (`package.json`): pnpm, yarn (berry when `.yarnrc.yml` exists),
+/// bun or npm, in the precedence of [`package_manager`]. `None` without a
+/// lockfile: `npm ci` would fail, and guessing is worse than writing nothing.
+fn node_prepare(root: &Path) -> Option<String> {
+    if !root.join("package.json").is_file() {
+        return None;
+    }
+    let has = |f: &str| root.join(f).is_file();
+    let cmd = if has("pnpm-lock.yaml") {
+        "pnpm install --frozen-lockfile --prefer-offline"
+    } else if has("yarn.lock") {
+        if has(".yarnrc.yml") {
+            "yarn install --immutable"
+        } else {
+            "yarn install --frozen-lockfile"
+        }
+    } else if has("bun.lockb") || has("bun.lock") {
+        "bun install --frozen-lockfile"
+    } else if has("package-lock.json") {
+        "npm ci"
+    } else {
+        return None;
+    };
+    Some(cmd.to_owned())
+}
+
+/// The same for a Python project (detected: `python` gates exist): uv or poetry.
+fn python_prepare(root: &Path) -> Option<String> {
+    if root.join("uv.lock").is_file() {
+        Some("uv sync --frozen".to_owned())
+    } else if root.join("poetry.lock").is_file() {
+        Some("poetry install --no-root".to_owned())
+    } else {
+        None
+    }
 }
 
 /// Detects the stack at `root` (never below it).
@@ -482,6 +523,15 @@ pub fn detect(root: &Path) -> Stack {
         new
     });
     stack.nested = nested_projects(root);
+    // Only for a stack detected at the root; cargo and go need nothing.
+    let mut prepare: Vec<String> = Vec::new();
+    if package_manager(root).is_some() {
+        prepare.extend(node_prepare(root));
+    }
+    if stack.names.iter().any(|n| n == "python") {
+        prepare.extend(python_prepare(root));
+    }
+    stack.prepare = (!prepare.is_empty()).then(|| prepare.join(" && "));
     stack
 }
 
@@ -560,6 +610,83 @@ mod tests {
         assert_eq!(Kind::Test.weight(), WeightSpec::Auto);
         assert_eq!(Kind::Lint.timeout(), "10m");
         assert_eq!(Kind::Test.timeout(), "30m");
+    }
+
+    /// `detect(..).prepare` of a root holding `files` (name, content).
+    fn prepare_of(files: &[(&str, &str)]) -> Option<String> {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, text) in files {
+            fs::write(dir.path().join(name), text).unwrap();
+        }
+        detect(dir.path()).prepare
+    }
+
+    /// Files of a fixture and the prepare command expected for them.
+    type PrepareCase<'a> = (&'a [(&'a str, &'a str)], Option<&'a str>);
+
+    #[test]
+    fn the_prepare_command_follows_the_lockfile() {
+        let pkg = ("package.json", "{\"scripts\": {\"test\": \"x\"}}");
+        let cases: [PrepareCase<'_>; 9] = [
+            (
+                &[pkg, ("pnpm-lock.yaml", "")],
+                Some("pnpm install --frozen-lockfile --prefer-offline"),
+            ),
+            (&[pkg, ("package-lock.json", "{}")], Some("npm ci")),
+            (
+                &[pkg, ("yarn.lock", "")],
+                Some("yarn install --frozen-lockfile"),
+            ),
+            (
+                &[pkg, ("yarn.lock", ""), (".yarnrc.yml", "")],
+                Some("yarn install --immutable"),
+            ),
+            (
+                &[pkg, ("bun.lockb", "")],
+                Some("bun install --frozen-lockfile"),
+            ),
+            (
+                &[pkg, ("bun.lock", "")],
+                Some("bun install --frozen-lockfile"),
+            ),
+            // No lockfile: `npm ci` would fail, nothing is written.
+            (&[pkg], None),
+            (
+                &[
+                    ("pyproject.toml", "[project]\nname = \"x\"\n"),
+                    ("uv.lock", ""),
+                ],
+                Some("uv sync --frozen"),
+            ),
+            (
+                &[
+                    ("pyproject.toml", "[project]\nname = \"x\"\n"),
+                    ("poetry.lock", ""),
+                ],
+                Some("poetry install --no-root"),
+            ),
+        ];
+        for (files, expected) in cases {
+            assert_eq!(prepare_of(files).as_deref(), expected, "{files:?}");
+        }
+    }
+
+    #[test]
+    fn cargo_go_and_unknown_stacks_need_no_prepare() {
+        assert_eq!(
+            prepare_of(&[
+                ("Cargo.toml", "[package]\nname = \"x\"\n"),
+                ("Cargo.lock", "")
+            ]),
+            None
+        );
+        assert_eq!(
+            prepare_of(&[("go.mod", "module x\n"), ("go.sum", "")]),
+            None
+        );
+        assert_eq!(prepare_of(&[("README.md", "")]), None);
+        // A lockfile without a project at the root says nothing.
+        assert_eq!(prepare_of(&[("uv.lock", "")]), None);
     }
 
     #[test]

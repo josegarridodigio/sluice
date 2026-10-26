@@ -8,6 +8,7 @@
 
 mod common;
 
+use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -149,6 +150,19 @@ impl Q {
 
     fn approve(&self, train: &Value) -> Output {
         self.run(&["queue", "approve", train_id(train), "--yes"])
+    }
+
+    /// `sluice queue approve --yes` with `extra` on top of the sandbox
+    /// environment (the approver's `PATH`, `CI`, ...).
+    fn approve_with(&self, train: &Value, extra: &[(&str, &str)]) -> Output {
+        StdCommand::new(Sandbox::binary())
+            .args(["queue", "approve", train_id(train), "--yes"])
+            .current_dir(&self.sb.repo)
+            .env_clear()
+            .envs(self.sb.env())
+            .envs(extra.iter().copied())
+            .output()
+            .expect("approve")
     }
 
     fn reconcile(&self) -> String {
@@ -1114,6 +1128,185 @@ fn declining_pre_push_hook_fails_the_train() {
     assert_eq!(q.bare_ref("refs/heads/main").unwrap(), base);
 }
 
+// ------------------------------------------- the daemon vouches for its push
+
+/// A directory with a `tool` script that prints `tool <version>`.
+fn tool_dir(q: &Q, name: &str, version: &str) -> PathBuf {
+    let dir = q.root.join(name);
+    fs::create_dir_all(&dir).expect("tool dir");
+    hook(&dir.join("tool"), &format!("echo 'tool {version}'"));
+    dir
+}
+
+fn path_with(first: &Path) -> String {
+    format!(
+        "{}:{}",
+        first.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+/// The repository's `pre-push` hook runs the real `sluice run --hook pre-push
+/// <gate>` for each gate and appends everything it prints to `log`.
+fn sluice_pre_push_hook(q: &Q, gates: &[&str], log: &Path) {
+    let bin = Sandbox::binary();
+    let body = gates.iter().fold(String::new(), |mut body, g| {
+        // Output to the log and to stderr (what the push reports on a
+        // declined hook), the exit status of `sluice` decides.
+        let _ = write!(
+            body,
+            "out=$('{}' run --hook pre-push {g} 2>&1)\nrc=$?\n\
+                 printf '%s\\n' \"$out\" >> '{}'\nprintf '%s\\n' \"$out\" >&2\n\
+                 [ \"$rc\" -eq 0 ] || exit 1\n",
+            bin.display(),
+            log.display()
+        );
+        body
+    });
+    q.repo_hook("pre-push", &body);
+}
+
+/// Issue 4: the hook of the train's push derives another key (`key_inputs`
+/// see the approver's `PATH`, `CI` is set) and would miss the cache and run
+/// the whole suite again inside `push_timeout`. The daemon answers from the
+/// train instead: the gate runs once, the push lands.
+#[test]
+fn the_pre_push_hook_of_the_trains_push_is_answered_from_the_train() {
+    let q = Q::new(&format!(
+        "{GATE}key_inputs = [\"tool --version\"]\n[queue]\npush_timeout = \"60s\"\n"
+    ));
+    let daemon_tool = tool_dir(&q, "bin-daemon", "1.0");
+    let approver_tool = tool_dir(&q, "bin-approver", "2.0");
+    // The daemon (autostarted by the first CLI call) sees tool 1.0.
+    let out =
+        q.sb.sluice_in(&q.sb.repo)
+            .env("PATH", path_with(&daemon_tool))
+            .args(["queue", "status", "--json"])
+            .output()
+            .expect("sluice");
+    assert!(out.status.success(), "{}", show(&out));
+    let hook_log = q.root.join("hook.log");
+    sluice_pre_push_hook(&q, &["test"], &hook_log);
+
+    let (wa, _a) = q.worktree("feat/a", &[("n.txt", "n\n")]);
+    let ja = q.enqueue(&wa, &[]);
+    let t = q.wait_ready("ready", |_| true);
+    assert_eq!(q.sb.runs(), 1, "the train ran the gate once");
+
+    // The approver's PATH puts another `tool` first and sets CI.
+    let out = q.approve_with(&t, &[("PATH", &path_with(&approver_tool)), ("CI", "1")]);
+    evidence("vouch approve", &show(&out));
+    assert!(out.status.success(), "{}", show(&out));
+    let st = q.status();
+    assert!(job_is(&st, &ja, "landed"), "{st:#}");
+    let s = train(&st, train_id(&t))["merge_sha"].as_str().unwrap();
+    assert_eq!(q.bare_ref("refs/heads/main").unwrap(), s);
+    assert_eq!(q.sb.runs(), 1, "the hook did not run the gate again");
+    let printed = fs::read_to_string(&hook_log).expect("the hook ran");
+    evidence("vouch hook output", &printed);
+    assert!(printed.contains("PASS (cached"), "{printed}");
+    assert!(printed.contains("verified by merge train"), "{printed}");
+    assert!(
+        q.daemon_log().contains("push hook vouched: train="),
+        "{}",
+        q.daemon_log()
+    );
+}
+
+/// A gate the hook script runs but the train did not verify fails the push at
+/// once as `pre_push_hook`, with the daemon's message, instead of running the
+/// gate until `push_timeout`. (A member that tags a new gate `pre-push` in
+/// `.sluice.toml` is caught earlier, when the train is built:
+/// `hook_gate_unverified`. What is left for the push is a hook script that
+/// calls a gate its configuration does not tag `pre-push`.)
+#[test]
+fn a_hook_gate_the_train_did_not_verify_fails_the_push_at_once() {
+    let base = format!(
+        "{GATE}[gates.extra]\ncmd = \"echo extra >> \\\"$SLUICE_TEST_COUNTER\\\"\"\n\
+         hooks = [\"pre-commit\"]\n[queue]\npush_timeout = \"60s\"\n"
+    );
+    let q = Q::new(&base);
+    let hook_log = q.root.join("hook.log");
+    sluice_pre_push_hook(&q, &["extra"], &hook_log);
+    let base_sha = q.bare_ref("refs/heads/main").unwrap();
+    let (wa, _a) = q.worktree("feat/a", &[("n.txt", "n\n")]);
+    let ja = q.enqueue(&wa, &[]);
+    let t = q.wait_ready("ready", |_| true);
+    assert_eq!(q.sb.runs(), 1, "the train ran its pre-push gate only");
+
+    let started = Instant::now();
+    let out = q.approve(&t);
+    let took = started.elapsed();
+    evidence("unverified approve", &show(&out));
+    assert_eq!(out.status.code(), Some(1), "{}", show(&out));
+    assert!(
+        took < Duration::from_secs(30),
+        "took {took:?}, not a timeout"
+    );
+    let st = q.status();
+    let j = job(&st, &ja);
+    assert_eq!(j["state"], "failed", "{st:#}");
+    assert_eq!(j["reason"], "pre_push_hook", "{j:#}");
+    let output = j["detail"]["output"].as_str().unwrap_or_default();
+    assert!(
+        output.contains("gate 'extra' runs in the pre-push hook but merge train"),
+        "{j:#}"
+    );
+    assert!(output.contains("[queue] gates"), "{j:#}");
+    assert_eq!(q.sb.runs(), 1, "the unverified gate never ran");
+    assert_eq!(q.bare_ref("refs/heads/main").unwrap(), base_sha);
+}
+
+/// A `sluice run --hook pre-push` started in the merge worktree by a process
+/// that is not a descendant of the push gets no vouch: it goes the normal way
+/// (here the cache is off, so the gate really runs).
+#[test]
+fn a_run_in_the_merge_worktree_outside_the_push_is_not_vouched() {
+    let q = Q::new(GATE);
+    let started = q.root.join("hook.started");
+    let release = q.root.join("hook.release");
+    q.repo_hook(
+        "pre-push",
+        &format!(
+            "touch '{}'\ni=0\nwhile [ ! -e '{}' ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done",
+            started.display(),
+            release.display()
+        ),
+    );
+    let (wa, _a) = q.worktree("feat/a", &[("n.txt", "n\n")]);
+    let ja = q.enqueue(&wa, &[]);
+    let t = q.wait_ready("ready", |_| true);
+    let id = train_id(&t).to_owned();
+    assert_eq!(q.sb.runs(), 1);
+
+    let mut approver = q.spawn_approve(&t);
+    wait_for("the push to reach its hook", || started.exists());
+    assert_eq!(train(&q.status(), &id)["state"], "pushing");
+
+    let merge_wt = q.sb.home.join("state/sluice/merge").join(&id);
+    let out =
+        q.sb.sluice_in(&merge_wt)
+            .env("SLUICE_CACHE", "0")
+            .args(["run", "--hook", "pre-push", "test"])
+            .output()
+            .expect("sluice run");
+    evidence("foreign run", &show(&out));
+    assert!(out.status.success(), "{}", show(&out));
+    let text = show(&out);
+    assert!(!text.contains("verified by merge train"), "{text}");
+    assert_eq!(q.sb.runs(), 2, "the gate ran: no vouch");
+    assert!(
+        !q.daemon_log().contains("push hook vouched"),
+        "{}",
+        q.daemon_log()
+    );
+
+    fs::write(&release, "").expect("release the hook");
+    let status = approver.wait().expect("approver");
+    assert!(status.success());
+    assert!(job_is(&q.status(), &ja, "landed"));
+}
+
 // ----------------------------------------------- base failures (section 7)
 
 /// A remote URL that does not exist: the job stays `queued` with reason
@@ -1190,4 +1383,62 @@ fn invalid_base_config_is_reported_then_fails_after_three_attempts() {
         show(&out)
     );
     assert_ne!(job(&q.status(), &ja)["state"], "failed");
+}
+
+/// The dead end of a target whose own configuration is broken: the branch
+/// that fixes it can land only through a human's `--trust-member-config`,
+/// which agents (even with `allow_agent_approval`) cannot use or approve.
+#[test]
+fn trusting_the_members_config_gets_past_a_broken_target_config() {
+    // The body after `version = 1` (what `write_config` and `Q::new` take).
+    const GOOD: &str = "[gates.test]\ncmd = \"true\"\nhooks = [\"pre-push\"]\n\n# a\n# b\n# end\n";
+    let q = Q::with_user(GOOD, "allow_agent_approval = true\n");
+    // The target's file breaks; the branch, forked from the broken target,
+    // repairs it (and changes the gate's command). The merged tree must hold a
+    // valid file: the train checks it, and a Sluice pre-push hook reads it.
+    q.sb.write_config(&format!("{GOOD}bogus_key = 1\n"));
+    q.sb.git(&["commit", "-q", "-am", "broken config"]);
+    q.sb.git(&["push", "-q", "origin", "main"]);
+    let fixed = format!(
+        "version = 1\n{}",
+        GOOD.replace("cmd = \"true\"", "cmd = \"echo ok\"")
+    );
+    let (wa, _a) = q.worktree("feat/a", &[("n.txt", "n\n"), (".sluice.toml", &fixed)]);
+    let ja = q.enqueue(&wa, &[]);
+    q.wait("failed on the broken base", |v| job_is(v, &ja, "failed"));
+
+    // An agent's terminal cannot use the flag.
+    let agent = StdCommand::new(Sandbox::binary())
+        .args(["queue", "retry", &ja, "--trust-member-config"])
+        .current_dir(&wa)
+        .env_clear()
+        .envs(q.sb.env())
+        .env("CLAUDECODE", "1")
+        .output()
+        .expect("retry");
+    assert_eq!(agent.status.code(), Some(4), "{}", show(&agent));
+    assert!(
+        String::from_utf8_lossy(&agent.stderr).contains("reserved to a human"),
+        "{}",
+        show(&agent)
+    );
+    assert!(job_is(&q.status(), &ja, "failed"));
+
+    // A human can.
+    let out = q.run_in(&wa, &["queue", "retry", &ja, "--trust-member-config"]);
+    assert!(out.status.success(), "{}", show(&out));
+    let t = q.wait_ready("the trusted train", |t| t["config_source"] == "member");
+    let text = q.status_text();
+    evidence("trusted train", &text);
+    assert!(text.contains("CONFIG FROM BRANCH feat/a"), "{text}");
+    assert!(text.contains("+cmd = \"echo ok\""), "{text}");
+    assert_eq!(members(&t), vec![ja.clone()]);
+
+    // Its approval is a human's too.
+    let refused = q.approve_with(&t, &[("CLAUDECODE", "1")]);
+    assert_eq!(refused.status.code(), Some(4), "{}", show(&refused));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("own .sluice.toml"));
+    let out = q.approve(&t);
+    assert!(out.status.success(), "{}", show(&out));
+    q.wait("landed", |v| job_is(v, &ja, "landed"));
 }

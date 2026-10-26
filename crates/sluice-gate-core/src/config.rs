@@ -109,8 +109,9 @@ pub struct QueueConfig {
     pub remote: String,
     /// Default target branch; `None` = the remote's HEAD branch.
     pub target: Option<String>,
-    /// Gates a train must pass; `None` = gates with a `pre-push` hook, else
-    /// every gate.
+    /// Gates a train must pass, plus every gate with a `pre-push` hook (the
+    /// push runs them); `None` = the gates with a `pre-push` hook, else every
+    /// gate.
     pub gates: Option<Vec<String>>,
     /// Maximum jobs combined into one train (1 disables batching).
     pub max_train: u32,
@@ -124,6 +125,16 @@ pub struct QueueConfig {
     /// group is killed and the call counts as failed.
     #[serde(with = "humantime_serde")]
     pub network_timeout: Duration,
+    /// Command run once per train, in the merge worktree, before the gates
+    /// (install dependencies a fresh worktree lacks). `None` = no preparation.
+    /// Needs sluice >= 0.6.0.
+    pub prepare: Option<String>,
+    /// Time limit of `prepare` (and of the probe that attributes its failure).
+    #[serde(with = "humantime_serde")]
+    pub prepare_timeout: Duration,
+    /// Budget units `prepare` consumes: an integer ceiling (at least 1) or
+    /// `"auto"`, like a gate's `weight`.
+    pub prepare_weight: Weight,
 }
 
 impl Default for QueueConfig {
@@ -136,12 +147,18 @@ impl Default for QueueConfig {
             audit_ref: true,
             push_timeout: Duration::from_secs(600),
             network_timeout: DEFAULT_NETWORK_TIMEOUT,
+            prepare: None,
+            prepare_timeout: DEFAULT_PREPARE_TIMEOUT,
+            prepare_weight: Weight::Auto,
         }
     }
 }
 
 /// Default `[queue] network_timeout`.
 pub const DEFAULT_NETWORK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Default `[queue] prepare_timeout`.
+pub const DEFAULT_PREPARE_TIMEOUT: Duration = Duration::from_mins(10);
 
 /// Why `remote` cannot be a `[queue] remote`: empty, starting with `-` (git
 /// would read it as an option) or containing whitespace or control
@@ -496,14 +513,8 @@ impl RepoConfig {
             .collect()
     }
 
-    fn validate(&self, path: &Path) -> Result<()> {
-        check_version(self.version, path)?;
-        if self.defaults.human_hook_policy == HookPolicy::FailFast {
-            return Err(config_err(
-                path,
-                "defaults.human_hook_policy cannot be \"fail-fast\" (use \"wait\" or \"run-unqueued\")",
-            ));
-        }
+    /// The `[queue]` checks of [`RepoConfig::validate`].
+    fn validate_queue(&self, path: &Path) -> Result<()> {
         if self.queue.max_train < 1 {
             return Err(config_err(path, "queue.max_train must be >= 1"));
         }
@@ -512,6 +523,20 @@ impl RepoConfig {
         }
         if self.queue.network_timeout.is_zero() {
             return Err(config_err(path, "queue.network_timeout must be > 0"));
+        }
+        if self
+            .queue
+            .prepare
+            .as_deref()
+            .is_some_and(|p| p.trim().is_empty())
+        {
+            return Err(config_err(path, "queue.prepare must not be empty"));
+        }
+        if self.queue.prepare_timeout.is_zero() {
+            return Err(config_err(path, "queue.prepare_timeout must be > 0"));
+        }
+        if self.queue.prepare_weight == Weight::Fixed(0) {
+            return Err(config_err(path, "queue.prepare_weight must be >= 1"));
         }
         if let Some(gates) = &self.queue.gates {
             for gate in gates {
@@ -523,6 +548,18 @@ impl RepoConfig {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn validate(&self, path: &Path) -> Result<()> {
+        check_version(self.version, path)?;
+        if self.defaults.human_hook_policy == HookPolicy::FailFast {
+            return Err(config_err(
+                path,
+                "defaults.human_hook_policy cannot be \"fail-fast\" (use \"wait\" or \"run-unqueued\")",
+            ));
+        }
+        self.validate_queue(path)?;
         for (name, gate) in &self.gates {
             if !valid_gate_name(name) {
                 return Err(config_err(
@@ -689,7 +726,8 @@ pub struct UserConfig {
 
 mod containment;
 pub use containment::{
-    AUTO, ContainmentConfig, MAX_CPU_WEIGHT, MemoryPolicy, parse_percent, parse_size_bytes,
+    AUTO, AUTO_GATES_OOM_SCORE_ADJ, ContainmentConfig, GatesOomScoreAdj, MAX_CPU_WEIGHT,
+    MAX_OOM_SCORE_ADJ, MemoryPolicy, parse_percent, parse_size_bytes,
 };
 
 /// Most entries `[agent] heavy_commands` plus `heavy_commands_extra` may hold.
@@ -817,7 +855,37 @@ pub struct AdmissionConfig {
     /// after PSI admission resumed.
     #[serde(with = "humantime_serde")]
     pub overcommit_interval: Duration,
+    /// Memory-aware admission (ADR-0019): a job starts only when the memory
+    /// it is expected to use fits what is available, unless nothing else
+    /// runs. `false` restores CPU-only admission.
+    pub memory_aware: bool,
+    /// Memory left for the desktop, the agents and the page cache by
+    /// memory-aware admission: `"auto"` (10 % of the machine's memory) or a
+    /// size such as `"3G"`.
+    pub memory_reserve: String,
+    /// The Sluice-side memory guard (ADR-0019 piece 7), off by default: under
+    /// real memory exhaustion (`MemAvailable` below the reserve for a few
+    /// seconds, with memory stalls) the daemon cancels its own running job
+    /// with the largest working set, reported as `killed_by = "memory"`. For
+    /// machines where `systemd-oomd` is absent or older than systemd 257.
+    pub memory_guard: bool,
 }
+
+impl AdmissionConfig {
+    /// `memory_reserve` in bytes on a machine with `total` bytes of memory
+    /// (`"auto"` is a tenth of it).
+    #[must_use]
+    pub fn memory_reserve_bytes(&self, total: u64) -> u64 {
+        if self.memory_reserve.trim() == AUTO_RESERVE {
+            total / 10
+        } else {
+            parse_size_bytes(&self.memory_reserve).unwrap_or(total / 10)
+        }
+    }
+}
+
+/// `[admission] memory_reserve = "auto"`.
+const AUTO_RESERVE: &str = "auto";
 
 /// The `[cache]` table.
 #[derive(Debug, Clone, Deserialize)]
@@ -1004,6 +1072,9 @@ impl Default for AdmissionConfig {
             cpu_some_avg10_low: 25.0,
             memory_some_avg10_low: 5.0,
             overcommit_interval: Duration::from_secs(5),
+            memory_aware: true,
+            memory_reserve: AUTO_RESERVE.to_owned(),
+            memory_guard: false,
         }
     }
 }
@@ -1024,6 +1095,58 @@ impl Default for AgentDetectionConfig {
             env_any_equals: BTreeMap::new(),
         }
     }
+}
+
+/// The `[admission]` checks of [`UserConfig::parse`].
+fn validate_admission(a: &AdmissionConfig, path: &Path) -> Result<()> {
+    if a.psi_poll_interval.is_zero() {
+        return Err(config_err(
+            path,
+            "admission.psi_poll_interval must be greater than zero",
+        ));
+    }
+    if a.psi_max_wait.is_zero() {
+        return Err(config_err(
+            path,
+            "admission.psi_max_wait must be greater than zero",
+        ));
+    }
+    let overcommit = a.overcommit;
+    if !overcommit.is_finite() || !(1.0..=4.0).contains(&overcommit) {
+        return Err(config_err(
+            path,
+            format!("admission.overcommit must be between 1.0 (off) and 4.0, got {overcommit}"),
+        ));
+    }
+    if a.overcommit_interval.is_zero() {
+        return Err(config_err(
+            path,
+            "admission.overcommit_interval must be greater than zero",
+        ));
+    }
+    let reserve = a.memory_reserve.trim();
+    if reserve != AUTO_RESERVE && parse_size_bytes(reserve).is_none() {
+        return Err(config_err(
+            path,
+            format!(
+                "admission.memory_reserve {reserve:?} must be \"auto\" or a size such as \"3G\""
+            ),
+        ));
+    }
+    for (name, value) in [
+        ("admission.cpu_some_avg10_max", a.cpu_some_avg10_max),
+        ("admission.memory_some_avg10_max", a.memory_some_avg10_max),
+        ("admission.cpu_some_avg10_low", a.cpu_some_avg10_low),
+        ("admission.memory_some_avg10_low", a.memory_some_avg10_low),
+    ] {
+        if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+            return Err(config_err(
+                path,
+                format!("{name} must be a percentage between 0 and 100, got {value}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl UserConfig {
@@ -1073,56 +1196,7 @@ impl UserConfig {
         if cfg.daemon.ionice_level > 7 {
             return Err(config_err(path, "daemon.ionice_level must be in 0..=7"));
         }
-        if cfg.admission.psi_poll_interval.is_zero() {
-            return Err(config_err(
-                path,
-                "admission.psi_poll_interval must be greater than zero",
-            ));
-        }
-        if cfg.admission.psi_max_wait.is_zero() {
-            return Err(config_err(
-                path,
-                "admission.psi_max_wait must be greater than zero",
-            ));
-        }
-        let overcommit = cfg.admission.overcommit;
-        if !overcommit.is_finite() || !(1.0..=4.0).contains(&overcommit) {
-            return Err(config_err(
-                path,
-                format!("admission.overcommit must be between 1.0 (off) and 4.0, got {overcommit}"),
-            ));
-        }
-        if cfg.admission.overcommit_interval.is_zero() {
-            return Err(config_err(
-                path,
-                "admission.overcommit_interval must be greater than zero",
-            ));
-        }
-        for (name, value) in [
-            (
-                "admission.cpu_some_avg10_max",
-                cfg.admission.cpu_some_avg10_max,
-            ),
-            (
-                "admission.memory_some_avg10_max",
-                cfg.admission.memory_some_avg10_max,
-            ),
-            (
-                "admission.cpu_some_avg10_low",
-                cfg.admission.cpu_some_avg10_low,
-            ),
-            (
-                "admission.memory_some_avg10_low",
-                cfg.admission.memory_some_avg10_low,
-            ),
-        ] {
-            if !value.is_finite() || !(0.0..=100.0).contains(&value) {
-                return Err(config_err(
-                    path,
-                    format!("{name} must be a percentage between 0 and 100, got {value}"),
-                ));
-            }
-        }
+        validate_admission(&cfg.admission, path)?;
         if let Err(e) = tracing_subscriber::EnvFilter::try_new(&cfg.debug.level) {
             return Err(config_err(
                 path,
@@ -1511,6 +1585,43 @@ depends_on = ["lint"]
     }
 
     #[test]
+    fn queue_prepare_defaults_and_validation() {
+        let c = parse("version = 1").unwrap();
+        assert!(c.queue.prepare.is_none());
+        assert_eq!(c.queue.prepare_timeout, Duration::from_mins(10));
+        assert_eq!(c.queue.prepare_weight, Weight::Auto);
+        let c = parse(
+            "version = 1\n[queue]\nprepare = \"pnpm install --frozen-lockfile\"\n\
+             prepare_timeout = \"3m\"\nprepare_weight = 2",
+        )
+        .unwrap();
+        assert_eq!(
+            c.queue.prepare.as_deref(),
+            Some("pnpm install --frozen-lockfile")
+        );
+        assert_eq!(c.queue.prepare_timeout, Duration::from_mins(3));
+        assert_eq!(c.queue.prepare_weight, Weight::Fixed(2));
+        let c = parse("version = 1\n[queue]\nprepare = \"x\"\nprepare_weight = \"auto\"").unwrap();
+        assert!(c.queue.prepare_weight.is_auto());
+        assert!(msg("version = 1\n[queue]\nprepare = \"  \"").contains("queue.prepare"));
+        assert!(
+            msg("version = 1\n[queue]\nprepare = \"x\"\nprepare_timeout = \"0s\"")
+                .contains("prepare_timeout")
+        );
+        assert!(
+            msg("version = 1\n[queue]\nprepare = \"x\"\nprepare_weight = 0")
+                .contains("prepare_weight")
+        );
+        assert!(
+            msg("version = 1\n[queue]\nprepare = \"x\"\nprepare_weight = \"heavy\"")
+                .contains("weight")
+        );
+        assert!(
+            msg("version = 1\n[queue]\nprepare_timeout = \"soon\"").contains("prepare_timeout")
+        );
+    }
+
+    #[test]
     fn user_queue_section() {
         let c = UserConfig::parse("version = 1", Path::new("u.toml")).unwrap();
         assert!(c.queue.enabled && !c.queue.allow_agent_approval);
@@ -1760,6 +1871,46 @@ budget_share_max = 4
                 .contains("cpu_some_avg10_low")
         );
         assert!(user_err("version = 1\n[scheduler]\norder = \"lifo\"").contains("order"));
+    }
+
+    #[test]
+    fn memory_admission_keys_default_on_and_validate() {
+        let c = UserConfig::default();
+        assert!(c.admission.memory_aware);
+        assert_eq!(c.admission.memory_reserve, "auto");
+        let total = 30 << 30;
+        assert_eq!(c.admission.memory_reserve_bytes(total), 3 << 30);
+        let c = UserConfig::parse(
+            "version = 1\n[admission]\nmemory_aware = false\nmemory_reserve = \"2G\"\n",
+            Path::new("/u.toml"),
+        )
+        .unwrap();
+        assert!(!c.admission.memory_aware);
+        assert_eq!(c.admission.memory_reserve_bytes(total), 2 << 30);
+        assert!(
+            user_err("version = 1\n[admission]\nmemory_reserve = \"lots\"")
+                .contains("memory_reserve")
+        );
+        assert!(
+            user_err("version = 1\n[admission]\nmemory_reserve = \"0\"").contains("memory_reserve")
+        );
+    }
+
+    #[test]
+    fn the_memory_guard_is_off_unless_asked_for() {
+        assert!(!UserConfig::default().admission.memory_guard);
+        let plain = UserConfig::parse("version = 1\n", Path::new("/u.toml")).unwrap();
+        assert!(!plain.admission.memory_guard);
+        let on = UserConfig::parse(
+            "version = 1\n[admission]\nmemory_guard = true\nmemory_reserve = \"2G\"\n",
+            Path::new("/u.toml"),
+        )
+        .unwrap();
+        assert!(on.admission.memory_guard);
+        assert_eq!(on.admission.memory_reserve_bytes(30 << 30), 2 << 30);
+        assert!(
+            user_err("version = 1\n[admission]\nmemory_guard = \"yes\"").contains("memory_guard")
+        );
     }
 
     #[test]

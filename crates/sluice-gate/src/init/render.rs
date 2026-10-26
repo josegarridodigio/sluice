@@ -74,7 +74,12 @@ fn gate_section(gate: &GatePlan) -> String {
 }
 
 /// The `.sluice.toml` for these gates.
-pub fn config_text(gates: &[GatePlan], stacks: &[String], nested: &[String]) -> String {
+pub fn config_text(
+    gates: &[GatePlan],
+    stacks: &[String],
+    nested: &[String],
+    prepare: Option<&str>,
+) -> String {
     let mut out = String::from(
         "# Sluice repository configuration, written by `sluice init`.\n\
          # Commit it: the gates are shared by everyone who works on this repository.\n\
@@ -95,6 +100,16 @@ pub fn config_text(gates: &[GatePlan], stacks: &[String], nested: &[String]) -> 
         for project in nested {
             let _ = writeln!(out, "#   {project}");
         }
+    }
+    // Before the gates: a carried gate table would otherwise swallow these lines.
+    if let Some(cmd) = prepare {
+        out.push_str(
+            "\n# The merge queue verifies each train in a fresh worktree that has none of the\n\
+             # git-ignored dependencies; this runs once per train before the gates\n\
+             # (needs Sluice 0.6.0).\n\
+             [queue]\n",
+        );
+        let _ = writeln!(out, "prepare = {}", toml_str(cmd));
     }
     for gate in gates {
         out.push('\n');

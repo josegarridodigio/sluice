@@ -14,7 +14,7 @@ worktree. The server does not know your cwd.
 | `queue_enqueue` | Put the committed branch (`branch`, default the current one; `base`, default the configured target) in the local merge queue. Refuses a detached HEAD and tracked uncommitted changes. |
 | `queue_status` | Trains, members, conflicts with paths, trains ready for a human. |
 | `queue_approve` | Human decision. Refused with `not-allowed` unless the user enabled agent approval. |
-| `queue_retry` | Re-queue a `conflict` or `failed` job with the current head of its branch. |
+| `queue_retry` | Re-queue a `conflict` or `failed` job with the current head of its branch, always judged by the target's configuration. The CLI's `--trust-member-config` is for humans; the tool does not offer it. |
 | `queue_cancel` | Withdraw a job. |
 
 ## Reading a `verify` result
@@ -34,30 +34,77 @@ e2e   FAIL exit=1 12.3s (job 1761...) log=/home/u/.local/state/sluice/logs/1761.
   you waited for and share that result.
 - Status values: `pass`, `fail`, `timeout`, `killed`, `error`, `cancelled`.
   A failing gate is a normal result flagged as an error: read the tail.
+- `KILLED for lack of memory after 41.2s (job ...) log=...: <message>`
+  (`killed_by` is `memory` in the structured result): the kernel's OOM killer,
+  systemd-oomd or Sluice's opt-in memory guard ended the gate. The message says
+  its peak and what was available. Running it again unchanged is likely to end
+  the same way: lower the gate's footprint (fewer test workers, less
+  concurrency) or tell the human; never run the gate through the shell to get
+  around it. A plain `KILLED after ...` is a cancel or a stop, not this.
+  Through the shell (`sluice run`, `sluice exec`, a rewritten command, a git
+  hook) the same event prints `sluice: <gate> KILLED for lack of memory after
+  41.2s (job ...)` followed by the daemon's message line (exit code 143): same
+  wording, same rule.
 - By default (`fail_fast`) the call returns at the first failing gate and the
   gates still pending are cancelled (`cancelled`); fix what the tail shows,
   then call `verify` again. With `fail_fast` false every gate runs and every
   failure is reported.
 - `not_cached_reason` appears on a pass that could not be cached (for example
   `CI` is set, or the tree is unknown): that pass will run again next time.
+- A queued job in `status` has `reason: "budget"` and, when it fits the CPU
+  budget but not the free memory, `wait_detail: "memory"` with the memory it is
+  expected to use (the text of `status`, like `sluice status`, prints
+  `(budget: memory)`, and the structured result has `wait_detail: "memory"`). It starts when a running gate ends: normal, wait for it
+  and do not run it outside Sluice.
 - Use `logs` with the job id for the full log, not another run.
 
 ## Merge queue states
 
-- `queued`: waiting for a train. `queue_status` shows the position.
+- `queued`: waiting for a train. `queue_status` shows the position, and
+  `waiting: <reason>` when the train cannot be built yet (see below).
 - `conflict`: your branch does not merge with the others on the target. The
   entry lists the conflicting paths. Rebase on the target, commit, `verify`,
   then `queue_retry` with the job id.
-- `failed`: a gate failed on the combined tree, or the target could not be
-  fetched (`base_unavailable`) after several tries. Fix the cause, commit,
+- `failed`: a gate failed on the combined tree, the prepare failed, or the
+  target could not be fetched after several tries. Fix the cause, commit,
   `verify`, `queue_retry`.
 - Train `ready`: everything passed; waiting for a human to run
   `sluice queue approve <train id>`. Tell the human and stop.
 - Train `needs_reconcile`: a push was interrupted; a human runs
   `sluice queue reconcile`. Do nothing.
 
+Reasons, with what you do:
+
+| Reason | Meaning | You |
+|---|---|---|
+| `base_unavailable`, `base_config_invalid` | the target cannot be fetched, or its `.sluice.toml` does not parse; the job waits and fails after 3 tries | tell the human; `queue_retry` once fixed |
+| `prepare_failed`, detail `base: true` | the target's `[queue] prepare` fails too (registry down, missing tool): the environment's or the target's problem; the job waits as `queued` | wait, or tell the human |
+| `prepare_failed`, detail `base: false` | your branch broke the prepare, usually a lockfile out of sync | fix, commit, `verify`, `queue_retry` |
+| `prepare_dirty` | the prepare leaves files the tree does not have (not in the commit, not git-ignored) | fix `.gitignore` or the prepare |
+| `gate_failed` | a gate failed, timed out, was killed or errored (a memory kill says so and has `killed_by: "memory"` in the detail) | read the log, fix, `queue_retry`; never retry a memory kill unchanged |
+| `gate_modified_tree` | the gates passed but edited tracked files (a formatter, for example) | commit the result or fix the gate |
+| `key_input_failed` | a gate's `key_inputs` command failed in the train's worktree; the job waits and fails after 3 tries | tell the human |
+| `member_config_invalid` | the `.sluice.toml` your branch changes does not parse once merged | fix the file, `queue_retry` |
+| `hook_gate_unverified`, `config_changed` | the branch changes `.sluice.toml`; the target's configuration judges the train, so a gate the `pre-push` hook asks for may not be verified. `config_changed` is the warning shown on the member | tell the human: land the configuration change first, or the human runs `sluice queue retry <job> --trust-member-config` |
+| `pre_push_hook` | the repository's `pre-push` hook declined during the push | read its output in the detail |
+| `push_rejected`, `target_checked_out`, `tree_mismatch`, `internal` | the remote refused the push, the target is checked out locally, the merged tree differs from what git snapshots, an unexpected error | tell the human |
+
+`--trust-member-config` (on `sluice queue enqueue` and `sluice queue retry`)
+builds the train from the branch's own `.sluice.toml`. It is a human decision:
+a person reads the diff of the file in the approval plan. Never use it, never
+suggest running it for you, and never ask to approve such a train (the daemon
+refuses both for agents, over MCP and from an agent's shell); explain it to
+the human instead.
+
+During the daemon's own push of an approved train, a Sluice `pre-push` hook
+(`sluice run --hook pre-push <gate>`) is answered from the train's record
+(`PASS (cached)`, `verified by merge train <id>`). There is nothing for you to
+do; a `sluice run` anywhere else is never answered this way.
+
 Error codes: `conflict-state`, `stale-plan`, `duplicate-branch`, `not-allowed`,
-`not-supported`. Report them to the human.
+`not-supported`. Report them to the human. `queue_enqueue` can also answer
+`bad-request` with `invalid_config: ...` when your branch's `.sluice.toml`
+does not parse: fix the file.
 
 ## Session start and shims
 
@@ -78,6 +125,10 @@ command in a `tools` leaf with less CPU weight (a guarded, silent line in the
 env file; read-only cgroupfs, as in the Bash sandbox, means `nice` 19 instead).
 Nothing is killed and nothing changes for you; `contained=` in the client log
 says what happened.
+
+The rules it gives you include the memory one: a gate `KILLED for lack of
+memory` is not retried unchanged. Heavy commands include `cargo check` and
+`cargo doc`, which go through the queue like `cargo build`.
 
 Context variants: repository with `.sluice.toml` (rules and gate names); git
 repository without it (propose Sluice once: `sluice init --dry-run`, show

@@ -89,6 +89,19 @@ memory_some_avg10_low = 5.0
 overcommit_interval = "5s"
 ```
 
+## Relation to memory-aware admission (ADR-0019)
+
+PSI measures stalls that already happen; it is about 0 while a job is still
+ramping up, which is when the next job is admitted. Memory-aware admission
+([[sluice/design/scheduler.md]], "Memory-aware admission") looks forward
+instead: it compares what each job is expected to use (learned working set)
+with `MemAvailable` minus a reserve and minus what running jobs are still
+expected to grow by. The two compose and neither replaces the other: PSI
+blocking still comes first (a blocked pass reports `psi`, and the starvation
+guard also needs the head to fit memory), `memory_some_avg10_low` still gates
+over-admission, and a job waiting for memory reports `budget` with
+`wait_detail = memory`, so the four wire reasons do not change.
+
 ## Observability
 
 `sluice status --json` → `budget.psi = { enabled, cpu_some_avg10,

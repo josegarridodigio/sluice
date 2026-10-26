@@ -391,6 +391,14 @@ fn node_pnpm_without_hooks_gets_githooks_and_a_local_hooks_path() {
             .iter()
             .any(|k| k == "pnpm --version")
     );
+    // The merge queue's fresh worktree has no node_modules: prepare installs them.
+    assert_eq!(
+        config.queue.prepare.as_deref(),
+        Some("pnpm install --frozen-lockfile --prefer-offline")
+    );
+    let text = repo.read(".sluice.toml");
+    assert!(text.contains("# The merge queue verifies each train in a fresh worktree"));
+    assert!(text.find("[queue]").unwrap() < text.find("[gates.").unwrap());
     assert_eq!(
         repo.read(".githooks/pre-commit"),
         "#!/bin/sh\nset -e\ncommand -v sluice >/dev/null 2>&1 || exit 0\n\
@@ -443,6 +451,11 @@ fn node_yarn_lefthook_is_edited_textually() {
     let config = repo.config();
     assert_eq!(config.gates["tsc"].cmd, "npx tsc --noEmit");
     assert_eq!(config.gates["test"].cmd, "yarn test");
+    // No `.yarnrc.yml`: classic yarn.
+    assert_eq!(
+        config.queue.prepare.as_deref(),
+        Some("yarn install --frozen-lockfile")
+    );
     // `lint` is detected but no hook runs it.
     assert_eq!(config.gates["lint"].hooks.len(), 0);
     assert!(!repo.dir.join(".githooks").exists());
@@ -458,6 +471,9 @@ fn rust_plain_gets_the_cookbook_gates() {
         ["clippy", "fmt", "test"]
     );
     assert_eq!(config.gates["fmt"].cmd, "cargo fmt --check");
+    // Cargo fetches into a shared cache: nothing to prepare.
+    assert!(config.queue.prepare.is_none());
+    assert!(!repo.read(".sluice.toml").contains("[queue]"));
     assert_eq!(config.gates["fmt"].weight, Weight::Fixed(1));
     assert_eq!(config.gates["clippy"].weight, Weight::Auto);
     assert_eq!(config.gates["test"].weight, Weight::Auto);
@@ -523,6 +539,7 @@ fn go_gets_vet_and_test() {
     let repo = Repo::new("go");
     check_init(&repo, true);
     let config = repo.config();
+    assert!(config.queue.prepare.is_none());
     assert_eq!(config.gates["vet"].cmd, "go vet ./...");
     assert_eq!(config.gates["vet"].weight, Weight::Fixed(2));
     assert_eq!(config.gates["test"].cmd, "go test -p 4 ./...");

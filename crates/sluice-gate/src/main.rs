@@ -177,12 +177,17 @@ enum Command {
     /// tools `queue_enqueue`, `queue_status`, `queue_approve`, `queue_retry`,
     /// `queue_cancel`. Logs go to stderr only. Register `sluice mcp` as a stdio MCP server in the agent's config.
     Mcp,
-    /// Internal: write this process's pid to `<LEAF>/cgroup.procs`, then exec the
-    /// command (containment placement helper; runs the command even when the move fails).
+    /// Internal: write this process's pid to `<LEAF>/cgroup.procs`, raise its
+    /// `oom_score_adj`, then exec the command (containment placement helper;
+    /// runs the command even when the move or the adj fails).
     #[command(hide = true)]
     CgExec {
-        /// Cgroup directory to move into.
+        /// Cgroup directory to move into (`-`: no move, only the adj).
         leaf: std::path::PathBuf,
+        /// Raise this process's `oom_score_adj` to at least this value
+        /// (never lowers it).
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u16).range(0..=1000))]
+        oom_score_adj: Option<u16>,
         /// The command and its arguments (after `--`).
         #[arg(last = true, required = true)]
         argv: Vec<std::ffi::OsString>,
@@ -375,6 +380,12 @@ enum QueueCommand {
         /// and `target`. Tags, raw SHAs, HEAD and checked-out local branches are refused.
         #[arg(long)]
         base: Option<String>,
+        /// Human only. Build this job's train from the branch's own `.sluice.toml`
+        /// (gates and `[queue]`) instead of the target's, to fix a configuration
+        /// that makes every train fail. The train is alone, shows the file's diff and
+        /// can only be approved by a human at the CLI. Agents are refused.
+        #[arg(long)]
+        trust_member_config: bool,
     },
     /// Show trains, their members, gates, conflicts and queued jobs.
     ///
@@ -404,6 +415,11 @@ enum QueueCommand {
     Retry {
         /// Job id, as shown by `sluice queue status`.
         job_id: String,
+        /// Human only. Build the job's train from the branch's own `.sluice.toml`
+        /// (see `enqueue --trust-member-config`). A plain retry goes back to the
+        /// target's configuration.
+        #[arg(long)]
+        trust_member_config: bool,
     },
     /// Cancel a job that has not been pushed.
     ///
@@ -552,7 +568,11 @@ fn main() -> ExitCode {
             ShimCommand::Exec { name, args } => shim::exec(&name, &args),
         },
         Command::Mcp => mcp(),
-        Command::CgExec { leaf, argv } => cg_exec::run(&leaf, &argv),
+        Command::CgExec {
+            leaf,
+            oom_score_adj,
+            argv,
+        } => cg_exec::run(&leaf, oom_score_adj, &argv),
         Command::Daemon {
             command: Some(DaemonCommand::Stop { force }),
             ..
@@ -587,12 +607,17 @@ fn main() -> ExitCode {
             no_restart,
         }),
         Command::Queue { command } => match command {
-            QueueCommand::Enqueue { branch, base } => {
-                queue::enqueue(branch.as_deref(), base.as_deref())
-            }
+            QueueCommand::Enqueue {
+                branch,
+                base,
+                trust_member_config,
+            } => queue::enqueue(branch.as_deref(), base.as_deref(), trust_member_config),
             QueueCommand::Status { json } => queue::status(json),
             QueueCommand::Approve { train_id, yes } => queue::approve(&train_id, yes),
-            QueueCommand::Retry { job_id } => queue::retry(&job_id),
+            QueueCommand::Retry {
+                job_id,
+                trust_member_config,
+            } => queue::retry(&job_id, trust_member_config),
             QueueCommand::Cancel { job_id } => queue::cancel(&job_id),
             QueueCommand::Reconcile => queue::reconcile(),
         },

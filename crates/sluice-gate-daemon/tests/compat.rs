@@ -633,3 +633,153 @@ fn a_refused_newer_database_names_the_release_that_wrote_it() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// ADR-0019: `gate_memory` rides the containment schema group (version 2)
+// ---------------------------------------------------------------------------
+
+fn table_exists(conn: &rusqlite::Connection, name: &str) -> bool {
+    raw_count(
+        conn,
+        &format!("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = '{name}'"),
+    ) == 1
+}
+
+fn column_names(conn: &rusqlite::Connection, table: &str) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+        .unwrap();
+    stmt.query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn backups(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".bak-"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// A database of every release opens, gets `gate_memory` through
+/// `containment_schema` 2, and `sched_schema` and `gate_stats` stay as they
+/// were (adding columns there would make released binaries refuse the file).
+#[test]
+fn every_old_database_gets_gate_memory_without_touching_the_scheduler_schema() {
+    use sluice_gate_daemon::migrate::{self, CONTAINMENT_TABLE, SCHED_SCHEMA_VERSION, SCHED_TABLE};
+    for release in RELEASES {
+        let (_dir, db) = copy_db(release);
+        drop(Store::open(&db).unwrap_or_else(|e| panic!("{release}: open: {e}")));
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        assert_eq!(
+            migrate::version(&conn, CONTAINMENT_TABLE).unwrap(),
+            2,
+            "{release}"
+        );
+        assert!(table_exists(&conn, "gate_memory"), "{release}");
+        assert_eq!(
+            migrate::version(&conn, SCHED_TABLE).unwrap(),
+            SCHED_SCHEMA_VERSION,
+            "{release}: sched_schema did not move"
+        );
+        assert_eq!(SCHED_SCHEMA_VERSION, 1);
+        assert_eq!(
+            column_names(&conn, "gate_stats"),
+            [
+                "repo",
+                "gate",
+                "cmd_hash",
+                "job_id",
+                "finished_at",
+                "outcome",
+                "wall_ms",
+                "cpu_ms",
+                "run_delay_ms",
+                "demand_milli"
+            ],
+            "{release}: gate_stats keeps its columns"
+        );
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 1, "{release}: schema.version stays 1");
+    }
+}
+
+/// A database at containment version 1 (written by 0.5.0) migrates in place
+/// and keeps what it had, with no backup copy: the migration is one new table.
+#[test]
+fn a_database_at_containment_v1_gains_gate_memory_in_place() {
+    use sluice_gate_daemon::migrate::{self, CONTAINMENT_TABLE};
+    let (dir, db) = copy_db("v0.5.0");
+    drop(Store::open(&db).unwrap());
+    // Put the file back where 0.5.0 left it: version 1, no `gate_memory`,
+    // with an intervention row.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "DROP TABLE gate_memory; \
+         DELETE FROM containment_schema; INSERT INTO containment_schema (version) VALUES (1); \
+         INSERT INTO interventions (at_ms, session, leaf, cause, detail) \
+         VALUES (5, 's', 'jobs/j', 'oom_kill', 'kept');",
+    )
+    .unwrap();
+    drop(conn);
+    let before = backups(dir.path());
+    let store = Store::open(&db).expect("a v1 containment group migrates");
+    drop(store);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    assert_eq!(migrate::version(&conn, CONTAINMENT_TABLE).unwrap(), 2);
+    assert!(table_exists(&conn, "gate_memory"));
+    assert_eq!(
+        raw_count(
+            &conn,
+            "SELECT count(*) FROM interventions WHERE detail = 'kept'"
+        ),
+        1,
+        "the table of version 1 is untouched"
+    );
+    assert_eq!(
+        backups(dir.path()),
+        before,
+        "an additive table needs no backup"
+    );
+    // Opening again is a no-op.
+    drop(Store::open(&db).unwrap());
+    assert_eq!(backups(dir.path()), before);
+}
+
+/// The previous release (containment target 1) opens a file that is already
+/// at containment version 2: its migration step finds nothing to do and does
+/// not lower the version, and the rows of `gate_memory` stay.
+#[test]
+fn a_release_that_knows_containment_v1_opens_a_v2_file() {
+    use sluice_gate_daemon::migrate::{self, CONTAINMENT_MIGRATIONS, CONTAINMENT_TABLE};
+    let (_dir, db) = copy_db("v0.5.0");
+    drop(Store::open(&db).unwrap());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "INSERT INTO gate_memory (repo, gate, cmd_hash, job_id, finished_at, outcome, \
+         anon_peak_bytes, peak_bytes, oom_killed) VALUES ('/r', 'test', 'aa', 'j', 1, 'pass', 7, NULL, 0)",
+        [],
+    )
+    .unwrap();
+    // 0.5.0's own call: its migration list stops at version 1, target 1.
+    let reached = migrate::apply(&conn, CONTAINMENT_TABLE, &CONTAINMENT_MIGRATIONS[..1], 1)
+        .expect("an older release applies nothing and does not fail");
+    assert_eq!(reached, 2, "the newer version is left alone");
+    assert_eq!(migrate::version(&conn, CONTAINMENT_TABLE).unwrap(), 2);
+    assert_eq!(raw_count(&conn, "SELECT count(*) FROM gate_memory"), 1);
+    // And its scheduler check (`sched_schema` 1) still passes.
+    assert_eq!(
+        migrate::version(&conn, migrate::SCHED_TABLE).unwrap(),
+        migrate::SCHED_SCHEMA_VERSION
+    );
+    drop(conn);
+    // The current release reads what an older one left.
+    let store = Store::open(&db).unwrap();
+    assert_eq!(store.gate_memory_recent(5).unwrap().len(), 1);
+}

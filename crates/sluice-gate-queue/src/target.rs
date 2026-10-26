@@ -38,7 +38,7 @@ impl Target {
 /// Why a base was refused. `code` is the machine-readable token placed
 /// first in the error message (`invalid_base`, `invalid_remote`, `tag`,
 /// `sha`, `head`, `own_branch`, `target_checked_out`, `unknown_base`,
-/// `no_default_target`).
+/// `no_default_target`, `invalid_config`).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{code}: {message}")]
 pub struct TargetError {
@@ -66,15 +66,27 @@ impl TargetError {
 
 /// `[queue]` defaults of the configuration found at `rev` (the enqueued
 /// head: only used to pick the default target, never for gates); the
-/// built-in defaults when the file is absent or invalid.
-#[must_use]
-pub fn defaults_at(git: &Git, common: &Path, rev: &str) -> QueueConfig {
+/// built-in defaults when the file is absent.
+///
+/// # Errors
+///
+/// `invalid_config` when the file exists at `rev` but does not parse: an
+/// older binary (or a typo) would otherwise silently pick the wrong target.
+pub fn defaults_at(git: &Git, common: &Path, rev: &str) -> Result<QueueConfig, TargetError> {
     let spec = format!("{rev}:{REPO_CONFIG_FILE}");
-    git.repo(common, &["show", &spec])
-        .ok()
-        .and_then(|text| RepoConfig::parse(&text, Path::new(REPO_CONFIG_FILE)).ok())
+    let Ok(text) = git.repo(common, &["show", &spec]) else {
+        return Ok(QueueConfig::default());
+    };
+    RepoConfig::parse(&text, Path::new(REPO_CONFIG_FILE))
         .map(|c| c.queue)
-        .unwrap_or_default()
+        .map_err(|e| {
+            TargetError::new(
+                "invalid_config",
+                format!(
+                    "{REPO_CONFIG_FILE} of the branch does not parse ({e:#}); fix it or pass --base"
+                ),
+            )
+        })
 }
 
 fn remotes(git: &Git, common: &Path) -> Vec<String> {

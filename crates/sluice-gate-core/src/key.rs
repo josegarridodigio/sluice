@@ -151,8 +151,9 @@ pub fn normalize_cmd(cmd: &str) -> String {
 
 /// Run the `key_inputs` commands and hash the `key_files`.
 ///
-/// Each input runs through `sh -c` in `repo_root` with `env` added to the
-/// inherited environment; stderr is discarded. Files are resolved relative to
+/// Each input runs through `sh -c` in `repo_root` with exactly `env` as its
+/// environment (the inherited one is cleared, so what an input prints cannot
+/// depend on the process that derives the key); stderr is discarded. Files are resolved relative to
 /// `repo_root`; a missing file yields `"absent"`.
 ///
 /// # Errors
@@ -172,6 +173,7 @@ pub fn collect_inputs(
             .arg("-c")
             .arg(cmd)
             .current_dir(repo_root)
+            .env_clear()
             .envs(env)
             .stdin(Stdio::null())
             .stderr(Stdio::null())
@@ -302,6 +304,20 @@ mod tests {
             ("present.txt".into(), hex::encode(Sha256::digest(b"data")))
         );
         assert_eq!(files[1], ("missing.txt".into(), "absent".into()));
+    }
+
+    #[test]
+    fn inputs_see_only_the_given_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        // HOME is set in any test process but absent from the map.
+        let (inputs, _) = collect_inputs(
+            &["printf %s \"$HOME\"".into()],
+            &[],
+            dir.path(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(inputs[0].1, hex::encode(Sha256::digest(b"")));
     }
 
     #[test]

@@ -379,9 +379,15 @@ Notes:
 - `depends_on` is validated (the gate must exist) but not scheduled yet; it
   documents intent and does not order execution.
 - `cmd` runs with `sh -c` from the repository root, so `cd pkg && ...` works.
-- `[queue] gates` is what a merge-queue train must pass. Without it, the gates
-  with a `pre-push` hook are used, which is already right here; the list makes
-  the choice explicit.
+- `[queue] gates` is what a merge-queue train must pass, plus every gate with a
+  `pre-push` hook (the push runs them). Without the key, the gates with a
+  `pre-push` hook are used, else every gate; here that is already right, the
+  list makes the choice explicit.
+- A stack whose dependencies are git-ignored (`node_modules`, `.venv`) needs
+  `[queue] prepare` (for example `pnpm install --frozen-lockfile
+  --prefer-offline`), because a train's gates run in a fresh worktree; `sluice
+  init` writes it from the lockfile. See "Preparing the merge worktree" in
+  [merge-queue.md](merge-queue.md). It needs Sluice 0.6.0.
 - A gate that should run in the merge queue but never in hooks simply has no
   `hooks` and is listed in `[queue] gates`. For a build whose output you need
   every time (never answered from the cache), use `mode = "queue-only"`

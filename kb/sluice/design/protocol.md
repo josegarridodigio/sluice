@@ -63,7 +63,11 @@ and `signal`) and `"queue-only"` (`FEATURE_QUEUE_ONLY`: honours
 `run.no_marker`), followed by the features of its extensions; a daemon
 running the merge-queue extension adds `"queue"`
 (`sluice_gate_proto::FEATURE_QUEUE`), so it sends
-`"features":["exec","queue-only","queue"]`. The blocking client exposes
+`"features":["exec","queue-only","queue","queue-trust-config"]` (0.6.0 adds
+`"queue-trust-config"`, `FEATURE_QUEUE_TRUST_CONFIG`: honours
+`trust_member_config` on `queue-enqueue` and `queue-retry`; a client that does
+not see it refuses `--trust-member-config` instead of sending a flag that
+would be ignored). The blocking client exposes
 them as `Client::features()` / `Client::supports(..)`. A `welcome` without
 `features` (a v0.2 daemon) parses as an empty list; clients send `exec` and
 `no_marker` only to a daemon listing the matching feature.
@@ -164,7 +168,17 @@ when unset, protocol stays 1):**
   `repo-cap`, `head-reserved`, `order`); `outcome.admission`: `nominal`,
   `over` (over-admission) or `guard` (PSI starvation guard);
   `outcome.killed_by` (only on `killed`): `last-subscriber`,
-  `early-verdict`, `stop` (`superseded` reserved).
+  `early-verdict`, `stop`, `memory` (`superseded` reserved).
+
+**Memory fields (0.6.0, ADR-0019; all optional, omitted when unset, protocol
+stays 1):** a job the kernel's OOM killer, `systemd-oomd` or the opt-in memory
+guard ended for lack of memory is `killed` with `outcome.killed_by = "memory"`
+and a `message` (`<gate> was killed for lack of memory after 41.2s (job peak
+18.1 GiB; ...)`); `outcome.memory_peak_bytes` is the `memory.peak` of the job's
+cgroup (page cache included). Every client prints the message instead of
+treating the kill as a cancel. A `cached` outcome may also carry a `message`
+(why nothing ran: a pass that appeared while queued, or a gate the merge train's
+push verified).
 
 ### `status`
 
@@ -197,6 +211,19 @@ is in rank order), `expected_ms`, `weight_cfg`, `wait_detail` (`outranked`,
 room; `reason` then stays `budget`, its four values are frozen);
 `totals.idle_while_waiting_ms`, `totals.waiting_wall_ms`,
 `totals.over_admissions` (per daemon instance).
+
+Memory fields of 0.6.0 (ADR-0019, all optional and omitted when the daemon has
+no figure; the frozen fixture is unchanged and tests of the proto crate pin them):
+`budget.memory` (`available_bytes` = `MemAvailable`, `reserve_bytes`,
+`headroom_bytes` = what running jobs are still expected to grow by);
+`running[]` `memory_bytes` (working set now), `memory_expected_bytes`,
+`memory_expected_learned`; `queued[]` `memory_expected_bytes`,
+`memory_expected_learned`, and `wait_detail = "memory"` (the job fits the budget
+but not the memory it is expected to use; `reason` stays `budget`).
+`containment` (0.5.0) with `sessions[]` and `interventions[]`, and, from 0.6.0,
+`containment.gates_oom_policy` (`limit_percent`, `duration_secs`) when the gates'
+scope has its own `systemd-oomd` policy, are described in
+[[sluice/design/containment.md]] section 8.
 
 Entries of `running` and `queued` have optional `kind` and `label`, omitted
 for gates: an exec job shows `"kind":"exec","label":"cargo build"` and

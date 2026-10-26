@@ -40,8 +40,9 @@ removes the redundancy and never leaves an agent hanging.
   never need the daemon.
 - **Daemon with budget and coalescing.** A per-user daemon runs gates under a
   weighted budget; identical simultaneous requests share one run.
-- **PSI admission.** New work is held while the machine is under real pressure
-  (Linux PSI).
+- **PSI and memory admission.** New work is held while the machine is under real
+  pressure (Linux PSI), and a gate starts only when the memory it is expected
+  to use (learned from its earlier runs) fits what is free.
 - **Git hooks** for Husky, lefthook, pre-commit/prek and plain `.githooks/`,
   failing fast inside agents instead of hanging.
 - **MCP tools and an agent plugin.** `sluice mcp` gives agents a blocking
@@ -53,7 +54,8 @@ removes the redundancy and never leaves an agent hanging.
 - **Path-scoped gates** key on part of the tree, so unrelated changes keep the
   cached pass.
 - **Local merge queue.** Agents enqueue committed branches; a human approves
-  one atomic landing.
+  one atomic landing. The train's worktree can be prepared (`[queue] prepare`,
+  for example a dependency install) before its gates run.
 - **`sluice doctor` and `sluice update`** check the installation (with a
   redacted bug-report bundle) and upgrade in place.
 
@@ -146,8 +148,10 @@ Sluice is alpha: complete enough for early adopters, not yet proven by long use.
   protection remains the enforcement for what lands.
 - **Containment needs cgroup v2 and a systemd user manager.** CPU weights
   need systemd 252 or newer (or an administrator's drop-in); the memory
-  policy needs `systemd-oomd` and systemd 257 or newer, otherwise memory is
-  only accounted. In containers, on cgroup v1 or without a user manager
+  policy needs `systemd-oomd` and systemd 257 or newer, otherwise the agents'
+  memory is only accounted (gate jobs are still admitted by memory and are the
+  kernel's preferred OOM victims; the opt-in `[admission] memory_guard` covers
+  machines without `systemd-oomd`). In containers, on cgroup v1 or without a user manager
   Sluice runs uncontained and `sluice doctor` says why. It protects against
   accidental overload, not against a process that moves itself out.
 - **0.5.0 containment was validated on two Ubuntu 26.04 machines** (20 and

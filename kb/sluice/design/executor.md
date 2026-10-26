@@ -225,7 +225,13 @@ finding 7).
   descendant starts inside the leaf. The leaf is created before the spawn and
   removed when the job ends (a leaf still holding a stray background process
   stays for the minute pruning). Without containment (off, disabled, or any
-  setup error) the wrapper is empty and the chain is the 0.4.1 one.
+  setup error) the wrapper is empty and the chain is the 0.4.1 one. Since 0.6.0
+  (ADR-0019) the wrapper is `sluice cg-exec <leaf> --oom-score-adj <N> -- ...`:
+  `cg-exec` also raises its own `oom_score_adj` to `max(N, inherited)` (`N` is
+  `[containment] gates_oom_score_adj`, 800 by default) before the `exec`, and a
+  leaf of `-` means no move into a cgroup (only the adj is applied, where cgroup
+  v2 or the user manager is missing). Both steps fail open. With
+  `[containment] enabled = false` nothing is wrapped.
 - Output: both pipes drained concurrently into one append-only log
   `<state>/logs/<job-id>.log` (interleaved, 8 KiB chunks) with a header
   line (`# sluice job …`) and footer (`# exit: …`). `log_bytes` is reported
@@ -379,8 +385,9 @@ with a message naming the file. `totals(since)` filters jobs by `queued_at` and 
    kills the gate, so the client prints `sluice: error: the daemon died
    while running <gate>; it was killed` (exit 143; before `started`:
    `… while <gate> was queued; it did not run`, exit 1); other errors print
-   `lost the connection to the daemon: <why>`, exit 1. `killed` prints `KILLED after <s>s (job …)` and
-   exits 143; a job dropped before it started prints `KILLED before it
+   `lost the connection to the daemon: <why>`, exit 1. `killed` prints `KILLED after <s>s (job …)` (`KILLED for lack of
+   memory after <s>s (job …)` then the daemon's message when the daemon says it was
+   killed for memory, as MCP `verify` does) and exits 143; a job dropped before it started prints `KILLED before it
    started (job <id>): the daemon stopped`.
 3. If the daemon cannot be reached or started (or refuses before
    `queued`): `sluice: daemon unavailable (<why>); running in-process`,

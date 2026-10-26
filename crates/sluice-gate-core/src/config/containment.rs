@@ -27,6 +27,52 @@ pub enum MemoryPolicy {
     None,
 }
 
+/// What `"auto"` means for `gates_oom_score_adj` (ADR-0019 piece 2): high
+/// enough that the kernel's OOM killer prefers a gate's processes to the
+/// agents' (their browsers run at 300), not so high that nothing else counts.
+pub const AUTO_GATES_OOM_SCORE_ADJ: u16 = 800;
+
+/// Highest `oom_score_adj`.
+pub const MAX_OOM_SCORE_ADJ: i64 = 1000;
+
+/// `[containment] gates_oom_score_adj`: `"auto"` or an integer in `0..=1000`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatesOomScoreAdj {
+    /// [`AUTO_GATES_OOM_SCORE_ADJ`].
+    Auto,
+    /// An explicit value (range checked by validation).
+    Value(i64),
+}
+
+impl GatesOomScoreAdj {
+    /// The value handed to `sluice cg-exec --oom-score-adj`.
+    #[must_use]
+    pub fn resolve(self) -> u16 {
+        match self {
+            Self::Auto => AUTO_GATES_OOM_SCORE_ADJ,
+            Self::Value(v) => u16::try_from(v.clamp(0, MAX_OOM_SCORE_ADJ)).unwrap_or(0),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for GatesOomScoreAdj {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Int(i64),
+            Text(String),
+        }
+        match Raw::deserialize(d)? {
+            Raw::Int(v) => Ok(Self::Value(v)),
+            Raw::Text(t) if t.trim() == AUTO => Ok(Self::Auto),
+            Raw::Text(t) => Err(serde::de::Error::custom(format!(
+                "containment.gates_oom_score_adj {t:?} must be \"auto\" or an integer from 0 to {MAX_OOM_SCORE_ADJ}"
+            ))),
+        }
+    }
+}
+
 /// The `[containment]` table (ADR-0017, design section 7): agent resource
 /// containment in cgroups through the systemd user manager.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -63,6 +109,15 @@ pub struct ContainmentConfig {
     pub memory_high: String,
     /// Opt-in `memory.max` per session; empty means none.
     pub memory_max: String,
+    /// `oom_score_adj` floor of gate and exec jobs (ADR-0019): `"auto"`
+    /// (800) or `0..=1000`. A job never gets less than it inherited.
+    pub gates_oom_score_adj: GatesOomScoreAdj,
+    /// Optional `memory.max` of the `jobs/` cgroup (all running gate and exec
+    /// jobs together, ADR-0019 piece 5), a size such as `"20G"`; empty means
+    /// none. There is deliberately no `memory.high` counterpart.
+    pub gates_memory_max: String,
+    /// Optional `memory.swap.max` of the `jobs/` cgroup; empty means none.
+    pub gates_memory_swap_max: String,
 }
 
 impl Default for ContainmentConfig {
@@ -82,6 +137,9 @@ impl Default for ContainmentConfig {
             memory_pressure_duration: AUTO.to_owned(),
             memory_high: String::new(),
             memory_max: String::new(),
+            gates_oom_score_adj: GatesOomScoreAdj::Auto,
+            gates_memory_max: String::new(),
+            gates_memory_swap_max: String::new(),
         }
     }
 }
@@ -152,6 +210,18 @@ impl ContainmentConfig {
         parse_size_bytes(&self.memory_max)
     }
 
+    /// `gates_memory_max` in bytes, `None` when unset.
+    #[must_use]
+    pub fn gates_memory_max_bytes(&self) -> Option<u64> {
+        parse_size_bytes(&self.gates_memory_max)
+    }
+
+    /// `gates_memory_swap_max` in bytes, `None` when unset.
+    #[must_use]
+    pub fn gates_memory_swap_max_bytes(&self) -> Option<u64> {
+        parse_size_bytes(&self.gates_memory_swap_max)
+    }
+
     pub(super) fn validate(&self, path: &Path) -> Result<()> {
         for (name, w) in [
             ("slice_cpu_weight", self.slice_cpu_weight),
@@ -214,6 +284,8 @@ impl ContainmentConfig {
         for (name, value) in [
             ("memory_high", &self.memory_high),
             ("memory_max", &self.memory_max),
+            ("gates_memory_max", &self.gates_memory_max),
+            ("gates_memory_swap_max", &self.gates_memory_swap_max),
         ] {
             if !value.trim().is_empty() && parse_size_bytes(value).is_none() {
                 return Err(config_err(
@@ -223,6 +295,16 @@ impl ContainmentConfig {
                     ),
                 ));
             }
+        }
+        if let GatesOomScoreAdj::Value(v) = self.gates_oom_score_adj
+            && !(0..=MAX_OOM_SCORE_ADJ).contains(&v)
+        {
+            return Err(config_err(
+                path,
+                format!(
+                    "containment.gates_oom_score_adj must be \"auto\" or an integer from 0 to {MAX_OOM_SCORE_ADJ}, got {v}"
+                ),
+            ));
         }
         Ok(())
     }
@@ -262,6 +344,54 @@ mod tests {
         assert_eq!(d.cpu_ceiling_percent(), None);
         assert_eq!(d.memory_high_bytes(), None);
         assert_eq!(d.memory_max_bytes(), None);
+        assert_eq!(d.gates_oom_score_adj, GatesOomScoreAdj::Auto);
+        assert_eq!(d.gates_oom_score_adj.resolve(), 800);
+        assert_eq!(d.gates_memory_max_bytes(), None);
+        assert_eq!(d.gates_memory_swap_max_bytes(), None);
+    }
+
+    #[test]
+    fn the_gates_ceiling_parses_and_is_validated() {
+        let c = parse(
+            "version = 1\n[containment]\ngates_memory_max = \"20G\"\n\
+             gates_memory_swap_max = \"512M\"\n",
+        )
+        .unwrap()
+        .containment;
+        assert_eq!(c.gates_memory_max_bytes(), Some(20 << 30));
+        assert_eq!(c.gates_memory_swap_max_bytes(), Some(512 << 20));
+        let empty = parse("version = 1\n[containment]\ngates_memory_max = \"\"\n")
+            .unwrap()
+            .containment;
+        assert_eq!(empty.gates_memory_max_bytes(), None);
+        let t = |body: &str| err(&format!("version = 1\n[containment]\n{body}\n"));
+        assert!(t("gates_memory_max = \"lots\"").contains("gates_memory_max"));
+        assert!(t("gates_memory_max = \"0\"").contains("gates_memory_max"));
+        assert!(t("gates_memory_swap_max = \"x\"").contains("gates_memory_swap_max"));
+    }
+
+    #[test]
+    fn gates_oom_score_adj_accepts_auto_or_a_number() {
+        let adj = |v: &str| {
+            parse(&format!(
+                "version = 1\n[containment]\ngates_oom_score_adj = {v}\n"
+            ))
+            .unwrap()
+            .containment
+            .gates_oom_score_adj
+        };
+        assert_eq!(adj("\"auto\""), GatesOomScoreAdj::Auto);
+        assert_eq!(adj("500").resolve(), 500);
+        assert_eq!(adj("0").resolve(), 0);
+        assert_eq!(adj("1000").resolve(), 1000);
+        let t = |v: &str| {
+            err(&format!(
+                "version = 1\n[containment]\ngates_oom_score_adj = {v}\n"
+            ))
+        };
+        assert!(t("1001").contains("gates_oom_score_adj"));
+        assert!(t("-1").contains("gates_oom_score_adj"));
+        assert!(t("\"high\"").contains("gates_oom_score_adj"));
     }
 
     #[test]

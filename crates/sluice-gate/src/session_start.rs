@@ -107,7 +107,10 @@ fn rules_text(gates: &[String]) -> String {
          output; redirect with `>` or `2>&1` instead. \
          4) Do not start several dev servers or watchers while gates run. \
          5) Never approve merge trains (`queue_approve`, `sluice queue approve`) and never push \
-         to the target branch."
+         to the target branch. \
+         6) A gate result `KILLED for lack of memory` is not a flaky failure: do not rerun it \
+         unchanged or outside Sluice; lower its footprint (e.g. test concurrency) or tell the \
+         human."
     )
 }
 
@@ -268,6 +271,7 @@ pub fn respond(input: &str, env: &EnvMap) -> Option<String> {
             hook: Some("session-start"),
             gate: "-",
             tree: None,
+            key: None,
             reason: None,
             decision: &decision,
             exit: 0,

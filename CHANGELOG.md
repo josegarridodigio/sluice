@@ -11,10 +11,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Golden files recorded from the 0.4.1 and 0.5.0 release binaries, read by the
   compatibility tests next to 0.1.0 through 0.4.0.
+- `[queue] prepare` (with `prepare_timeout`, `prepare_weight`): a command run
+  once per merge train, through the scheduler, before its gates, so gates that
+  need git-ignored dependencies (`node_modules`, `.venv`) can run in the merge
+  worktree. A failure is attributed by preparing the base alone: nobody's fault
+  (members requeued, `prepare_failed`, `failed` after three attempts) or the
+  member's (split, `prepare_failed`); `prepare_dirty` when it leaves files the
+  tree does not have. `sluice init` writes it for detected lockfiles (#3).
+- `sluice queue enqueue|retry --trust-member-config`: a human-only way to land a
+  fix of the queue's own configuration; the train runs the branch's
+  `.sluice.toml`, the approval shows its diff and binds its hash. Refused over
+  MCP and from an agent's environment, whatever `allow_agent_approval` says.
+- Memory safety of gate jobs (ADR-0019): admission by each gate's learned
+  memory working set (`[admission] memory_aware`, `memory_reserve`), so two
+  suites that do not fit together wait for each other; gate processes are the
+  preferred victims of the kernel's OOM killer (`[containment]
+  gates_oom_score_adj`, `memory.oom.group` on each job leaf) and of
+  `systemd-oomd` (a policy on the gates' scope that acts before the agents');
+  a gate killed for memory ends `killed` with `killed_by = "memory"` and a
+  message naming its peak; opt-in `[admission] memory_guard` cancels Sluice's
+  own largest gate under real exhaustion; optional `[containment]
+  gates_memory_max` / `gates_memory_swap_max` cap all gate jobs together on
+  `jobs/` (unset by default; a hit kills one job whole, reported as a memory
+  kill).
+- `client.log` lines carry `key=`; the daemon logs every hook `run` request;
+  `sluice run --explain` reports the cache mode.
+- `sluice status` shows the memory admission sees (`memory:` line, `mem` per
+  job, `(budget: memory)` for a gate that waits for memory) and the gates'
+  `systemd-oomd` policy; `status --json` gains the optional fields
+  (`budget.memory`, `wait_detail = "memory"`, per-job memory,
+  `containment.gates_oom_policy`). `sluice doctor` gains `gates-oom`,
+  `gates-memory-policy` and `memory-guard`.
+- A branch whose merged `.sluice.toml` asks the `pre-push` hook for gates the
+  train does not verify, or does not parse, fails at build time
+  (`hook_gate_unverified`, `member_config_invalid`) instead of at the push; the
+  other members are requeued.
 
 ### Changed
 
+- The daemon's environment no longer inherits per-invocation variables from
+  the client that autostarted it (`SLUICE_JOB`, `SLUICE_AGENT`, `SLUICE_CACHE`,
+  `SLUICE_DISABLE`, the session leaf, agent-detection variables, the shim
+  directory in `PATH`); `key_inputs` run with exactly the gate's environment.
+- A merge train verifies `[queue] gates` plus every gate with a `pre-push`
+  hook.
+- `cargo check` and `cargo doc` are heavy commands (they go through the queue).
+- New config keys (`[queue] prepare*`, `[admission] memory_*`,
+  `[containment] gates_oom_score_adj`, `gates_memory_max`,
+  `gates_memory_swap_max`) are rejected by older binaries.
+
 ### Fixed
+
+- The daemon's own push of an approved train no longer re-runs the gates the
+  train verified: a Sluice `pre-push` hook launched by that push is answered
+  from the train's record (checked by process ancestry and the worktree's
+  commit); a hook gate the train did not verify fails the push at once instead
+  of running into `push_timeout` and `needs_reconcile` (#4).
+- A gate that modifies tracked files fails its train (`gate_modified_tree`)
+  instead of looping through dissolve and re-approval; a pass that wrote no
+  marker is shown as `not cached`.
+- `config_changed` compares against the merge base and is shown in `queue
+  status` and the approval plan; a gate failure keeps it.
+- An unparsable `.sluice.toml` on the enqueued branch is reported
+  (`invalid_config`) instead of silently picking the default target.
+- Stored train settings missing a field keep the real defaults (a zero push
+  timeout could follow from an unreadable row).
+- The output of a push that hit `push_timeout` is kept in the train's note.
+- A `key_inputs` command failing in the merge worktree requeues the members
+  (`key_input_failed`) instead of failing them as `internal`.
+- A train's gates are killed when the train drops them, also under
+  `last_subscriber_gone = "finish"`.
+- Paths of changed files reported by the queue (`dirty_merge`,
+  `gate_modified_tree`, `prepare_dirty`) no longer lose their first character.
 
 ## [0.5.0] - 2026-10-24
 

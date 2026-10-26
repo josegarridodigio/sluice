@@ -22,6 +22,7 @@ mod extension;
 
 pub use extension::{
     BoxFuture, DaemonHandle, Extension, ExtensionCtx, LeaseFence, RunSubscription, StoreError,
+    Vouch,
 };
 
 use std::collections::{BTreeMap, HashMap};
@@ -56,16 +57,22 @@ use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, interval_at, sleep, timeout};
 
-use crate::containment::{Containment, ContainmentSetup};
+use crate::containment::{self, Containment, ContainmentSetup};
 use crate::executor::{
     self, ExecSpec, ExecStatus, Finished, IoPriority, Launch, ProcessInfo, RunningHandle, Sink,
 };
+use crate::guard::{self, Guard, GuardJob, Sample as GuardSample, Victim};
+use crate::interventions::{self, InterventionRow};
+use crate::memkill;
+use crate::memory::{self, PeakCache, PeakSample, WorkingSet};
 use crate::psi::{self, Admission};
 use crate::reaper::Reaper;
 pub use crate::reaper::ReaperCommand;
 use crate::sampler::{self, JobUsage, Utilisation};
 use crate::scheduler::{self as sched, Class, Enqueued, JobSpec, Policy, Pressure, Scheduler};
-use crate::store::{FinishMeta, GateStat, JobRow, JobState, QueuedMeta, RequestRow, Store};
+use crate::store::{
+    FinishMeta, GateMemory, GateStat, JobRow, JobState, QueuedMeta, RequestRow, Store,
+};
 use crate::{Error, Result};
 use sluice_gate_core::config::{Fairness, QueueOrder, auto_ceiling};
 
@@ -292,6 +299,9 @@ struct JobEntry {
     usage: JobUsage,
     /// Why the job was killed, when Sluice killed it.
     killed_by: Option<&'static str>,
+    /// The message of a job the memory guard cancelled (replaces the generic
+    /// "was killed" text when the job ends).
+    guard_message: Option<String>,
 }
 
 /// What [`register`] hands to the connection handler.
@@ -340,6 +350,11 @@ struct Shared {
     util: Mutex<Utilisation>,
     /// Learned gate statistics (never held together with another mutex).
     stats: Mutex<StatsCache>,
+    /// Recent working sets of each gate, for the expected peak of memory-aware
+    /// admission (never held together with another mutex).
+    peaks: Mutex<PeakCache>,
+    /// The opt-in memory guard (never held together with another mutex).
+    guard: Mutex<Guard>,
     /// CPUs of the daemon's affinity mask (`None`: every CPU of `/proc/stat`).
     allowed_cpus: Option<std::collections::BTreeSet<u32>>,
     /// CPUs available to the daemon, for `status`.
@@ -443,11 +458,16 @@ impl Shared {
     }
 }
 
-/// The daemon's own environment sanitised like a client's `child_env`;
-/// falls back to dropping `GIT_*` and `CLAUDE*` when git cannot list its
-/// local variables.
+/// The daemon's own environment made neutral (`env::daemon_env`, so a daemon
+/// started by hand matches an autostarted one) and sanitised like a client's
+/// `child_env`; falls back to dropping `GIT_*` and `CLAUDE*` when git cannot
+/// list its local variables.
 fn sanitised_env() -> BTreeMap<String, String> {
     let env: BTreeMap<String, String> = sluice_gate_core::config::process_env();
+    let detection = sluice_gate_core::config::UserConfig::load(&env)
+        .map(|u| u.agent_detection)
+        .unwrap_or_default();
+    let env = sluice_gate_core::env::daemon_env(&env, &detection);
     git::child_env(&env).unwrap_or_else(|e| {
         tracing::warn!("cannot sanitise the environment through git: {e}");
         env.into_iter()
@@ -675,8 +695,9 @@ fn rotate_daemon_log(settings: &LogSettings) {
 const GATE_STATS_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 
 fn prune_gate_stats(shared: &Shared, now: u64) {
+    let unseen_since = now.saturating_sub(GATE_STATS_RETENTION_MS);
     if let Some(n) = shared.store("pruning gate statistics", |s| {
-        s.prune_gate_stats(now.saturating_sub(GATE_STATS_RETENTION_MS))
+        Ok(s.prune_gate_stats(unseen_since)? + s.prune_gate_memory(unseen_since)?)
     }) && n > 0
     {
         tracing::info!("deleted {n} gate statistics row(s) of commands unseen for 90 days");
@@ -708,6 +729,39 @@ fn load_stats(store: &Store) -> StatsCache {
         Err(e) => tracing::warn!("cannot load the gate statistics: {e}"),
     }
     stats
+}
+
+/// The working sets kept in the database (last runs of every key).
+fn load_peaks(store: &Store) -> PeakCache {
+    let mut peaks = PeakCache::default();
+    match store.gate_memory_recent(memory::PEAK_WINDOW) {
+        Ok(rows) => {
+            for r in rows {
+                peaks.push(
+                    (r.repo, r.gate, r.cmd_hash),
+                    PeakSample {
+                        anon_peak_bytes: r.anon_peak_bytes,
+                        killed: r.oom_killed,
+                    },
+                );
+            }
+        }
+        Err(e) => tracing::warn!("cannot load the gate working sets: {e}"),
+    }
+    peaks
+}
+
+/// Hands the learned peaks of every key to the scheduler (the stats mutex is
+/// never held with the state one).
+fn seed_peaks(shared: &Shared) {
+    let known: Vec<(StatsKey, u64)> = lock(&shared.peaks)
+        .expectations()
+        .map(|(k, v)| (k.clone(), v))
+        .collect();
+    let mut st = shared.state();
+    for (key, bytes) in known {
+        st.sched.set_learned_peak(key, Some(bytes));
+    }
 }
 
 /// The utilisation sampler, bounded by the daemon's cgroup CPU limit.
@@ -755,6 +809,7 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
         return Err(Error::AlreadyRunning(config.lock_path.clone()));
     }
     let stats = load_stats(&store);
+    let peaks = load_peaks(&store);
     let (allowed_cpus, cpus) = daemon_cpus(&config.proc_root);
     let store = Mutex::new(store);
     if let Err(e) = reconcile_orphans(&store, &instance).await {
@@ -798,6 +853,8 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
         psi: Mutex::new(Admission::new(&config.admission)),
         util: Mutex::new(utilisation(&config.proc_root)),
         stats: Mutex::new(stats),
+        peaks: Mutex::new(peaks),
+        guard: Mutex::new(Guard::new(config.admission.memory_guard)),
         allowed_cpus,
         cpus,
         instance,
@@ -817,6 +874,7 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
         containment_off,
         config,
     });
+    seed_peaks(&shared);
     prune_logs(&shared);
     start_extensions(&shared).await;
 
@@ -979,7 +1037,7 @@ async fn drain(shared: &Arc<Shared>, force: bool) {
                 dropped.push((id, closed));
             } else if force && let Some(entry) = st.jobs.get_mut(&id) {
                 entry.cancelled = true;
-                entry.killed_by = Some("stop");
+                note_killed_by(&mut entry.killed_by, "stop");
                 if let Some(h) = &entry.handle {
                     h.cancel();
                 }
@@ -1059,30 +1117,138 @@ fn sample_tick(shared: &Shared) -> bool {
         (st.sched.has_queued(), gates)
     };
     lock(&shared.util).observe(times, now, queued);
-    if gates.is_empty() {
-        return changed;
-    }
-    let pgids: std::collections::HashSet<i32> = gates.iter().map(|g| g.1).collect();
-    let members = sampler::group_members(proc_root, &pgids);
-    let samples: Vec<(String, Vec<_>, Option<u64>)> = gates
-        .into_iter()
-        .map(|(id, pgid, leader)| {
-            let tasks = members
-                .get(&pgid)
-                .into_iter()
-                .flatten()
-                .flat_map(|&pid| sampler::read_tasks(proc_root, pid))
-                .collect();
-            (id, tasks, sampler::leader_ticks(proc_root, leader))
-        })
-        .collect();
-    let mut st = shared.state();
-    for (id, tasks, leader) in samples {
-        if let Some(entry) = st.jobs.get_mut(&id) {
-            entry.usage.update(&tasks, leader);
+    if !gates.is_empty() {
+        let samples = read_job_samples(shared, gates);
+        let mut st = shared.state();
+        for (id, tasks, leader, working_set) in samples {
+            if let Some(entry) = st.jobs.get_mut(&id) {
+                entry.usage.update(&tasks, leader);
+                entry.usage.observe_memory(working_set);
+            }
         }
     }
+    guard_tick(shared, now);
     changed
+}
+
+/// The memory guard's second (ADR-0019 piece 7): reads `meminfo`, the
+/// pressure and the running jobs' latest working sets, asks [`Guard`] and
+/// cancels the job it chooses. A no-op unless `[admission] memory_guard`.
+fn guard_tick(shared: &Shared, now: u64) {
+    let a = &shared.config.admission;
+    if !a.memory_guard {
+        return;
+    }
+    let Some(info) = memory::read_meminfo(&shared.config.proc_root) else {
+        return;
+    };
+    let jobs: Vec<GuardJob> = {
+        let st = shared.state();
+        st.jobs
+            .iter()
+            .filter(|(_, e)| e.stats_key.is_some() && e.process.is_some() && !e.cancelled)
+            .filter_map(|(id, e)| {
+                Some(GuardJob {
+                    id: id.clone(),
+                    working_set: e.usage.memory_now()?,
+                })
+            })
+            .collect()
+    };
+    let sample = GuardSample {
+        available: info.available_bytes,
+        reserve: a.memory_reserve_bytes(info.total_bytes),
+        full_avg10: guard_pressure(shared),
+    };
+    let victim = lock(&shared.guard).observe(now, sample, &jobs);
+    if let Some(victim) = victim {
+        cancel_for_memory(shared, now, &victim, sample.full_avg10);
+    }
+}
+
+/// `full avg10` of the daemon scope's `memory.pressure`; the system's memory
+/// pressure when the machine has no such scope (no containment, or a
+/// scope without the memory controller).
+fn guard_pressure(shared: &Shared) -> Option<f64> {
+    shared
+        .containment
+        .as_ref()
+        .and_then(|c| {
+            guard::read_full_avg10(&c.tree().layout.daemon_scope_dir().join("memory.pressure"))
+        })
+        .or_else(|| guard::read_full_avg10(&shared.config.psi_root.join("memory")))
+}
+
+/// Cancels the job the guard chose through the normal cancel path (the
+/// executor kills its process group), marks it `killed_by = "memory"` with
+/// the guard's message and records an intervention.
+fn cancel_for_memory(shared: &Shared, now: u64, victim: &Victim, full_avg10: Option<f64>) {
+    let message = {
+        let mut st = shared.state();
+        let Some(entry) = st.jobs.get_mut(&victim.id) else {
+            return;
+        };
+        let Some(handle) = entry.handle.as_ref().filter(|_| !entry.cancelled) else {
+            return;
+        };
+        let message = guard::cancel_message(&entry.request.name(), victim);
+        handle.cancel();
+        entry.cancelled = true;
+        entry.killed_by = Some(memkill::KILLED_BY_MEMORY);
+        entry.guard_message = Some(message.clone());
+        message
+    };
+    tracing::warn!(
+        job = %victim.id,
+        working_set = victim.working_set,
+        available = victim.available,
+        reserve = victim.reserve,
+        full_avg10,
+        "memory guard: cancelling the running job with the largest working set"
+    );
+    record_interventions(
+        shared,
+        &[InterventionRow {
+            at_ms: now,
+            session: None,
+            leaf: format!("jobs/{}", victim.id),
+            cause: interventions::CAUSE_SLUICE_MEMORY_GUARD.to_owned(),
+            detail: Some(message),
+        }],
+    );
+}
+
+/// One running gate's readings of a tick: tasks, leader ticks and working set.
+type JobSample = (String, Vec<sampler::TaskReading>, Option<u64>, WorkingSet);
+
+/// Reads the CPU tasks and the memory of every running gate (`(id, pgid,
+/// leader pid)`). The working set is `anon` + swap of the job's leaf, or, when
+/// the machine gives no leaf, the summed resident set of its process group.
+fn read_job_samples(shared: &Shared, gates: Vec<(String, i32, u32)>) -> Vec<JobSample> {
+    let proc_root = &shared.config.proc_root;
+    let groups: std::collections::HashSet<i32> = gates.iter().map(|g| g.1).collect();
+    let members = sampler::group_members(proc_root, &groups);
+    gates
+        .into_iter()
+        .map(|(id, pgid, leader)| {
+            let pids = members.get(&pgid).map_or(&[][..], Vec::as_slice);
+            let tasks = pids
+                .iter()
+                .flat_map(|&pid| sampler::read_tasks(proc_root, pid))
+                .collect();
+            let working_set = shared
+                .containment
+                .as_ref()
+                .and_then(|c| memory::read_cgroup(&c.tree().layout.jobs_dir().join(&id)))
+                .unwrap_or_else(|| memory::read_rss(proc_root, pids));
+            (
+                id,
+                tasks,
+                sampler::leader_ticks(proc_root, leader),
+                working_set,
+            )
+        })
+        .collect()
 }
 
 /// Samples PSI, utilisation and job demand every `psi_poll_interval` (1 s
@@ -1143,8 +1309,13 @@ fn containment_tick(shared: &Shared, prune: bool) {
         }
     }
     c.sample(shared.cpus);
-    for row in c.collect_interventions(now_ms()) {
-        let new = shared.store("recording an intervention", |s| s.record_intervention(&row));
+    record_interventions(shared, &c.collect_interventions(now_ms()));
+}
+
+/// Stores new interventions, tells the agent through the explain log and logs them.
+fn record_interventions(shared: &Shared, rows: &[InterventionRow]) {
+    for row in rows {
+        let new = shared.store("recording an intervention", |s| s.record_intervention(row));
         if new == Some(true) {
             // The file the guard and the MCP server read to tell the agent
             // (they never ask the daemon, and the guard may not).
@@ -1205,7 +1376,8 @@ fn cpu_calm(shared: &Shared) -> bool {
 
 /// One admission pass: [`sched::plan`] over the current pressure (PSI
 /// blocking and the starvation guard, the over-admission conditions and the
-/// idle CPUs of the utilisation sampler).
+/// idle CPUs of the utilisation sampler) and over the machine's memory
+/// (`meminfo`) and the working set of the running jobs (ADR-0019).
 fn admit(shared: &Shared, now: u64) -> Vec<(String, sched::Admission)> {
     let a = &shared.config.admission;
     let (blocking, calm) = {
@@ -1232,16 +1404,27 @@ fn admit(shared: &Shared, now: u64) -> Vec<(String, sched::Admission)> {
         let u = lock(&shared.util);
         (u.idle_cpus(), u.sampled_at())
     };
-    let started = shared.state().sched.admit_with(
-        now,
-        Pressure {
-            blocking,
-            guard_due,
-            calm,
-            idle_cpus,
-            sampled_at,
-        },
-    );
+    let facts = memory::facts(a, memory::read_meminfo(&shared.config.proc_root));
+    let started = {
+        let mut st = shared.state();
+        // The working set each running job had at its last sample.
+        let currents = st
+            .jobs
+            .iter()
+            .filter_map(|(id, e)| Some((id.clone(), e.usage.memory_now()?)))
+            .collect();
+        st.sched.set_memory(facts, currents);
+        st.sched.admit_with(
+            now,
+            Pressure {
+                blocking,
+                guard_due,
+                calm,
+                idle_cpus,
+                sampled_at,
+            },
+        )
+    };
     for (id, admission) in &started {
         match admission {
             sched::Admission::Guard => {
@@ -1304,6 +1487,28 @@ fn finish_job(shared: &Shared, id: &str, outcome: Outcome, exit_code: Option<i32
     announce_closed(shared, id, closed);
 }
 
+/// The `killed_by` an outcome is stored with: only `killed` outcomes have
+/// one; Sluice's own cancel reason (`entry`) wins, otherwise the one the
+/// classifier set (`memory`) survives.
+fn merged_killed_by(
+    status: OutcomeStatus,
+    entry: Option<&'static str>,
+    classified: Option<String>,
+) -> Option<String> {
+    if status != OutcomeStatus::Killed {
+        return None;
+    }
+    entry.map(str::to_owned).or(classified)
+}
+
+/// The memory guard's own words for a job it cancelled, in place of the
+/// generic "was killed" (only while the job ends `killed`).
+fn guard_message(status: OutcomeStatus, entry: Option<&JobEntry>) -> Option<String> {
+    entry
+        .filter(|_| status == OutcomeStatus::Killed)
+        .and_then(|e| e.guard_message.clone())
+}
+
 /// What [`close_job`] leaves to do once the state lock is released.
 struct Closed {
     label: &'static str,
@@ -1311,6 +1516,7 @@ struct Closed {
     events: Option<broadcast::Sender<JobEvent>>,
     started_at: Option<u64>,
     learned: Option<(StatsKey, GateStat)>,
+    memory: Option<(StatsKey, GateMemory)>,
 }
 
 /// The part of [`finish_job`] done under the state lock: the job leaves the
@@ -1338,7 +1544,7 @@ fn close_job(
     };
     let mut outcome = outcome;
     let now = now_ms();
-    let (events, started_at, learned) = {
+    let (events, started_at, learned, memory) = {
         let max = st.sched.subscribers_max(id).unwrap_or(1);
         let record = st.sched.record(id, now);
         if st.sched.finish(id).is_none() {
@@ -1356,36 +1562,27 @@ fn close_job(
             outcome.wait_reason = r.dominant().map(|c| c.as_str().to_owned());
             outcome.admission = r.admission.map(|a| a.as_str().to_owned());
         }
-        let killed_by = entry.as_ref().and_then(|e| e.killed_by);
-        if outcome.status == OutcomeStatus::Killed {
-            outcome.killed_by = killed_by.map(str::to_owned);
+        outcome.killed_by = merged_killed_by(
+            outcome.status,
+            entry.as_ref().and_then(|e| e.killed_by),
+            outcome.killed_by.take(),
+        );
+        if let Some(message) = guard_message(outcome.status, entry.as_ref()) {
+            outcome.message = message;
         }
         let wall_ms = started_at.map(|s| now.saturating_sub(s));
         let demand = entry
             .as_ref()
             .zip(wall_ms)
             .and_then(|(e, wall)| e.usage.finish(wall, calm_end));
-        let mut learned = None;
-        if let (Some(e), Some(d), Some(wall)) = (&entry, demand, wall_ms)
-            && let Some(key) = &e.stats_key
-            && learns_from(outcome.status)
-        {
-            learned = Some((
-                key.clone(),
-                GateStat {
-                    repo: key.0.clone(),
-                    gate: key.1.clone(),
-                    cmd_hash: key.2.clone(),
-                    job_id: id.to_owned(),
-                    finished_at: now,
-                    outcome: label.to_owned(),
-                    wall_ms: wall,
-                    cpu_ms: d.cpu_ms,
-                    run_delay_ms: d.run_delay_ms,
-                    demand_milli: d.demand_milli,
-                },
-            ));
-        }
+        let learned = entry
+            .as_ref()
+            .zip(demand)
+            .zip(wall_ms)
+            .and_then(|((e, d), wall)| learned_stat(e, &outcome, label, id, now, (d, wall)));
+        let memory = entry
+            .as_ref()
+            .and_then(|e| learned_memory(e.stats_key.as_ref()?, &e.usage, &outcome, id, now));
         let finish = FinishMeta {
             waits: record.as_ref().map_or([0; 5], |r| r.waits),
             cpu_ms: demand.map(|d| d.cpu_ms),
@@ -1407,9 +1604,12 @@ fn close_job(
             if let Some((_, stat)) = &learned {
                 s.insert_gate_stat(stat)?;
             }
+            if let Some((_, working_set)) = &memory {
+                s.insert_gate_memory(working_set)?;
+            }
             Ok(())
         });
-        (entry.map(|e| e.events), started_at, learned)
+        (entry.map(|e| e.events), started_at, learned, memory)
     };
     Closed {
         label,
@@ -1417,7 +1617,72 @@ fn close_job(
         events,
         started_at,
         learned,
+        memory,
     }
+}
+
+/// What a finished job teaches the learned weight and expected time of its
+/// key: passing runs only ([`learns_from`]), with a measured demand.
+fn learned_stat(
+    entry: &JobEntry,
+    outcome: &Outcome,
+    label: &str,
+    id: &str,
+    now: u64,
+    (demand, wall_ms): (sampler::Demand, u64),
+) -> Option<(StatsKey, GateStat)> {
+    let key = entry
+        .stats_key
+        .as_ref()
+        .filter(|_| learns_from(outcome.status))?;
+    Some((
+        key.clone(),
+        GateStat {
+            repo: key.0.clone(),
+            gate: key.1.clone(),
+            cmd_hash: key.2.clone(),
+            job_id: id.to_owned(),
+            finished_at: now,
+            outcome: label.to_owned(),
+            wall_ms,
+            cpu_ms: demand.cpu_ms,
+            run_delay_ms: demand.run_delay_ms,
+            demand_milli: demand.demand_milli,
+        },
+    ))
+}
+
+/// What a finished job teaches the expected peak of its key (ADR-0019):
+/// passing runs and runs killed for lack of memory (they would otherwise
+/// leave a gate that keeps dying at "unknown" forever); a failure that is
+/// not a memory kill stopped early and teaches nothing. Needs a sampled
+/// working set.
+fn learned_memory(
+    key: &StatsKey,
+    usage: &JobUsage,
+    outcome: &Outcome,
+    id: &str,
+    now: u64,
+) -> Option<(StatsKey, GateMemory)> {
+    let killed = outcome.status == OutcomeStatus::Killed
+        && outcome.killed_by.as_deref() == Some(memkill::KILLED_BY_MEMORY);
+    if !killed && !learns_from(outcome.status) {
+        return None;
+    }
+    Some((
+        key.clone(),
+        GateMemory {
+            repo: key.0.clone(),
+            gate: key.1.clone(),
+            cmd_hash: key.2.clone(),
+            job_id: id.to_owned(),
+            finished_at: now,
+            outcome: if killed { "killed" } else { "pass" }.to_owned(),
+            anon_peak_bytes: usage.memory_peak()?,
+            peak_bytes: outcome.memory_peak_bytes.or(usage.cgroup_peak()),
+            oom_killed: killed,
+        },
+    ))
 }
 
 /// The part of [`finish_job`] done without the state lock: learned weights,
@@ -1429,7 +1694,24 @@ fn announce_closed(shared: &Shared, id: &str, closed: Closed) {
         events,
         started_at,
         learned,
+        memory,
     } = closed;
+    if let Some((key, working_set)) = memory {
+        // Never held with the state mutex; queued and running jobs of this
+        // key use the new expected peak at the next admission pass.
+        let expected = {
+            let mut peaks = lock(&shared.peaks);
+            peaks.push(
+                key.clone(),
+                PeakSample {
+                    anon_peak_bytes: working_set.anon_peak_bytes,
+                    killed: working_set.oom_killed,
+                },
+            );
+            peaks.expected(&key)
+        };
+        shared.state().sched.set_learned_peak(key, expected);
+    }
     if let Some((key, stat)) = learned {
         // The stats mutex is never held with the state one: queued jobs of
         // this key take the new learned weight at the next admission pass.
@@ -1513,20 +1795,119 @@ async fn start_job(shared: Arc<Shared>, id: String) {
     }
 }
 
+/// A job that ran: how it ended and, when the kernel or `systemd-oomd`
+/// killed it for lack of memory, the proof ([`memkill`]).
+struct Launched {
+    finished: Finished,
+    memory_kill: Option<MemoryKill>,
+}
+
+/// A job classified as killed for lack of memory.
+struct MemoryKill {
+    /// The outcome message.
+    message: String,
+    /// `memory.peak` of the job's leaf.
+    peak_bytes: Option<u64>,
+}
+
 /// Spawns a job, records its start, broadcasts `started` and waits for it
 /// with periodic `progress`. `None` when it could not start (the job is
 /// then already finished with an `error` outcome).
-async fn launch(shared: &Shared, id: &str, mut spec: ExecSpec) -> Option<Finished> {
+async fn launch(shared: &Arc<Shared>, id: &str, mut spec: ExecSpec) -> Option<Launched> {
+    let gate = spec.gate.clone();
     // Containment: the job starts through `sluice cg-exec <leaf> --` in its
     // own leaf of the daemon scope, and the leaf goes away with the job.
-    if let Some(c) = &shared.containment {
-        spec.wrapper = c.job_prefix(id);
-    }
+    // Without a leaf the helper still raises the job's `oom_score_adj`.
+    spec.wrapper = job_wrapper(shared, id);
     let finished = launch_placed(shared, id, spec).await;
+    let memory_kill = match &finished {
+        Some(f) if shared.containment.is_some() => job_memory_end(shared, id, &gate, f).await,
+        _ => None,
+    };
     if let Some(c) = &shared.containment {
         c.release_job(id);
     }
-    finished
+    finished.map(|finished| Launched {
+        finished,
+        memory_kill,
+    })
+}
+
+/// The `cg-exec` argv prefix of a job: placed in its leaf when containment
+/// is running, only raising the `oom_score_adj` when it is configured but
+/// the machine does not allow it (no cgroup v2, no user manager), empty
+/// with `[containment] enabled = false`.
+fn job_wrapper(shared: &Shared, id: &str) -> Vec<std::ffi::OsString> {
+    if let Some(c) = &shared.containment {
+        let prefix = c.job_prefix(id);
+        if !prefix.is_empty() {
+            return prefix;
+        }
+    }
+    match &shared.config.containment {
+        Some(setup) => containment::cg_exec_prefix(
+            &setup.exe,
+            std::ffi::OsStr::new(containment::NO_LEAF),
+            shared.config.user.containment.gates_oom_score_adj.resolve(),
+        ),
+        None => Vec::new(),
+    }
+}
+
+/// Reads the ended job's leaf (still there), records the kills it holds and
+/// decides whether the job died of memory. Runs on a blocking thread.
+async fn job_memory_end(
+    shared: &Arc<Shared>,
+    id: &str,
+    gate: &str,
+    finished: &Finished,
+) -> Option<MemoryKill> {
+    let shared = Arc::clone(shared);
+    let (id, gate) = (id.to_owned(), gate.to_owned());
+    let (status, duration) = (finished.status, finished.duration);
+    tokio::task::spawn_blocking(move || memory_end(&shared, &id, &gate, status, duration))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Journal lines are searched from this long before the job started.
+const JOURNAL_SLACK: Duration = Duration::from_secs(5);
+
+fn memory_end(
+    shared: &Shared,
+    id: &str,
+    gate: &str,
+    status: ExecStatus,
+    duration: Duration,
+) -> Option<MemoryKill> {
+    let c = shared.containment.as_ref()?;
+    let now = now_ms();
+    let end = c.read_job_end(id, now);
+    let mut rows = end.rows;
+    let mut journal_hit = false;
+    if memkill::needs_journal(status, end.oom_kill, end.oom_group_kill) {
+        let since = (now / 1000).saturating_sub((duration + JOURNAL_SLACK).as_secs());
+        if let Some(row) = c.oomd_killed_job(id, since) {
+            journal_hit = true;
+            rows.push(row);
+        }
+    }
+    record_interventions(shared, &rows);
+    let evidence = memkill::MemoryEvidence {
+        gate,
+        status,
+        oom_kill: end.oom_kill,
+        oom_group_kill: end.oom_group_kill,
+        journal_hit,
+        peak_bytes: end.peak_bytes,
+        available_bytes: memkill::mem_available(&shared.config.proc_root),
+        duration,
+    };
+    memkill::memory_kill_message(&evidence).map(|message| MemoryKill {
+        message,
+        peak_bytes: end.peak_bytes,
+    })
 }
 
 async fn launch_placed(shared: &Shared, id: &str, spec: ExecSpec) -> Option<Finished> {
@@ -1652,7 +2033,11 @@ async fn start_exec(shared: Arc<Shared>, id: String, request: Arc<ExecRequest>) 
         log_path: shared.config.logs_dir.join(format!("{id}.exec")),
         wrapper: Vec::new(),
     };
-    let Some(finished) = launch(&shared, &id, spec).await else {
+    let Some(Launched {
+        finished,
+        memory_kill,
+    }) = launch(&shared, &id, spec).await
+    else {
         return;
     };
     let secs = finished.duration.as_secs_f64();
@@ -1691,6 +2076,12 @@ async fn start_exec(shared: Arc<Shared>, id: String, request: Arc<ExecRequest>) 
         ExecStatus::Signaled(s) => outcome.signal = Some(s),
         ExecStatus::Timeout | ExecStatus::Killed => {}
     }
+    if let Some(kill) = memory_kill {
+        outcome.status = OutcomeStatus::Killed;
+        outcome.message = kill.message;
+        outcome.killed_by = Some(memkill::KILLED_BY_MEMORY.to_owned());
+        outcome.memory_peak_bytes = kill.peak_bytes;
+    }
     let tail = shared.config.tail_lines;
     let log = finished.log_path;
     outcome.tail = tokio::task::spawn_blocking(move || executor::tail_lines(&log, tail))
@@ -1709,6 +2100,7 @@ async fn start_gate(shared: Arc<Shared>, id: String, request: Arc<RunRequest>) {
         marker_hit(&shared, &request).await
     };
     if let Some(marker) = marker {
+        log_hook_run(hook_run_tag(&request).as_deref(), "hit by the double-check");
         let outcome = Outcome {
             status: OutcomeStatus::Cached,
             exit_code: Some(0),
@@ -1728,11 +2120,11 @@ async fn start_gate(shared: Arc<Shared>, id: String, request: Arc<RunRequest>) {
     }
 
     let log_path = shared.config.logs_dir.join(format!("{id}.log"));
-    let Some(finished) = launch(&shared, &id, exec_spec(&shared, &request, &id, &log_path)).await
+    let Some(launched) = launch(&shared, &id, exec_spec(&shared, &request, &id, &log_path)).await
     else {
         return;
     };
-    let (outcome, exit_code) = conclude(&shared, &request, &id, finished).await;
+    let (outcome, exit_code) = conclude(&shared, &request, &id, launched).await;
     finish_job(&shared, &id, outcome, exit_code);
 }
 
@@ -1876,9 +2268,21 @@ async fn conclude(
     shared: &Arc<Shared>,
     request: &Arc<RunRequest>,
     id: &str,
-    finished: Finished,
+    launched: Launched,
 ) -> (Outcome, Option<i32>) {
-    let (status, exit_code, message, miss_reason) = classify(request, &finished);
+    let Launched {
+        finished,
+        memory_kill,
+    } = launched;
+    let (mut status, mut exit_code, mut message, mut miss_reason) = classify(request, &finished);
+    let mut killed_by = None;
+    let mut memory_peak_bytes = None;
+    if let Some(kill) = memory_kill {
+        (status, exit_code, message) = (OutcomeStatus::Killed, None, kill.message);
+        miss_reason = Some("killed for memory");
+        killed_by = Some(memkill::KILLED_BY_MEMORY.to_owned());
+        memory_peak_bytes = kill.peak_bytes;
+    }
     let mut outcome = Outcome {
         status,
         exit_code,
@@ -1889,6 +2293,8 @@ async fn conclude(
             .log_error
             .as_ref()
             .map(|e| format!("{e}; the output was kept in memory for the tail only")),
+        killed_by,
+        memory_peak_bytes,
         ..Outcome::default()
     };
     // Queue-only gates (`no_marker`) never write a marker or a miss record.
@@ -2107,7 +2513,7 @@ async fn handle_connection(shared: Arc<Shared>, stream: UnixStream) {
     match request {
         ClientMessage::Run { id, request } => {
             let via = run_via(&client, &request);
-            handle_run(&shared, rd, wr, id, request, via).await;
+            handle_run(&shared, rd, wr, id, request, via, peer_pid).await;
         }
         ClientMessage::Exec { id, request } => handle_exec(&shared, rd, wr, id, request).await,
         ClientMessage::Status { id } => {
@@ -2190,7 +2596,7 @@ fn status_report(shared: &Shared) -> StatusReport {
         let adm = lock(&shared.psi);
         (adm.info(), adm.blocked_ms_total(), adm.blocking())
     };
-    let (running, queued, total, used, cap, over_admissions) = {
+    let (running, queued, total, used, cap, over_admissions, memory) = {
         let st = shared.state();
         let (running, queued) = st.sched.snapshot(now, psi_blocking);
         let caller = |id: &str| {
@@ -2230,6 +2636,9 @@ fn status_report(shared: &Shared) -> StatusReport {
                     waited_ms: Some(v.started_at.saturating_sub(v.queued_at)),
                     admission: Some(v.admission.as_str().to_owned()),
                     demand,
+                    memory_bytes: v.memory_current,
+                    memory_expected_bytes: v.memory_expected.map(|e| e.bytes),
+                    memory_expected_learned: v.memory_expected.map(|e| e.learned),
                 }
             })
             .collect();
@@ -2255,6 +2664,8 @@ fn status_report(shared: &Shared) -> StatusReport {
                     expected_ms: v.expected_ms,
                     weight_cfg: Some(v.weight_cfg),
                     wait_detail: v.detail.map(str::to_owned),
+                    memory_expected_bytes: v.memory_expected.map(|e| e.bytes),
+                    memory_expected_learned: v.memory_expected.map(|e| e.learned),
                 }
             })
             .collect();
@@ -2265,6 +2676,14 @@ fn status_report(shared: &Shared) -> StatusReport {
             st.sched.used(),
             st.sched.cap(),
             st.sched.over_admissions(),
+            st.sched
+                .memory_facts()
+                .zip(st.sched.memory_headroom())
+                .map(|(f, headroom_bytes)| proto::MemoryBudget {
+                    available_bytes: f.available_bytes,
+                    reserve_bytes: f.reserve_bytes,
+                    headroom_bytes,
+                }),
         )
     };
     let (idle_cpus, idle_while_waiting_ms, waiting_wall_ms) = {
@@ -2315,6 +2734,7 @@ fn status_report(shared: &Shared) -> StatusReport {
             cap: Some(cap),
             cpus: Some(shared.cpus),
             idle_cpus,
+            memory,
         },
         running,
         queued,
@@ -2725,6 +3145,7 @@ fn register_job(shared: &Shared, job: NewJob) -> std::result::Result<Registered,
                     stats_key: job.stats_key,
                     usage: JobUsage::default(),
                     killed_by: None,
+                    guard_message: None,
                 },
             );
             Ok(Registered {
@@ -2761,10 +3182,24 @@ fn detach(shared: &Shared, job_id: &str) {
     detach_because(shared, job_id, None);
 }
 
+/// Records why Sluice cancelled a job, unless an earlier cancel already did:
+/// the first cause stays (a guard cancel's `memory` must not become
+/// `last-subscriber` when the client drops its connection next).
+fn note_killed_by(slot: &mut Option<&'static str>, cause: &'static str) {
+    slot.get_or_insert(cause);
+}
+
 /// [`detach`] with the client's reason (`cancel.reason`), recorded as the
 /// job's `killed_by` when this subscriber was the last one (default
 /// `last-subscriber`).
 fn detach_because(shared: &Shared, job_id: &str, reason: Option<&str>) {
+    detach_with(shared, job_id, reason, false);
+}
+
+/// [`detach_because`]; `force` kills the job when its last subscriber goes
+/// even under `last_subscriber_gone = "finish"` (a run whose owner is
+/// removing its working directory).
+fn detach_with(shared: &Shared, job_id: &str, reason: Option<&str>, force: bool) {
     let killed_by = match reason {
         Some(proto::CANCEL_EARLY_VERDICT) => "early-verdict",
         _ => "last-subscriber",
@@ -2779,12 +3214,15 @@ fn detach_because(shared: &Shared, job_id: &str, reason: Option<&str>) {
         // has nothing to cache, so losing its last subscriber always kills it.
         let is_exec = st.jobs.get(job_id).is_some_and(|e| e.request.is_exec());
         if remaining > 0
-            || (shared.config.last_subscriber_gone == LastSubscriberGone::Finish && !is_exec)
+            || (shared.config.last_subscriber_gone == LastSubscriberGone::Finish
+                && !is_exec
+                && !force)
         {
             return;
         }
         if let Some(entry) = st.jobs.get_mut(job_id) {
-            entry.killed_by = Some(killed_by);
+            // A cancel that already named its cause (the memory guard) keeps it.
+            note_killed_by(&mut entry.killed_by, killed_by);
         }
         if st.sched.is_queued(job_id) {
             // Dropped under the lock of the check: the scheduling loop
@@ -2926,6 +3364,91 @@ impl Subscriber<'_> {
     }
 }
 
+/// What identifies a `run` request that came from a git hook, for its log
+/// line (`None` without a hook): gate, hook, the first 12 hex digits of the
+/// tree and key (`-` when unknown) and the caller.
+fn hook_run_tag(request: &RunRequest) -> Option<String> {
+    let hook = request.hook.as_ref()?;
+    let short =
+        |h: Option<&str>| h.map_or_else(|| "-".to_owned(), |h| h.chars().take(12).collect());
+    Some(format!(
+        "gate={} hook={hook} tree={} key={} caller={}",
+        request.gate.name,
+        short(
+            request
+                .tree
+                .as_ref()
+                .map(sluice_gate_core::tree::TreeHash::as_str)
+        ),
+        short(request.key.as_ref().map(CacheKey::as_str)),
+        caller_str(request.caller),
+    ))
+}
+
+/// Logs, at `info`, what the daemon decided about a hook `run` request
+/// (`queued`, `coalesced`, `hit by the double-check`), so a hook that missed
+/// the cache can be explained from the daemon log alone.
+fn log_hook_run(tag: Option<&str>, decision: &str) {
+    if let Some(tag) = tag {
+        tracing::info!("hook run request: {tag} decision={decision}");
+    }
+}
+
+/// First answer of an extension to a hook `run` request (see
+/// [`Extension::vouch_run`]); only hook runs are asked.
+async fn ask_extensions(
+    shared: &Shared,
+    request: &RunRequest,
+    peer_pid: Option<i32>,
+) -> Option<Vouch> {
+    let peer = peer_pid.and_then(|p| u32::try_from(p).ok());
+    for e in &shared.extensions().active {
+        if let Some(v) = e.vouch_run(request, peer).await {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Replies to a vouched `run` with the `done` a normal run would end with:
+/// `cached` (exit 0) for a verified gate, `error` for a refused one. No
+/// `queued`/`started` precede it (the client reads until `done`), nothing is
+/// registered and nothing runs.
+async fn answer_vouch(wr: &mut OwnedWriteHalf, id: u64, request: &RunRequest, vouch: Vouch) {
+    let gate = &request.gate.name;
+    let (job_id, outcome) = match vouch {
+        Vouch::Verified { train_id, job_id } => {
+            let by = job_id.as_ref().map_or_else(
+                || format!("merge train {train_id}"),
+                |job| format!("merge train {train_id} (job {job})"),
+            );
+            tracing::info!("push hook vouched: train={train_id} gate={gate} verdict=verified");
+            let outcome = Outcome {
+                status: OutcomeStatus::Cached,
+                exit_code: Some(0),
+                message: format!("{gate}: verified by {by}"),
+                ..Outcome::default()
+            };
+            (job_id.unwrap_or_default(), outcome)
+        }
+        Vouch::Refused { message } => {
+            tracing::info!("push hook vouched: train=- gate={gate} verdict=refused: {message}");
+            let outcome = Outcome {
+                status: OutcomeStatus::Error,
+                message,
+                ..Outcome::default()
+            };
+            (String::new(), outcome)
+        }
+    };
+    let done = ServerMessage::Done {
+        id,
+        job_id,
+        outcome,
+    };
+    let _ = send(wr, &done).await;
+}
+
 #[allow(clippy::too_many_lines, reason = "one connection, in protocol order")]
 async fn handle_run(
     shared: &Arc<Shared>,
@@ -2934,7 +3457,15 @@ async fn handle_run(
     id: u64,
     request: RunRequest,
     via: &'static str,
+    peer_pid: Option<i32>,
 ) {
+    let hook_tag = hook_run_tag(&request);
+    if request.hook.is_some()
+        && let Some(vouch) = ask_extensions(shared, &request, peer_pid).await
+    {
+        answer_vouch(&mut wr, id, &request, vouch).await;
+        return;
+    }
     let Registered {
         job_id,
         coalesced,
@@ -2955,6 +3486,10 @@ async fn handle_run(
         }
     };
     tracing::info!(job = %job_id, coalesced, position, "run request queued");
+    log_hook_run(
+        hook_tag.as_deref(),
+        if coalesced { "coalesced" } else { "queued" },
+    );
     if !coalesced {
         shared.wake.notify_one();
     }
@@ -3305,5 +3840,115 @@ mod tests {
         ] {
             assert!(!learns_from(status), "{status:?}");
         }
+    }
+
+    #[test]
+    fn the_first_cancel_cause_is_kept() {
+        let mut slot = None;
+        note_killed_by(&mut slot, memkill::KILLED_BY_MEMORY);
+        note_killed_by(&mut slot, "last-subscriber");
+        note_killed_by(&mut slot, "stop");
+        assert_eq!(slot, Some(memkill::KILLED_BY_MEMORY));
+        let mut slot = None;
+        note_killed_by(&mut slot, "last-subscriber");
+        assert_eq!(slot, Some("last-subscriber"));
+    }
+
+    #[test]
+    fn the_classifiers_killed_by_survives_close_job_unless_sluice_cancelled() {
+        let memory = || Some(memkill::KILLED_BY_MEMORY.to_owned());
+        assert_eq!(
+            merged_killed_by(OutcomeStatus::Killed, None, memory()),
+            memory()
+        );
+        // Sluice's own reason wins over the classifier's.
+        assert_eq!(
+            merged_killed_by(OutcomeStatus::Killed, Some("stop"), memory()),
+            Some("stop".to_owned())
+        );
+        assert_eq!(merged_killed_by(OutcomeStatus::Killed, None, None), None);
+        // Only killed outcomes carry one.
+        for status in [
+            OutcomeStatus::Fail,
+            OutcomeStatus::Pass,
+            OutcomeStatus::Error,
+        ] {
+            assert_eq!(merged_killed_by(status, Some("stop"), memory()), None);
+        }
+    }
+
+    fn key() -> StatsKey {
+        (PathBuf::from("/r"), "test".to_owned(), "c0ffee".to_owned())
+    }
+
+    fn sampled(peak: u64) -> JobUsage {
+        let mut usage = JobUsage::default();
+        usage.observe_memory(WorkingSet {
+            bytes: peak / 2,
+            peak: Some(peak + 7),
+        });
+        usage.observe_memory(WorkingSet {
+            bytes: peak,
+            peak: Some(peak + 9),
+        });
+        usage.observe_memory(WorkingSet {
+            bytes: peak / 3,
+            peak: Some(peak + 8),
+        });
+        usage
+    }
+
+    fn outcome(status: OutcomeStatus, killed_by: Option<&str>) -> Outcome {
+        Outcome {
+            status,
+            killed_by: killed_by.map(str::to_owned),
+            ..Outcome::default()
+        }
+    }
+
+    /// ADR-0019: passing runs and runs killed for lack of memory teach the
+    /// expected peak; no other failure does; the weight still learns from
+    /// passing runs only.
+    #[test]
+    fn memory_is_learned_from_passes_and_memory_kills_only() {
+        let usage = sampled(1000);
+        let pass = learned_memory(&key(), &usage, &outcome(OutcomeStatus::Pass, None), "j", 5)
+            .expect("a pass teaches")
+            .1;
+        assert_eq!(pass.anon_peak_bytes, 1000, "the largest sample");
+        assert_eq!(pass.peak_bytes, Some(1009), "memory.peak, shown only");
+        assert_eq!((pass.outcome.as_str(), pass.oom_killed), ("pass", false));
+        assert_eq!(
+            (pass.gate.as_str(), pass.cmd_hash.as_str()),
+            ("test", "c0ffee")
+        );
+        let mut killed = outcome(OutcomeStatus::Killed, Some(memkill::KILLED_BY_MEMORY));
+        killed.memory_peak_bytes = Some(4242);
+        let killed = learned_memory(&key(), &usage, &killed, "j", 5).unwrap().1;
+        assert_eq!(
+            (killed.outcome.as_str(), killed.oom_killed),
+            ("killed", true)
+        );
+        assert_eq!(killed.peak_bytes, Some(4242), "the kernel's peak wins");
+        for no in [
+            outcome(OutcomeStatus::Fail, None),
+            outcome(OutcomeStatus::Timeout, None),
+            outcome(OutcomeStatus::Error, None),
+            // Sluice's own cancel is not a memory kill.
+            outcome(OutcomeStatus::Killed, Some("stop")),
+            outcome(OutcomeStatus::Killed, None),
+        ] {
+            assert_eq!(learned_memory(&key(), &usage, &no, "j", 5), None, "{no:?}");
+        }
+        // Nothing sampled (or only zeros): nothing to learn.
+        let none = JobUsage::default();
+        let pass = outcome(OutcomeStatus::Pass, None);
+        assert_eq!(learned_memory(&key(), &none, &pass, "j", 5), None);
+        let mut zeros = JobUsage::default();
+        zeros.observe_memory(WorkingSet::default());
+        assert_eq!(learned_memory(&key(), &zeros, &pass, "j", 5), None);
+        // The weight's rule is unchanged.
+        assert!(learns_from(OutcomeStatus::Pass));
+        assert!(!learns_from(OutcomeStatus::Killed));
     }
 }

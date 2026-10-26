@@ -56,6 +56,11 @@ pub const FEATURE_EXEC: &str = "exec";
 /// (queue-only gates). Clients set `no_marker` only for a daemon listing it.
 pub const FEATURE_QUEUE_ONLY: &str = "queue-only";
 
+/// Feature announced by a daemon that honours `trust_member_config` on
+/// `queue-enqueue` and `queue-retry` (ADR-0018 section 6). A client refuses the
+/// flag when the daemon does not list it, instead of having it ignored.
+pub const FEATURE_QUEUE_TRUST_CONFIG: &str = "queue-trust-config";
+
 /// Value of [`RunningJob::kind`] / [`QueuedJob::kind`] for `sluice exec` jobs.
 pub const JOB_KIND_EXEC: &str = "exec";
 
@@ -63,6 +68,11 @@ pub const JOB_KIND_EXEC: &str = "exec";
 /// because a sibling gate failed (ADR-0011 M4); also the `killed_by` value
 /// of a job cancelled that way.
 pub const CANCEL_EARLY_VERDICT: &str = "early-verdict";
+
+/// `killed_by` of a job that the kernel OOM killer or `systemd-oomd` killed
+/// for lack of memory (ADR-0019): its `status` is `killed` and `message`
+/// says what happened.
+pub const KILLED_BY_MEMORY: &str = "memory";
 
 /// Maximum accepted length of one protocol line, in bytes (1 MiB).
 pub const MAX_LINE_BYTES: usize = 1 << 20;
@@ -196,6 +206,15 @@ pub enum ClientMessage {
         /// Surface the request came from (audit trail); `None` = CLI.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         via: Option<ApproveVia>,
+        /// Build the job's next train from the member's own `.sluice.toml`
+        /// (human CLI only; only sent to a daemon announcing
+        /// [`FEATURE_QUEUE_TRUST_CONFIG`]); omitted from the wire when false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        trust_member_config: bool,
+        /// Agent-detection variables of the client (only sent with
+        /// `trust_member_config`), so the daemon can refuse an agent's request.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        env: BTreeMap<String, String>,
     },
     /// Merge queue: cancel a job. Reply: `queue-job`.
     QueueCancel {
@@ -246,6 +265,11 @@ pub struct EnqueueRequest {
     /// Surface the request came from (audit trail); `None` = CLI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<ApproveVia>,
+    /// Build the job's train from the branch's own `.sluice.toml` (human CLI
+    /// only; only sent to a daemon announcing [`FEATURE_QUEUE_TRUST_CONFIG`]);
+    /// omitted from the wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trust_member_config: bool,
 }
 
 /// Surface a queue request came from: `queue-approve` (required) and,
@@ -648,10 +672,25 @@ pub struct Outcome {
     /// `guard` (PSI starvation guard); omitted when it never started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admission: Option<String>,
-    /// Who killed the job: `last-subscriber`, `early-verdict`, `stop` or
-    /// `superseded`; omitted unless it was killed.
+    /// Who killed the job: `last-subscriber`, `early-verdict`, `stop`,
+    /// `superseded` or `memory` (the kernel OOM killer or `systemd-oomd`
+    /// killed the job for lack of memory; `message` says so and `status` is
+    /// `killed`); omitted unless it was killed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub killed_by: Option<String>,
+    /// Peak memory of the job's cgroup (`memory.peak`, page cache included)
+    /// in bytes, when it was read; omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_peak_bytes: Option<u64>,
+}
+
+impl Outcome {
+    /// The job was killed for lack of memory ([`KILLED_BY_MEMORY`]); a client
+    /// prints [`Outcome::message`] instead of treating it as a cancel.
+    #[must_use]
+    pub fn killed_for_memory(&self) -> bool {
+        self.status == OutcomeStatus::Killed && self.killed_by.as_deref() == Some(KILLED_BY_MEMORY)
+    }
 }
 
 /// Category of an [`Outcome`].
@@ -756,6 +795,22 @@ pub struct ContainmentInfo {
     /// Length of that window in milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_ms: Option<u64>,
+    /// The `systemd-oomd` memory pressure policy of the gates' scope, when
+    /// the daemon created it (absent without `systemd-oomd`, below systemd
+    /// 257, or with `memory_policy = "none"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gates_oom_policy: Option<OomPolicyInfo>,
+}
+
+/// A `ManagedOOMMemoryPressure` policy: the limit and how long it has to be
+/// exceeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct OomPolicyInfo {
+    /// `ManagedOOMMemoryPressureLimit`, whole percent.
+    pub limit_percent: u32,
+    /// `ManagedOOMMemoryPressureDurationSec`, seconds.
+    pub duration_secs: u64,
 }
 
 /// Usage of one live agent session cgroup (`s-<id>`).
@@ -810,6 +865,13 @@ impl StatusReport {
         {
             let _ = writeln!(out, "outside jobs: {p:.1}% CPU");
         }
+        if let Some(p) = self.containment.as_ref().and_then(|c| c.gates_oom_policy) {
+            let _ = writeln!(
+                out,
+                "gates memory policy: systemd-oomd at {}% for {}s",
+                p.limit_percent, p.duration_secs
+            );
+        }
         if let Some(rows) = self.interventions.as_ref().filter(|r| !r.is_empty()) {
             let _ = writeln!(out, "interventions:");
             for i in rows {
@@ -829,6 +891,72 @@ impl StatusReport {
             }
         }
         out
+    }
+}
+
+/// `18.0 GiB`: bytes in GiB with one decimal (the text status).
+#[must_use]
+pub fn gib_text(bytes: u64) -> String {
+    // Display only: a count of bytes far below 2^53.
+    #[allow(clippy::cast_precision_loss, reason = "one decimal of a display value")]
+    let gib = bytes as f64 / f64::from(1u32 << 30);
+    format!("{gib:.1} GiB")
+}
+
+/// An expected peak: `18.0 GiB` when learned from earlier runs, `~18.0 GiB`
+/// when guessed from the weight.
+fn expected_text(bytes: u64, learned: Option<bool>) -> String {
+    let guess = if learned == Some(false) { "~" } else { "" };
+    format!("{guess}{}", gib_text(bytes))
+}
+
+impl MemoryBudget {
+    /// The `memory:` line of the text status (no trailing newline). Shared by
+    /// `sluice status` and the MCP `status` tool.
+    #[must_use]
+    pub fn status_line(&self) -> String {
+        format!(
+            "memory:   {} available, {} reserved, {} still to grow in running jobs",
+            gib_text(self.available_bytes),
+            gib_text(self.reserve_bytes),
+            gib_text(self.headroom_bytes)
+        )
+    }
+}
+
+impl RunningJob {
+    /// The job's memory in the text status, `  mem 3.1 GiB/18.0 GiB`
+    /// (current/expected; the expected peak has a `~` when it is a guess), or
+    /// nothing when the daemon sent none.
+    #[must_use]
+    pub fn memory_text(&self) -> String {
+        match (self.memory_bytes, self.memory_expected_bytes) {
+            (Some(now), Some(expected)) => format!(
+                "  mem {}/{}",
+                gib_text(now),
+                expected_text(expected, self.memory_expected_learned)
+            ),
+            (Some(now), None) => format!("  mem {}", gib_text(now)),
+            _ => String::new(),
+        }
+    }
+}
+
+impl QueuedJob {
+    /// The expected peak in the text status, `  mem 18.0 GiB`, or nothing.
+    #[must_use]
+    pub fn memory_text(&self) -> String {
+        self.memory_expected_bytes.map_or_else(String::new, |b| {
+            format!("  mem {}", expected_text(b, self.memory_expected_learned))
+        })
+    }
+
+    /// The `: <detail>` appended to the wait reason, or nothing.
+    #[must_use]
+    pub fn wait_detail_text(&self) -> String {
+        self.wait_detail
+            .as_deref()
+            .map_or_else(String::new, |d| format!(": {d}"))
     }
 }
 
@@ -905,6 +1033,29 @@ pub struct BudgetInfo {
     /// Mean idle CPUs over the last two utilisation samples.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle_cpus: Option<f64>,
+    /// Memory-aware admission (ADR-0019); omitted when it is off or the
+    /// machine's memory could not be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryBudget>,
+}
+
+/// What memory-aware admission sees (`status`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the unit in every name is part of the wire format"
+)]
+pub struct MemoryBudget {
+    /// `MemAvailable` at the last admission pass, bytes (swap is never
+    /// counted).
+    pub available_bytes: u64,
+    /// Memory kept for everything that is not a gate (`[admission]
+    /// memory_reserve`), bytes.
+    pub reserve_bytes: u64,
+    /// What the running jobs are still expected to grow by (expected peak
+    /// minus current, summed), bytes.
+    pub headroom_bytes: u64,
 }
 
 /// Linux pressure stall information.
@@ -968,6 +1119,18 @@ pub struct RunningJob {
     /// in CPUs); gates and `exec` jobs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub demand: Option<f64>,
+    /// Working set now (`anon` + swap of the job's cgroup, or the summed
+    /// resident set without containment), bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
+    /// Peak the job is expected to reach, bytes (learned from earlier runs
+    /// or guessed from its weight).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_expected_bytes: Option<u64>,
+    /// `true` when `memory_expected_bytes` comes from earlier runs, `false`
+    /// when it is a guess from the weight.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_expected_learned: Option<bool>,
 }
 
 /// A queued job in a status report.
@@ -1015,10 +1178,18 @@ pub struct QueuedJob {
     /// otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub weight_auto: Option<bool>,
-    /// Detail of `reason` when the job would fit but higher-ranked jobs
-    /// took the room: `outranked`, `lane` or `human-first`.
+    /// Detail of `reason`: `outranked`, `lane` or `human-first` when the job
+    /// would fit but higher-ranked jobs took the room; `memory` when the
+    /// budget has room but the memory it is expected to use does not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_detail: Option<String>,
+    /// Peak the job is expected to reach, bytes (learned or guessed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_expected_bytes: Option<u64>,
+    /// `true` when `memory_expected_bytes` comes from earlier runs, `false`
+    /// when it is a guess from the weight.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_expected_learned: Option<bool>,
 }
 
 /// Why a queued job is not running yet.
@@ -1219,6 +1390,30 @@ pub struct TrainGate {
     /// Run time in milliseconds, once finished.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Remark on the result, e.g. `not cached: the gate modified the tree;
+    /// verify the new tree again` for a pass that wrote no marker. Never
+    /// part of the train hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// The preparation of a train's merge worktree (`[queue] prepare`), as
+/// stored in `queue_trains.prepare`. Never part of the train hash.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TrainPrepare {
+    /// `running`, `pass`, `fail`, `timeout`, `killed`, `error` or `dirty`
+    /// (the command passed but left files the tree did not have).
+    pub status: String,
+    /// Sluice job id of the run, when one was submitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    /// Run time in milliseconds, once finished.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Log of the run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
 }
 
 /// One merge-queue train as shown to clients (columns of `queue_trains`).
@@ -1271,6 +1466,20 @@ pub struct QueueTrainView {
     /// `[queue] network_timeout` of the base, in milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network_timeout_ms: Option<u64>,
+    /// State of the train's `[queue] prepare` run; absent when the base has
+    /// no `prepare` or the train never needed it (every gate hit the cache).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepare: Option<TrainPrepare>,
+    /// `"member"` when the train runs the gates and `[queue]` settings of its
+    /// member's own `.sluice.toml` (`--trust-member-config`); absent for an
+    /// ordinary train, which runs the base's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_source: Option<String>,
+    /// For a `config_source = "member"` train: the unified diff
+    /// `git diff <base>...<head> -- .sluice.toml` (the whole member file, after
+    /// a note, when the base has none), capped at 64 KiB with a truncation note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_diff: Option<String>,
 }
 
 /// Decision taken by `queue-reconcile` for one train.
@@ -1459,6 +1668,11 @@ mod tests {
                     memory_some_avg10: None,
                     blocking: false,
                 },
+                memory: Some(MemoryBudget {
+                    available_bytes: 22 << 30,
+                    reserve_bytes: 3 << 30,
+                    headroom_bytes: 16 << 30,
+                }),
                 ..BudgetInfo::default()
             },
             running: vec![RunningJob {
@@ -1472,6 +1686,9 @@ mod tests {
                 caller: Caller::Human,
                 kind: None,
                 label: None,
+                memory_bytes: Some(2 << 30),
+                memory_expected_bytes: Some(18 << 30),
+                memory_expected_learned: Some(true),
                 ..RunningJob::default()
             }],
             queued: vec![
@@ -1486,6 +1703,9 @@ mod tests {
                     reason: WaitReason::HeadReserved,
                     kind: None,
                     label: None,
+                    wait_detail: Some("memory".into()),
+                    memory_expected_bytes: Some(18 << 30),
+                    memory_expected_learned: Some(false),
                     ..QueuedJob::default()
                 },
                 QueuedJob {
@@ -1517,6 +1737,7 @@ mod tests {
                 detail: Some("memory, pids; cpu by nice".into()),
                 outside_jobs_cpu_percent: Some(3.25),
                 window_ms: Some(10_000),
+                gates_oom_policy: None,
             }),
             sessions: Some(vec![SessionUsage {
                 id: "abc".into(),
@@ -1568,6 +1789,7 @@ mod tests {
                 job_id: Some("j".into()),
                 status: "pass".into(),
                 duration_ms: Some(12_400),
+                note: None,
             }],
             train_hash: Some(KEY.into()),
             approved_via: Some(ApproveVia::Cli),
@@ -1578,7 +1800,78 @@ mod tests {
             note: None,
             push_timeout_ms: Some(600_000),
             network_timeout_ms: Some(60_000),
+            prepare: None,
+            config_source: None,
+            config_diff: None,
         }
+    }
+
+    #[test]
+    fn the_prepare_view_is_optional_on_the_wire() {
+        let mut view = train_view();
+        let json = serde_json::to_value(&view).unwrap();
+        assert!(json.get("prepare").is_none(), "{json}");
+        view.prepare = Some(TrainPrepare {
+            status: "pass".into(),
+            job_id: Some("j-1".into()),
+            duration_ms: Some(41_200),
+            log_path: None,
+        });
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["prepare"]["status"], "pass");
+        assert!(json["prepare"].get("log_path").is_none());
+        let back: QueueTrainView = serde_json::from_value(json).unwrap();
+        assert_eq!(back, view);
+        // A view from an older daemon has no such field.
+        let mut old = serde_json::to_value(train_view()).unwrap();
+        old.as_object_mut().unwrap().remove("prepare");
+        assert!(
+            serde_json::from_value::<QueueTrainView>(old)
+                .unwrap()
+                .prepare
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_trust_flag_and_the_config_view_are_optional_on_the_wire() {
+        // An old client never sends the flag; a false flag is not sent.
+        let m = decode_client(
+            r#"{"type":"queue-enqueue","id":1,"repo":"/r/.git","worktree":"/r","branch":"b","head_sha":"abc","caller":"human"}"#,
+        )
+        .unwrap();
+        let ClientMessage::QueueEnqueue { mut request, .. } = m else {
+            panic!("not queue-enqueue");
+        };
+        assert!(!request.trust_member_config);
+        let line = encode(&ClientMessage::QueueEnqueue {
+            id: 1,
+            request: request.clone(),
+        })
+        .unwrap();
+        assert!(!line.contains("trust_member_config"), "{line}");
+        request.trust_member_config = true;
+        let line = encode(&ClientMessage::QueueEnqueue { id: 1, request }).unwrap();
+        assert!(line.contains(r#""trust_member_config":true"#), "{line}");
+        let m = decode_client(r#"{"type":"queue-retry","job_id":"j","head_sha":"abc"}"#).unwrap();
+        assert!(matches!(
+            m,
+            ClientMessage::QueueRetry {
+                trust_member_config: false,
+                ..
+            }
+        ));
+        // The view fields appear only for a trusted train.
+        let mut view = train_view();
+        let json = serde_json::to_value(&view).unwrap();
+        assert!(json.get("config_source").is_none(), "{json}");
+        assert!(json.get("config_diff").is_none(), "{json}");
+        view.config_source = Some("member".into());
+        view.config_diff = Some("+gate".into());
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["config_source"], "member");
+        let back: QueueTrainView = serde_json::from_value(json).unwrap();
+        assert_eq!(back, view);
     }
 
     #[test]
@@ -1629,6 +1922,7 @@ mod tests {
                     session: Some("s1".into()),
                     env: BTreeMap::from([("SSH_AUTH_SOCK".into(), "/a".into())]),
                     via: Some(ApproveVia::Mcp),
+                    trust_member_config: false,
                 },
             },
             ClientMessage::QueueStatus {
@@ -1648,12 +1942,16 @@ mod tests {
                 job_id: "j".into(),
                 head_sha: TREE.into(),
                 via: None,
+                trust_member_config: false,
+                env: BTreeMap::new(),
             },
             ClientMessage::QueueRetry {
                 id: 8,
                 job_id: "j".into(),
                 head_sha: TREE.into(),
                 via: Some(ApproveVia::Mcp),
+                trust_member_config: true,
+                env: BTreeMap::from([("CLAUDECODE".into(), "1".into())]),
             },
             ClientMessage::QueueCancel {
                 id: 9,
@@ -2065,7 +2363,13 @@ mod tests {
         );
 
         let done = encode(&outcome()).unwrap();
-        for k in ["queue_wait_ms", "wait_reason", "admission", "killed_by"] {
+        for k in [
+            "queue_wait_ms",
+            "wait_reason",
+            "admission",
+            "killed_by",
+            "memory_peak_bytes",
+        ] {
             assert!(!done.contains(k), "{done}");
         }
         let full = Outcome {
@@ -2073,6 +2377,7 @@ mod tests {
             wait_reason: Some("budget".into()),
             admission: Some("over".into()),
             killed_by: Some(CANCEL_EARLY_VERDICT.into()),
+            memory_peak_bytes: Some(18 << 30),
             ..outcome()
         };
         let back: Outcome = serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();

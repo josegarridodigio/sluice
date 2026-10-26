@@ -250,13 +250,17 @@ fn weight_effective_and_auto_are_additive_optional_fields() {
 /// optional and additive; schema 1 is unchanged and old reports still parse.
 #[test]
 fn containment_fields_are_additive_optional_fields() {
-    use sluice_gate_proto::{ContainmentInfo, Intervention, SessionUsage};
+    use sluice_gate_proto::{ContainmentInfo, Intervention, OomPolicyInfo, SessionUsage};
     let mut with = report();
     with.containment = Some(ContainmentInfo {
         level: "partial".into(),
         detail: Some("memory, pids; cpu by nice".into()),
         outside_jobs_cpu_percent: Some(3.5),
         window_ms: Some(10_000),
+        gates_oom_policy: Some(OomPolicyInfo {
+            limit_percent: 30,
+            duration_secs: 3,
+        }),
     });
     with.sessions = Some(vec![SessionUsage {
         id: "abc".into(),
@@ -280,7 +284,8 @@ fn containment_fields_are_additive_optional_fields() {
             "level": "partial",
             "detail": "memory, pids; cpu by nice",
             "outside_jobs_cpu_percent": 3.5,
-            "window_ms": 10000
+            "window_ms": 10000,
+            "gates_oom_policy": {"limit_percent": 30, "duration_secs": 3}
         })
     );
     assert_eq!(
@@ -315,6 +320,7 @@ fn containment_text_lists_state_sessions_outside_cpu_and_interventions() {
         detail: Some("memory, pids; cpu by nice".into()),
         outside_jobs_cpu_percent: Some(3.24),
         window_ms: None,
+        gates_oom_policy: None,
     });
     r.sessions = Some(vec![SessionUsage {
         id: "abc".into(),
@@ -346,5 +352,28 @@ fn containment_text_lists_state_sessions_outside_cpu_and_interventions() {
     assert!(
         r.containment_text()
             .starts_with("containment: off (user manager not reachable)\n")
+    );
+}
+
+/// The gates' oomd policy (W6c) is an optional addition to `containment`:
+/// printed when present, absent from the JSON otherwise.
+#[test]
+fn the_gates_oom_policy_is_optional_and_printed() {
+    use sluice_gate_proto::{ContainmentInfo, OomPolicyInfo};
+    let mut r = report();
+    r.containment = Some(ContainmentInfo {
+        level: "full".into(),
+        ..ContainmentInfo::default()
+    });
+    let json = serde_json::to_value(&r).unwrap();
+    assert!(json["containment"].get("gates_oom_policy").is_none());
+    assert_eq!(r.containment_text(), "containment: full\n");
+    r.containment.as_mut().unwrap().gates_oom_policy = Some(OomPolicyInfo {
+        limit_percent: 30,
+        duration_secs: 3,
+    });
+    assert_eq!(
+        r.containment_text(),
+        "containment: full\ngates memory policy: systemd-oomd at 30% for 3s\n"
     );
 }

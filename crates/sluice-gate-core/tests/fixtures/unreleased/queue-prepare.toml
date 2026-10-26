@@ -1,0 +1,12 @@
+# Written for 0.6.0 (ADR-0018): `[queue] prepare`, `prepare_timeout` and
+# `prepare_weight`. Not a recording of a released binary; 0.5.0 and older
+# reject this file because `[queue]` refuses unknown keys.
+version = 1
+
+[gates.test]
+cmd = "pnpm test"
+
+[queue]
+prepare = "pnpm install --frozen-lockfile --prefer-offline"
+prepare_timeout = "15m"
+prepare_weight = 2

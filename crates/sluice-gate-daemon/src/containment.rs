@@ -29,7 +29,9 @@ use sluice_gate_core::cgroup::{CGROUP_MOUNT, CgroupError};
 use sluice_gate_core::config::{ContainmentConfig, EnvMap};
 use sluice_gate_proto as proto;
 
-use crate::interventions::{InterventionRow, MemoryWatcher, parse_oomd_journal, watch_targets};
+use crate::interventions::{
+    InterventionRow, MemoryWatcher, find_job_kill, parse_oomd_journal, watch_targets,
+};
 use crate::reaper::ReaperCommand;
 
 /// Empty session and job cgroups younger than this are left alone (a fresh
@@ -40,6 +42,22 @@ pub const PRUNE_GRACE: Duration = Duration::from_secs(60);
 const FIRST_JOURNAL_LOOKBACK: Duration = Duration::from_secs(3600);
 /// Overlap of consecutive journal reads (rows are stored once anyway).
 const JOURNAL_OVERLAP: Duration = Duration::from_secs(30);
+
+/// Pause before the journal is asked about a kill that just happened.
+const JOURNAL_SETTLE: Duration = Duration::from_millis(400);
+
+/// What the leaf of a finished job said (see [`Containment::read_job_end`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobMemoryEnd {
+    /// `oom_kill` of the leaf.
+    pub oom_kill: u64,
+    /// `oom_group_kill` of the leaf.
+    pub oom_group_kill: u64,
+    /// `memory.peak` of the leaf.
+    pub peak_bytes: Option<u64>,
+    /// Interventions to record for kills no earlier poll had seen.
+    pub rows: Vec<InterventionRow>,
+}
 
 /// What the CLI hands the daemon to enable containment.
 #[derive(Debug, Clone)]
@@ -61,6 +79,8 @@ pub struct ContainmentSetup {
 pub struct Containment {
     tree: Tree,
     exe: PathBuf,
+    /// `--oom-score-adj` handed to `cg-exec` (`[containment] gates_oom_score_adj`).
+    oom_score_adj: u16,
     agents_ready: bool,
     oomd_active: bool,
     holder: Mutex<Option<Child>>,
@@ -218,13 +238,16 @@ impl Containment {
             level = "partial";
             detail = Some("agents scope unavailable".to_owned());
         }
+        let watcher =
+            MemoryWatcher::with_backstop(tree.layout.jobs_dir(), tree.layout.daemon_scope_dir());
         Ok(Self {
             tree,
             exe: setup.exe.clone(),
+            oom_score_adj: cfg.gates_oom_score_adj.resolve(),
             agents_ready,
             oomd_active: caps.oomd_active,
             holder: Mutex::new(holder),
-            watcher: Mutex::new(MemoryWatcher::new()),
+            watcher: Mutex::new(watcher),
             journal: Mutex::new(JournalState::default()),
             level,
             detail,
@@ -264,6 +287,10 @@ impl Containment {
             detail: self.detail.clone(),
             outside_jobs_cpu_percent: percent,
             window_ms: window,
+            gates_oom_policy: self.tree.settings.daemon_oom.map(|o| proto::OomPolicyInfo {
+                limit_percent: u32::from(o.limit_percent),
+                duration_secs: o.duration.map_or(0, |d| d.as_secs()),
+            }),
         };
         (info, self.sessions())
     }
@@ -290,18 +317,13 @@ impl Containment {
     }
 
     /// Creates the leaf `jobs/<job-id>` and returns the argv prefix that
-    /// places a job in it (`sluice cg-exec <leaf> --`), to be put before the
-    /// `nice`/`ionice` chain. Empty (the job runs unplaced) when the leaf
+    /// places a job in it (`sluice cg-exec <leaf> --oom-score-adj N --`), to
+    /// be put before the `nice`/`ionice` chain. Empty (the job runs unplaced) when the leaf
     /// cannot be created.
     #[must_use]
     pub fn job_prefix(&self, job_id: &str) -> Vec<OsString> {
         match self.tree.job_leaf(job_id) {
-            Ok(leaf) => vec![
-                self.exe.clone().into_os_string(),
-                "cg-exec".into(),
-                leaf.dir.into_os_string(),
-                "--".into(),
-            ],
+            Ok(leaf) => cg_exec_prefix(&self.exe, leaf.dir.as_os_str(), self.oom_score_adj),
             Err(e) => {
                 tracing::debug!(job = %job_id, "containment: no job leaf: {e}");
                 Vec::new()
@@ -340,11 +362,59 @@ impl Containment {
             &layout.daemon_scope_dir(),
             &layout.jobs_dir(),
         );
-        let mut rows = lock(&self.watcher).poll(&targets, now_ms);
+        let mut rows = {
+            let mut watcher = lock(&self.watcher);
+            let mut rows = watcher.poll(&targets, now_ms);
+            rows.extend(watcher.backstop(now_ms));
+            rows
+        };
         if self.agents_ready && self.oomd_active {
             rows.extend(self.journal_rows());
         }
         rows
+    }
+
+    /// Reads what the kernel counted in the leaf of a job that just ended
+    /// (it is removed right after): its OOM counters and `memory.peak`, and
+    /// the rows for kills the periodic poll had not reported. Blocking.
+    #[must_use]
+    pub fn read_job_end(&self, job_id: &str, now_ms: u64) -> JobMemoryEnd {
+        let dir = self.tree.layout.jobs_dir().join(job_id);
+        let usage = read_usage(&dir);
+        let events = usage.memory_events;
+        let rows = lock(&self.watcher).settle_job(
+            &self.tree.layout.daemon_scope_dir(),
+            &dir,
+            now_ms,
+            (events.oom_kill, events.oom_group_kill),
+        );
+        JobMemoryEnd {
+            oom_kill: events.oom_kill,
+            oom_group_kill: events.oom_group_kill,
+            peak_bytes: usage.memory_peak,
+            rows,
+        }
+    }
+
+    /// The one bounded journal query of a job that ended by `SIGKILL`
+    /// without any kernel counter: the `systemd-oomd` line naming its leaf,
+    /// if there is one (`since_unix` is when the job started). Waits a moment
+    /// first, because oomd logs the kill around the time it sends it.
+    /// Blocking; `None` without `systemd-oomd`, without `journalctl` or on
+    /// any failure.
+    #[must_use]
+    pub fn oomd_killed_job(&self, job_id: &str, since_unix: u64) -> Option<InterventionRow> {
+        if !self.oomd_active || lock(&self.journal).disabled {
+            return None;
+        }
+        std::thread::sleep(JOURNAL_SETTLE);
+        match systemd::journal_oomd(self.tree.env(), since_unix, false) {
+            Ok(text) => find_job_kill(&text, job_id),
+            Err(e) => {
+                tracing::debug!(job = %job_id, "containment: journal read failed: {e}");
+                None
+            }
+        }
     }
 
     fn journal_rows(&self) -> Vec<InterventionRow> {
@@ -391,6 +461,24 @@ impl Containment {
         let _ = child.wait();
     }
 }
+
+/// `<exe> cg-exec <leaf> --oom-score-adj <adj> --`: the argv prefix that
+/// places a job in `leaf` and raises its `oom_score_adj`. A `leaf` of
+/// [`NO_LEAF`] only raises the adj.
+#[must_use]
+pub fn cg_exec_prefix(exe: &Path, leaf: &std::ffi::OsStr, adj: u16) -> Vec<OsString> {
+    vec![
+        exe.as_os_str().to_owned(),
+        "cg-exec".into(),
+        leaf.to_owned(),
+        "--oom-score-adj".into(),
+        adj.to_string().into(),
+        "--".into(),
+    ]
+}
+
+/// What `cg-exec` takes as the leaf when there is none.
+pub const NO_LEAF: &str = "-";
 
 /// CPU used between two readings of `usage_usec`, as a percentage of `cpus`
 /// CPUs over `wall`. `None` for a zero window or a counter that went back.

@@ -15,17 +15,25 @@
 //! - [`push`]: push arguments, process handling, porcelain classification.
 //! - [`reconcile`]: the reconcile decision table and its queries.
 //! - [`runner`]: the runner loop, train build, gates, push orchestration.
+//! - `prepare`: `[queue] prepare`, the prepare job and the base probe.
+//! - `hookcheck`: a merged config asking the `pre-push` hook for unverified gates.
+//! - `trust`: the member's own configuration for `--trust-member-config`.
+//! - `vouch`: the answer to the repository's `pre-push` hook during the train's push.
 //! - [`extension`]: [`QueueExtension`], the `Extension` implementation.
 //!
 //! Design: `kb/sluice/design/merge-queue.md`.
 
 pub mod extension;
 pub mod git;
+mod hookcheck;
 pub mod model;
+mod prepare;
 pub mod push;
 pub mod reconcile;
 pub mod runner;
 pub mod store;
 pub mod target;
+mod trust;
+mod vouch;
 
 pub use extension::{QueueExtension, QueueOptions};

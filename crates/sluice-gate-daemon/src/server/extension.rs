@@ -5,7 +5,8 @@
 //! calls [`Extension::on_start`] once (lease held, before the socket is
 //! bound), spawns [`Extension::run`] as a long-lived task, routes the
 //! `queue-*` client messages to [`Extension::handle`], merges
-//! [`Extension::status_summary`] into `status` and announces
+//! [`Extension::status_summary`] into `status`, lets an extension answer a hook
+//! `run` request itself ([`Extension::vouch_run`]) and announces
 //! [`Extension::features`] in `welcome`. Everything an extension needs from
 //! the daemon goes through [`DaemonHandle`].
 //!
@@ -27,7 +28,7 @@ use tokio::time::{Instant, Interval, interval_at};
 
 use super::{
     DaemonConfig, JobEvent, LEASE_NAME, PROGRESS_EVERY, Registered, Shared, Subscriber,
-    close_request, detach, lock, register, rfc3339,
+    close_request, detach_with, lock, register, rfc3339,
 };
 
 /// A boxed, `Send` future: the return type of the [`Extension`] methods,
@@ -74,6 +75,40 @@ pub trait Extension: Send + Sync + std::fmt::Debug {
     fn status_summary(&self) -> BoxFuture<'_, Option<QueueSummary>> {
         Box::pin(async { None })
     }
+
+    /// Lets the extension answer a `run` request itself, before the daemon
+    /// registers or schedules it. Consulted only for requests that carry a
+    /// `hook` (a git hook run, so ordinary `sluice run` and `verify` calls pay
+    /// nothing), in extension order; the first `Some` wins. `peer_pid` is the
+    /// requesting process from `SO_PEERCRED`, when available. `None` (the
+    /// default) means "not mine": the request goes the normal way.
+    fn vouch_run<'a>(
+        &'a self,
+        request: &'a RunRequest,
+        peer_pid: Option<u32>,
+    ) -> BoxFuture<'a, Option<Vouch>> {
+        let _ = (request, peer_pid);
+        Box::pin(async { None })
+    }
+}
+
+/// An extension's direct answer to a `run` request (see
+/// [`Extension::vouch_run`]). The daemon replies with an ordinary `done`
+/// and nothing runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Vouch {
+    /// The gate is already verified for this tree: `done{cached}`, exit 0.
+    Verified {
+        /// Id of the train (or other record) that verified it.
+        train_id: String,
+        /// Sluice job that ran the gate, when there was one.
+        job_id: Option<String>,
+    },
+    /// The gate must not pass here: `done{error}` carrying `message`.
+    Refused {
+        /// Why, for the person reading the hook's output.
+        message: String,
+    },
 }
 
 /// Context of one request handed to [`Extension::handle`].
@@ -226,6 +261,7 @@ impl DaemonHandle {
                     events: Some(events),
                     tick: interval_at(Instant::now() + PROGRESS_EVERY, PROGRESS_EVERY),
                     finished: false,
+                    kill_on_drop: false,
                 }
             }
             Err(message) => RunSubscription {
@@ -242,8 +278,20 @@ impl DaemonHandle {
                 events: None,
                 tick: interval_at(Instant::now() + PROGRESS_EVERY, PROGRESS_EVERY),
                 finished: true,
+                kill_on_drop: false,
             },
         }
+    }
+
+    /// Like [`DaemonHandle::submit_run`], but dropping the subscription
+    /// before `done` always cancels the job (when it was the last
+    /// subscriber), whatever `last_subscriber_gone` says: the caller owns the
+    /// directory the job runs in (a train's merge worktree) and is about to
+    /// remove it, so the job must not keep running there to cache a result.
+    pub fn submit_run_owned(&self, request: RunRequest) -> RunSubscription {
+        let mut sub = self.submit_run(request);
+        sub.kill_on_drop = true;
+        sub
     }
 
     /// The fencing token of the lease this daemon acquired at start.
@@ -356,7 +404,8 @@ impl DaemonHandle {
 /// `ServerMessage`s a client would receive (`queued`, `started`,
 /// `progress`, `done`; or a single `error`). Dropping it before `done`
 /// unsubscribes, exactly like a client disconnecting (the
-/// `last_subscriber_gone` policy applies).
+/// `last_subscriber_gone` policy applies, except for runs submitted with
+/// [`DaemonHandle::submit_run_owned`], which are always cancelled).
 pub struct RunSubscription {
     shared: Arc<Shared>,
     job_id: String,
@@ -367,6 +416,9 @@ pub struct RunSubscription {
     events: Option<broadcast::Receiver<JobEvent>>,
     tick: Interval,
     finished: bool,
+    /// Cancel the job when the last subscriber is dropped, whatever
+    /// `last_subscriber_gone` says.
+    kill_on_drop: bool,
 }
 
 impl std::fmt::Debug for RunSubscription {
@@ -432,7 +484,7 @@ impl Drop for RunSubscription {
     fn drop(&mut self) {
         if !self.finished {
             tracing::debug!(job = %self.job_id, "extension subscription dropped");
-            detach(&self.shared, &self.job_id);
+            detach_with(&self.shared, &self.job_id, None, self.kill_on_drop);
             close_request(&self.shared, self.request_row.take(), true);
         }
     }

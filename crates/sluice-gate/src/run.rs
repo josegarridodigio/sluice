@@ -116,6 +116,8 @@ struct Trace {
     caller: Option<&'static str>,
     /// Working-tree hash, when it was computed.
     tree: Option<String>,
+    /// Cache key, when it was derived.
+    key: Option<String>,
     /// Short code of why the cache was off, when it was (`skip-worktree`).
     reason: Option<&'static str>,
     /// Decision keyword (see [`crate::clientlog`]); `None` until decided.
@@ -143,6 +145,7 @@ pub fn run(args: &RunArgs) -> ExitCode {
             hook: args.hook.as_deref(),
             gate: &args.gate,
             tree: trace.tree.as_deref(),
+            key: trace.key.as_deref(),
             reason: trace.reason,
             decision,
             exit,
@@ -220,6 +223,7 @@ fn run_traced(args: &RunArgs, trace: &mut Trace) -> ExitCode {
             trace.decision = Some("hit");
             // The current tree: on a scoped hit `hit.tree` is an earlier one.
             trace.tree = Some(tree.as_str().to_owned());
+            trace.key = Some(hit.key.as_str().to_owned());
             println!(
                 "sluice: {} PASS (cached, passed {} ago)",
                 ctx.gate_name,
@@ -246,8 +250,9 @@ fn run_traced(args: &RunArgs, trace: &mut Trace) -> ExitCode {
     // Policy on a miss, only inside a hook and only when the cache was consulted:
     // with caching off or an unknown tree the gate can never be cached, so
     // refusing to run would block the caller forever.
-    if let CacheState::Miss { tree, .. } = &state {
+    if let CacheState::Miss { tree, key, .. } = &state {
         trace.tree = Some(tree.as_str().to_owned());
+        trace.key = Some(key.as_str().to_owned());
     }
     if let Some(parent) = env.get(JOB_ENV_VAR).filter(|v| !v.is_empty()) {
         // Inside a Sluice job: queueing would wait for budget the parent holds.
@@ -304,6 +309,9 @@ fn run_queued(
     trace: &mut Trace,
 ) -> ExitCode {
     let env = &ctx.env;
+    if let Some((_, key)) = &queue_only {
+        trace.key = Some(key.as_str().to_owned());
+    }
     let request = match run_request(ctx, args, caller, &state) {
         Ok(r) => r,
         Err(e) => return fail(&e),
@@ -580,7 +588,10 @@ fn report_outcome(
                 .map(|s| s.to_string_lossy().into_owned())
         })
         .unwrap_or_else(|| done_job.to_owned());
-    if outcome.status == OutcomeStatus::Killed && outcome.log_path.is_none() {
+    if outcome.status == OutcomeStatus::Killed
+        && outcome.log_path.is_none()
+        && !outcome.killed_for_memory()
+    {
         // Dropped from the queue (daemon stop, cancellation): it never ran.
         eprintln!(
             "sluice: {} KILLED before it started (job {job_id}): the daemon stopped",
@@ -601,6 +612,11 @@ fn report_outcome(
                 CacheState::Off { .. } | CacheState::Hit { .. } => String::new(),
             };
             println!("sluice: {} PASS (cached{passed})", ctx.gate_name);
+            // Why nothing ran, when the daemon says so (a pass that appeared
+            // while queued, a gate verified by the merge train's push).
+            if !outcome.message.is_empty() {
+                eprintln!("sluice: {}", outcome.message);
+            }
             return ExitCode::SUCCESS;
         }
         OutcomeStatus::Error => return fail(&outcome.message),
@@ -630,6 +646,9 @@ fn report_outcome(
             job_id: &job_id,
             log_path: outcome.log_path.as_deref().unwrap_or(Path::new("-")),
             tail: &outcome.tail,
+            memory_kill: outcome
+                .killed_for_memory()
+                .then_some(outcome.message.as_str()),
         },
     )
 }
@@ -655,6 +674,8 @@ struct Report<'a> {
     log_path: &'a Path,
     /// Tail sent by the daemon, used when the log file cannot be read.
     tail: &'a [String],
+    /// The daemon's message when the job was killed for lack of memory.
+    memory_kill: Option<&'a str>,
 }
 
 /// Prints the Phase 1 summary (and tail) of a run and returns its exit code.
@@ -676,7 +697,13 @@ fn report(ctx: &Context, r: &Report<'_>) -> ExitCode {
             ExitCode::from(EXIT_TIMEOUT)
         }
         Finish::Killed => {
-            eprintln!("sluice: {gate} KILLED after {secs:.1}s (job {job}) log={log}");
+            eprintln!(
+                "{}",
+                killed_headline(gate, r.memory_kill.is_some(), secs, job, &log.to_string())
+            );
+            if let Some(message) = r.memory_kill {
+                eprintln!("sluice: {message}");
+            }
             print_tail_or(r.log_path, ctx.tail_lines, r.tail);
             ExitCode::from(EXIT_KILLED)
         }
@@ -689,6 +716,13 @@ fn report(ctx: &Context, r: &Report<'_>) -> ExitCode {
             exit_code_of(r.exit_code)
         }
     }
+}
+
+/// The headline of a killed run. A memory kill has one wording in every
+/// client (MCP `verify`, `sluice exec`); the daemon's message follows it.
+fn killed_headline(gate: &str, memory: bool, secs: f64, job: &str, log: &str) -> String {
+    let cause = if memory { " for lack of memory" } else { "" };
+    format!("sluice: {gate} KILLED{cause} after {secs:.1}s (job {job}) log={log}")
 }
 
 fn fail(message: &str) -> ExitCode {
@@ -738,7 +772,32 @@ fn explain(ctx: &Context, env: &EnvMap, mode: &CacheMode, extra: &[String]) -> E
         git::version().unwrap_or_else(|e| e.to_string())
     );
     println!("gate:         {} ({})", ctx.gate_name, ctx.gate.cmd.trim());
-    println!("cache mode:   {mode:?}");
+    // The same conditions `lookup::lookup` and `run_traced` apply before they
+    // consult the store: when one holds, a lookup line would be misleading.
+    let lookup_off = match mode {
+        CacheMode::Enabled if ctx.gate.is_queue_only() => {
+            println!("cache mode:   enabled");
+            Some("queue-only gate".to_owned())
+        }
+        CacheMode::Enabled if !ctx.gate.cache => {
+            println!("cache mode:   enabled");
+            Some(format!("gate '{}' has cache = false", ctx.gate_name))
+        }
+        CacheMode::Enabled => {
+            println!("cache mode:   enabled");
+            None
+        }
+        CacheMode::Disabled { reason } => {
+            println!("cache mode:   disabled ({reason})");
+            Some(reason.clone())
+        }
+        CacheMode::Bypass => {
+            println!(
+                "cache mode:   bypass (SLUICE_DISABLE is set: the gate runs directly, no cache, no queue)"
+            );
+            Some("SLUICE_DISABLE is set".to_owned())
+        }
+    };
     let caller = agent::detect(
         env,
         &ctx.user.agent_detection.env_any_set,
@@ -774,6 +833,11 @@ fn explain(ctx: &Context, env: &EnvMap, mode: &CacheMode, extra: &[String]) -> E
             match lookup::derive_key(ctx, lookup::key_tree(&ctx.gate, &tree, &entries), extra) {
                 Ok((_, key)) => {
                     println!("key:          {key}");
+                    if let Some(reason) = &lookup_off {
+                        println!("lookup:       OFF ({reason})");
+                        println!("markers:      {}", ctx.store.dir().display());
+                        return ExitCode::SUCCESS;
+                    }
                     match ctx.store.lookup(&key, ctx.ttl) {
                         Ok(Lookup::Hit(m)) => println!(
                             "lookup:       HIT (passed {} ago, job {})",
@@ -901,6 +965,7 @@ fn execute(ctx: &Context, args: &RunArgs, state: CacheState) -> ExitCode {
             job_id: &exec.job_id,
             log_path: &exec.log_path,
             tail: &exec.memory_tail,
+            memory_kill: None,
         },
     )
 }
@@ -1199,6 +1264,18 @@ mod tests {
         assert_eq!(age(&fmt(Duration::from_hours(2))), "2h");
         assert_eq!(age(&fmt(Duration::from_hours(72))), "3d");
         assert_eq!(age("garbage"), "?");
+    }
+
+    #[test]
+    fn a_memory_kill_has_the_one_wording_of_every_client() {
+        assert_eq!(
+            killed_headline("test", true, 41.24, "j1", "/l/j1.log"),
+            "sluice: test KILLED for lack of memory after 41.2s (job j1) log=/l/j1.log"
+        );
+        assert_eq!(
+            killed_headline("test", false, 2.0, "j2", "/l/j2.log"),
+            "sluice: test KILLED after 2.0s (job j2) log=/l/j2.log"
+        );
     }
 
     #[test]

@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use common::Sandbox;
 use sluice_gate_core::cgroup::detect::{self, Outcome};
 use sluice_gate_core::cgroup::systemd;
-use sluice_gate_core::cgroup::tree::{Tree, TreeSettings};
+use sluice_gate_core::cgroup::tree::{self, Tree, TreeSettings};
 use sluice_gate_core::cgroup::{CGROUP_MOUNT, Layout};
 use sluice_gate_core::config::{ContainmentConfig, EnvMap, process_env};
 use tempfile::TempDir;
@@ -320,12 +320,15 @@ fn the_daemon_and_its_jobs_live_in_their_own_cgroups() {
         .into_iter()
         .find(|p| !procs(p).is_empty())
         .expect("busy job leaf");
-    let members = procs(&leaf);
+    // `sluice cg-exec` writes its own pid to the leaf and then `exec`s the
+    // command: right after the move the leaf may still show the wrapper.
+    let is_command = |p: &u32| cmdline_of(*p).contains("sleep") || cmdline_of(*p).contains("sh -c");
     assert!(
-        members
+        wait_for(Duration::from_secs(10), || procs(&leaf)
             .iter()
-            .any(|p| cmdline_of(*p).contains("sleep") || cmdline_of(*p).contains("sh -c")),
-        "the job's processes are in its leaf: {members:?}"
+            .any(is_command)),
+        "the job's processes are in its leaf: {:?}",
+        procs(&leaf)
     );
     assert!(run.wait().expect("run ends").success());
     let seen = fs::read_to_string(format!("{}.cg", stack.sb.counter.display())).unwrap();
@@ -435,10 +438,15 @@ fn without_a_user_manager_the_daemon_runs_as_before() {
     let out = stack.run(&["run", "probe"]);
     assert!(out.status.success(), "{out:?}");
     let seen = fs::read_to_string(format!("{}.cg", stack.sb.counter.display())).unwrap();
-    assert!(
-        !seen.contains("/jobs/") && !seen.contains("sluice-test"),
+    // The gate stays where its daemon is (no leaf of its own). Comparing with
+    // the daemon's cgroup, not looking for `/jobs/`: the suite itself may run
+    // inside a Sluice job leaf of the machine's daemon, which both inherit.
+    assert_eq!(
+        seen.trim().trim_start_matches("0::"),
+        cgroup_of(daemon_pid),
         "no leaf without containment: {seen}"
     );
+    assert!(!seen.contains("sluice-test"), "{seen}");
     assert!(stack.units().is_empty(), "{:?}", stack.units());
     // `status` says so, with the reason.
     let status = stack.status().expect("status");
@@ -507,7 +515,12 @@ fn containment_can_be_switched_off_in_the_config() {
     let out = stack.run(&["run", "probe"]);
     assert!(out.status.success(), "{out:?}");
     let seen = fs::read_to_string(format!("{}.cg", stack.sb.counter.display())).unwrap();
-    assert!(!seen.contains("/jobs/"), "no leaf when disabled: {seen}");
+    // Same cgroup as the daemon: see `without_a_user_manager_the_daemon_runs_as_before`.
+    assert_eq!(
+        seen.trim().trim_start_matches("0::"),
+        cgroup_of(daemon_pid),
+        "no leaf when disabled: {seen}"
+    );
     assert!(stack.units().is_empty(), "{:?}", stack.units());
     let text = String::from_utf8_lossy(&stack.run(&["status"]).stdout).into_owned();
     assert!(
@@ -611,4 +624,80 @@ fn status_and_doctor_show_a_real_session() {
             .unwrap()
             .starts_with("memory policy")
     );
+}
+
+/// ADR-0019 piece 3 (T-W6-13): where systemd-oomd can act (it is active and
+/// systemd is 257 or newer, with the default `memory_policy = "oomd"`), the
+/// daemon scope carries its own pressure policy with the agents' limit and a
+/// shorter duration, and `daemon/` is marked `user.oomd_omit`; elsewhere
+/// neither policy exists. No memory is used: only properties are read.
+#[test]
+fn the_gates_scope_has_a_policy_ahead_of_the_agents_and_the_daemon_is_omitted() {
+    let Some(stack) = Stack::new("oompolicy", "", true) else {
+        return;
+    };
+    let layout = stack.layout();
+    let caps = detect::detect(&stack.env);
+    let cfg = ContainmentConfig::default();
+    let _ = stack.start_daemon();
+    let props = [
+        "ManagedOOMMemoryPressure",
+        "ManagedOOMMemoryPressureLimit",
+        "ManagedOOMMemoryPressureDurationUSec",
+    ];
+    let gates = systemd::show(&stack.env, &layout.daemon_scope, &props).expect("show gates scope");
+    let agents =
+        systemd::show(&stack.env, &layout.agents_scope, &props).expect("show agents scope");
+    if !caps.oomd_policy_enabled(&cfg) {
+        println!("oomd cannot act here: checking that no policy was created");
+        assert_ne!(gates["ManagedOOMMemoryPressure"], "kill", "{gates:?}");
+        assert_ne!(agents["ManagedOOMMemoryPressure"], "kill", "{agents:?}");
+        return;
+    }
+    let policy = detect::pressure_policy(&stack.env, &cfg, caps.facts.uid).unwrap();
+    let expected = detect::derive_gates_policy(policy);
+    assert_eq!(gates["ManagedOOMMemoryPressure"], "kill", "{gates:?}");
+    assert_eq!(agents["ManagedOOMMemoryPressure"], "kill", "{agents:?}");
+    // Same limit on both scopes.
+    assert_eq!(
+        gates["ManagedOOMMemoryPressureLimit"], agents["ManagedOOMMemoryPressureLimit"],
+        "the gates' limit equals the agents'"
+    );
+    let percent = systemd::fixed_to_percent(
+        gates["ManagedOOMMemoryPressureLimit"]
+            .parse()
+            .expect("a fixed-point limit"),
+    );
+    assert!(
+        (percent - f64::from(expected.limit_percent)).abs() < 0.5,
+        "limit {percent} vs {}",
+        expected.limit_percent
+    );
+    // Shorter duration (systemd prints whole seconds below a minute as `3s`).
+    if policy.duration.as_secs() < 60 {
+        assert_eq!(
+            gates["ManagedOOMMemoryPressureDurationUSec"],
+            format!("{}s", expected.duration.as_secs()),
+            "{gates:?}"
+        );
+        assert_eq!(
+            agents["ManagedOOMMemoryPressureDurationUSec"],
+            format!("{}s", policy.duration.as_secs()),
+            "{agents:?}"
+        );
+    }
+    assert!(expected.duration <= policy.duration);
+    // The daemon is never a candidate. A filesystem without user xattrs
+    // (cgroupfs always has them on a kernel that supports oomd) skips this part.
+    let leaf = layout.daemon_leaf_dir();
+    if !tree::has_oomd_omit(&leaf) {
+        // Not set by the daemon: only acceptable when the filesystem refuses
+        // user xattrs (setting it here would then fail too).
+        assert!(
+            !tree::set_oomd_omit(&leaf),
+            "the filesystem takes user xattrs but the daemon did not mark daemon/"
+        );
+        println!("skipped: this cgroup filesystem has no user xattrs");
+    }
+    drop(stack);
 }

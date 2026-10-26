@@ -40,7 +40,7 @@ status`, `client.log` and `daemon.log` lines, and the wording of errors.
 | Daemon features | `welcome.features` | `["exec", "queue-only", "queue"]` (0.2.0: `["queue"]`) |
 | Status JSON | `schema` | 1 |
 | Queue status JSON | `schema` | 1 |
-| Database | tables `schema`, `queue_schema` and `sched_schema` | 1, 1 and 1 |
+| Database | tables `schema`, `queue_schema` and `sched_schema` | 1, 1 and 1 (`containment_schema` is 2 from 0.6.0; older binaries ignore it) |
 | Exit codes, CLI flags, MCP tools | none | n/a |
 | Plugin | `plugin.json` `version`, follows the release | |
 
@@ -52,7 +52,10 @@ options are optional and default to today's behaviour. Another `version` value
 is a new format and comes with a migration note and a warning release.
 
 Old binaries read new data like this: parsing is strict (unknown keys are an
-error), so **an older binary rejects a config that uses a newer option**. For
+error), so **an older binary rejects a config that uses a newer option**. In
+`.sluice.toml`, 0.6.0 adds `[queue] prepare`, `prepare_timeout` and
+`prepare_weight` (fixture `queue-prepare.toml`): every machine that reads a file
+using them needs 0.6.0, hooks and agents' binaries included. For
 example 0.1.0 rejects a `[queue]` table, and 0.2.0 will reject options added in
 0.3.0. The same holds for a new value of an existing key: `weight = "auto"`
 (0.4.0) is rejected by 0.3.0 and older, which accept only integers. If several versions share a repository, avoid the new keys until
@@ -63,7 +66,10 @@ everyone has upgraded.
 Any file valid for 0.1.0 or 0.2.0 loads with the same effective values;
 `daemon.idle_exit` stays accepted although it has no effect. The `SLUICE_*`
 variables and their truthy and falsy words keep their meaning; new ones may be
-added. An older binary rejects keys it does not know, as above.
+added. An older binary rejects keys it does not know, as above: a
+`[containment] gates_oom_score_adj` / `gates_memory_max` / `gates_memory_swap_max` or `[admission] memory_aware` /
+`memory_reserve` / `memory_guard` (0.6.0) in a file shared with an older binary stops that
+binary's daemon from loading the config.
 
 ### Cache keys, markers and miss records
 
@@ -91,7 +97,9 @@ The daemon speaks newline-delimited JSON over a Unix socket. `protocol` stays
 1. Clients and daemons of different versions meet, because a daemon outlives
 `sluice update`: an old client works against a new daemon and a new client
 against an old one. Optional message families are announced in
-`welcome.features` (a new family is a new feature string) and are only sent to
+`welcome.features` (a new family is a new feature string; 0.6.0 adds
+`queue-trust-config`, and a client that does not see it refuses
+`--trust-member-config` instead of sending a flag an old daemon would ignore) and are only sent to
 a peer that announced them; a daemon without the merge queue answers queue
 requests with an error and keeps serving. Unknown fields are ignored on both
 sides. A real `protocol` bump keeps the refusal that tells you to run `sluice
@@ -111,8 +119,22 @@ client in use.
 with no daemon it prints `{"schema":1,"daemon":null}`. `sluice queue status
 --json` (and `queue_status`) prints `{"schema": 1, "trains": [...], "jobs":
 [...]}`. Every field a script could read in the 0.1.0 and 0.2.0 output keeps its
-path, type and meaning. New optional fields and new counters may appear; unknown
-queue job and train states are parsed as `unknown` by current clients.
+path, type and meaning. New optional fields and new counters may appear (0.6.0:
+`containment.gates_oom_policy`, the memory fields of running and queued jobs, in
+`queue status` the train's `prepare`, `config_source` and `config_diff`, a gate's
+`note`, and the reasons `gate_modified_tree`, `prepare_failed`, `prepare_dirty`,
+`key_input_failed`, `hook_gate_unverified` and `member_config_invalid`; an
+outcome's `killed_by` may be `memory`);
+unknown queue job and train states are parsed as `unknown` by current clients.
+
+0.6.0 also changes where `systemd-oomd` acts: `sluice-daemon.scope` gets its own
+memory pressure policy (the agents' limit with half the duration) and its
+`daemon/` leaf the `user.oomd_omit` attribute, on the machines where the agents'
+policy exists. Nothing to configure and nothing an older binary has to
+understand: a scope that outlives an upgrade is aligned at runtime, and an older
+daemon simply creates it without the policy. The opt-in `[admission]
+memory_guard` and its `sluice_memory_guard` interventions are one-way like the
+other 0.6.0 keys (fixture `crates/sluice-gate-core/tests/fixtures/unreleased/admission-memory-guard.toml`).
 
 ### The database
 
@@ -123,9 +145,19 @@ queue's state in two independent schemas. Markers are not in it.
 - Additive changes (a new table, a nullable column, an index) are applied when
   the daemon opens the file, do not change the schema version, and so keep
   older binaries working.
+- The queue's 0.6.0 additions are nullable or defaulted columns
+  (`queue_trains.prepare`, `config_source`, `config_hash`,
+  `queue_jobs.trust_config`), added by an idempotent migration when the daemon
+  opens the file; `queue_schema` stays 1 and an older binary ignores them.
 - The scheduler timeline and the learned-weight statistics of 0.3.0 (extra
   `jobs` columns and the `job_requests` and `gate_stats` tables) are additive
   and tracked by their own `sched_schema` version; older binaries ignore them.
+- The containment additions have their own `containment_schema` version
+  (`interventions` in 0.5.0, version 1; the `gate_memory` table of memory-aware
+  admission in 0.6.0, version 2). A newer version is never an error for an older
+  binary, which finds nothing to apply and ignores the table; the migration is
+  one new table, so no backup is written. `gate_stats` and `sched_schema` did
+  not change: a column there would make 0.5.0 and older refuse the file.
 - A non-additive change bumps that schema's version and ships a forward
   migration that runs once on open, after copying `sluice.db` to
   `sluice.db.bak-<version>`. One release of warnings comes first.

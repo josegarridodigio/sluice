@@ -6,17 +6,20 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context as _, anyhow};
-use sluice_gate_daemon::server::{BoxFuture, DaemonHandle, Extension, ExtensionCtx, StoreError};
+use sluice_gate_daemon::server::{
+    BoxFuture, DaemonHandle, Extension, ExtensionCtx, StoreError, Vouch,
+};
 use sluice_gate_proto::{
     ApproveVia, ClientMessage, EnqueueRequest, ErrorCode, FEATURE_QUEUE,
-    QUEUE_STATUS_SCHEMA_VERSION, QueueJobState as J, QueueJobView, QueueStatusReport, QueueSummary,
-    QueueTrainState as T, QueueTrainView, ReconcileDecision, ReconcileResult, ServerMessage,
+    FEATURE_QUEUE_TRUST_CONFIG, QUEUE_STATUS_SCHEMA_VERSION, QueueJobState as J, QueueJobView,
+    QueueStatusReport, QueueSummary, QueueTrainState as T, QueueTrainView, ReconcileDecision,
+    ReconcileResult, RunRequest, ServerMessage,
 };
 
 use crate::git::{EnvMap, allowlisted};
 use crate::model::{job_cancellable_now, job_is_active};
 use crate::reconcile::{Decision, TrainFacts, decide, gather};
-use crate::runner::{self, Core, current_hash, store_msg};
+use crate::runner::{self, CONFIG_SOURCE_MEMBER, Core, current_hash, is_trusted, store_msg};
 use crate::store::{self, Actor, JobEdit, JobRow, NewJob, Refusal, TrainEdit, TrainRow};
 use crate::target;
 
@@ -127,6 +130,10 @@ fn train_view(t: &TrainRow) -> QueueTrainView {
         network_timeout_ms: Some(
             u64::try_from(t.settings.network_timeout().as_millis()).unwrap_or(u64::MAX),
         ),
+        prepare: t.prepare.clone(),
+        config_source: t.config_source.clone(),
+        // Filled by `status`, which runs git for it.
+        config_diff: None,
     }
 }
 
@@ -155,7 +162,7 @@ fn canonical(p: &Path) -> PathBuf {
 
 impl Extension for QueueExtension {
     fn features(&self) -> &[&'static str] {
-        &[FEATURE_QUEUE]
+        &[FEATURE_QUEUE, FEATURE_QUEUE_TRUST_CONFIG]
     }
 
     fn on_start<'a>(&'a self, handle: &'a DaemonHandle) -> BoxFuture<'a, anyhow::Result<()>> {
@@ -222,7 +229,7 @@ impl Extension for QueueExtension {
             }
             let reply = match msg {
                 ClientMessage::QueueEnqueue { id, request } => enqueue(core, id, request).await,
-                ClientMessage::QueueStatus { id, repo } => status(core, id, repo.as_deref()),
+                ClientMessage::QueueStatus { id, repo } => status(core, id, repo.as_deref()).await,
                 ClientMessage::QueueApprove {
                     id,
                     train_id,
@@ -235,7 +242,18 @@ impl Extension for QueueExtension {
                     job_id,
                     head_sha,
                     via,
-                } => retry(core, id, &job_id, &head_sha, actor_of(via)).await,
+                    trust_member_config,
+                    env,
+                } => {
+                    let r = Retry {
+                        job_id: &job_id,
+                        head_sha: &head_sha,
+                        via,
+                        trust: trust_member_config,
+                        env: &env,
+                    };
+                    retry(core, id, &r).await
+                }
                 ClientMessage::QueueCancel { id, job_id, via } => {
                     cancel(core, id, &job_id, actor_of(via))
                 }
@@ -246,6 +264,20 @@ impl Extension for QueueExtension {
             };
             core.notify.notify_one();
             Some(reply)
+        })
+    }
+
+    fn vouch_run<'a>(
+        &'a self,
+        request: &'a RunRequest,
+        peer_pid: Option<u32>,
+    ) -> BoxFuture<'a, Option<Vouch>> {
+        Box::pin(async move {
+            let core = self.core.get()?;
+            if !core.handle.config().queue.enabled {
+                return None;
+            }
+            crate::vouch::vouch(core, request, peer_pid).await
         })
     }
 
@@ -327,6 +359,16 @@ fn start_recovery(core: &Core) -> anyhow::Result<()> {
 }
 
 async fn enqueue(core: &Arc<Core>, id: u64, req: EnqueueRequest) -> ServerMessage {
+    if req.trust_member_config {
+        let via = req.via.unwrap_or(ApproveVia::Cli);
+        let refusal = trust_refusal(core.handle.config(), via, &req.env).or_else(|| {
+            (req.caller == sluice_gate_proto::Caller::Agent)
+                .then(|| trust_refusal_text("this client declared itself an agent"))
+        });
+        if let Some(refusal) = refusal {
+            return err(id, ErrorCode::NotAllowed, refusal);
+        }
+    }
     let repo = canonical(&req.repo);
     let git = core.git_for(&req.env);
     let (g2, r2, branch, head, base) = (
@@ -355,7 +397,15 @@ async fn enqueue(core: &Arc<Core>, id: u64, req: EnqueueRequest) -> ServerMessag
                 format!("{head} is not a commit of {}", r2.display()),
             ));
         };
-        let defaults = target::defaults_at(&g2, &r2, &full);
+        // The head's config only picks the default target: an explicit base
+        // does not need it, so an unparsable file is refused only without one.
+        let defaults = match target::defaults_at(&g2, &r2, &full) {
+            Ok(d) => d,
+            Err(e) if base.as_deref().is_none_or(|b| b.trim().is_empty()) => {
+                return Err((ErrorCode::BadRequest, e.to_string()));
+            }
+            Err(_) => sluice_gate_core::config::QueueConfig::default(),
+        };
         // Remote queries of the resolution (`ls-remote`) are bounded by the
         // head's `[queue] network_timeout`: a stall only delays this request.
         let g2 = g2.with_network_timeout(defaults.network_timeout);
@@ -388,6 +438,7 @@ async fn enqueue(core: &Arc<Core>, id: u64, req: EnqueueRequest) -> ServerMessag
         caller: req.caller,
         session: req.session.clone(),
         env: allowlisted(&req.env),
+        trust_config: req.trust_member_config,
     };
     let actor = actor_of(req.via);
     match core.write(actor, |w| {
@@ -399,24 +450,56 @@ async fn enqueue(core: &Arc<Core>, id: u64, req: EnqueueRequest) -> ServerMessag
     }
 }
 
-fn status(core: &Core, id: u64, repo: Option<&Path>) -> ServerMessage {
+async fn status(core: &Arc<Core>, id: u64, repo: Option<&Path>) -> ServerMessage {
     let repo = repo.map(canonical);
-    match core.read(|tx| {
+    let read = core.read(|tx| {
         let jobs = store::jobs(tx, repo.as_deref())?
             .iter()
             .map(|j| job_view(tx, j))
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let trains = store::trains(tx, repo.as_deref())?
-            .iter()
-            .map(train_view)
-            .collect();
-        Ok(QueueStatusReport {
-            schema: QUEUE_STATUS_SCHEMA_VERSION,
-            trains,
-            jobs,
-        })
-    }) {
-        Ok(status) => ServerMessage::QueueStatus { id, status },
+        let mut trains = Vec::new();
+        // Trusted trains still to be judged: (index, repo, base, head).
+        let mut to_diff = Vec::new();
+        for t in store::trains(tx, repo.as_deref())? {
+            if is_trusted(&t) && matches!(t.state, T::Verifying | T::Ready) {
+                let head = store::train_jobs(tx, &t)?
+                    .first()
+                    .map(|j| j.head_sha.clone());
+                if let Some(head) = head {
+                    to_diff.push((trains.len(), t.repo.clone(), t.base_sha.clone(), head));
+                }
+            }
+            trains.push(train_view(&t));
+        }
+        Ok((
+            QueueStatusReport {
+                schema: QUEUE_STATUS_SCHEMA_VERSION,
+                trains,
+                jobs,
+            },
+            to_diff,
+        ))
+    });
+    match read {
+        Ok((mut status, to_diff)) => {
+            if !to_diff.is_empty() {
+                let git = core.git.clone();
+                let diffs = runner::blocking(move || {
+                    to_diff
+                        .into_iter()
+                        .map(|(i, repo, base, head)| {
+                            (i, crate::trust::config_diff(&git, &repo, &base, &head))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .unwrap_or_default();
+                for (i, diff) in diffs {
+                    status.trains[i].config_diff = Some(diff);
+                }
+            }
+            ServerMessage::QueueStatus { id, status }
+        }
         Err(e) => store_err(id, &e),
     }
 }
@@ -435,20 +518,64 @@ pub fn agent_approval_refusal(
     if config.queue.allow_agent_approval {
         return None;
     }
-    if via == ApproveVia::Mcp {
-        return Some(
+    match agent_origin(config, via, env)? {
+        Origin::Mcp => Some(
             "approval through MCP is disabled; set [queue] allow_agent_approval = true in the user config"
                 .to_owned(),
-        );
-    }
-    let detection = &config.agent_detection;
-    match sluice_gate_core::agent::detect(env, &detection.env_any_set, &detection.env_any_equals) {
-        sluice_gate_core::agent::Caller::Agent { rule } => Some(format!(
+        ),
+        Origin::Agent(rule) => Some(format!(
             "approval is reserved to humans and this client is an agent ({rule}); \
              set [queue] allow_agent_approval = true in the user config to allow it"
         )),
+    }
+}
+
+/// Where a request that is not a human's at the CLI came from.
+enum Origin {
+    /// The MCP tools.
+    Mcp,
+    /// A CLI whose environment is detected as an agent's (the rule that
+    /// matched).
+    Agent(String),
+}
+
+/// `None` for a human at the CLI; the agent-ish origin otherwise.
+fn agent_origin(
+    config: &sluice_gate_core::config::UserConfig,
+    via: ApproveVia,
+    env: &EnvMap,
+) -> Option<Origin> {
+    if via == ApproveVia::Mcp {
+        return Some(Origin::Mcp);
+    }
+    let detection = &config.agent_detection;
+    match sluice_gate_core::agent::detect(env, &detection.env_any_set, &detection.env_any_equals) {
+        sluice_gate_core::agent::Caller::Agent { rule } => Some(Origin::Agent(rule)),
         sluice_gate_core::agent::Caller::Human => None,
     }
+}
+
+/// The refusal text of everything `--trust-member-config` touches.
+fn trust_refusal_text(who: &str) -> String {
+    format!(
+        "building a train from the branch's own .sluice.toml (--trust-member-config) is reserved \
+         to a human at the CLI, and {who}: a branch that chooses its own gates needs a person \
+         to read its configuration. [queue] allow_agent_approval does not change this"
+    )
+}
+
+/// Why a request that enqueues or retries with `--trust-member-config`, or
+/// approves a train built that way, is refused, or `None`. Stricter than
+/// [`agent_approval_refusal`]: `[queue] allow_agent_approval` never lifts it.
+pub fn trust_refusal(
+    config: &sluice_gate_core::config::UserConfig,
+    via: ApproveVia,
+    env: &EnvMap,
+) -> Option<String> {
+    Some(trust_refusal_text(&match agent_origin(config, via, env)? {
+        Origin::Mcp => "this request comes through MCP".to_owned(),
+        Origin::Agent(rule) => format!("this client is an agent ({rule})"),
+    }))
 }
 
 fn approve(
@@ -467,6 +594,9 @@ fn approve(
     } else {
         Actor::Cli
     };
+    // The agent check below needs the client's whole environment (its
+    // detection variables); only the allowlist is stored for the push.
+    let client_env = env;
     let env = allowlisted(env);
     let r = core.write(actor, |w| {
         let Some(t) = store::train(w.tx(), train_id)? else {
@@ -474,6 +604,15 @@ fn approve(
                 "no train {train_id}"
             ))));
         };
+        // A train that runs its branch's own configuration: humans only, even
+        // when the user allowed agents to approve.
+        if is_trusted(&t)
+            && let Some(refusal) = trust_refusal(core.handle.config(), via, client_env)
+        {
+            return Err(store::refuse(Refusal::NotAllowed(format!(
+                "train {train_id} runs the {CONFIG_SOURCE_MEMBER}'s own .sluice.toml; {refusal}"
+            ))));
+        }
         if t.state == T::Dissolved {
             return Err(store::refuse(Refusal::Stale(format!(
                 "train {train_id} was dissolved ({}); check 'sluice queue status'",
@@ -517,13 +656,29 @@ fn approve(
     }
 }
 
-async fn retry(
-    core: &Arc<Core>,
-    id: u64,
-    job_id: &str,
-    head_sha: &str,
-    actor: Actor,
-) -> ServerMessage {
+/// The fields of a `queue-retry` request.
+struct Retry<'a> {
+    job_id: &'a str,
+    head_sha: &'a str,
+    via: Option<ApproveVia>,
+    /// `--trust-member-config`.
+    trust: bool,
+    /// The client's agent-detection variables.
+    env: &'a EnvMap,
+}
+
+async fn retry(core: &Arc<Core>, id: u64, req: &Retry<'_>) -> ServerMessage {
+    let (job_id, head_sha) = (req.job_id, req.head_sha);
+    let actor = actor_of(req.via);
+    if req.trust
+        && let Some(refusal) = trust_refusal(
+            core.handle.config(),
+            req.via.unwrap_or(ApproveVia::Cli),
+            req.env,
+        )
+    {
+        return err(id, ErrorCode::NotAllowed, refusal);
+    }
     let Ok(Some(j)) = core.read(|tx| store::job(tx, job_id)) else {
         return err(id, ErrorCode::NotFound, format!("no queue job {job_id}"));
     };
@@ -563,7 +718,13 @@ async fn retry(
                 reason: Some(None),
                 detail: Some(None),
                 solo: Some(false),
-                note: Some("retry".into()),
+                // A plain retry goes back to the base's configuration.
+                trust_config: Some(req.trust),
+                note: Some(if req.trust {
+                    "retry (trusting the member's config)".into()
+                } else {
+                    "retry".into()
+                }),
                 ..JobEdit::default()
             },
         )

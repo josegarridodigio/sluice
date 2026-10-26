@@ -7,6 +7,8 @@
 //! - [`psi`]: pressure stall information sampling and the PSI admission gate.
 //! - [`sampler`]: CPU utilisation (`/proc/stat`) and per-job demand (`schedstat`).
 //! - [`executor`]: runs one gate in a process group with log capture and timeout.
+//! - [`guard`]: the opt-in Sluice-side memory guard (cancels its own largest job).
+//! - [`memkill`]: telling a gate killed for lack of memory from one that failed.
 //! - [`reaper`]: companion process that kills the gate groups when the daemon dies.
 //! - [`server`]: socket listener, protocol handling, subscribers, lifecycle.
 //!
@@ -15,7 +17,10 @@
 
 pub mod containment;
 pub mod executor;
+pub mod guard;
 pub mod interventions;
+pub mod memkill;
+pub mod memory;
 mod meta;
 pub mod migrate;
 pub mod psi;

@@ -107,13 +107,89 @@ With every switch off the order is plain FIFO (ADR-0007).
    jobs are never preempted; while `used > B` nothing is admitted nominally.
 
 Each queued job left waiting gets a cause: `budget`, `psi`, `repo-cap`,
-`head-reserved`, or `order` (it fitted the budget before this pass but
+`head-reserved`, `order` (it fitted the budget before this pass but
 higher-ranked jobs took the room; detail `human-first`, `lane` or
-`outranked`). `status` keeps the four frozen wire reasons (an `order` wait
-reports `budget`) and adds `wait_detail`. Each pass adds the elapsed time
+`outranked`) or `memory` (the budget has room but the memory the job is
+expected to use does not, next section). `status` keeps the four frozen wire
+reasons (an `order` or `memory` wait reports `budget`) and adds `wait_detail`. Each pass adds the elapsed time
 to every queued job's previous cause (the state before the sample decides);
 the accumulators are the job's `wait_*_ms` columns and the largest one is
 the `done.wait_reason`.
+
+## Memory-aware admission (ADR-0019 piece 1)
+
+The CPU budget and PSI do not see memory: a PSI reading lags a job that is
+still ramping up (memory pressure was about 0 at each admission of three
+`pnpm test` gates that then grew to 18 GiB each on a 30 GiB machine). `plan`
+therefore takes an optional `Snapshot.memory: Option<MemoryFacts
+{ available_bytes, total_bytes, reserve_bytes }>`; `None` is the rule off and
+every plan is exactly the one CPU-only admission produces (differential test).
+
+**Inputs.** `MemAvailable` and `MemTotal` of `<proc_root>/meminfo`, read at each
+admission pass; `reserve = [admission] memory_reserve` (`auto` = 10 % of
+`MemTotal`, a size like `3G` otherwise: what the desktop, the agents and the
+page cache need to stay alive; deliberately not learned). Per running job its
+current working set (`cur`) and expected peak `E`; per queued job `E`.
+
+**Working set and expected peak.** The 1 s sampler (`sample_tick`) reads, per
+running gate or `exec` job, `anon` of the job leaf's `memory.stat` plus
+`memory.swap.current` (page cache is left out: `MemAvailable` already counts
+it as available, counting it twice would refuse jobs that fit), or the summed
+`VmRSS` of the job's process group when containment gives no leaf. `JobUsage`
+keeps the last value and the running peak (and `memory.peak`, shown only). At
+the end of a passing run, or of a run killed for lack of memory, one row goes
+to `gate_memory` (table of the containment schema group, version 2; newest 20
+per `(repo, gate, cmd_hash)`, pruned with `gate_stats`; `exec` jobs use
+`exec:<label>`). `E = max(anon_peak of the last 5 rows) × 1.2`, a killed run
+counting `× 1.25` first (it stopped early). One sample is enough (a maximum
+needs no average). A failing run that is not a memory kill teaches nothing; the
+weight's `learns_from` is unchanged (passing runs only). An unknown peak is
+guessed as `w / B × (MemTotal − reserve)` with the job's effective weight `w`
+(for `auto` on a budget of 12, half of the usable memory), marked `guessed` in
+`status` until a run replaces it.
+
+**Rule.**
+
+```
+headroom_r  = max(0, E_r − cur_r)                  # a running job still to grow
+H           = Σ headroom of running jobs + Σ E of jobs started earlier in this pass
+free        = MemAvailable − reserve − H           # swap never counts
+alone       = nothing runs and nothing was started earlier in this pass
+fits_mem(j) = alone  ||  E_j ≤ free
+```
+
+`fits_mem` is an extra condition of the nominal pass (the weight and
+repository-cap tests are unchanged), of the starvation guard, and, stricter, of
+over-admission, which also needs a **learned** `E` and takes no `alone`
+exemption (never over-admit blind). Jobs started earlier in the pass add their
+whole `E` to `H`, so two big jobs cannot both start off one stale
+`MemAvailable`. A job blocked only by memory reports `wait_detail = memory`
+(wire reason `budget`), its wait is added to the budget accumulator, and PSI
+blocking still comes first (a blocked pass reports `psi`).
+
+**Invariants.**
+
+- Never `Σ E > free` unless that job started with nothing else running and
+  nothing started earlier in the pass (`alone`): an idle machine always starts
+  the first ranked job, so progress is always possible. Any running job, however
+  light, withdraws the exemption (a big job never joins others on faith) (if the agents, not Sluice, use the memory, that
+  job is the preferred victim of the kernel and of oomd, W6a/W6c).
+- No hold-and-wait: a job holds nothing while it waits, admission is
+  all-or-nothing, so memory cannot create a cycle.
+- The overdue-head reservation covers memory: a head that fits the budget but
+  not memory reserves once overdue (a head blocked only by its repository cap
+  still never does), so nothing behind it starts; running jobs end (timeouts
+  bound them), the machine drains, `alone` becomes true and it starts (also when
+  its `E` exceeds what is free even then). The ADR-0007 bound
+  (`head_reserve_after` + the longest running job) holds under every switch
+  combination (`no_starvation_under_any_switch_combination` has the memory
+  switch; `an_overdue_head_blocked_only_by_memory_starts_within_the_bound`).
+- Weights are untouched (ADR-0015): memory adds a second constraint, it does
+  not change the CPU weight or its learning; CPU-driven over-admission stays
+  CPU-driven, now also needing a learned peak that fits.
+- A memory-blocked job that is not overdue still lets smaller jobs backfill.
+- `plan` stays a pure function of the snapshot; `jobs` and `gate_stats` are
+  unchanged and `sched_schema` stays 1.
 
 ## Learned weights (ADR-0011 M2)
 
@@ -208,6 +284,12 @@ obey every rule here; the scheduler has no queue specific code.
   never over the cap, never while blocking or without PSI; the guard never
   over-admits; under reservation only the head; budget 6 / cap 9 never runs
   two weight-6 jobs.
+- Memory (ADR-0019): two jobs expected to peak at 18 GiB with 22 GiB available
+  and a 3 GiB reserve → one starts, the other waits with `wait_detail =
+  memory`; jobs started in the same pass are counted; never `Σ E > free` unless the
+  job started with nothing else running (property test); rule off or plenty of memory → CPU-only plans under all
+  16 switch combinations; an overdue memory-blocked head starts within
+  `head_reserve_after` + the longest running job.
 - Marker appearing while queued → `cached`, no process run.
 - Last subscriber gone → process killed under `cancel`; an early-verdict
   cancel kills only a job nobody else waits for.

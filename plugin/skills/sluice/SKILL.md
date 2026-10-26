@@ -15,7 +15,8 @@ The plugin's session hook does the setup; there is nothing for the user to
 install, edit or export beyond the `sluice` binary itself:
 
 - Shell shims are on automatically in every repository: heavy commands
-  (builds, test runners, `ng`, `playwright`, package scripts, `make`, ...)
+  (builds, `cargo check`/`cargo doc`, test runners, `ng`, `playwright`,
+  package scripts, `make`, ...)
   are queued under the machine's shared budget even when they run inside a
   subshell, `$(...)`, `sh -c` or a script. You do not prefix anything.
 - Never retry a queued command without Sluice. Do not wrap builds or tests
@@ -60,6 +61,14 @@ session. Never install or update on your own.
   running the same tree and gate, you shared its result).
 - On FAIL the result includes the log tail of the first failure. Read it, fix
   the code, call `verify` again.
+- `KILLED for lack of memory ...` is not a test failure: the kernel or
+  systemd-oomd (or Sluice's opt-in memory guard) ended the gate for lack of
+  memory. Do not retry it unchanged and never run it through the shell to get
+  around it: reduce its footprint (for example test concurrency) or tell the
+  human.
+- A gate that `status` shows as waiting for memory (`(budget: memory)` in
+  its text, `wait_detail` `memory` in the structured result) is only queued
+  behind other gates: normal, wait. Do not run it outside Sluice.
 - For more output use `logs` (newest job by default, or a job id). For queued
   and running jobs, and the cache state of your tree, use `status` with
   `working_directory`. Do not re-run anything to diagnose.
@@ -84,6 +93,15 @@ change the hook policy.
    or fix it, commit, `verify` again, then `queue_retry` with the job id.
    `queue_enqueue` would answer `duplicate-branch`. `queue_cancel` withdraws a
    job you no longer want.
+
+For a reason you cannot read in `queue_status`, see "Merge queue states" in
+`reference.md`. In short: `prepare_failed` on a waiting job is the target's or
+the environment's problem (wait or tell the human); on a failed job with
+`base: false` your branch broke the prepare (usually a lockfile out of sync):
+fix it, commit, `queue_retry`; a branch that changes
+`.sluice.toml` (`hook_gate_unverified`, `config_changed`) is for the human.
+`--trust-member-config` is human-only: never use it and never ask to approve
+such a train; explain it to the human.
 
 Never approve a train: not with `queue_approve`, not with
 `sluice queue approve` in Bash, unless the human told you to in this

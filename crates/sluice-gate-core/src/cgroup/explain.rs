@@ -48,7 +48,8 @@ pub struct Event {
     pub session: Option<String>,
     /// Cgroup path inside the Sluice scope (`s-abc/tools`).
     pub leaf: String,
-    /// `oom_kill`, `oom_group_kill`, `oomd_memory_pressure` or `oomd_swap`.
+    /// `oom_kill`, `oom_group_kill`, `oomd_memory_pressure`, `oomd_swap` or
+    /// `sluice_memory_guard` (Sluice's own guard cancelled a gate job).
     pub cause: String,
     /// Human-readable detail, when known.
     pub detail: Option<String>,
@@ -151,6 +152,7 @@ pub fn cause_text(cause: &str) -> &str {
         "oom_group_kill" => "kernel OOM killer, whole group",
         "oomd_memory_pressure" => "systemd-oomd, memory pressure",
         "oomd_swap" => "systemd-oomd, swap use",
+        "sluice_memory_guard" => "Sluice memory guard, gate cancelled for lack of memory",
         other => other,
     }
 }
@@ -269,6 +271,24 @@ mod tests {
 
     fn now() -> SystemTime {
         humantime::parse_rfc3339("2026-10-24T12:00:00Z").unwrap()
+    }
+
+    #[test]
+    fn every_known_cause_has_friendly_text() {
+        for cause in [
+            "oom_kill",
+            "oom_group_kill",
+            "oomd_memory_pressure",
+            "oomd_swap",
+            "sluice_memory_guard",
+        ] {
+            assert_ne!(cause_text(cause), cause, "{cause}");
+        }
+        assert_eq!(cause_text("something_new"), "something_new");
+        assert!(
+            note_for(&ev("a", "2026-10-24T11:59:00Z", "sluice_memory_guard"))
+                .contains("Sluice memory guard")
+        );
     }
 
     #[test]

@@ -108,7 +108,8 @@ session-start`. Within a 300 ms watchdog it:
 - gives the agent the rules as context (at most about 1,500 characters): verify
   before every commit with the `verify` tool, never retry a queued command
   without Sluice, do not wrap builds or tests in subshells or scripts, do not
-  start several dev servers while gates run, never approve merge trains.
+  start several dev servers while gates run, never approve merge trains, and a
+  gate result `KILLED for lack of memory` is not retried unchanged.
 
 `CLAUDECODE` already marks the session as an agent, so the shims queue heavy
 commands without `SLUICE_SHIMS=1`. The hook fails open: on any error it prints
@@ -177,7 +178,7 @@ section 3):
 | `queue_enqueue` | Put the committed branch (default: the current one) in the local merge queue. Refuses a detached HEAD and tracked uncommitted changes. |
 | `queue_status` | Trains, members and their state, conflicts with paths, and which trains are ready for a human to approve. |
 | `queue_approve` | Approve a ready train. Refused with `not-allowed` unless the user config has `[queue] allow_agent_approval = true`. |
-| `queue_retry` | Re-queue a `conflict` or `failed` job with the current head of its branch (after rebasing or fixing it). |
+| `queue_retry` | Re-queue a `conflict` or `failed` job with the current head of its branch (after rebasing or fixing it). Always with the target's configuration: `--trust-member-config` (the branch's own `.sluice.toml`) is for humans at the CLI and is refused to agents. |
 | `queue_cancel` | Withdraw a job (only recorded while it is pushing; honoured once nothing landed is proven). |
 
 `verify` takes `working_directory` (absolute path inside the repository or
@@ -213,6 +214,13 @@ the same instructions. For agents without the plugin, paste this into `AGENTS.md
   on this tree`, call `verify` for that gate, then retry the git command.
 - For diagnosis use `sluice cache status` (what is cached for this tree) and
   `sluice logs` (newest job log) instead of re-running anything.
+- A gate result `KILLED for lack of memory ...` is not a test failure to retry
+  unchanged: the kernel or systemd-oomd ended it because the machine ran out of
+  memory. Reduce the gate's footprint (for example test concurrency) or tell the
+  human; never run the gate through the shell to get around it.
+- A gate that `status` shows as waiting for memory (`(budget: memory)` in the text
+  of MCP `status` and of `sluice status`, `wait_detail: "memory"` in the structured result) is only queued behind
+  other gates: wait, do not run it outside Sluice.
 ```
 
 Adapt the examples in the second bullet to your stack.
@@ -237,6 +245,24 @@ gist as its own instructions, but the file is read first:
   rebase or fix it, commit, call `verify` again, and call `queue_retry` with
   the job id. The job keeps the branch, so `queue_enqueue` would answer
   `duplicate-branch`. `queue_cancel` withdraws a job you no longer want.
+- Read the reason `queue_status` gives. `prepare_failed` on a waiting job
+  (`base: true`) is the target's or the environment's problem: wait, or tell
+  the human; with `base: false` your branch broke the prepare (often a
+  lockfile out of sync): fix it and call `queue_retry`. `prepare_dirty` (the
+  prepare leaves files the tree does not have: fix `.gitignore` or the
+  prepare), `gate_modified_tree` (a gate edits tracked files, for example a
+  formatter: commit the result or fix the gate) and `member_config_invalid`
+  (your branch's `.sluice.toml` does not parse) are yours to fix.
+  `key_input_failed` is the environment's: tell the human.
+- If the branch changes `.sluice.toml` (`config_changed`,
+  `hook_gate_unverified`), the target's configuration judges it. Tell the
+  human to land the configuration change first, or to run
+  `sluice queue retry <job> --trust-member-config`. That flag (and approving a
+  train built with it) is for humans only: never use it, never ask to
+  approve such a train, the daemon refuses it.
+- The push of an approved train runs the repository's `pre-push` hook; a Sluice
+  hook is answered from the train, so there is nothing to do. A hook that
+  declines fails the job with `pre_push_hook`: read its output.
 - Errors start with a code: `conflict-state`, `stale-plan`,
   `duplicate-branch`, `not-allowed`, `not-supported`. Report them; do not work
   around them.
@@ -289,7 +315,9 @@ can never be cached, so refusing would block the caller forever: the gate
 just runs. The policy applies only when the cache was consulted and missed.
 
 `sluice run --explain <gate>` prints every decision (cache mode, caller and
-rule, hook, policies, tree, key, lookup result) without running anything.
+rule, hook, policies, tree, key, lookup result) without running anything;
+when the cache mode or the gate's `cache = false` turns caching off, the lookup
+line reads `lookup: OFF (<reason>)` instead of a HIT or MISS.
 
 ## 5. How Sluice knows it is an agent
 
@@ -505,8 +533,8 @@ yes (entry 1 of PATH)`, `this shell: heavy commands go through the queue`.
 ## Heavy commands (Sluice)
 
 This machine shares its CPU between several agents through Sluice. Builds and
-test runs (`make`, `cargo build`, `cargo test`, `pnpm build`, `docker build`,
-`pytest`, ...) are queued automatically by shims in your PATH; run them the
+test runs (`make`, `cargo build`, `cargo check`, `cargo test`, `pnpm build`,
+`docker build`, `pytest`, ...) are queued automatically by shims in your PATH; run them the
 normal way and wait for them, even if they take longer to start.
 
 - Do not bypass the queue (no absolute paths like `/usr/bin/make`, no

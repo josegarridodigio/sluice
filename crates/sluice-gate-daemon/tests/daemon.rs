@@ -1555,6 +1555,195 @@ async fn idle_while_waiting_grows_when_the_budget_leaves_cpus_idle() {
     d.shutdown().await;
 }
 
+const GIB: u64 = 1 << 30;
+
+/// Writes a fake `/proc/meminfo` (sizes in GiB), atomically.
+fn write_meminfo(proc_root: &Path, total_gib: u64, available_gib: u64) {
+    let tmp = proc_root.join("meminfo.tmp");
+    std::fs::write(
+        &tmp,
+        format!(
+            "MemTotal:       {} kB\nMemFree:        1024 kB\nMemAvailable:   {} kB\n\
+             SwapFree:       99999999 kB\n",
+            total_gib * GIB / 1024,
+            available_gib * GIB / 1024
+        ),
+    )
+    .unwrap();
+    std::fs::rename(&tmp, proc_root.join("meminfo")).unwrap();
+}
+
+/// A daemon of budget 2 reading a fake `/proc` (only `meminfo`) holding
+/// `total` GiB of which `available` are available; two gates of weight 1
+/// always fit its CPU budget.
+async fn memory_daemon(total_gib: u64, available_gib: u64, aware: bool) -> (Daemon, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let proc_root = dir.path().join("proc");
+    std::fs::create_dir_all(&proc_root).unwrap();
+    write_meminfo(&proc_root, total_gib, available_gib);
+    let mut cfg = config(dir.path(), 2, LastSubscriberGone::Cancel);
+    cfg.proc_root.clone_from(&proc_root);
+    cfg.admission.psi_poll_interval = Duration::from_millis(50);
+    cfg.admission.memory_aware = aware;
+    (start_in(dir, cfg).await, proc_root)
+}
+
+/// T-W6-5: the second gate waits for memory although the CPU budget has room
+/// (`reason` stays `budget`, `wait_detail` says `memory`), and starts as soon
+/// as `MemAvailable` recovers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gate_waits_for_memory_and_starts_when_meminfo_recovers() {
+    let repo = make_repo();
+    // 20 GiB machine, 12 GiB available, reserve 2 GiB (auto): a gate of
+    // weight 1 on a budget of 2 is guessed at half of the 18 GiB usable.
+    let (d, proc_root) = memory_daemon(20, 12, true).await;
+    let (wa, mut ra) = d
+        .request(&run_msg(&repo, "holder", "sleep 30", None, None, 0))
+        .await;
+    until_started(&mut ra).await;
+    let (wb, mut rb) = d
+        .request(&run_msg(&repo, "waiter", "true", None, None, 0))
+        .await;
+    assert!(matches!(
+        next(&mut rb).await,
+        Some(ServerMessage::Queued { .. })
+    ));
+    let s = status_until(&d, "the memory wait", |s| {
+        s.queued
+            .first()
+            .is_some_and(|q| q.wait_detail.as_deref() == Some("memory"))
+    })
+    .await;
+    assert_eq!(s.queued[0].reason, sluice_gate_proto::WaitReason::Budget);
+    assert_eq!(s.queued[0].memory_expected_bytes, Some(9 * GIB));
+    assert_eq!(s.queued[0].memory_expected_learned, Some(false), "a guess");
+    let run = &s.running[0];
+    assert_eq!(run.memory_expected_bytes, Some(9 * GIB));
+    assert_eq!(run.memory_expected_learned, Some(false));
+    let mem = s.budget.memory.expect("the memory rule is on");
+    assert_eq!(mem.available_bytes, 12 * GIB);
+    assert_eq!(mem.reserve_bytes, 2 * GIB);
+    assert_eq!(
+        mem.headroom_bytes,
+        9 * GIB - run.memory_bytes.unwrap_or(0),
+        "what the holder is still expected to grow by"
+    );
+    // The queue did not move while memory stayed short.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(status(&d).await.queued.len(), 1);
+    // MemAvailable recovers: the waiter starts and passes.
+    write_meminfo(&proc_root, 20, 30);
+    let msgs = tokio::time::timeout(WAIT, until_done(&mut rb))
+        .await
+        .expect("the waiter runs once memory is back");
+    assert_eq!(done_status(&msgs), OutcomeStatus::Pass);
+    // The wait was charged to the budget accumulator.
+    let store = Store::open_read_only(&d.config.db_path).unwrap();
+    let job = msgs
+        .iter()
+        .find_map(|m| match m {
+            ServerMessage::Done { job_id, .. } => Some(job_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let t = store.timeline(&job).unwrap().unwrap();
+    assert!(t.waits[0].is_some_and(|w| w >= 300), "budget wait: {t:?}");
+    drop((wa, wb));
+    d.shutdown().await;
+}
+
+/// T-W6-5: a gate alone (nothing else runs) starts even when `MemAvailable` is
+/// far below what it is expected to use (progress is always possible), a
+/// second one then waits, and a daemon with
+/// `memory_aware = false` ignores `meminfo` altogether.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gate_alone_runs_with_tiny_memory_and_the_switch_turns_the_rule_off() {
+    let repo = make_repo();
+    let (d, _proc) = memory_daemon(20, 1, true).await;
+    let (_w, mut r) = d
+        .request(&run_msg(&repo, "alone", "true", None, None, 0))
+        .await;
+    let msgs = until_done(&mut r).await;
+    assert_eq!(done_status(&msgs), OutcomeStatus::Pass);
+    // The exemption is for a machine with nothing else running: once a
+    // gate runs, however light, a second one waits for memory.
+    let (wa, mut ra) = d
+        .request(&run_msg(&repo, "holder", "sleep 30", None, None, 0))
+        .await;
+    until_started(&mut ra).await;
+    let (wb, mut rb) = d
+        .request(&run_msg(&repo, "second", "true", None, None, 0))
+        .await;
+    assert!(matches!(
+        next(&mut rb).await,
+        Some(ServerMessage::Queued { .. })
+    ));
+    status_until(&d, "the memory wait", |s| {
+        s.queued
+            .first()
+            .is_some_and(|q| q.wait_detail.as_deref() == Some("memory"))
+    })
+    .await;
+    drop((wa, wb));
+    d.shutdown().await;
+
+    // Rule off: two gates run together on the same tiny memory, and the
+    // status carries no memory section.
+    let (d, _proc) = memory_daemon(20, 1, false).await;
+    let (wa, mut ra) = d
+        .request(&run_msg(&repo, "holder", "sleep 30", None, None, 0))
+        .await;
+    until_started(&mut ra).await;
+    let (wb, mut rb) = d
+        .request(&run_msg(&repo, "second", "sleep 30", None, None, 0))
+        .await;
+    until_started(&mut rb).await;
+    let s = status(&d).await;
+    assert_eq!((s.running.len(), s.queued.len()), (2, 0));
+    assert_eq!(s.budget.memory, None);
+    assert!(s.running.iter().all(|j| j.memory_expected_bytes.is_none()));
+    drop((wa, wb));
+    d.shutdown().await;
+}
+
+/// A finished gate teaches its working set: the daemon samples the processes of
+/// the job's group (the real `/proc` here, tiny processes), stores the run in
+/// `gate_memory` and the next run of the same command is expected to peak at
+/// what was learned, not at a guess.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finished_gate_teaches_its_working_set() {
+    let repo = make_repo();
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path(), 2, LastSubscriberGone::Cancel);
+    cfg.admission.psi_poll_interval = Duration::from_millis(50);
+    let d = start_in(dir, cfg).await;
+    let (_w, mut r) = d
+        .request(&run_msg(&repo, "learner", "sleep 1", None, None, 0))
+        .await;
+    assert_eq!(done_status(&until_done(&mut r).await), OutcomeStatus::Pass);
+    let store = Store::open_read_only(&d.config.db_path).unwrap();
+    let rows = store.gate_memory_recent(5).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (rows[0].gate.as_str(), rows[0].outcome.as_str()),
+        ("learner", "pass")
+    );
+    assert!(rows[0].anon_peak_bytes > 0, "{rows:?}");
+    assert!(!rows[0].oom_killed);
+    let learned = rows[0].anon_peak_bytes + rows[0].anon_peak_bytes / 5;
+    // The same command again: its expectation is the learned peak.
+    let (_w2, mut r2) = d
+        .request(&run_msg(&repo, "learner", "sleep 1", None, None, 0))
+        .await;
+    until_started(&mut r2).await;
+    let s = status(&d).await;
+    let run = &s.running[0];
+    assert_eq!(run.memory_expected_learned, Some(true), "{run:?}");
+    assert_eq!(run.memory_expected_bytes, Some(learned));
+    assert_eq!(done_status(&until_done(&mut r2).await), OutcomeStatus::Pass);
+    d.shutdown().await;
+}
+
 /// M4, daemon side: a `cancel` with reason `early-verdict` detaches one
 /// subscriber; the job keeps running while another one waits and is killed
 /// (recorded as `killed_by = early-verdict`) when the last one leaves so.
@@ -1661,5 +1850,163 @@ async fn a_queued_job_dropped_by_its_last_subscriber_never_starts() {
     assert!(s.running.is_empty() && s.queued.is_empty(), "{s:?}");
     assert!(!flag.exists(), "the dropped job never ran");
     drop(wa);
+    d.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// The Sluice-side memory guard (ADR-0019 piece 7, W6e)
+// ---------------------------------------------------------------------------
+
+/// Writes the fake `/proc/<pid>` of a gate leader: its own process group and
+/// a resident set of `rss_gib` GiB (the guard reads it like any job without a
+/// cgroup leaf).
+fn write_fake_process(proc_root: &Path, pid: i32, rss_gib: u64) {
+    let dir = proc_root.join(pid.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("stat"),
+        format!("{pid} (sh) S 1 {pid} {pid} 0 0\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("status"),
+        format!("Name:\tsh\nVmRSS:\t{} kB\n", rss_gib * GIB / 1024),
+    )
+    .unwrap();
+}
+
+/// Writes the fake system memory pressure file with the given `full avg10`.
+fn write_memory_pressure(psi_root: &Path, full_avg10: f64) {
+    std::fs::create_dir_all(psi_root).unwrap();
+    std::fs::write(
+        psi_root.join("memory"),
+        format!(
+            "some avg10=60.00 avg60=20.00 avg300=5.00 total=1\n\
+             full avg10={full_avg10:.2} avg60=10.00 avg300=2.00 total=1\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// A daemon of budget 2 with a fake `/proc` (`meminfo` plus the leaders'
+/// entries) and a fake pressure directory, the guard `on` or off, memory
+/// admission off so both gates run whatever `meminfo` says.
+async fn guard_daemon(guard: bool) -> (Daemon, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let proc_root = dir.path().join("proc");
+    std::fs::create_dir_all(&proc_root).unwrap();
+    // 20 GiB machine, reserve 2 GiB (auto), healthy.
+    write_meminfo(&proc_root, 20, 15);
+    let psi_root = dir.path().join("pressure");
+    write_memory_pressure(&psi_root, 0.0);
+    let mut cfg = config(dir.path(), 2, LastSubscriberGone::Cancel);
+    cfg.proc_root.clone_from(&proc_root);
+    cfg.psi_root.clone_from(&psi_root);
+    cfg.admission.psi_poll_interval = Duration::from_millis(50);
+    cfg.admission.memory_aware = false;
+    cfg.admission.memory_guard = guard;
+    (start_in(dir, cfg).await, proc_root, psi_root)
+}
+
+/// Starts two gates ("small" 3 GiB, "big" 6 GiB of fake resident set) and
+/// returns their connections and pids. The machine is still healthy.
+async fn two_fake_gates(
+    d: &Daemon,
+    repo: &Repo,
+    proc_root: &Path,
+) -> ((OwnedWriteHalf, Reader), (OwnedWriteHalf, Reader), i32) {
+    let mut started = Vec::new();
+    for (name, gib) in [("small", 3), ("big", 6)] {
+        let pidfile = d.path(&format!("{name}.pid"));
+        let cmd = format!("echo $$ > {}; sleep 30", pidfile.display());
+        let (w, mut r) = d.request(&run_msg(repo, name, &cmd, None, None, 0)).await;
+        until_started(&mut r).await;
+        let pid = read_pid(&pidfile).await;
+        write_fake_process(proc_root, pid, gib);
+        started.push((w, r, pid));
+    }
+    let (wb, rb, big) = started.pop().unwrap();
+    let (ws, rs, _) = started.pop().unwrap();
+    ((ws, rs), (wb, rb), big)
+}
+
+/// W6e: with the guard on, three seconds of trouble (`MemAvailable`
+/// below the reserve, the gates holding more than it, memory stalls) cancel the
+/// gate with the largest working set: `killed` with `killed_by = memory` and the
+/// guard's message, an `interventions` row, and the other gate keeps running
+/// (one action, then the cooldown).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_memory_guard_cancels_the_largest_gate_under_exhaustion() {
+    let repo = make_repo();
+    let (d, proc_root, psi_root) = guard_daemon(true).await;
+    let (small, (_wb, mut rb), big_pid) = two_fake_gates(&d, &repo, &proc_root).await;
+    let (ws, rs) = small;
+    // Healthy so far: nothing happens however long it takes.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(status(&d).await.running.len(), 2);
+    // The machine runs out of memory and stalls.
+    write_meminfo(&proc_root, 20, 1);
+    write_memory_pressure(&psi_root, 40.0);
+    let msgs = tokio::time::timeout(WAIT, until_done(&mut rb))
+        .await
+        .expect("the guard cancels the biggest gate");
+    let (job, outcome) = done_outcome(&msgs);
+    assert_eq!(outcome.status, OutcomeStatus::Killed, "{outcome:?}");
+    assert_eq!(outcome.killed_by.as_deref(), Some("memory"));
+    assert!(outcome.killed_for_memory());
+    assert!(
+        outcome
+            .message
+            .contains("cancelled by Sluice for lack of memory: job working set 6.0 GiB, MemAvailable 1.0 GiB below the reserve 2.0 GiB"),
+        "{}",
+        outcome.message
+    );
+    assert!(!group_alive(big_pid), "the process group was killed");
+    // The row of the intervention, with the guard's cause.
+    let store = Store::open_read_only(&d.config.db_path).unwrap();
+    let rows = store.recent_interventions(0, 10).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].cause, "sluice_memory_guard");
+    assert_eq!(rows[0].leaf, format!("jobs/{job}"));
+    assert_eq!(rows[0].session, None);
+    // Cooldown: the other gate is not touched while it lasts.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let s = status(&d).await;
+    assert_eq!(s.running.len(), 1, "{:?}", s.running);
+    assert_eq!(s.running[0].gate, "small");
+    drop((ws, rs));
+    d.shutdown().await;
+}
+
+/// W6e: off by default. The same exhaustion changes nothing for a daemon
+/// without `[admission] memory_guard`, and with the guard on a lone gate below
+/// the reserve is never touched.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_memory_guard_does_nothing_when_off_or_when_nothing_is_to_blame() {
+    let repo = make_repo();
+    assert!(!AdmissionConfig::default().memory_guard);
+    let (d, proc_root, psi_root) = guard_daemon(false).await;
+    let (_a, _b, _) = two_fake_gates(&d, &repo, &proc_root).await;
+    write_meminfo(&proc_root, 20, 1);
+    write_memory_pressure(&psi_root, 90.0);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(status(&d).await.running.len(), 2, "the guard is off");
+    d.shutdown().await;
+
+    // Guard on, but the only gate holds less than the reserve (the agents
+    // cause the shortage, not the gates): no action.
+    let (d, proc_root, psi_root) = guard_daemon(true).await;
+    let pidfile = d.path("lone.pid");
+    let cmd = format!("echo $$ > {}; sleep 30", pidfile.display());
+    let (_w, mut r) = d
+        .request(&run_msg(&repo, "lone", &cmd, None, None, 0))
+        .await;
+    until_started(&mut r).await;
+    let pid = read_pid(&pidfile).await;
+    write_fake_process(&proc_root, pid, 1);
+    write_meminfo(&proc_root, 20, 1);
+    write_memory_pressure(&psi_root, 90.0);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(status(&d).await.running.len(), 1, "nothing to blame");
     d.shutdown().await;
 }

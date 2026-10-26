@@ -131,6 +131,8 @@ pub struct Store {
     path: PathBuf,
     /// `sched_schema` version of the file (0: no timeline columns).
     sched: u32,
+    /// The file has the `gate_memory` table (`containment_schema` 2).
+    memory: bool,
 }
 
 /// Scheduling facts written when a job is queued (`sched_schema` 1).
@@ -205,6 +207,31 @@ pub struct GateStat {
     pub demand_milli: u32,
 }
 
+/// The working set of one finished run (`gate_memory`, `containment_schema` 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateMemory {
+    /// Repository identity.
+    pub repo: PathBuf,
+    /// Gate name (`exec:<label>` for `sluice exec`).
+    pub gate: String,
+    /// 16 hex of the command hash (empty for `exec`).
+    pub cmd_hash: String,
+    /// Job id.
+    pub job_id: String,
+    /// End time.
+    pub finished_at: u64,
+    /// `pass` or `killed` (a run killed for lack of memory).
+    pub outcome: String,
+    /// Largest sampled `anon` + swap of the job (resident set without a
+    /// cgroup), bytes.
+    pub anon_peak_bytes: u64,
+    /// `memory.peak` of the job's cgroup (page cache included), bytes; only
+    /// shown, never used for admission.
+    pub peak_bytes: Option<u64>,
+    /// The run was killed for lack of memory.
+    pub oom_killed: bool,
+}
+
 /// A job with its timeline (`sluice logs --timeline`). The timeline fields
 /// are `None` on rows written by releases without them.
 #[derive(Debug, Clone, PartialEq)]
@@ -239,6 +266,8 @@ pub struct Timeline {
 
 /// Rows kept per `gate_stats` key.
 const GATE_STATS_KEEP: i64 = 20;
+/// Rows kept per `gate_memory` key.
+const GATE_MEMORY_KEEP: i64 = 20;
 
 impl std::fmt::Debug for Store {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -352,6 +381,7 @@ impl Store {
             conn,
             path: path.to_path_buf(),
             sched: 0,
+            memory: false,
         };
         let fresh = store.init_schema()?;
         store.migrate(fresh, migrations)?;
@@ -364,6 +394,7 @@ impl Store {
             crate::migrate::CONTAINMENT_SCHEMA_VERSION,
         )
         .map_err(db)?;
+        store.memory = true;
         crate::meta::record_writer(&store.conn).map_err(db)?;
         Ok(store)
     }
@@ -417,8 +448,12 @@ impl Store {
             conn,
             path: path.to_path_buf(),
             sched: 0,
+            memory: false,
         };
         store.check_version()?;
+        store.memory = crate::migrate::version(&store.conn, crate::migrate::CONTAINMENT_TABLE)
+            .map_err(db)?
+            >= 2;
         // Only the columns this build knows are ever selected, so a newer
         // (additive) `sched_schema` reads fine.
         store.sched = crate::migrate::version(&store.conn, crate::migrate::SCHED_TABLE)
@@ -1127,6 +1162,115 @@ impl Store {
             .map_err(db)
     }
 
+    /// Inserts the working set of one finished run and keeps the newest 20
+    /// of its key. A file without `gate_memory` (opened read-only before the
+    /// migration) ignores it.
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn insert_gate_memory(&self, m: &GateMemory) -> Result<()> {
+        if !self.memory {
+            return Ok(());
+        }
+        let tx = self.tx()?;
+        let repo = path_str(&m.repo);
+        tx.execute(
+            "INSERT INTO gate_memory (repo, gate, cmd_hash, job_id, finished_at, outcome, \
+             anon_peak_bytes, peak_bytes, oom_killed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                repo,
+                m.gate,
+                m.cmd_hash,
+                m.job_id,
+                i(m.finished_at),
+                m.outcome,
+                i(m.anon_peak_bytes),
+                m.peak_bytes.map(i),
+                i64::from(m.oom_killed),
+            ],
+        )
+        .map_err(db)?;
+        tx.execute(
+            "DELETE FROM gate_memory WHERE repo = ?1 AND gate = ?2 AND cmd_hash = ?3 \
+             AND rowid NOT IN (SELECT rowid FROM gate_memory WHERE repo = ?1 AND gate = ?2 \
+             AND cmd_hash = ?3 ORDER BY finished_at DESC, rowid DESC LIMIT ?4)",
+            params![repo, m.gate, m.cmd_hash, GATE_MEMORY_KEEP],
+        )
+        .map_err(db)?;
+        tx.commit().map_err(db)?;
+        Ok(())
+    }
+
+    /// The newest `per_key` working sets of every key, oldest first within
+    /// a key.
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn gate_memory_recent(&self, per_key: usize) -> Result<Vec<GateMemory>> {
+        if !self.memory {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT repo, gate, cmd_hash, job_id, finished_at, outcome, anon_peak_bytes, \
+                 peak_bytes, oom_killed FROM gate_memory \
+                 ORDER BY repo, gate, cmd_hash, finished_at DESC, rowid DESC",
+            )
+            .map_err(db)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(GateMemory {
+                    repo: PathBuf::from(r.get::<_, String>(0)?),
+                    gate: r.get(1)?,
+                    cmd_hash: r.get(2)?,
+                    job_id: r.get(3)?,
+                    finished_at: u(r.get(4)?),
+                    outcome: r.get(5)?,
+                    anon_peak_bytes: u(r.get(6)?),
+                    peak_bytes: r.get::<_, Option<i64>>(7)?.map(u),
+                    oom_killed: r.get::<_, i64>(8)? != 0,
+                })
+            })
+            .map_err(db)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db)?;
+        let mut out: Vec<GateMemory> = Vec::with_capacity(rows.len());
+        let mut group: Vec<GateMemory> = Vec::new();
+        for row in rows {
+            let same = group.last().is_some_and(|g| {
+                g.repo == row.repo && g.gate == row.gate && g.cmd_hash == row.cmd_hash
+            });
+            if !same {
+                out.extend(group.drain(..).rev());
+            }
+            if group.len() < per_key {
+                group.push(row);
+            }
+        }
+        out.extend(group.drain(..).rev());
+        Ok(out)
+    }
+
+    /// Deletes the working sets of keys with no run since `unseen_since_ms`
+    /// (the same rule as [`Store::prune_gate_stats`]); returns the rows deleted.
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn prune_gate_memory(&self, unseen_since_ms: u64) -> Result<usize> {
+        if !self.memory {
+            return Ok(0);
+        }
+        self.conn
+            .execute(
+                "DELETE FROM gate_memory WHERE (repo, gate, cmd_hash) IN \
+                 (SELECT repo, gate, cmd_hash FROM gate_memory GROUP BY repo, gate, cmd_hash \
+                  HAVING max(finished_at) < ?1)",
+                [i(unseen_since_ms)],
+            )
+            .map_err(db)
+    }
+
     fn timeline_of(&self, job: JobRow) -> Result<Timeline> {
         let mut t = Timeline {
             job,
@@ -1744,6 +1888,89 @@ mod tests {
                 .iter()
                 .all(|g| g.cmd_hash == "aaaa")
         );
+    }
+
+    #[test]
+    fn gate_memory_keeps_twenty_per_key_and_prunes_with_the_stats() {
+        let (_d, p) = tmp();
+        let s = Store::open(&p).unwrap();
+        let sample = |n: u64, key: &str| GateMemory {
+            repo: PathBuf::from("/r"),
+            gate: "test".into(),
+            cmd_hash: key.into(),
+            job_id: format!("j{n}"),
+            finished_at: n,
+            outcome: if n.is_multiple_of(2) {
+                "pass"
+            } else {
+                "killed"
+            }
+            .into(),
+            anon_peak_bytes: 1_000 + n,
+            peak_bytes: (!n.is_multiple_of(3)).then_some(5_000 + n),
+            oom_killed: n % 2 == 1,
+        };
+        for n in 0..25 {
+            s.insert_gate_memory(&sample(n, "aaaa")).unwrap();
+        }
+        s.insert_gate_memory(&sample(3, "bbbb")).unwrap();
+        let all = s.gate_memory_recent(100).unwrap();
+        assert_eq!(
+            all.iter().filter(|m| m.cmd_hash == "aaaa").count(),
+            20,
+            "pruned to 20"
+        );
+        let recent = s.gate_memory_recent(5).unwrap();
+        let a: Vec<u64> = recent
+            .iter()
+            .filter(|m| m.cmd_hash == "aaaa")
+            .map(|m| m.finished_at)
+            .collect();
+        assert_eq!(a, (20..25).collect::<Vec<_>>(), "newest five, oldest first");
+        // Everything round-trips, killed runs and a missing `memory.peak` too.
+        assert_eq!(
+            recent.iter().find(|m| m.finished_at == 23),
+            Some(&sample(23, "aaaa"))
+        );
+        assert_eq!(
+            recent.iter().find(|m| m.finished_at == 24),
+            Some(&sample(24, "aaaa"))
+        );
+        assert!(
+            s.gate_memory_recent(5)
+                .unwrap()
+                .iter()
+                .any(|m| m.peak_bytes.is_none())
+        );
+        assert_eq!(s.prune_gate_memory(10).unwrap(), 1, "bbbb unseen since 3");
+        assert!(
+            s.gate_memory_recent(10)
+                .unwrap()
+                .iter()
+                .all(|m| m.cmd_hash == "aaaa")
+        );
+    }
+
+    #[test]
+    fn gate_memory_is_ignored_by_a_file_without_the_table() {
+        // A read-only open of a database no migration has touched yet.
+        let (_d, p) = tmp();
+        v020_db(&p);
+        let s = Store::open_read_only(&p).unwrap();
+        let sample = GateMemory {
+            repo: PathBuf::from("/r"),
+            gate: "test".into(),
+            cmd_hash: "aaaa".into(),
+            job_id: "j".into(),
+            finished_at: 1,
+            outcome: "pass".into(),
+            anon_peak_bytes: 1,
+            peak_bytes: None,
+            oom_killed: false,
+        };
+        s.insert_gate_memory(&sample).unwrap();
+        assert_eq!(s.gate_memory_recent(5).unwrap(), Vec::new());
+        assert_eq!(s.prune_gate_memory(10).unwrap(), 0);
     }
 
     #[test]

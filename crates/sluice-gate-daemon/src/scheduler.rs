@@ -86,6 +86,11 @@ pub enum WaitCause {
     Reserved,
     /// It would have fitted, but higher-ranked jobs took the room first.
     Order,
+    /// The budget has room, but the memory the job is expected to use does
+    /// not fit what is available (ADR-0019). Shares the budget accumulator
+    /// (index 0) and the `budget` wire reason, like [`WaitCause::Order`]
+    /// shares the reason; the wire detail is `memory`.
+    Memory,
 }
 
 impl WaitCause {
@@ -101,7 +106,9 @@ impl WaitCause {
     /// Index of the cause's accumulator.
     pub fn index(self) -> usize {
         match self {
-            Self::Budget => 0,
+            // The `jobs.wait_*_ms` columns are frozen: memory waits count as
+            // budget waits.
+            Self::Budget | Self::Memory => 0,
             Self::Psi => 1,
             Self::RepoCap => 2,
             Self::Reserved => 3,
@@ -109,10 +116,11 @@ impl WaitCause {
         }
     }
 
-    /// The frozen wire reason (an outranked job reports `budget`).
+    /// The frozen wire reason (an outranked or memory-blocked job reports
+    /// `budget`).
     pub fn reason(self) -> WaitReason {
         match self {
-            Self::Budget | Self::Order => WaitReason::Budget,
+            Self::Budget | Self::Order | Self::Memory => WaitReason::Budget,
             Self::Psi => WaitReason::Psi,
             Self::RepoCap => WaitReason::RepoCap,
             Self::Reserved => WaitReason::HeadReserved,
@@ -127,6 +135,7 @@ impl WaitCause {
             Self::RepoCap => "repo-cap",
             Self::Reserved => "head-reserved",
             Self::Order => "order",
+            Self::Memory => "memory",
         }
     }
 }
@@ -210,6 +219,11 @@ pub struct RunningView {
     pub subscribers: usize,
     /// How it was admitted.
     pub admission: Admission,
+    /// Working set now (last sample), bytes; `None` with memory-aware
+    /// admission off.
+    pub memory_current: Option<u64>,
+    /// Peak it is expected to reach; `None` with memory-aware admission off.
+    pub memory_expected: Option<Expected>,
 }
 
 /// A queued job as shown by `status`.
@@ -238,12 +252,16 @@ pub struct QueuedView {
     pub reason: WaitReason,
     /// The detailed cause.
     pub cause: WaitCause,
-    /// `outranked`, `lane` or `human-first` for [`WaitCause::Order`].
+    /// `outranked`, `lane` or `human-first` for [`WaitCause::Order`];
+    /// `memory` for [`WaitCause::Memory`].
     pub detail: Option<&'static str>,
     /// 1-based position in the priority order.
     pub rank: usize,
     /// Expected run time from history.
     pub expected_ms: Option<u64>,
+    /// Peak the job is expected to reach; `None` with memory-aware
+    /// admission off.
+    pub memory_expected: Option<Expected>,
 }
 
 /// Scheduling facts of one job for the timeline (`jobs` columns).
@@ -354,6 +372,55 @@ pub struct Pressure {
     pub sampled_at: Option<u64>,
 }
 
+/// Memory the machine offers at one admission pass (ADR-0019).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the unit in every name keeps byte counts apart from weights"
+)]
+pub struct MemoryFacts {
+    /// `MemAvailable`, bytes. Swap is never counted.
+    pub available_bytes: u64,
+    /// `MemTotal`, bytes.
+    pub total_bytes: u64,
+    /// Memory kept for everything that is not a gate, bytes.
+    pub reserve_bytes: u64,
+}
+
+/// The peak a job is expected to reach, and where the figure comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Expected {
+    /// Bytes.
+    pub bytes: u64,
+    /// From earlier runs of the same gate; `false` is a guess from the weight.
+    pub learned: bool,
+}
+
+impl MemoryFacts {
+    /// What gates may use at most: the machine's memory minus the reserve.
+    fn usable(&self) -> u64 {
+        self.total_bytes.saturating_sub(self.reserve_bytes)
+    }
+
+    /// The expected peak of a job: the learned one, else a guess from its
+    /// weight, `w / B` of [`Self::usable`] (the CPU weight is the only prior
+    /// the user already expressed).
+    pub fn estimate(&self, learned: Option<u64>, weight: u32, budget: u32) -> Expected {
+        if let Some(bytes) = learned {
+            return Expected {
+                bytes,
+                learned: true,
+            };
+        }
+        let share =
+            u128::from(self.usable()) * u128::from(weight.min(budget)) / u128::from(budget.max(1));
+        Expected {
+            bytes: u64::try_from(share).unwrap_or(u64::MAX),
+            learned: false,
+        }
+    }
+}
+
 /// A queued job in a [`Snapshot`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedSnap {
@@ -374,6 +441,9 @@ pub struct QueuedSnap {
     pub queued_at: u64,
     /// Expected run time.
     pub expected_ms: Option<u64>,
+    /// Peak memory learned from earlier runs of the key, bytes; `None`
+    /// guesses it from the weight.
+    pub expected_peak: Option<u64>,
 }
 
 /// A running job in a [`Snapshot`].
@@ -387,6 +457,11 @@ pub struct RunningSnap {
     pub lane: PathBuf,
     /// Units held.
     pub weight: u32,
+    /// Working set at the last sample, bytes (0 before the first).
+    pub current: u64,
+    /// Peak learned from earlier runs of the key, bytes; `None` guesses it
+    /// from the weight held.
+    pub expected_peak: Option<u64>,
 }
 
 /// Everything one admission decision depends on.
@@ -408,6 +483,9 @@ pub struct Snapshot<'a> {
     pub queued: &'a [QueuedSnap],
     /// Current learned weights by key.
     pub learned: &'a Learned,
+    /// Memory-aware admission: `None` is the rule off (plans are those of
+    /// CPU-only admission, byte for byte).
+    pub memory: Option<MemoryFacts>,
 }
 
 /// One queued job left waiting by a [`Plan`].
@@ -417,7 +495,7 @@ pub struct Wait {
     pub id: String,
     /// Why it waits.
     pub cause: WaitCause,
-    /// Detail of [`WaitCause::Order`].
+    /// Detail of [`WaitCause::Order`] and [`WaitCause::Memory`].
     pub detail: Option<&'static str>,
 }
 
@@ -435,6 +513,9 @@ pub struct Plan {
     /// Effective weight of each job of `order` in this pass, parallel to it
     /// (the weight a started job is admitted with).
     pub weights: Vec<u32>,
+    /// Expected peak of each job of `order`, parallel to it; empty with
+    /// memory-aware admission off.
+    pub expected: Vec<Expected>,
 }
 
 fn overdue(s: &Snapshot<'_>, j: &QueuedSnap) -> bool {
@@ -500,131 +581,303 @@ pub fn rank(s: &Snapshot<'_>) -> Vec<usize> {
     idx
 }
 
-/// The admission decision of one pass: (1) PSI blocking → only the guard
-/// may start the first ranked job, within the budget; (2) a nominal pass in
-/// rank order with backfill and head reservation; (3) at most one
-/// over-admission (the reserved head, else the first ranked job under the
-/// cap) when the pressure allows it and nothing started nominally.
-#[allow(
-    clippy::too_many_lines,
-    reason = "the three steps of ADR-0011 section 8, in order"
-)]
-pub fn plan(s: &Snapshot<'_>) -> Plan {
-    let p = s.policy;
-    let lanes = lane_ranks(s);
-    let mut order: Vec<usize> = (0..s.queued.len()).collect();
-    order.sort_by(|&a, &b| compare(s, &lanes, a, b));
-    // Effective weights from the current learned statistics, by queue index.
-    let w: Vec<u32> = s.queued.iter().map(|j| queued_weight(s, j)).collect();
-    let mut plan = Plan {
-        order: order.iter().map(|&i| s.queued[i].id.clone()).collect(),
-        weights: order.iter().map(|&i| w[i]).collect(),
-        ..Plan::default()
-    };
-    let mut held: Vec<(&Path, u32)> = s
-        .running
-        .iter()
-        .map(|r| (r.repo.as_path(), r.weight))
-        .collect();
-    let used_of = |held: &[(&Path, u32)]| held.iter().map(|(_, w)| *w).sum::<u32>();
-    let fits_repo = |held: &[(&Path, u32)], i: usize| {
-        let j = &s.queued[i];
-        p.repo_caps.get(&j.repo).is_none_or(|&cap| {
-            let repo_used: u32 = held
+/// The memory bookkeeping of one pass (ADR-0019).
+struct MemPass {
+    facts: MemoryFacts,
+    /// Expected peak of every queued job, by queue index.
+    peaks: Vec<Expected>,
+    /// Headroom of the running jobs plus the full expected peak of the jobs
+    /// started earlier in this pass.
+    held: u64,
+    /// A job runs or was started in this pass: the progress exemption of
+    /// [`MemPass::fits`] no longer applies.
+    busy: bool,
+}
+
+impl MemPass {
+    fn new(s: &Snapshot<'_>, facts: MemoryFacts, w: &[u32]) -> Self {
+        let budget = s.policy.budget;
+        let held = running_headroom_of(s, &facts);
+        Self {
+            facts,
+            peaks: s
+                .queued
+                .iter()
+                .zip(w)
+                .map(|(j, &w)| facts.estimate(j.expected_peak, w, budget))
+                .collect(),
+            held,
+            busy: !s.running.is_empty(),
+        }
+    }
+
+    /// Memory a new job may still take: what is available minus the reserve
+    /// and the growth still expected of the jobs already admitted.
+    fn free(&self) -> u64 {
+        self.facts
+            .available_bytes
+            .saturating_sub(self.facts.reserve_bytes)
+            .saturating_sub(self.held)
+    }
+
+    /// The job fits, or nothing at all runs and nothing started earlier in
+    /// this pass (the progress exemption: an idle machine always starts the
+    /// first ranked job, however big its expected peak).
+    fn fits(&self, i: usize) -> bool {
+        !self.busy || self.peaks[i].bytes <= self.free()
+    }
+
+    /// The job fits on a learned peak, with no `alone` exemption
+    /// (over-admission never starts a job blind).
+    fn fits_learned(&self, i: usize) -> bool {
+        self.peaks[i].learned && self.peaks[i].bytes <= self.free()
+    }
+
+    /// The job starts: its whole expected peak counts from now on.
+    fn start(&mut self, i: usize) {
+        let e = self.peaks[i].bytes;
+        self.held = self.held.saturating_add(e);
+        self.busy = true;
+    }
+}
+
+/// Headroom of the running jobs: what they are still expected to grow by
+/// (`max(0, expected - current)`, summed).
+fn running_headroom_of(s: &Snapshot<'_>, facts: &MemoryFacts) -> u64 {
+    s.running.iter().fold(0, |held, r| {
+        let e = facts
+            .estimate(r.expected_peak, r.weight, s.policy.budget)
+            .bytes;
+        held.saturating_add(e.saturating_sub(r.current))
+    })
+}
+
+/// What the running jobs are still expected to grow by, bytes; `None` with
+/// memory-aware admission off.
+pub fn running_headroom(s: &Snapshot<'_>) -> Option<u64> {
+    s.memory.map(|facts| running_headroom_of(s, &facts))
+}
+
+/// The state of one admission pass: the ranking, the effective weights, what
+/// is held and what the pass has started.
+struct Pass<'s> {
+    s: Snapshot<'s>,
+    lanes: Vec<usize>,
+    /// Indices of `s.queued` in rank order.
+    order: Vec<usize>,
+    /// Effective weights by queue index.
+    w: Vec<u32>,
+    /// `(repo, weight)` of the running jobs and of those started so far.
+    held: Vec<(&'s Path, u32)>,
+    mem: Option<MemPass>,
+}
+
+impl<'s> Pass<'s> {
+    fn new(s: Snapshot<'s>) -> Self {
+        let lanes = lane_ranks(&s);
+        let mut order: Vec<usize> = (0..s.queued.len()).collect();
+        order.sort_by(|&a, &b| compare(&s, &lanes, a, b));
+        // Effective weights from the current learned statistics, by queue index.
+        let w: Vec<u32> = s.queued.iter().map(|j| queued_weight(&s, j)).collect();
+        let held = s
+            .running
+            .iter()
+            .map(|r| (r.repo.as_path(), r.weight))
+            .collect();
+        let mem = s.memory.map(|facts| MemPass::new(&s, facts, &w));
+        Self {
+            s,
+            lanes,
+            order,
+            w,
+            held,
+            mem,
+        }
+    }
+
+    /// The plan before any decision: the ranking, the weights, the peaks.
+    fn skeleton(&self) -> Plan {
+        Plan {
+            order: self
+                .order
+                .iter()
+                .map(|&i| self.s.queued[i].id.clone())
+                .collect(),
+            weights: self.order.iter().map(|&i| self.w[i]).collect(),
+            expected: self
+                .mem
+                .iter()
+                .flat_map(|m| self.order.iter().map(|&i| m.peaks[i]))
+                .collect(),
+            ..Plan::default()
+        }
+    }
+
+    fn used(&self) -> u32 {
+        self.held.iter().map(|(_, w)| *w).sum()
+    }
+
+    fn fits_repo(&self, i: usize) -> bool {
+        let j = &self.s.queued[i];
+        self.s.policy.repo_caps.get(&j.repo).is_none_or(|&cap| {
+            let repo_used: u32 = self
+                .held
                 .iter()
                 .filter(|(r, _)| *r == j.repo.as_path())
                 .map(|(_, w)| *w)
                 .sum();
-            repo_used + w[i] <= cap
+            repo_used + self.w[i] <= cap
         })
-    };
-    let used0 = used_of(&held);
+    }
 
-    if s.pressure.blocking {
-        for (pos, &i) in order.iter().enumerate() {
-            let j = &s.queued[i];
-            if pos == 0 && s.pressure.guard_due && used0 + w[i] <= p.budget && fits_repo(&held, i) {
-                plan.start.push((j.id.clone(), Admission::Guard));
+    fn fits_mem(&self, i: usize) -> bool {
+        self.mem.as_ref().is_none_or(|m| m.fits(i))
+    }
+
+    fn fits_mem_learned(&self, i: usize) -> bool {
+        self.mem.as_ref().is_none_or(|m| m.fits_learned(i))
+    }
+
+    /// Admits job `i` into the pass: its weight and memory count from now on.
+    fn start(&mut self, i: usize) {
+        self.held.push((self.s.queued[i].repo.as_path(), self.w[i]));
+        if let Some(m) = &mut self.mem {
+            m.start(i);
+        }
+    }
+
+    /// PSI blocks: nothing starts, except the first ranked job when the
+    /// starvation guard is due and it fits the budget, its cap and memory.
+    fn blocked(&self, plan: &mut Plan) {
+        let used0 = self.used();
+        for (pos, &i) in self.order.iter().enumerate() {
+            let id = &self.s.queued[i].id;
+            if pos == 0
+                && self.s.pressure.guard_due
+                && used0 + self.w[i] <= self.s.policy.budget
+                && self.fits_repo(i)
+                && self.fits_mem(i)
+            {
+                plan.start.push((id.clone(), Admission::Guard));
                 continue;
             }
             plan.waits.push(Wait {
-                id: j.id.clone(),
+                id: id.clone(),
                 cause: WaitCause::Psi,
                 detail: None,
             });
         }
-        return plan;
     }
 
-    let mut reserved: Option<usize> = None;
-    let mut first_waiting = true;
-    let mut started: Vec<usize> = Vec::new();
-    let mut waiting: Vec<usize> = Vec::new();
-    for &i in &order {
-        let j = &s.queued[i];
-        let used = used_of(&held);
-        let fits_budget = used + w[i] <= p.budget;
-        let fits_cap = fits_repo(&held, i);
-        if reserved.is_none() && fits_budget && fits_cap {
-            plan.start.push((j.id.clone(), Admission::Nominal));
-            held.push((j.repo.as_path(), w[i]));
-            started.push(i);
-            continue;
-        }
-        // Only a head blocked by the budget reserves: a head blocked by its
-        // repository cap alone must not stop other repositories.
-        if first_waiting && reserved.is_none() && !fits_budget && overdue(s, j) {
-            reserved = Some(i);
-        }
-        first_waiting = false;
-        let (cause, detail) = if !fits_budget {
-            if !started.is_empty() && used0 + w[i] <= p.budget {
-                (WaitCause::Order, Some(order_detail(s, &lanes, &started, i)))
-            } else {
-                (WaitCause::Budget, None)
+    /// The nominal pass in rank order with backfill and head reservation.
+    /// Returns the reserved head and the jobs left waiting.
+    fn nominal(&mut self, plan: &mut Plan) -> (Option<usize>, Vec<usize>) {
+        let s = self.s;
+        let used0 = self.used();
+        let mut reserved: Option<usize> = None;
+        let mut first_waiting = true;
+        let mut started: Vec<usize> = Vec::new();
+        let mut waiting: Vec<usize> = Vec::new();
+        for i in self.order.clone() {
+            let j = &s.queued[i];
+            let fits_budget = self.used() + self.w[i] <= s.policy.budget;
+            let fits_cap = self.fits_repo(i);
+            let fits_mem = self.fits_mem(i);
+            if reserved.is_none() && fits_budget && fits_cap && fits_mem {
+                plan.start.push((j.id.clone(), Admission::Nominal));
+                self.start(i);
+                started.push(i);
+                continue;
             }
-        } else if !fits_cap {
-            (WaitCause::RepoCap, None)
-        } else {
-            (WaitCause::Reserved, None)
-        };
-        waiting.push(i);
-        plan.waits.push(Wait {
-            id: j.id.clone(),
-            cause,
-            detail,
-        });
+            // Only a head blocked by the budget or by memory reserves: a
+            // head blocked by its repository cap alone must not stop other
+            // repositories.
+            if first_waiting
+                && reserved.is_none()
+                && overdue(&s, j)
+                && (!fits_budget || (fits_cap && !fits_mem))
+            {
+                reserved = Some(i);
+            }
+            first_waiting = false;
+            let (cause, detail) = if !fits_budget {
+                if !started.is_empty() && used0 + self.w[i] <= s.policy.budget {
+                    (
+                        WaitCause::Order,
+                        Some(order_detail(&s, &self.lanes, &started, i)),
+                    )
+                } else {
+                    (WaitCause::Budget, None)
+                }
+            } else if !fits_cap {
+                (WaitCause::RepoCap, None)
+            } else if !fits_mem {
+                (WaitCause::Memory, Some("memory"))
+            } else {
+                (WaitCause::Reserved, None)
+            };
+            waiting.push(i);
+            plan.waits.push(Wait {
+                id: j.id.clone(),
+                cause,
+                detail,
+            });
+        }
+        (reserved, waiting)
     }
-    plan.reserved = reserved.map(|i| s.queued[i].id.clone());
 
-    let interval_ok = s
-        .last_overcommit_at
-        .is_none_or(|t| s.now.saturating_sub(t) >= p.overcommit_interval_ms);
-    if p.cap > p.budget
-        && plan.start.is_empty()
-        && s.pressure.calm
-        && interval_ok
-        && samples_after_last_start(s)
-    {
-        let used = used_of(&held);
-        let candidate = reserved.or_else(|| {
-            waiting
-                .iter()
-                .copied()
-                .find(|&i| used + w[i] <= p.cap && fits_repo(&held, i))
-        });
+    /// At most one over-admission (the reserved head, else the first ranked
+    /// job under the cap) when nothing started nominally and the pressure
+    /// allows it. It needs a learned peak that fits memory.
+    fn over_admit(&self, plan: &mut Plan, reserved: Option<usize>, waiting: &[usize]) {
+        let s = self.s;
+        let p = s.policy;
+        let interval_ok = s
+            .last_overcommit_at
+            .is_none_or(|t| s.now.saturating_sub(t) >= p.overcommit_interval_ms);
+        if p.cap <= p.budget
+            || !plan.start.is_empty()
+            || !s.pressure.calm
+            || !interval_ok
+            || !samples_after_last_start(&s)
+        {
+            return;
+        }
+        let used = self.used();
+        let eligible =
+            |i: usize| used + self.w[i] <= p.cap && self.fits_repo(i) && self.fits_mem_learned(i);
+        let candidate = reserved.or_else(|| waiting.iter().copied().find(|&i| eligible(i)));
         if let Some(i) = candidate
-            && used + w[i] <= p.cap
-            && fits_repo(&held, i)
+            && eligible(i)
             && s.pressure
                 .idle_cpus
-                .is_some_and(|idle| idle >= f64::from(w[i].div_ceil(3).max(1)))
+                .is_some_and(|idle| idle >= f64::from(self.w[i].div_ceil(3).max(1)))
         {
             let id = &s.queued[i].id;
             plan.start.push((id.clone(), Admission::Over));
             plan.waits.retain(|wt| &wt.id != id);
         }
     }
+}
+
+/// The admission decision of one pass: (1) PSI blocking → only the guard
+/// may start the first ranked job, within the budget; (2) a nominal pass in
+/// rank order with backfill and head reservation; (3) at most one
+/// over-admission (the reserved head, else the first ranked job under the
+/// cap) when the pressure allows it and nothing started nominally. With
+/// memory facts (ADR-0019) a job also has to fit the memory it is expected
+/// to use, unless nothing runs and nothing started earlier in the pass;
+/// without them the rule is off.
+pub fn plan(s: &Snapshot<'_>) -> Plan {
+    let mut pass = Pass::new(*s);
+    let mut plan = pass.skeleton();
+    if s.pressure.blocking {
+        pass.blocked(&mut plan);
+        return plan;
+    }
+    let (reserved, waiting) = pass.nominal(&mut plan);
+    plan.reserved = reserved.map(|i| s.queued[i].id.clone());
+    pass.over_admit(&mut plan, reserved, &waiting);
     plan
 }
 
@@ -763,6 +1016,7 @@ impl Job {
             class: self.spec.class,
             queued_at: self.spec.queued_at,
             expected_ms: self.spec.expected_ms,
+            expected_peak: None,
         }
     }
 
@@ -772,6 +1026,8 @@ impl Job {
             repo: self.spec.repo.clone(),
             lane: self.spec.lane.clone(),
             weight: self.spec.weight,
+            current: 0,
+            expected_peak: None,
         }
     }
 }
@@ -786,6 +1042,13 @@ pub struct Scheduler {
     /// Current learned weights by key (refreshed by [`Scheduler::set_learned`]
     /// and by the history a job carries at enqueue).
     learned: Learned,
+    /// Learned peak memory (expected working set, bytes) by key.
+    learned_peaks: BTreeMap<LearnKey, u64>,
+    /// Memory facts of the last [`Scheduler::set_memory`]: `None` is the
+    /// memory rule off.
+    memory: Option<MemoryFacts>,
+    /// Working set of each running job at its last sample, bytes.
+    currents: BTreeMap<String, u64>,
     last_overcommit_at: Option<u64>,
     /// Time of the latest admission of any kind.
     last_start_at: Option<u64>,
@@ -811,6 +1074,9 @@ impl Scheduler {
             queue: Vec::new(),
             running: Vec::new(),
             learned: Learned::new(),
+            learned_peaks: BTreeMap::new(),
+            memory: None,
+            currents: BTreeMap::new(),
             last_overcommit_at: None,
             last_start_at: None,
             over_admissions: 0,
@@ -863,6 +1129,41 @@ impl Scheduler {
         }
     }
 
+    /// Replaces the learned peak memory of `key` (bytes); `None` removes it
+    /// (the job is then guessed from its weight). Queued and running jobs of
+    /// that key use it from the next pass.
+    pub fn set_learned_peak(&mut self, key: LearnKey, peak_bytes: Option<u64>) {
+        match peak_bytes {
+            Some(bytes) => {
+                self.learned_peaks.insert(key, bytes);
+            }
+            None => {
+                self.learned_peaks.remove(&key);
+            }
+        }
+    }
+
+    /// Sets what the next passes (and `status`) know about memory: the
+    /// machine's facts (`None` turns the rule off) and the working set of
+    /// each running job at its last sample.
+    pub fn set_memory(&mut self, facts: Option<MemoryFacts>, currents: BTreeMap<String, u64>) {
+        self.memory = facts;
+        self.currents = currents;
+    }
+
+    /// The machine's memory at the last [`Scheduler::set_memory`]; `None`
+    /// with the rule off.
+    pub fn memory_facts(&self) -> Option<MemoryFacts> {
+        self.memory
+    }
+
+    /// What the running jobs are still expected to grow by at the last
+    /// [`Scheduler::set_memory`], bytes; `None` with the rule off.
+    pub fn memory_headroom(&self) -> Option<u64> {
+        let (running, queued) = self.snaps();
+        running_headroom(&self.snapshot_at(self.last_now, &running, &queued))
+    }
+
     /// Adds a request. The configured weight is clamped to
     /// `1..=min(budget, repo cap)` (a warning is logged once per clamped
     /// job) and becomes `weight_cfg`; the history it carries refreshes the
@@ -912,11 +1213,29 @@ impl Scheduler {
         }
     }
 
+    fn peak_of(&self, key: Option<&LearnKey>) -> Option<u64> {
+        key.and_then(|k| self.learned_peaks.get(k)).copied()
+    }
+
     fn snaps(&self) -> (Vec<RunningSnap>, Vec<QueuedSnap>) {
-        (
-            self.running.iter().map(Job::running_snap).collect(),
-            self.queue.iter().map(Job::queued_snap).collect(),
-        )
+        let running = self
+            .running
+            .iter()
+            .map(|j| RunningSnap {
+                current: self.currents.get(&j.spec.id).copied().unwrap_or(0),
+                expected_peak: self.peak_of(j.spec.learn_key.as_ref()),
+                ..j.running_snap()
+            })
+            .collect();
+        let queued = self
+            .queue
+            .iter()
+            .map(|j| QueuedSnap {
+                expected_peak: self.peak_of(j.spec.learn_key.as_ref()),
+                ..j.queued_snap()
+            })
+            .collect();
+        (running, queued)
     }
 
     fn snapshot_at<'a>(
@@ -934,6 +1253,7 @@ impl Scheduler {
             running,
             queued,
             learned: &self.learned,
+            memory: self.memory,
         }
     }
 
@@ -1136,6 +1456,16 @@ impl Scheduler {
                 queued_at: j.spec.queued_at,
                 subscribers: j.subscribers,
                 admission: j.admission.unwrap_or(Admission::Nominal),
+                memory_current: self
+                    .memory
+                    .map(|_| self.currents.get(&j.spec.id).copied().unwrap_or(0)),
+                memory_expected: self.memory.map(|f| {
+                    f.estimate(
+                        self.peak_of(j.spec.learn_key.as_ref()),
+                        j.spec.weight,
+                        self.policy.budget,
+                    )
+                }),
             })
             .collect();
         running.sort_by_key(|v| v.started_at);
@@ -1171,6 +1501,7 @@ impl Scheduler {
                     detail: wait.and_then(|w| w.detail),
                     rank: pos + 1,
                     expected_ms: j.spec.expected_ms,
+                    memory_expected: plan.expected.get(pos).copied(),
                 })
             })
             .collect();

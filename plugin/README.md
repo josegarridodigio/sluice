@@ -35,8 +35,8 @@ the agent offers to run `sluice init` and asks you first.
 | Piece | File | What it does |
 |---|---|---|
 | MCP server | `.mcp.json` | Registers `sluice mcp`. Tools: `verify`, `status`, `gate_list`, `logs`, `queue_enqueue`, `queue_status`, `queue_approve`, `queue_retry`, `queue_cancel`. From a plugin they are named `mcp__plugin_sluice_sluice__<tool>`; use that form in permission rules. |
-| Skill | `skills/sluice/SKILL.md` (+ `reference.md`) | Loaded when the agent is about to run tests, linters or type checks, commit, push or land a branch in a repository with a `.sluice.toml`. Teaches `verify`, reading its result, exit code 3 from hooks, and the merge-queue flow (verify, `queue_enqueue`, stop, never approve). |
-| Session hook | `hooks/hooks.json`, `hooks/session-start.sh` | `SessionStart` (`startup`, `resume`, `clear`, `compact`). Runs `sluice agent session-start`: installs the shims in `~/.local/share/sluice/shims`, prepends that directory to the session's `PATH` through `CLAUDE_ENV_FILE` (once) and adds the rules as context. A missing or older `sluice` is reported to the agent, which asks you before installing or updating. Test: `hooks/test-session-start.sh`. |
+| Skill | `skills/sluice/SKILL.md` (+ `reference.md`) | Loaded when the agent is about to run tests, linters or type checks, commit, push or land a branch in a repository with a `.sluice.toml`. Teaches `verify`, reading its result (a gate `KILLED for lack of memory` is not retried unchanged; a gate waiting for memory is only queued), exit code 3 from hooks, and the merge-queue flow (verify, `queue_enqueue`, stop, never approve; what to do for each queue reason; `--trust-member-config` is human-only). |
+| Session hook | `hooks/hooks.json`, `hooks/session-start.sh` | `SessionStart` (`startup`, `resume`, `clear`, `compact`). Runs `sluice agent session-start`: installs the shims in `~/.local/share/sluice/shims`, prepends that directory to the session's `PATH` through `CLAUDE_ENV_FILE` (once) and adds the rules as context (verify before commits, never retry a queued command without Sluice, never approve merge trains, and a gate killed for lack of memory is not retried unchanged). A missing or older `sluice` is reported to the agent, which asks you before installing or updating. Test: `hooks/test-session-start.sh`. |
 | Guard hook | `hooks/hooks.json`, `hooks/guard.sh` | `PreToolUse` on `Bash`. Runs `sluice guard`: rewrites gate commands to `sluice run <gate> -v` and heavy commands (builds, test runners) to `sluice exec -- ...` so they share the machine's budget, as `allow` or `ask` depending on your permission settings; denies `sluice queue approve` and raw gate commands it does not rewrite. Falls back to the 0.2.0 deny-only shell logic with an older `sluice`. |
 
 ### The guard hook
@@ -60,9 +60,12 @@ What `sluice guard` does with a Bash command:
      (`pnpm build` for a gate `npm run build`) becomes `sluice run build -v`;
    - a heavy command (`[agent] heavy_commands` of the user config; default
      `docker build`, `docker buildx build`, `docker compose build`, package
-     `build` scripts, `cargo build|test|clippy|nextest`, `go build|test`,
-     `make`, `gradle`, `mvn`, `tsc`, `vite build`, `webpack`, `next build`,
-     `pytest`, `jest`, `vitest`): `cargo build --release 2>&1 | tail -20`
+     `build` scripts, `cargo build|test|clippy|check|doc|nextest`,
+     `go build|test`, `make`, `gradle`, `mvn`, `tsc`, `vite build`,
+     `webpack`, `next build`, `pytest`, `jest`, `vitest`, and the Angular, Nx,
+     Turborepo, Playwright, Cypress, .NET, Bazel, CMake and Ninja commands
+     listed in [docs/configuration.md](../docs/configuration.md#heavy-commands-with-no-config)):
+     `cargo build --release 2>&1 | tail -20`
      becomes `sluice exec --label cargo-build -- cargo build --release 2>&1 | tail -20`
      (same output and exit code, run under the machine's budget).
 

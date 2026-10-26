@@ -22,7 +22,9 @@ use anyhow::{Context as _, Result, anyhow};
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 use nix::sys::socket::{self, AddressFamily, SockFlag, SockType, UnixAddr};
+use sluice_gate_core::config::UserConfig;
 use sluice_gate_core::dirs;
+use sluice_gate_core::env::daemon_env;
 use sluice_gate_core::git::EnvMap;
 
 /// Exit status of `sluice daemon` when another daemon still holds
@@ -583,11 +585,17 @@ fn spawn_daemon(env: &EnvMap, socket: &Path, log_path: &Path) -> Spawn {
         Err(e) => return Spawn::Failed(format!("cannot find myself: {e}")),
     };
     // The daemon outlives this hook or terminal: give it a neutral
-    // environment without the per-invocation git hook variables.
+    // environment without anything that describes this invocation (git hook
+    // variables, agent and job variables, the shim directory in `PATH`). The
+    // user's agent-detection variables come from their config; an unreadable
+    // config falls back to the defaults (the daemon reports it itself).
+    let detection = UserConfig::load(env)
+        .map(|u| u.agent_detection)
+        .unwrap_or_default();
     let mut cmd = Command::new(exe);
     cmd.arg("daemon")
         .env_clear()
-        .envs(env.iter().filter(|(k, _)| !k.starts_with("GIT_")))
+        .envs(daemon_env(env, &detection))
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err))

@@ -22,13 +22,15 @@ use sluice_gate_core::tree::{self, SnapshotFull, StagedEntries, TreeHash};
 use sluice_gate_daemon::server::{DaemonHandle, RunSubscription, StoreError};
 use sluice_gate_proto::{
     Caller, GateSpec, OutcomeStatus, QueueJobState as J, QueueTrainState as T, RepoInfo,
-    RunRequest, ServerMessage, TrainGate,
+    RunRequest, ServerMessage, TrainGate, TrainPrepare,
 };
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
 use crate::git::{EnvMap, Git, worktree_git_dir};
+use crate::hookcheck;
 use crate::model::{TrainHashInput, train_hash};
+use crate::prepare;
 use crate::push::{self, PushEnd, PushVerdict};
 use crate::store::{
     self, Actor, JobEdit, JobRow, MarkerRow, NewTrain, TrainEdit, TrainRow, TrainSettings, Writer,
@@ -55,6 +57,24 @@ pub struct Core {
     pub merge_dir: PathBuf,
     /// Program spawned for the push instead of `git` (tests only).
     pub push_program: Option<PathBuf>,
+}
+
+/// `config_source` of a train built from its member's own `.sluice.toml`
+/// (`--trust-member-config`, ADR-0018 section 6).
+pub const CONFIG_SOURCE_MEMBER: &str = "member";
+
+/// True when the train runs the configuration of its member's branch, not the
+/// base's.
+pub(crate) fn is_trusted(t: &TrainRow) -> bool {
+    t.config_source.as_deref() == Some(CONFIG_SOURCE_MEMBER)
+}
+
+/// What a claim for a trusted job carries: the job (always alone in its
+/// train) and the hash of the config blob its train was built from.
+#[derive(Debug, Clone)]
+struct Trust {
+    job: String,
+    config_hash: String,
 }
 
 /// A merge-queue error message for a request or a log line.
@@ -199,7 +219,9 @@ impl Core {
 }
 
 /// Runs blocking work (git) off the async threads.
-async fn blocking<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> Result<R> {
+pub(crate) async fn blocking<R: Send + 'static>(
+    f: impl FnOnce() -> R + Send + 'static,
+) -> Result<R> {
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| anyhow!("blocking task failed: {e}"))
@@ -282,7 +304,10 @@ pub fn sweep_merge_dir(core: &Core) {
     let trains = core.read(|tx| store::trains(tx, None)).unwrap_or_default();
     for e in entries.flatten() {
         let path = e.path();
-        let owner = trains.iter().find(|t| t.worktree == path);
+        // A train's worktree or its base probe (`<train>-base`).
+        let owner = trains
+            .iter()
+            .find(|t| t.worktree == path || prepare::probe_path(t) == path);
         match owner {
             Some(t) if crate::model::train_is_active(t.state) || core.is_busy(&t.id) => {}
             Some(t) => core.git.remove_worktree(&t.repo, &path),
@@ -305,9 +330,11 @@ async fn step(core: &Arc<Core>, tasks: &mut JoinSet<()>) -> Result<()> {
         .map_err(|e| anyhow!(store_msg(&e)))?;
     // Housekeeping: worktrees of recently finished trains.
     for t in &finished {
-        if t.worktree.exists() && !core.is_busy(&t.id) {
-            let (git, repo, wt) = (core.git.clone(), t.repo.clone(), t.worktree.clone());
-            blocking(move || git.remove_worktree(&repo, &wt)).await?;
+        for wt in [t.worktree.clone(), prepare::probe_path(t)] {
+            if wt.exists() && !core.is_busy(&t.id) {
+                let (git, repo) = (core.git.clone(), t.repo.clone());
+                blocking(move || git.remove_worktree(&repo, &wt)).await?;
+            }
         }
     }
     let ready: HashSet<&str> = trains
@@ -510,6 +537,40 @@ fn trusted_network_timeout(git: &Git, j: &JobRow) -> Duration {
     default
 }
 
+/// The configuration of a trusted job's own branch; `None` when it cannot be
+/// used (an invalid file fails the job with `member_config_invalid`).
+async fn member_config(core: &Arc<Core>, first: &JobRow) -> Option<crate::trust::MemberConfig> {
+    let (git, j) = (core.git.clone(), first.clone());
+    match blocking(move || crate::trust::read_member_config(&git, &j.repo, &j.head_sha)).await {
+        Ok(Ok(m)) => Some(m),
+        Ok(Err(e)) => {
+            tracing::warn!(job = %first.id, "member config invalid: {e:#}");
+            let detail = json!({ "error": format!("{e:#}") });
+            let failed = core.write(Actor::Runner, |w| {
+                w.job_to(
+                    &first.id,
+                    J::Queued,
+                    J::Failed,
+                    &JobEdit {
+                        reason: Some(Some("member_config_invalid".into())),
+                        detail: Some(Some(detail)),
+                        note: Some("member_config_invalid".into()),
+                        ..JobEdit::default()
+                    },
+                )
+            });
+            if let Err(err) = failed {
+                tracing::debug!("recording the failure refused: {}", store_msg(&err));
+            }
+            None
+        }
+        Err(e) => {
+            tracing::warn!(job = %first.id, "reading the member config failed: {e:#}");
+            None
+        }
+    }
+}
+
 /// Step 2 for one group, then step 1's claim. `None` when nothing was
 /// claimed (the failure is recorded on the queued jobs).
 async fn prepare_and_claim(
@@ -518,13 +579,21 @@ async fn prepare_and_claim(
     group: &(PathBuf, String, String),
     ids: &[String],
 ) -> Option<(TrainRow, Option<RepoConfig>)> {
+    // A trusted job's train runs its own branch's configuration: read and
+    // validated first, a broken file fails the job (no retry loop).
+    let member = if first.trust_config {
+        Some(member_config(core, first).await?)
+    } else {
+        None
+    };
+    let trusted = member.is_some();
     let (git, j) = (core.git_for(&first.env), first.clone());
     let prepared = blocking(move || {
         let timeout = trusted_network_timeout(&git, &j);
-        prepare(&git.with_network_timeout(timeout), &j)
+        prepare(&git.with_network_timeout(timeout), &j, !trusted)
     })
     .await;
-    let (base_sha, endpoint_hash, config) = match prepared {
+    let (base_sha, endpoint_hash, base_config) = match prepared {
         Ok(Ok(p)) => p,
         Ok(Err(e)) => {
             tracing::warn!(job = %first.id, "cannot prepare a train for {}: {e}", first.target);
@@ -539,13 +608,29 @@ async fn prepare_and_claim(
         }
     };
     let id = train_id();
+    // The base's gates and `[queue]`, or the member's for a trusted job
+    // (`remote` and `target` stay as resolved at enqueue).
+    let (config, trust) = match member {
+        Some(m) => (
+            m.config,
+            Some(Trust {
+                job: first.id.clone(),
+                config_hash: m.hash,
+            }),
+        ),
+        None => (base_config, None),
+    };
     let queue = config.as_ref().map(|c| c.queue.clone()).unwrap_or_default();
     let settings = TrainSettings {
         push_timeout_ms: u64::try_from(queue.push_timeout.as_millis()).unwrap_or(u64::MAX),
         audit_ref: queue.audit_ref,
         network_timeout_ms: u64::try_from(queue.network_timeout.as_millis()).unwrap_or(u64::MAX),
     };
-    let max = queue.max_train.max(1) as usize;
+    let max = if trust.is_some() {
+        1
+    } else {
+        queue.max_train.max(1) as usize
+    };
     let worktree = core.merge_dir.join(&id);
     let claimed = core.write(Actor::Runner, |w| {
         claim(
@@ -557,6 +642,7 @@ async fn prepare_and_claim(
             &endpoint_hash,
             &worktree,
             settings,
+            trust.as_ref(),
         )
     });
     match claimed {
@@ -627,8 +713,10 @@ impl std::fmt::Display for PrepareError {
 }
 
 /// Step 2: base SHA (for a remote: fetched from the push URL, with the
-/// deadline of `git`), endpoint hash, config of the base.
-fn prepare(git: &Git, j: &JobRow) -> Result<Prepared, PrepareError> {
+/// deadline of `git`), endpoint hash, config of the base (`read_config`: not
+/// for a trusted job, whose train does not use the base's config, so a base
+/// whose config is broken does not stand in its way).
+fn prepare(git: &Git, j: &JobRow, read_config_of_base: bool) -> Result<Prepared, PrepareError> {
     let unavailable = |e: anyhow::Error| PrepareError::Unavailable(format!("{e:#}"));
     let (url, endpoint) = endpoint(git, &j.repo, &j.remote).map_err(unavailable)?;
     let base_sha = if j.remote.is_empty() {
@@ -645,14 +733,23 @@ fn prepare(git: &Git, j: &JobRow) -> Result<Prepared, PrepareError> {
             .map_err(unavailable)?
             .ok_or_else(|| PrepareError::Unavailable(format!("fetch did not produce {base_ref}")))?
     };
-    let config = read_config(git, &j.repo, &base_sha)
-        .map_err(|e| PrepareError::ConfigInvalid(format!("{e:#}")))?;
+    let config = if read_config_of_base {
+        read_config(git, &j.repo, &base_sha)
+            .map_err(|e| PrepareError::ConfigInvalid(format!("{e:#}")))?
+    } else {
+        None
+    };
     Ok((base_sha, endpoint, config))
 }
 
-/// True for the reasons a queued job carries while its base cannot be prepared.
+/// True for the reasons a queued job carries while no train can be built for
+/// it for a reason that is nobody's fault: the base cannot be prepared, or
+/// the key inputs fail in the merge worktree.
 fn is_base_failure(reason: Option<&str>) -> bool {
-    matches!(reason, Some("base_unavailable" | "base_config_invalid"))
+    matches!(
+        reason,
+        Some("base_unavailable" | "base_config_invalid" | "key_input_failed" | "prepare_failed")
+    )
 }
 
 /// The user config's `[queue] tick` in milliseconds.
@@ -665,21 +762,44 @@ fn tick_ms(core: &Core) -> u64 {
 /// failures a job becomes `failed` with that reason.
 fn record_unprepared(w: &Writer<'_, '_>, ids: &[String], e: &PrepareError) -> rusqlite::Result<()> {
     for id in ids {
-        // `None`: claimed or cancelled meanwhile, nothing to record.
-        let Some(failures) = w.note_queued_failure(id, e.reason(), e.message())? else {
-            continue;
-        };
-        if failures >= MAX_PREPARE_FAILURES {
-            w.job_to(
-                id,
-                J::Queued,
-                J::Failed,
-                &JobEdit {
-                    note: Some(format!("{} after {failures} attempts", e.reason())),
-                    ..JobEdit::default()
-                },
-            )?;
-        }
+        record_queued_failure(w, id, e.reason(), e.message())?;
+    }
+    Ok(())
+}
+
+/// Records `reason` on the queued job `id`; the third consecutive failure
+/// makes it `failed`.
+fn record_queued_failure(
+    w: &Writer<'_, '_>,
+    id: &str,
+    reason: &str,
+    error: &str,
+) -> rusqlite::Result<()> {
+    record_queued_failure_with(w, id, reason, error, &serde_json::Value::Null)
+}
+
+/// [`record_queued_failure`] with more keys in the recorded detail.
+fn record_queued_failure_with(
+    w: &Writer<'_, '_>,
+    id: &str,
+    reason: &str,
+    error: &str,
+    extra: &serde_json::Value,
+) -> rusqlite::Result<()> {
+    // `None`: claimed or cancelled meanwhile, nothing to record.
+    let Some(failures) = w.note_queued_failure_with(id, reason, error, extra)? else {
+        return Ok(());
+    };
+    if failures >= MAX_PREPARE_FAILURES {
+        w.job_to(
+            id,
+            J::Queued,
+            J::Failed,
+            &JobEdit {
+                note: Some(format!("{reason} after {failures} attempts")),
+                ..JobEdit::default()
+            },
+        )?;
     }
     Ok(())
 }
@@ -704,8 +824,11 @@ pub fn read_config(git: &Git, common: &Path, rev: &str) -> Result<Option<RepoCon
 }
 
 /// Step 1, in one transaction: re-reads the queued jobs of the group, takes
-/// up to `max` of them (a `solo` job alone), creates the train, moves them to
-/// `merging`.
+/// up to `max` of them (a `solo` or trusted job alone, and a batch stops
+/// before one), creates the train, moves them to `merging`. `trust` is the
+/// trusted job whose config the caller read: when the first job of the group
+/// is not exactly that one (or is trusted without `trust`), nothing is
+/// claimed, because the settings passed in belong to another train.
 #[allow(clippy::too_many_arguments)]
 fn claim(
     w: &Writer<'_, '_>,
@@ -716,6 +839,7 @@ fn claim(
     endpoint: &str,
     worktree: &Path,
     settings: TrainSettings,
+    trust: Option<&Trust>,
 ) -> rusqlite::Result<Option<TrainRow>> {
     let tx = w.tx();
     let busy = store::trains(tx, Some(&group.0))?.into_iter().any(|t| {
@@ -725,9 +849,31 @@ fn claim(
         return Ok(None);
     }
     let mut members = Vec::new();
+    // Jobs whose last train failed on its key inputs or its prepare keep that
+    // reason and its failure count through the claim: the count spans the
+    // attempts.
+    let mut counting: HashSet<String> = HashSet::new();
     for j in store::jobs_in_state(tx, J::Queued)? {
         if j.repo != group.0 || j.remote != group.1 || j.target != group.2 {
             continue;
+        }
+        if matches!(
+            j.reason.as_deref(),
+            Some("key_input_failed" | "prepare_failed")
+        ) {
+            counting.insert(j.id.clone());
+        }
+        if members.is_empty() {
+            let actual = j.trust_config.then_some(j.id.as_str());
+            if actual != trust.map(|t| t.job.as_str()) {
+                return Ok(None);
+            }
+        }
+        if j.trust_config {
+            if members.is_empty() {
+                members.push(j.id);
+            }
+            break;
         }
         if j.solo {
             if members.is_empty() {
@@ -753,16 +899,19 @@ fn claim(
         worktree: worktree.to_path_buf(),
         members: members.clone(),
         settings,
+        config_source: trust.map(|_| CONFIG_SOURCE_MEMBER.to_owned()),
+        config_hash: trust.map(|t| t.config_hash.clone()),
     })?;
     for m in &members {
+        let keep = counting.contains(m);
         w.job_to(
             m,
             J::Queued,
             J::Merging,
             &JobEdit {
                 train_id: Some(Some(id.to_owned())),
-                reason: Some(None),
-                detail: Some(None),
+                reason: (!keep).then_some(None),
+                detail: (!keep).then_some(None),
                 ..JobEdit::default()
             },
         )?;
@@ -872,12 +1021,22 @@ async fn build_inner(core: &Arc<Core>, train: &TrainRow, config: Option<RepoConf
                 return Ok(true);
             }
             for (job, config_changed) in &survivors {
+                // Keeps the key-input failure count a claim carried over.
+                let existing = store::job(w.tx(), job)?.and_then(|j| j.detail);
+                let detail = if *config_changed {
+                    Some(merge_detail(
+                        existing.as_ref(),
+                        &json!({ "config_changed": true }),
+                    ))
+                } else {
+                    existing
+                };
                 w.job_to(
                     job,
                     J::Merging,
                     J::Verifying,
                     &JobEdit {
-                        detail: Some(config_changed.then(|| json!({ "config_changed": true }))),
+                        detail: Some(detail),
                         ..JobEdit::default()
                     },
                 )?;
@@ -911,64 +1070,61 @@ async fn build_inner(core: &Arc<Core>, train: &TrainRow, config: Option<RepoConf
         index_file: wt_git.join("index"),
         objects_dir: train.repo.join("objects"),
     };
-    let (p2, env, scratch) = (paths.clone(), core.git.env().clone(), core.scratch.clone());
-    let snap = blocking(move || tree::snapshot_entries(&p2, &env, &scratch)).await?;
     // The staged entries of the merge worktree feed path-scoped keys
     // (design path-scoped-keys.md, section 7): no extra git spawn.
-    let entries = match snap {
-        Ok(SnapshotFull::Known { root, entries }) if root.as_str() == merged.t => Arc::new(entries),
-        other => {
-            let why = match other {
-                Ok(SnapshotFull::Known { root, .. }) => format!("snapshot {root} != {}", merged.t),
-                Ok(SnapshotFull::Unknown { reason }) => reason,
-                Err(e) => e.to_string(),
-            };
-            return fail_survivors(core, train, "tree_mismatch", &json!({ "error": why }))
-                .map_err(|e| anyhow!(store_msg(&e)));
+    let entries = match snapshot_of(core, &paths, &merged.t).await? {
+        Ok(entries) => entries,
+        Err(problem) => {
+            return fail_survivors(
+                core,
+                train,
+                "tree_mismatch",
+                &json!({ "error": problem.why() }),
+            )
+            .map_err(|e| anyhow!(store_msg(&e)));
         }
     };
 
-    // Step 5–6: keys, markers, runs.
+    // What the push's hook will read must not ask for gates this train skips.
+    if reject_hook_gates(core, train, &merged, config.as_ref()).await? {
+        return Ok(());
+    }
+
+    // Step 5–6: prepare, keys, markers, runs.
     let gates = select_gates(config.as_ref());
     let tree_hash = sluice_gate_core::tree::TreeHash::try_from(merged.t.clone())
         .map_err(|e| anyhow!("invalid tree {}: {e}", merged.t))?;
-    let mut views: Vec<TrainGate> = Vec::new();
-    let mut to_run: Vec<(usize, String, Gate, Option<sluice_gate_core::key::CacheKey>)> =
-        Vec::new();
-    let ttl = core.handle.daemon_config().marker_ttl;
-    for (name, gate) in gates {
-        let key = if gate.cache {
-            let (g2, wt, env, tr, n, es) = (
-                gate.clone(),
-                train.worktree.clone(),
-                core.child_env.clone(),
-                tree_hash.clone(),
-                name.clone(),
-                Arc::clone(&entries),
-            );
-            Some(blocking(move || derive_key(&g2, &n, &tr, &es, &wt, &env)).await??)
-        } else {
-            None
-        };
-        let hit = match &key {
-            Some(k) => matches!(
-                MarkerStore::new(&train.repo).lookup(k, ttl),
-                Ok(Lookup::Hit(_))
-            ),
-            None => false,
-        };
-        views.push(TrainGate {
-            gate: name.clone(),
-            key: key.as_ref().map(|k| k.as_str().to_owned()),
-            job_id: None,
-            status: if hit { "cached" } else { "pending" }.to_owned(),
-            duration_ms: None,
-        });
-        if !hit {
-            to_run.push((views.len() - 1, name, gate, key));
+    let mut derived = derive_views(core, train, &gates, &tree_hash, &entries).await?;
+    if let Some(spec) = prepare::Spec::from_config(config.as_ref()) {
+        // Fast path: an already verified tree costs nothing, not even the
+        // installation of its dependencies.
+        let all_hit = matches!(&derived, Ok((_, to_run)) if to_run.is_empty());
+        if !all_hit {
+            let step = prepare_train(core, train, &spec, &merged, &paths).await?;
+            let Some(entries) = step else {
+                return Ok(());
+            };
+            // The keys may need what the prepare installed.
+            derived = derive_views(core, train, &gates, &tree_hash, &entries).await?;
         }
     }
-    let mut failure: Option<(usize, serde_json::Value)> = None;
+    let (mut views, to_run) = match derived {
+        Ok(d) => d,
+        Err((gate, error)) => return key_input_failed(core, train, &gate, &error),
+    };
+    // The keys derived: a reason left by an earlier failed attempt is stale.
+    if jobs.iter().any(|j| {
+        matches!(
+            j.reason.as_deref(),
+            Some("key_input_failed" | "prepare_failed")
+        )
+    }) {
+        let tid = train.id.clone();
+        core.write(Actor::Runner, |w| clear_key_failures(w, &tid))
+            .map_err(|e| anyhow!(store_msg(&e)))?;
+    }
+    let ran: Vec<String> = to_run.iter().map(|(_, n, _, _)| n.clone()).collect();
+    let mut failure: Option<Failure> = None;
     if !to_run.is_empty() {
         let mut subs: Vec<(usize, RunSubscription)> = Vec::new();
         for (idx, name, gate, key) in to_run {
@@ -1005,7 +1161,9 @@ async fn build_inner(core: &Arc<Core>, train: &TrainRow, config: Option<RepoConf
                 no_marker: false,
                 requested_at: None,
             };
-            let sub = core.handle.submit_run(req);
+            // Killed when the train drops it, whatever `last_subscriber_gone`
+            // says: the worktree it runs in is about to be removed.
+            let sub = core.handle.submit_run_owned(req);
             views[idx].job_id = (!sub.job_id().is_empty()).then(|| sub.job_id().to_owned());
             "running".clone_into(&mut views[idx].status);
             subs.push((idx, sub));
@@ -1023,6 +1181,9 @@ async fn build_inner(core: &Arc<Core>, train: &TrainRow, config: Option<RepoConf
             )
         });
         failure = await_gates(core, train, subs, &mut views).await;
+        if failure.is_none() {
+            failure = modified_tree(core, train, &ran).await?;
+        }
     }
 
     // Step 7: outcome, decided inside the write transaction so that a
@@ -1038,12 +1199,401 @@ async fn build_inner(core: &Arc<Core>, train: &TrainRow, config: Option<RepoConf
     Ok(())
 }
 
+/// Build-time check of the merged `.sluice.toml` (what the push's `pre-push`
+/// hook will read): it must not ask for gates the train does not verify.
+/// Members that changed the configuration fail (`hook_gate_unverified`, or
+/// `member_config_invalid` when it does not parse); the others are requeued,
+/// not split. True when the train ended here.
+async fn reject_hook_gates(
+    core: &Arc<Core>,
+    train: &TrainRow,
+    merged: &Merged,
+    config: Option<&RepoConfig>,
+) -> Result<bool> {
+    let wt = train.worktree.clone();
+    let Some(text) = blocking(move || hookcheck::read_merged(&wt)).await?? else {
+        return Ok(false);
+    };
+    let verified: Vec<String> = select_gates(config).into_iter().map(|(n, _)| n).collect();
+    let Some(problem) = hookcheck::check(&text, &verified) else {
+        return Ok(false);
+    };
+    let changed: HashSet<&str> = merged
+        .survivors
+        .iter()
+        .filter(|(_, c)| *c)
+        .map(|(j, _)| j.as_str())
+        .collect();
+    if changed.is_empty() {
+        // No member touched the configuration: nobody to blame.
+        tracing::warn!(train = %train.id, "merged config problem with no member changing it: {problem:?}");
+        return Ok(false);
+    }
+    let (reason, what) = match &problem {
+        hookcheck::Problem::Invalid(_) => (
+            "member_config_invalid",
+            "the merged .sluice.toml does not parse".to_owned(),
+        ),
+        hookcheck::Problem::Unverified(names) => (
+            "hook_gate_unverified",
+            format!(
+                "the merged .sluice.toml asks the pre-push hook for gates the train does not verify: {}",
+                names.join(", ")
+            ),
+        ),
+    };
+    let id = train.id.clone();
+    core.write(Actor::Runner, |w| {
+        let t = store::train(w.tx(), &id)?
+            .ok_or_else(|| store::refuse(store::Refusal::NotFound(id.clone())))?;
+        let jobs = store::train_jobs(w.tx(), &t)?;
+        let alive: Vec<&JobRow> = jobs.iter().filter(|j| j.state == J::Verifying).collect();
+        if alive.len() != merged.survivors.len() {
+            return w.dissolve(&t, T::Verifying, "member cancelled", false);
+        }
+        for j in alive.iter().filter(|j| changed.contains(j.id.as_str())) {
+            let detail = match &problem {
+                hookcheck::Problem::Invalid(error) => json!({ "error": error }),
+                hookcheck::Problem::Unverified(names) => json!({
+                    "gates": names,
+                    "hint": format!(
+                        "land the configuration change first, or a human can run \
+                         `sluice queue retry {} --trust-member-config`",
+                        j.id
+                    ),
+                }),
+            };
+            w.job_to(
+                &j.id,
+                J::Verifying,
+                J::Failed,
+                &JobEdit {
+                    reason: Some(Some(reason.into())),
+                    detail: Some(Some(merge_detail(j.detail.as_ref(), &detail))),
+                    note: Some(what.clone()),
+                    ..JobEdit::default()
+                },
+            )?;
+        }
+        // The members that did not change the configuration go back to the queue.
+        w.dissolve(&t, T::Verifying, &what, false)
+    })
+    .map_err(|e| anyhow!(store_msg(&e)))?;
+    tracing::info!(train = %id, reason, "{what}");
+    Ok(true)
+}
+
+/// Why the merge worktree does not snapshot to `T`.
+#[derive(Debug)]
+enum SnapshotProblem {
+    /// It snapshots to another tree (`root`).
+    Differs(String),
+    /// The snapshot could not be taken.
+    Unknown(String),
+}
+
+impl SnapshotProblem {
+    fn why(&self) -> String {
+        match self {
+            Self::Differs(why) | Self::Unknown(why) => why.clone(),
+        }
+    }
+}
+
+/// The staged entries of the merge worktree when it snapshots to `t`.
+async fn snapshot_of(
+    core: &Arc<Core>,
+    paths: &RepoPaths,
+    t: &str,
+) -> Result<Result<Arc<StagedEntries>, SnapshotProblem>> {
+    let (p2, env, scratch) = (paths.clone(), core.git.env().clone(), core.scratch.clone());
+    let snap = blocking(move || tree::snapshot_entries(&p2, &env, &scratch)).await?;
+    Ok(match snap {
+        Ok(SnapshotFull::Known { root, entries }) if root.as_str() == t => Ok(Arc::new(entries)),
+        Ok(SnapshotFull::Known { root, .. }) => {
+            Err(SnapshotProblem::Differs(format!("snapshot {root} != {t}")))
+        }
+        Ok(SnapshotFull::Unknown { reason }) => Err(SnapshotProblem::Unknown(reason)),
+        Err(e) => Err(SnapshotProblem::Unknown(e.to_string())),
+    })
+}
+
+/// A gate to run: its index in the views, name, definition and key.
+type ToRun = (usize, String, Gate, Option<CacheKey>);
+
+/// Keys and cache lookups of every gate of the train: the gate views and the
+/// gates that missed. `Err((gate, error))`: a `key_inputs` command (or a
+/// `key_files` entry) of `gate` failed.
+async fn derive_views(
+    core: &Arc<Core>,
+    train: &TrainRow,
+    gates: &[(String, Gate)],
+    tree_hash: &TreeHash,
+    entries: &Arc<StagedEntries>,
+) -> Result<Result<(Vec<TrainGate>, Vec<ToRun>), (String, String)>> {
+    let mut views: Vec<TrainGate> = Vec::new();
+    let mut to_run: Vec<ToRun> = Vec::new();
+    let ttl = core.handle.daemon_config().marker_ttl;
+    for (name, gate) in gates {
+        let key = if gate.cache {
+            let (g2, wt, env, tr, n, es) = (
+                gate.clone(),
+                train.worktree.clone(),
+                core.child_env.clone(),
+                tree_hash.clone(),
+                name.clone(),
+                Arc::clone(entries),
+            );
+            match blocking(move || derive_key(&g2, &n, &tr, &es, &wt, &env)).await? {
+                Ok(k) => Some(k),
+                Err(e) => return Ok(Err((name.clone(), format!("{e:#}")))),
+            }
+        } else {
+            None
+        };
+        let hit = match &key {
+            Some(k) => matches!(
+                MarkerStore::new(&train.repo).lookup(k, ttl),
+                Ok(Lookup::Hit(_))
+            ),
+            None => false,
+        };
+        views.push(TrainGate {
+            gate: name.clone(),
+            key: key.as_ref().map(|k| k.as_str().to_owned()),
+            job_id: None,
+            status: if hit { "cached" } else { "pending" }.to_owned(),
+            duration_ms: None,
+            note: None,
+        });
+        if !hit {
+            to_run.push((views.len() - 1, name.clone(), gate.clone(), key));
+        }
+    }
+    Ok(Ok((views, to_run)))
+}
+
+/// Runs the base's `[queue] prepare` in the merge worktree (design section 5,
+/// step 4b). `Some(entries)`: it passed and the worktree still snapshots to
+/// `T`, the train goes on with these staged entries. `None`: the train was
+/// dealt with (a member cancelled, the failure attributed, the snapshot
+/// unusable).
+async fn prepare_train(
+    core: &Arc<Core>,
+    train: &TrainRow,
+    spec: &prepare::Spec,
+    merged: &Merged,
+    paths: &RepoPaths,
+) -> Result<Option<Arc<StagedEntries>>> {
+    let sub = prepare::submit(core, train, spec, &train.worktree, &paths.git_dir);
+    let job_id = (!sub.job_id().is_empty()).then(|| sub.job_id().to_owned());
+    store_prepare(
+        core,
+        train,
+        &TrainPrepare {
+            status: "running".to_owned(),
+            job_id,
+            ..TrainPrepare::default()
+        },
+    )?;
+    let run = match prepare::await_run(core, train, sub).await {
+        prepare::End::Cancelled => {
+            member_cancelled(core, train)?;
+            return Ok(None);
+        }
+        prepare::End::Done(run) => run,
+    };
+    if run.status != "pass" {
+        store_prepare(core, train, &run.view(run.status))?;
+        attribute(core, train, spec, merged, &run, &[]).await?;
+        return Ok(None);
+    }
+    match snapshot_of(core, paths, &merged.t).await? {
+        Ok(entries) => {
+            store_prepare(core, train, &run.view("pass"))?;
+            Ok(Some(entries))
+        }
+        Err(SnapshotProblem::Differs(_)) => {
+            let (git, wt) = (core.git.clone(), train.worktree.clone());
+            let dirty = blocking(move || prepare::dirty_paths(&git, &wt))
+                .await?
+                .unwrap_or_default();
+            store_prepare(core, train, &run.view("dirty"))?;
+            attribute(core, train, spec, merged, &run, &dirty).await?;
+            Ok(None)
+        }
+        Err(problem) => {
+            store_prepare(core, train, &run.view("pass"))?;
+            fail_survivors(
+                core,
+                train,
+                "tree_mismatch",
+                &json!({ "error": problem.why() }),
+            )
+            .map_err(|e| anyhow!(store_msg(&e)))?;
+            Ok(None)
+        }
+    }
+}
+
+/// Records the prepare view on the train (never part of the train hash).
+fn store_prepare(core: &Core, train: &TrainRow, view: &TrainPrepare) -> Result<()> {
+    core.write(Actor::Runner, |w| {
+        w.train_to(
+            &train.id,
+            T::Verifying,
+            T::Verifying,
+            &TrainEdit {
+                prepare: Some(Some(view.clone())),
+                ..TrainEdit::default()
+            },
+        )
+    })
+    .map_err(|e| anyhow!(store_msg(&e)))
+}
+
+/// A member was cancelled while the train was preparing: the train is
+/// dissolved and the other members go back to `queued`.
+fn member_cancelled(core: &Core, train: &TrainRow) -> Result<()> {
+    core.write(Actor::Runner, |w| {
+        let t = store::train(w.tx(), &train.id)?
+            .ok_or_else(|| store::refuse(store::Refusal::NotFound(train.id.clone())))?;
+        w.dissolve(&t, T::Verifying, "member cancelled", false)
+    })
+    .map_err(|e| anyhow!(store_msg(&e)))
+}
+
+/// A prepare run failed (`run`) or passed and left `dirty` paths: finds out
+/// whose fault it is by preparing the base alone. The base fails too: nobody's
+/// fault, every member goes back to `queued` with `prepare_failed`
+/// (`base: true`), paced and counted like a base that cannot be fetched. The
+/// base prepares: a member's, so the single member fails and several split,
+/// like a gate failure.
+async fn attribute(
+    core: &Arc<Core>,
+    train: &TrainRow,
+    spec: &prepare::Spec,
+    merged: &Merged,
+    run: &prepare::Run,
+    dirty: &[String],
+) -> Result<()> {
+    let cause = if dirty.is_empty() {
+        run.error_text()
+    } else {
+        format!(
+            "prepare left files the tree does not have: {}",
+            dirty.join(", ")
+        )
+    };
+    tracing::warn!(train = %train.id, "{cause}");
+    let probe = match prepare::probe_base(core, train, spec).await {
+        Ok(Some(p)) => p,
+        Ok(None) => return member_cancelled(core, train),
+        Err(e) => {
+            // No fact to attribute by: not the members' doing.
+            let error = format!("{cause}; the base could not be probed: {e:#}");
+            let mut detail = run.detail();
+            detail["base"] = json!(true);
+            return requeue_unprepared(core, train, &error, &detail);
+        }
+    };
+    let mut detail = run.detail();
+    if !dirty.is_empty() {
+        detail["paths"] = json!(dirty);
+        detail["message"] = json!(cause);
+    }
+    if probe.passed() {
+        detail["base"] = json!(false);
+        let (reason, what) = if dirty.is_empty() {
+            ("prepare_failed", "prepare failed")
+        } else {
+            ("prepare_dirty", "prepare modified the tree")
+        };
+        let failure = Failure {
+            reason,
+            what: what.to_owned(),
+            detail,
+        };
+        let id = train.id.clone();
+        let outcome = core
+            .write(Actor::Runner, |w| {
+                // The stale remark of an earlier attempt would be shown next
+                // to this failure.
+                clear_key_failures(w, &id)?;
+                finish_train(w, &id, merged, &[], Some(&failure))
+            })
+            .map_err(|e| anyhow!(store_msg(&e)))?;
+        tracing::info!(train = %id, ?outcome, "prepare failed on the train, not on its base");
+        return Ok(());
+    }
+    detail["base"] = json!(true);
+    detail["base_job_id"] = json!(probe.run.job_id);
+    requeue_unprepared(core, train, &cause, &detail)
+}
+
+/// Dissolves the train and puts its members back to `queued` with
+/// `prepare_failed` (not `solo`: the members did nothing wrong); the third
+/// consecutive attempt fails them.
+fn requeue_unprepared(
+    core: &Core,
+    train: &TrainRow,
+    error: &str,
+    detail: &serde_json::Value,
+) -> Result<()> {
+    let id = train.id.clone();
+    core.write(Actor::Runner, |w| {
+        let t = store::train(w.tx(), &id)?
+            .ok_or_else(|| store::refuse(store::Refusal::NotFound(id.clone())))?;
+        let members: Vec<String> = store::train_jobs(w.tx(), &t)?
+            .into_iter()
+            .filter(|j| j.state == J::Verifying)
+            .map(|j| j.id)
+            .collect();
+        w.dissolve(&t, T::Verifying, "prepare_failed", false)?;
+        for m in &members {
+            record_queued_failure_with(w, m, "prepare_failed", error, detail)?;
+        }
+        Ok(())
+    })
+    .map_err(|e| anyhow!(store_msg(&e)))
+}
+
+/// Why the verification of a train failed: handled alike for a gate that
+/// failed and for gates that left the tree modified.
+#[derive(Debug, Clone)]
+pub(crate) struct Failure {
+    /// The job `reason`: `gate_failed` or `gate_modified_tree`.
+    pub(crate) reason: &'static str,
+    /// What happened, as the audit and train note put it (`gate test failed`).
+    pub(crate) what: String,
+    /// The job `detail`, merged into what the job already carries.
+    pub(crate) detail: serde_json::Value,
+}
+
+/// `extra`'s keys over the object `base` (anything else in `base` is
+/// dropped): details accumulate (`config_changed`, then a failure) instead of
+/// overwriting each other.
+pub(crate) fn merge_detail(
+    base: Option<&serde_json::Value>,
+    extra: &serde_json::Value,
+) -> serde_json::Value {
+    let mut out = match base {
+        Some(serde_json::Value::Object(m)) => m.clone(),
+        _ => serde_json::Map::new(),
+    };
+    if let serde_json::Value::Object(e) = extra {
+        out.extend(e.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    serde_json::Value::Object(out)
+}
+
 /// How [`finish_train`] ended a verifying train.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Finish {
     /// A member left `verifying` (cancelled): dissolved, the others queued.
     MemberGone,
-    /// A gate failed: the single member failed, or the members split.
+    /// A gate failed or modified the tree: the single member failed, or the
+    /// members split.
     GateFailed,
     /// Every gate passed: `ready`.
     Ready,
@@ -1057,7 +1607,7 @@ pub(crate) fn finish_train(
     id: &str,
     merged: &Merged,
     views: &[TrainGate],
-    failure: Option<&(usize, serde_json::Value)>,
+    failure: Option<&Failure>,
 ) -> rusqlite::Result<Finish> {
     let t = store::train(w.tx(), id)?
         .ok_or_else(|| store::refuse(store::Refusal::NotFound(id.to_owned())))?;
@@ -1067,8 +1617,7 @@ pub(crate) fn finish_train(
         w.dissolve(&t, T::Verifying, "member cancelled", false)?;
         return Ok(Finish::MemberGone);
     }
-    if let Some((idx, detail)) = failure {
-        let gate = views[*idx].gate.clone();
+    if let Some(failure) = failure {
         w.train_to(
             id,
             T::Verifying,
@@ -1086,18 +1635,21 @@ pub(crate) fn finish_train(
                 J::Verifying,
                 J::Failed,
                 &JobEdit {
-                    reason: Some(Some("gate_failed".into())),
-                    detail: Some(Some(detail.clone())),
-                    note: Some(format!("gate {gate} failed")),
+                    reason: Some(Some(failure.reason.into())),
+                    detail: Some(Some(merge_detail(
+                        alive[0].detail.as_ref(),
+                        &failure.detail,
+                    ))),
+                    note: Some(failure.what.clone()),
                     ..JobEdit::default()
                 },
             )?;
-            w.dissolve(&t, T::Verifying, &format!("gate {gate} failed"), false)?;
+            w.dissolve(&t, T::Verifying, &failure.what, false)?;
         } else {
             w.dissolve(
                 &t,
                 T::Verifying,
-                &format!("gate {gate} failed; members split"),
+                &format!("{}; members split", failure.what),
                 true,
             )?;
         }
@@ -1122,6 +1674,7 @@ pub(crate) fn finish_train(
         merge_sha: &merged.s,
         merge_tree: &merged.t,
         gate_keys: &gate_keys,
+        config_hash: t.config_hash.as_deref().filter(|_| is_trusted(&t)),
     });
     for (j, _) in &member_heads {
         w.job_to(j, J::Verifying, J::Ready, &JobEdit::default())?;
@@ -1139,6 +1692,33 @@ pub(crate) fn finish_train(
     Ok(Finish::Ready)
 }
 
+/// The failure of a gate whose job ended without passing. A job killed for
+/// lack of memory says so in `what` and carries `killed_by`, so the train's
+/// view tells the agent not to retry blindly.
+fn gate_failure(view: &TrainGate, job_id: &str, outcome: &sluice_gate_proto::Outcome) -> Failure {
+    let memory = outcome.killed_for_memory();
+    let mut detail = json!({
+        "gate": view.gate,
+        "job_id": job_id,
+        "status": view.status,
+        "exit_code": outcome.exit_code,
+        "log_path": outcome.log_path,
+        "message": outcome.message,
+    });
+    if let (true, Some(map)) = (memory, detail.as_object_mut()) {
+        map.insert("killed_by".to_owned(), json!(outcome.killed_by));
+    }
+    Failure {
+        reason: "gate_failed",
+        what: if memory {
+            format!("gate {} was killed for lack of memory", view.gate)
+        } else {
+            format!("gate {} failed", view.gate)
+        },
+        detail,
+    }
+}
+
 /// Waits for every gate; the first failure drops the other subscriptions
 /// (unsubscribe). Also stops when a member leaves `verifying` (cancel).
 async fn await_gates(
@@ -1146,10 +1726,12 @@ async fn await_gates(
     train: &TrainRow,
     subs: Vec<(usize, RunSubscription)>,
     views: &mut [TrainGate],
-) -> Option<(usize, serde_json::Value)> {
+) -> Option<Failure> {
     let mut set: JoinSet<(usize, Option<ServerMessage>)> = JoinSet::new();
+    // Which gate a task is for, to name it when the task panics.
+    let mut gate_of: HashMap<tokio::task::Id, usize> = HashMap::new();
     for (idx, mut sub) in subs {
-        set.spawn(async move {
+        let handle = set.spawn(async move {
             let mut last = None;
             while let Some(m) = sub.recv().await {
                 let end = matches!(m, ServerMessage::Done { .. } | ServerMessage::Error { .. });
@@ -1160,6 +1742,7 @@ async fn await_gates(
             }
             (idx, last)
         });
+        gate_of.insert(handle.id(), idx);
     }
     let tick = core
         .handle
@@ -1167,11 +1750,22 @@ async fn await_gates(
         .queue
         .tick
         .max(Duration::from_millis(50));
+    let mut ticker = tokio::time::interval(tick);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
     loop {
         tokio::select! {
             r = set.join_next() => {
                 let r = r?;
-                let Ok((idx, msg)) = r else { continue };
+                // A panicked receiver task leaves its gate without a result: that
+                // is an error outcome, never a gate left "running".
+                let (idx, msg, lost) = match r {
+                    Ok((idx, msg)) => (idx, msg, None),
+                    Err(e) => {
+                        let Some(&idx) = gate_of.get(&e.id()) else { continue };
+                        (idx, None, Some(format!("the gate's receiver task failed: {e}")))
+                    }
+                };
                 match msg {
                     Some(ServerMessage::Done { job_id, outcome, .. }) => {
                         views[idx].duration_ms = Some(outcome.duration_ms);
@@ -1184,16 +1778,15 @@ async fn await_gates(
                             OutcomeStatus::Killed => "killed",
                             OutcomeStatus::Error | OutcomeStatus::Unknown => "error",
                         }.clone_into(&mut views[idx].status);
+                        if ok
+                            && !outcome.marker_written
+                            && let Some(reason) = &outcome.not_cached_reason
+                        {
+                            views[idx].note = Some(format!("not cached: {reason}"));
+                        }
                         if !ok {
                             set.abort_all();
-                            return Some((idx, json!({
-                                "gate": views[idx].gate,
-                                "job_id": job_id,
-                                "status": views[idx].status,
-                                "exit_code": outcome.exit_code,
-                                "log_path": outcome.log_path,
-                                "message": outcome.message,
-                            })));
+                            return Some(gate_failure(&views[idx], &job_id, &outcome));
                         }
                     }
                     other => {
@@ -1201,18 +1794,22 @@ async fn await_gates(
                         set.abort_all();
                         let message = match other {
                             Some(ServerMessage::Error { message, .. }) => message,
-                            _ => "the gate run ended without a result".to_owned(),
+                            _ => lost.unwrap_or_else(|| "the gate run ended without a result".to_owned()),
                         };
-                        return Some((idx, json!({
-                            "gate": views[idx].gate,
-                            "job_id": views[idx].job_id,
-                            "status": "error",
-                            "message": message,
-                        })));
+                        return Some(Failure {
+                            reason: "gate_failed",
+                            what: format!("gate {} failed", views[idx].gate),
+                            detail: json!({
+                                "gate": views[idx].gate,
+                                "job_id": views[idx].job_id,
+                                "status": "error",
+                                "message": message,
+                            }),
+                        });
                     }
                 }
             }
-            () = tokio::time::sleep(tick) => {
+            _ = ticker.tick() => {
                 let jobs = core.read(|tx| store::train_jobs(tx, train)).unwrap_or_default();
                 if jobs.iter().any(|j| j.state == J::Cancelled) {
                     set.abort_all();
@@ -1223,29 +1820,127 @@ async fn await_gates(
     }
 }
 
-/// Gates a train must pass: `[queue] gates`, else the gates whose hooks
-/// contain `pre-push`, else every gate.
+/// After the gates passed: tracked files of the merge worktree must still
+/// match `S`. A gate that edits them would make the pre-push check dissolve
+/// the train and the rebuild repeat it, an approval loop that never lands, so
+/// the train fails here with `gate_modified_tree`. `ran` names the gates that
+/// ran (cached ones did not touch the worktree).
+async fn modified_tree(
+    core: &Arc<Core>,
+    train: &TrainRow,
+    ran: &[String],
+) -> Result<Option<Failure>> {
+    let (git, wt) = (core.git.clone(), train.worktree.clone());
+    let paths = blocking(move || git.status_paths(&wt, false)).await??;
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Failure {
+        reason: "gate_modified_tree",
+        what: "gates modified the tree".to_owned(),
+        detail: json!({ "gates": ran, "paths": paths }),
+    }))
+}
+
+/// A `key_inputs` command (or `key_files` entry) failed in the merge
+/// worktree: nobody's fault, and every gate keeps failing the same way for
+/// every member. The train is dissolved and its members go back to `queued`
+/// with `key_input_failed`, paced like a base that cannot be prepared and
+/// `failed` after [`MAX_PREPARE_FAILURES`] attempts.
+fn key_input_failed(core: &Core, train: &TrainRow, gate: &str, error: &str) -> Result<()> {
+    tracing::warn!(train = %train.id, "key inputs of gate {gate} failed: {error}");
+    let (id, msg) = (train.id.clone(), format!("gate {gate}: {error}"));
+    core.write(Actor::Runner, |w| {
+        let t = store::train(w.tx(), &id)?
+            .ok_or_else(|| store::refuse(store::Refusal::NotFound(id.clone())))?;
+        let members: Vec<String> = store::train_jobs(w.tx(), &t)?
+            .into_iter()
+            .filter(|j| j.state == J::Verifying)
+            .map(|j| j.id)
+            .collect();
+        w.dissolve(&t, T::Verifying, "key_input_failed", false)?;
+        for m in &members {
+            record_queued_failure(w, m, "key_input_failed", &msg)?;
+        }
+        Ok(())
+    })
+    .map_err(|e| anyhow!(store_msg(&e)))
+}
+
+/// Drops `key_input_failed` / `prepare_failed` and the count (and the
+/// failure's own keys) from the verifying members of `train_id`: the keys
+/// derived, so the failure is over.
+fn clear_key_failures(w: &Writer<'_, '_>, train_id: &str) -> rusqlite::Result<()> {
+    let t = store::train(w.tx(), train_id)?
+        .ok_or_else(|| store::refuse(store::Refusal::NotFound(train_id.to_owned())))?;
+    for j in store::train_jobs(w.tx(), &t)? {
+        if j.state != J::Verifying
+            || !matches!(
+                j.reason.as_deref(),
+                Some("key_input_failed" | "prepare_failed")
+            )
+        {
+            continue;
+        }
+        let rest = match j.detail {
+            Some(serde_json::Value::Object(mut m)) => {
+                for k in [
+                    "error",
+                    "failures",
+                    "job_id",
+                    "status",
+                    "exit_code",
+                    "log_path",
+                    "message",
+                    "base",
+                    "base_job_id",
+                    "paths",
+                ] {
+                    m.remove(k);
+                }
+                (!m.is_empty()).then_some(serde_json::Value::Object(m))
+            }
+            other => other,
+        };
+        w.set_job_remark(&j.id, J::Verifying, None, rest.as_ref())?;
+    }
+    Ok(())
+}
+
+/// Gates a train must pass: `[queue] gates` plus the gates whose hooks
+/// contain `pre-push` (the repository's push hook runs them during the
+/// train's push and the daemon answers from the train's record, so the train
+/// must have verified them), else the `pre-push` gates, else every gate.
+/// Order: the `[queue] gates` list as written, then the added `pre-push`
+/// gates by name; no duplicates.
 fn select_gates(config: Option<&RepoConfig>) -> Vec<(String, Gate)> {
     let Some(c) = config else {
         return Vec::new();
     };
-    if let Some(names) = &c.queue.gates {
-        return names
-            .iter()
-            .filter_map(|n| c.gates.get(n).map(|g| (n.clone(), g.clone())))
-            .collect();
-    }
     let pre_push = c.gates_for_hook("pre-push");
-    if !pre_push.is_empty() {
-        return pre_push
-            .into_iter()
-            .map(|(n, g)| (n.to_owned(), g.clone()))
+    let mut out: Vec<(String, Gate)> = Vec::new();
+    if let Some(names) = &c.queue.gates {
+        for n in names {
+            if let Some(g) = c.gates.get(n)
+                && !out.iter().any(|(o, _)| o == n)
+            {
+                out.push((n.clone(), g.clone()));
+            }
+        }
+    }
+    for (n, g) in pre_push {
+        if !out.iter().any(|(o, _)| o == n) {
+            out.push((n.to_owned(), g.clone()));
+        }
+    }
+    if out.is_empty() && c.queue.gates.is_none() {
+        return c
+            .gates
+            .iter()
+            .map(|(n, g)| (n.clone(), g.clone()))
             .collect();
     }
-    c.gates
-        .iter()
-        .map(|(n, g)| (n.clone(), g.clone()))
-        .collect()
+    out
 }
 
 /// The key a client would derive for `gate` on the merge worktree's
@@ -1333,10 +2028,14 @@ fn merge_members(git: &Git, t: &TrainRow, members: &[(String, String, String)]) 
     let ff =
         members.len() == 1 && git.is_ancestor(&t.repo, &t.base_sha, &members[0].2)? == Some(true);
     for (job, branch, head) in members {
+        // Three dots: what the member changed since it forked from the base
+        // (`git diff A...B` compares merge-base(A, B) with B), not what the
+        // base changed since then.
+        let range = format!("{}...{head}", t.base_sha);
         let config_changed = !git
             .repo_out(
                 &t.repo,
-                &["diff", "--quiet", &t.base_sha, head, "--", REPO_CONFIG_FILE],
+                &["diff", "--quiet", &range, "--", REPO_CONFIG_FILE],
             )?
             .status
             .success();
@@ -1379,14 +2078,10 @@ fn merge_members(git: &Git, t: &TrainRow, members: &[(String, String, String)]) 
             merged.conflicts.push((job.clone(), reason, paths));
             continue;
         }
-        let dirty = git.wt(wt, &["status", "--porcelain"])?;
-        if !dirty.is_empty() {
+        let paths = git.status_paths(wt, true)?;
+        if !paths.is_empty() {
             git.wt(wt, &["reset", "--quiet", "--hard", &before])?;
             let _ = git.wt(wt, &["clean", "-fdq"]);
-            let paths = dirty
-                .lines()
-                .map(|l| l.get(3..).unwrap_or(l).to_owned())
-                .collect();
             merged.conflicts.push((job.clone(), "dirty_merge", paths));
             continue;
         }
@@ -1424,6 +2119,7 @@ pub(crate) fn current_hash(t: &TrainRow, jobs: &[JobRow], state: J) -> Option<St
         merge_sha: t.merge_sha.as_deref()?,
         merge_tree: t.merge_tree.as_deref()?,
         gate_keys: &gate_keys,
+        config_hash: t.config_hash.as_deref().filter(|_| is_trusted(t)),
     }))
 }
 
@@ -1621,7 +2317,9 @@ async fn push_train(core: &Arc<Core>, id: &str) -> Result<()> {
                 }
                 let timeout = Duration::from_millis(t.settings.push_timeout_ms.max(1));
                 match proc_.wait(timeout).await {
-                    PushEnd::TimedOut => PushVerdict::Ambiguous("push_timeout".into()),
+                    PushEnd::TimedOut { stdout, stderr } => {
+                        PushVerdict::Ambiguous(push::timeout_note(&stdout, &stderr))
+                    }
                     PushEnd::Exited {
                         code,
                         stdout,
@@ -1805,6 +2503,200 @@ mod tests {
     }
 
     #[test]
+    fn details_accumulate_instead_of_overwriting() {
+        let flag = json!({"config_changed": true});
+        let failure = json!({"gate": "test", "status": "fail"});
+        assert_eq!(
+            merge_detail(Some(&flag), &failure),
+            json!({"config_changed": true, "gate": "test", "status": "fail"})
+        );
+        assert_eq!(merge_detail(None, &failure), failure);
+        // The later value wins on a clash; a non-object base is dropped.
+        assert_eq!(
+            merge_detail(Some(&json!({"gate": "old", "x": 1})), &failure),
+            json!({"gate": "test", "x": 1, "status": "fail"})
+        );
+        assert_eq!(merge_detail(Some(&json!("text")), &flag), flag);
+    }
+
+    fn modified() -> Failure {
+        Failure {
+            reason: "gate_modified_tree",
+            what: "gates modified the tree".into(),
+            detail: json!({"gates": ["test"], "paths": ["a.txt"]}),
+        }
+    }
+
+    #[test]
+    fn a_modified_tree_fails_a_single_member_and_keeps_config_changed() {
+        let mut c = conn();
+        let f = fence("tok");
+        two_member_train(&mut c, &f);
+        with(&mut c, |tx| {
+            let w = Writer::new(tx, &f, Actor::Runner)?;
+            w.job_to(
+                "j1",
+                J::Merging,
+                J::Verifying,
+                &JobEdit {
+                    detail: Some(Some(json!({"config_changed": true}))),
+                    ..JobEdit::default()
+                },
+            )?;
+            // j2 conflicted: the train goes on with j1 alone.
+            w.job_to("j2", J::Merging, J::Conflict, &JobEdit::default())?;
+            w.train_to(
+                "t1",
+                T::Building,
+                T::Verifying,
+                &TrainEdit {
+                    merge_sha: Some("s".into()),
+                    merge_tree: Some("t".into()),
+                    ..TrainEdit::default()
+                },
+            )
+        })
+        .unwrap();
+        let merged = Merged {
+            survivors: vec![("j1".into(), true)],
+            ..merged()
+        };
+        let out = with(&mut c, |tx| {
+            let w = Writer::new(tx, &f, Actor::Runner)?;
+            finish_train(&w, "t1", &merged, &[], Some(&modified()))
+        })
+        .unwrap();
+        assert_eq!(out, Finish::GateFailed);
+        let (j1, t) = with(&mut c, |tx| {
+            Ok((
+                store::job(tx, "j1")?.unwrap(),
+                store::train(tx, "t1")?.unwrap(),
+            ))
+        })
+        .unwrap();
+        assert_eq!(j1.state, J::Failed);
+        assert_eq!(j1.reason.as_deref(), Some("gate_modified_tree"));
+        assert_eq!(
+            j1.detail,
+            Some(json!({
+                "config_changed": true,
+                "gates": ["test"],
+                "paths": ["a.txt"]
+            }))
+        );
+        assert_eq!(t.state, T::Dissolved);
+    }
+
+    #[test]
+    fn a_modified_tree_splits_a_multi_member_train() {
+        let mut c = conn();
+        let f = fence("tok");
+        verifying_pair(&mut c, &f);
+        let out = with(&mut c, |tx| {
+            let w = Writer::new(tx, &f, Actor::Runner)?;
+            finish_train(&w, "t1", &merged(), &[], Some(&modified()))
+        })
+        .unwrap();
+        assert_eq!(out, Finish::GateFailed);
+        let (j1, j2, t) = with(&mut c, |tx| {
+            Ok((
+                store::job(tx, "j1")?.unwrap(),
+                store::job(tx, "j2")?.unwrap(),
+                store::train(tx, "t1")?.unwrap(),
+            ))
+        })
+        .unwrap();
+        for j in [&j1, &j2] {
+            assert_eq!(j.state, J::Queued);
+            assert!(j.solo, "split into solo trains");
+        }
+        assert_eq!(t.state, T::Dissolved);
+        assert_eq!(
+            t.note.as_deref(),
+            Some("gates modified the tree; members split")
+        );
+    }
+
+    #[test]
+    fn a_passing_prepare_clears_the_failure_remark_and_keeps_config_changed() {
+        let mut c = conn();
+        let f = fence("tok");
+        verifying_pair(&mut c, &f);
+        let detail = json!({
+            "config_changed": true, "error": "prepare fail", "failures": 2,
+            "job_id": "j-1", "status": "fail", "base": true
+        });
+        let (j1, j2) = with(&mut c, |tx| {
+            let w = Writer::new(tx, &f, Actor::Runner)?;
+            w.set_job_remark("j1", J::Verifying, Some("prepare_failed"), Some(&detail))?;
+            clear_key_failures(&w, "t1")?;
+            Ok((
+                store::job(tx, "j1")?.unwrap(),
+                store::job(tx, "j2")?.unwrap(),
+            ))
+        })
+        .unwrap();
+        assert_eq!(j1.reason, None);
+        assert_eq!(j1.detail, Some(json!({"config_changed": true})));
+        assert_eq!(j2.reason, None);
+    }
+
+    #[test]
+    fn a_prepare_failure_splits_a_pair_like_a_gate_failure() {
+        let failure = Failure {
+            reason: "prepare_failed",
+            what: "prepare failed".to_owned(),
+            detail: json!({"base": false, "status": "fail", "job_id": "j-1"}),
+        };
+        let mut c = conn();
+        let f = fence("tok");
+        verifying_pair(&mut c, &f);
+        let out = with(&mut c, |tx| {
+            let w = Writer::new(tx, &f, Actor::Runner)?;
+            finish_train(&w, "t1", &merged(), &[], Some(&failure))
+        })
+        .unwrap();
+        assert_eq!(out, Finish::GateFailed);
+        let (j1, t) = with(&mut c, |tx| {
+            Ok((
+                store::job(tx, "j1")?.unwrap(),
+                store::train(tx, "t1")?.unwrap(),
+            ))
+        })
+        .unwrap();
+        assert_eq!((j1.state, j1.solo), (J::Queued, true));
+        assert_eq!(t.note.as_deref(), Some("prepare failed; members split"));
+    }
+
+    #[test]
+    fn a_gate_note_does_not_change_the_train_hash() {
+        let mut c = conn();
+        let f = fence("tok");
+        verifying_pair(&mut c, &f);
+        let views = vec![TrainGate {
+            gate: "test".into(),
+            key: Some("k".into()),
+            status: "pass".into(),
+            note: Some("not cached: the gate modified the tree".into()),
+            ..TrainGate::default()
+        }];
+        let out = with(&mut c, |tx| {
+            let w = Writer::new(tx, &f, Actor::Runner)?;
+            finish_train(&w, "t1", &merged(), &views, None)
+        })
+        .unwrap();
+        assert_eq!(out, Finish::Ready);
+        let t = with(&mut c, |tx| store::train(tx, "t1")).unwrap().unwrap();
+        assert_eq!(t.gates[0].note.as_deref(), views[0].note.as_deref());
+        let jobs = with(&mut c, |tx| store::train_jobs(tx, &t)).unwrap();
+        // The recomputed hash (from keys only) still matches the stored one.
+        assert_eq!(t.train_hash, current_hash(&t, &jobs, J::Ready));
+        let mut plain = t.clone();
+        plain.gates[0].note = None;
+        assert_eq!(current_hash(&plain, &jobs, J::Ready), t.train_hash);
+    }
+
+    #[test]
     fn passing_gates_make_the_train_ready_with_a_hash() {
         let mut c = conn();
         let f = fence("tok");
@@ -1888,5 +2780,37 @@ mod tests {
             let runner = derive_key(&r.gate, name, &root, &entries, &dir, &env).unwrap();
             assert_eq!(runner, key, "gate {name}");
         }
+    }
+
+    fn selected(body: &str) -> Vec<String> {
+        let c = RepoConfig::parse(
+            &format!("version = 1\n{body}"),
+            Path::new("/x/.sluice.toml"),
+        )
+        .unwrap();
+        select_gates(Some(&c)).into_iter().map(|(n, _)| n).collect()
+    }
+
+    #[test]
+    fn queue_gates_are_extended_with_the_pre_push_gates() {
+        let gates = "[gates.a]\ncmd = \"true\"\n[gates.b]\ncmd = \"true\"\nhooks = [\"pre-push\"]\n\
+                     [gates.c]\ncmd = \"true\"\nhooks = [\"pre-push\"]\n[gates.d]\ncmd = \"true\"\n";
+        // The [queue] list first, as written; then the pre-push gates not in it.
+        assert_eq!(
+            selected(&format!("[queue]\ngates = [\"d\", \"a\"]\n{gates}")),
+            ["d", "a", "b", "c"]
+        );
+        // No duplicates when a listed gate also has the hook.
+        assert_eq!(
+            selected(&format!("[queue]\ngates = [\"c\", \"d\"]\n{gates}")),
+            ["c", "d", "b"]
+        );
+        // No [queue] gates: the pre-push gates.
+        assert_eq!(selected(gates), ["b", "c"]);
+        // Neither: every gate.
+        assert_eq!(
+            selected("[gates.x]\ncmd = \"true\"\n[gates.y]\ncmd = \"true\"\n"),
+            ["x", "y"]
+        );
     }
 }

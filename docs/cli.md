@@ -413,6 +413,32 @@ cgroups (time, session, leaf, cause). With `--json` the optional fields
 `procs`) and `interventions[]` (`at`, `session`, `leaf`, `cause`, `detail`)
 are present when the daemon reports them (schema 1, additive).
 
+With memory-aware admission (0.6.0, `[admission] memory_aware`) the job lists
+carry memory, and the containment block may add the gates' oomd policy:
+
+```text
+memory:   22.0 GiB available, 3.0 GiB reserved, 16.0 GiB still to grow in running jobs
+running:  1
+  test             app                  weight 6    41.2s  1 subscriber(s)  mem 3.1 GiB/18.0 GiB  job 1761...
+queued:   1
+  #1   e2e             app                  weight 4  waiting     12.0s  (budget: memory)  expected 3m  mem ~9.0 GiB
+containment: full
+gates memory policy: systemd-oomd at 30% for 3s
+```
+
+`memory:` is what admission sees (`MemAvailable`, the reserve, and what the
+running jobs are still expected to grow by). A running job shows its working set
+over its expected peak (`~` when the peak is a guess from the weight because the
+gate has not run yet); a queued job shows `(budget: memory)` when it fits the CPU
+budget but not the memory it is expected to use. `gates memory policy` appears
+only where the gates' scope has its own `systemd-oomd` policy. In `--json`:
+`budget.memory` (`available_bytes`, `reserve_bytes`, `headroom_bytes`),
+`running[]` `memory_bytes`, `memory_expected_bytes`, `memory_expected_learned`,
+`queued[]` `wait_detail` (`"memory"`; `reason` stays `"budget"`),
+`memory_expected_bytes`, `memory_expected_learned`, and
+`containment.gates_oom_policy` (`limit_percent`, `duration_secs`). All optional
+and additive.
+
 <details>
 <summary>Full help</summary>
 
@@ -529,6 +555,16 @@ own scripts are left alone.
 | nothing | the commented starter template |
 
 Projects below the root are not configured; they are listed in a comment.
+
+**`[queue] prepare`.** The merge queue verifies each train in a fresh worktree
+without the git-ignored dependencies, so `init` also writes a `[queue]` table
+with the command that restores them, picked from the lockfile at the root:
+`pnpm-lock.yaml` `pnpm install --frozen-lockfile --prefer-offline`,
+`package-lock.json` `npm ci`, `yarn.lock` `yarn install --immutable` (with a
+`.yarnrc.yml`) or `yarn install --frozen-lockfile`, `bun.lock[b]`
+`bun install --frozen-lockfile`, `uv.lock` `uv sync --frozen`, `poetry.lock`
+`poetry install --no-root`. Nothing is written for cargo, go, a Node project
+without a lockfile or an unknown stack. It needs Sluice 0.6.0.
 
 **Weights and timeouts.** Lint, vet and type checks get `weight = 2`, a
 formatter 1, test runners and multi-threaded builds `weight = "auto"` (half the
@@ -731,6 +767,9 @@ Options:
       --base <BASE>
           Where the train lands: `<remote>/<branch>` (pushed), `<branch>` (a local branch, updated in place) or a bare name tried first as a branch of the configured remote and then as a local branch. Defaults to `[queue] remote` and `target`. Tags, raw SHAs, HEAD and checked-out local branches are refused
 
+      --trust-member-config
+          Human only. Build this job's train from the branch's own `.sluice.toml` (gates and `[queue]`) instead of the target's, to fix a configuration that makes every train fail. The train is alone, shows the file's diff and can only be approved by a human at the CLI. Agents are refused
+
   -h, --help
           Print help (see a summary with '-h')
 ```
@@ -801,13 +840,16 @@ Re-queue a conflicted or failed job with the current head of its branch.
 
 Run it in the repository of the job after rebasing or fixing the branch; the branch head is re-read here.
 
-Usage: sluice queue retry <JOB_ID>
+Usage: sluice queue retry [OPTIONS] <JOB_ID>
 
 Arguments:
   <JOB_ID>
           Job id, as shown by `sluice queue status`
 
 Options:
+      --trust-member-config
+          Human only. Build the job's train from the branch's own `.sluice.toml` (see `enqueue --trust-member-config`). A plain retry goes back to the target's configuration
+
   -h, --help
           Print help (see a summary with '-h')
 ```
@@ -882,8 +924,12 @@ ADR-0017) explains what the machine allows: `containment` (the summary,
 `system-bus` in a login scope), `controller-files` (`cpu.weight`,
 `memory.current` and `pids.max` present in the agents scope or the user
 manager's cgroup), `slice`, `memory-policy` (on or off, with the thresholds
-derived from the system's `systemd-oomd` policy shown when on) and, when the
-CPU cannot be weighted, `fallback`. Inside an agent shell `session` says where
+derived from the system's `systemd-oomd` policy shown when on), `gates-oom` (the
+`oom_score_adj` gate jobs run at; a warning when an ancestor of the jobs'
+cgroup has `memory.oom.group = 1`), `gates-memory-policy` (the oomd policy of the
+gates' scope and whether `daemon/` carries `user.oomd_omit`), `memory-guard`
+(whether the opt-in `[admission] memory_guard` is on, and a suggestion to turn
+it on where oomd cannot act) and, when the CPU cannot be weighted, `fallback`. Inside an agent shell `session` says where
 this shell and the agent are (`in ui`, `in tools` or outside the session) and
 why. None of them fails the run.
 
@@ -969,7 +1015,9 @@ Options:
 | `sluice update` | 0 updated, up to date or `--check`; 1 error; 2 usage. |
 
 `sluice run --explain <gate>` shows every decision Sluice would take (caller
-detection, policy, tree, key, cache lookup) without running anything.
+detection, policy, tree, key, cache lookup) without running anything. When the
+cache mode (`SLUICE_CACHE=0`, `CI`, `SLUICE_DISABLE`) or the gate's `cache = false`
+turns caching off, it prints `lookup: OFF (<reason>)` instead of a HIT or MISS.
 
 ## Environment variables
 

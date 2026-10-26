@@ -555,6 +555,7 @@ async fn enqueue_via_mcp(
             session: None,
             env: fx.client_env(),
             via: Some(ApproveVia::Mcp),
+            trust_member_config: false,
         },
     };
     match d.ask(&msg).await {
@@ -584,6 +585,10 @@ async fn cancelling_a_conflict_keeps_the_ready_train() {
             ready(t) && t.members == vec![ja.job_id.clone(), jb.job_id.clone()]
         })
         .await;
+    // The gate left an untracked file: no marker, said on the gate.
+    let note = t.gates[0].note.as_deref().unwrap_or_default();
+    assert!(note.starts_with("not cached: "), "{:?}", t.gates);
+    assert_eq!(t.gates[0].status, "pass");
     let vb = d.wait_job(&jb.job_id, J::Conflict).await;
     assert_eq!(vb.train_id, None, "a conflicting job leaves its train");
     assert!(matches!(
@@ -847,11 +852,25 @@ async fn option_shaped_remotes_never_run() {
     let base = format!("--upload-pack=touch {} #/main", witness.display());
     let r = d.enqueue(&fx, &wa, "feat/a", &a, Some(&base)).await;
     assert_eq!(error_code(&r), ErrorCode::BadRequest, "{r:?}");
-    // The head's `.sluice.toml` is invalid (the remote starts with '-'):
-    // the built-in defaults pick `origin`, and the train is built on it.
-    let j = d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    // The head's `.sluice.toml` is invalid (the remote starts with '-'): it
+    // cannot pick the default target, so an enqueue without `--base` is
+    // refused, not silently sent to the built-in default.
+    match d.enqueue(&fx, &wa, "feat/a", &a, None).await {
+        ServerMessage::Error { code, message, .. } => {
+            assert_eq!(code, ErrorCode::BadRequest);
+            assert!(message.starts_with("invalid_config:"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // With an explicit base the head's config is not needed to enqueue; the
+    // train then refuses the invalid merged configuration before any network
+    // call or gate (a Sluice pre-push hook could not read it either).
+    let j = d
+        .enqueue_ok(&fx, &wa, "feat/a", &a, Some("origin/main"))
+        .await;
     assert_eq!(j.remote, "origin");
-    d.wait_train("ready", ready).await;
+    let failed = d.wait_job(&j.job_id, J::Failed).await;
+    assert_eq!(failed.reason.as_deref(), Some("member_config_invalid"));
     assert!(!witness.exists(), "the injected command ran");
     d.shutdown().await;
 }
@@ -1015,5 +1034,956 @@ async fn out_of_scope_member_keeps_the_scoped_hit() {
         .await;
     assert_eq!(t.gates[0].status, "cached", "{t:#?}");
     assert_eq!(runs(&counter), 0, "no gate ran");
+    d.shutdown().await;
+}
+
+// ------------------------------------------------------ train results (W2)
+
+/// A gate that edits a tracked file of the merge worktree fails the train
+/// with `gate_modified_tree` (it used to be dissolved by the pre-push check,
+/// rebuilt and asked for approval again forever).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gate_that_edits_a_tracked_file_fails_the_train() {
+    let toml =
+        "version = 1\n[gates.test]\ncmd = \"echo changed >> a.txt\"\nhooks = [\"pre-push\"]\n";
+    let fx = Fixture::new(toml);
+    let (wa, a) = fx.branch("feat/a", "main", &[("n.txt", "n\n")]);
+    let d = Daemon::start(&fx, user_config(false)).await;
+    let j = d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    let failed = d.wait_job(&j.job_id, J::Failed).await;
+    assert_eq!(failed.reason.as_deref(), Some("gate_modified_tree"));
+    let detail = failed.detail.unwrap();
+    assert_eq!(detail["gates"], serde_json::json!(["test"]));
+    assert_eq!(detail["paths"], serde_json::json!(["a.txt"]));
+    // No loop: the train is dissolved and nothing is built again.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let st = d.status().await;
+    assert_eq!(st.trains.len(), 1, "{:#?}", st.trains);
+    assert_eq!(st.trains[0].state, T::Dissolved);
+    assert_eq!(st.jobs[0].state, J::Failed);
+    assert!(!d.state.join("merge").join(&st.trains[0].train_id).exists());
+    d.shutdown().await;
+}
+
+/// Two members whose gate edits a tracked file: the pair fails, the members
+/// split, and each fails alone with the same reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_modified_tree_splits_the_train_then_fails_each_member() {
+    let toml =
+        "version = 1\n[gates.test]\ncmd = \"echo changed >> a.txt\"\nhooks = [\"pre-push\"]\n";
+    let fx = Fixture::new(toml);
+    let (wa, a) = fx.branch("feat/a", "main", &[("n.txt", "n\n")]);
+    let (wb, b) = fx.branch("feat/b", "main", &[("m.txt", "m\n")]);
+    let d = Daemon::start(&fx, user_config(false)).await;
+    let ja = d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    let jb = d.enqueue_ok(&fx, &wb, "feat/b", &b, None).await;
+    for j in [&ja, &jb] {
+        let failed = d.wait_job(&j.job_id, J::Failed).await;
+        assert_eq!(failed.reason.as_deref(), Some("gate_modified_tree"));
+    }
+    let st = d.status().await;
+    let pair = st.trains.iter().find(|t| t.members.len() == 2).unwrap();
+    assert_eq!(pair.state, T::Dissolved);
+    assert!(
+        pair.note
+            .as_deref()
+            .is_some_and(|n| n.ends_with("members split")),
+        "{pair:?}"
+    );
+    assert_eq!(st.trains.len(), 3, "the pair and one solo train each");
+    d.shutdown().await;
+}
+
+/// `config_changed` compares the member with the commit it forked from: a
+/// branch that never touched `.sluice.toml` is not flagged because the base
+/// did change it meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn config_changed_ignores_what_the_base_changed() {
+    let fx = Fixture::new(GATE_TRUE);
+    let (wa, a) = fx.branch("feat/a", "main", &[("n.txt", "n\n")]);
+    // The remote's main edits `.sluice.toml` after the branch forked.
+    let scratch = fx.root.join("base-edit");
+    common::git_in(
+        &fx.root,
+        &fx.env,
+        &[
+            "clone",
+            "-q",
+            fx.bare.to_str().unwrap(),
+            scratch.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(
+        scratch.join(".sluice.toml"),
+        format!("{GATE_TRUE}# edited on the base\n"),
+    )
+    .unwrap();
+    common::git_in(&scratch, &fx.env, &["add", "-A"]);
+    common::git_in(&scratch, &fx.env, &["commit", "-q", "-m", "base edit"]);
+    common::git_in(&scratch, &fx.env, &["push", "-q", "origin", "HEAD:main"]);
+    let d = Daemon::start(&fx, user_config(false)).await;
+    let j = d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    d.wait_train("ready", ready).await;
+    let job = d.wait_job(&j.job_id, J::Ready).await;
+    assert!(
+        job.detail
+            .as_ref()
+            .and_then(|d| d.get("config_changed"))
+            .is_none(),
+        "{job:?}"
+    );
+    d.shutdown().await;
+}
+
+/// A gate failure keeps `config_changed` in the job's detail instead of
+/// overwriting it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gate_failure_keeps_config_changed() {
+    let toml = "version = 1\n[gates.test]\ncmd = \"test ! -e bad.txt\"\nhooks = [\"pre-push\"]\n";
+    let fx = Fixture::new(toml);
+    let edited = format!("{toml}# edited by the agent\n");
+    let (wa, a) = fx.branch(
+        "feat/a",
+        "main",
+        &[("bad.txt", "bad\n"), (".sluice.toml", &edited)],
+    );
+    let d = Daemon::start(&fx, user_config(false)).await;
+    let j = d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    let failed = d.wait_job(&j.job_id, J::Failed).await;
+    assert_eq!(failed.reason.as_deref(), Some("gate_failed"));
+    let detail = failed.detail.unwrap();
+    assert_eq!(detail["config_changed"], true);
+    assert_eq!(detail["gate"], "test");
+    d.shutdown().await;
+}
+
+/// A member whose `.sluice.toml` adds a gate for the pre-push hook cannot land
+/// through a train that runs the target's configuration: the push's hook
+/// would ask for a gate nobody verified. It fails at build time, before any
+/// gate runs or any approval, with the gate names and the way out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_adding_a_pre_push_gate_fails_at_build_time() {
+    let fx = Fixture::new(GATE_TRUE);
+    let ran = fx.root.join("lint-ran");
+    let edited = format!(
+        "{GATE_TRUE}[gates.lint]\ncmd = \"touch {}\"\nhooks = [\"pre-push\"]\n",
+        ran.display()
+    );
+    let (wa, a) = fx.branch(
+        "feat/a",
+        "main",
+        &[("n.txt", "n\n"), (".sluice.toml", &edited)],
+    );
+    let d = Daemon::start(&fx, user_config(false)).await;
+    let j = d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    let failed = d.wait_job(&j.job_id, J::Failed).await;
+    assert_eq!(failed.reason.as_deref(), Some("hook_gate_unverified"));
+    let detail = failed.detail.unwrap();
+    assert_eq!(detail["gates"], serde_json::json!(["lint"]), "{detail}");
+    assert_eq!(detail["config_changed"], true);
+    let hint = detail["hint"].as_str().unwrap();
+    assert!(
+        hint.contains("--trust-member-config") && hint.contains(&j.job_id),
+        "{hint}"
+    );
+    assert!(!ran.exists(), "no gate runs for such a train");
+    let st = d.status().await;
+    assert!(
+        st.trains.iter().all(|t| t.gates.is_empty()),
+        "{:#?}",
+        st.trains
+    );
+    d.shutdown().await;
+}
+
+/// Only the member that changed the configuration fails; the other is
+/// requeued (not split) and lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_other_member_of_such_a_train_is_requeued_and_lands() {
+    let fx = Fixture::new(GATE_TRUE);
+    let edited = format!("{GATE_TRUE}[gates.lint]\ncmd = \"true\"\nhooks = [\"pre-push\"]\n");
+    let (wa, a) = fx.branch("feat/a", "main", &[(".sluice.toml", &edited)]);
+    let (wb, b) = fx.branch("feat/b", "main", &[("b.txt", "b\n")]);
+    let d = Daemon::start(&fx, user_config(false)).await;
+    let ja = d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    let jb = d.enqueue_ok(&fx, &wb, "feat/b", &b, None).await;
+    let failed = d.wait_job(&ja.job_id, J::Failed).await;
+    assert_eq!(failed.reason.as_deref(), Some("hook_gate_unverified"));
+    let t = d
+        .wait_train("B alone ready", |t| {
+            t.state == T::Ready && t.members == vec![jb.job_id.clone()]
+        })
+        .await;
+    d.approve(
+        &fx,
+        &t.train_id,
+        t.train_hash.as_deref().unwrap(),
+        ApproveVia::Cli,
+    )
+    .await;
+    d.wait_job(&jb.job_id, J::Landed).await;
+    d.shutdown().await;
+}
+
+/// A merged configuration that does not parse fails the member that changed
+/// it with `member_config_invalid` and the parse error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_breaking_the_config_fails_with_member_config_invalid() {
+    let fx = Fixture::new(GATE_TRUE);
+    let (wa, a) = fx.branch("feat/a", "main", &[(".sluice.toml", "version = [\n")]);
+    let d = Daemon::start(&fx, user_config(false)).await;
+    // An explicit base: without one the enqueue itself is refused
+    // (`invalid_config`, the head's file cannot pick the default target).
+    let j = d
+        .enqueue_ok(&fx, &wa, "feat/a", &a, Some("origin/main"))
+        .await;
+    let failed = d.wait_job(&j.job_id, J::Failed).await;
+    assert_eq!(failed.reason.as_deref(), Some("member_config_invalid"));
+    assert!(failed.detail.unwrap()["error"].is_string());
+    d.shutdown().await;
+}
+
+/// A hung hook's last output lands in the `push_timeout` note.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_push_timeout_note_carries_the_hooks_output() {
+    let toml = format!("{GATE_TRUE}[queue]\npush_timeout = \"2s\"\n");
+    let fx = Fixture::new(&toml);
+    let (wa, a) = fx.branch("feat/a", "main", &[("n.txt", "n\n")]);
+    let fifo = fx.root.join("fifo");
+    let st = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    fx.write_hook(
+        "pre-push",
+        &format!(
+            "echo 'running the slow suite' >&2\ncat '{}' >/dev/null",
+            fifo.display()
+        ),
+    );
+    let d = Daemon::start(&fx, user_config(false)).await;
+    d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    let t = d.wait_train("ready", ready).await;
+    d.approve(
+        &fx,
+        &t.train_id,
+        t.train_hash.as_deref().unwrap(),
+        ApproveVia::Cli,
+    )
+    .await;
+    let parked = d
+        .wait_train("needs_reconcile", |x| {
+            x.train_id == t.train_id && x.state == T::NeedsReconcile
+        })
+        .await;
+    let note = parked.note.unwrap_or_default();
+    assert!(note.starts_with("push_timeout: "), "{note}");
+    assert!(note.contains("running the slow suite"), "{note}");
+    d.shutdown().await;
+}
+
+/// A failing `key_inputs` command in the merge worktree is nobody's fault:
+/// the job goes back to `queued` with `key_input_failed` (never `internal`),
+/// and becomes `failed` after three attempts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failing_key_inputs_requeue_then_fail_after_three_attempts() {
+    let toml = "version = 1\n[gates.test]\ncmd = \"true\"\nhooks = [\"pre-push\"]\n\
+                key_inputs = [\"false\"]\n";
+    let fx = Fixture::new(toml);
+    let (wa, a) = fx.branch("feat/a", "main", &[("n.txt", "n\n")]);
+    let d = Daemon::start(&fx, user_config(false)).await;
+    let j = d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    // The first attempt records the reason on the waiting job.
+    d.wait_for("key_input_failed recorded", |s| {
+        s.jobs
+            .iter()
+            .any(|x| x.job_id == j.job_id && x.reason.as_deref() == Some("key_input_failed"))
+    })
+    .await;
+    let failed = d.wait_job(&j.job_id, J::Failed).await;
+    assert_eq!(failed.reason.as_deref(), Some("key_input_failed"));
+    let detail = failed.detail.unwrap();
+    assert_eq!(detail["failures"], 3);
+    assert!(
+        detail["error"].as_str().unwrap().contains("gate test"),
+        "{detail}"
+    );
+    let st = d.status().await;
+    assert_eq!(st.trains.len(), 3, "one train per attempt");
+    assert!(st.trains.iter().all(|t| t.state == T::Dissolved));
+    d.shutdown().await;
+}
+
+/// Dropping a train's gate runs kills them even under
+/// `last_subscriber_gone = "finish"`: the failing gate ends the train, and
+/// the slow one that was still running in the doomed worktree is cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_train_kills_its_other_gates_under_the_finish_policy() {
+    use sluice_gate_daemon::server::LastSubscriberGone;
+
+    let fx = Fixture::new("");
+    let pidfile = fx.root.join("slow.pid");
+    let toml = format!(
+        "version = 1\n\
+         [gates.fail]\ncmd = \"while [ ! -s {pid} ]; do sleep 0.1; done; exit 1\"\n\
+         hooks = [\"pre-push\"]\nweight = 1\n\
+         [gates.slow]\ncmd = \"echo $$ > {pid}; sleep 60\"\n\
+         hooks = [\"pre-push\"]\nweight = 1\n",
+        pid = pidfile.display()
+    );
+    std::fs::write(fx.repo.join(".sluice.toml"), toml).unwrap();
+    fx.git(&["commit", "-q", "-am", "gates"]);
+    fx.git(&["push", "-q", "origin", "main"]);
+    let (wa, a) = fx.branch("feat/a", "main", &[("n.txt", "n\n")]);
+    let d = Daemon::start_policy(&fx, user_config(false), None, LastSubscriberGone::Finish).await;
+    let j = d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    let failed = d.wait_job(&j.job_id, J::Failed).await;
+    assert_eq!(failed.reason.as_deref(), Some("gate_failed"));
+    let pid: u32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // The slow gate sleeps 60 s: it is gone long before that only if the
+    // train cancelled it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the slow gate kept running in the removed worktree"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    d.shutdown().await;
+}
+
+// ------------------------------------------------- `[queue] prepare` (W4)
+
+/// `.sluice.toml` with one pre-push gate and a `[queue] prepare`.
+fn prepare_toml(gate: &str, prepare: &str) -> String {
+    format!(
+        "version = 1\n[gates.test]\ncmd = \"{gate}\"\nhooks = [\"pre-push\"]\n\
+         [queue]\nprepare = \"{prepare}\"\n"
+    )
+}
+
+/// Commits `.sluice.toml` (and a `.gitignore` for `deps/`) on the target.
+fn commit_config(fx: &Fixture, toml: &str) {
+    std::fs::write(fx.repo.join(".sluice.toml"), toml).unwrap();
+    std::fs::write(fx.repo.join(".gitignore"), "deps/\n").unwrap();
+    fx.git(&["add", "-A"]);
+    fx.git(&["commit", "-q", "-m", "config"]);
+    fx.git(&["push", "-q", "origin", "main"]);
+}
+
+/// The lines a prepare command appended to `counter` (`pwd`: the merge
+/// worktree, or `<train>-base` for the base probe).
+fn prepare_dirs(counter: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(counter)
+        .map(|s| s.lines().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+/// A gate that needs a git-ignored file only `prepare` creates passes, the
+/// keys (whose `key_inputs` need that file too) are derived after the
+/// prepare, and the train lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prepare_provides_the_ignored_files_the_gates_need() {
+    let fx = Fixture::new("");
+    let toml = "version = 1\n[gates.test]\ncmd = \"test -f deps/ready\"\n\
+                hooks = [\"pre-push\"]\nkey_inputs = [\"cat deps/ready\"]\n\
+                [queue]\nprepare = \"mkdir -p deps && echo ok > deps/ready\"\n";
+    commit_config(&fx, toml);
+    let (wa, a) = fx.branch("feat/a", "main", &[("n.txt", "n\n")]);
+    let d = Daemon::start(&fx, user_config(false)).await;
+    let j = d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    let t = d.wait_train("ready", ready).await;
+    let prepared = t.prepare.clone().expect("the train records its prepare");
+    assert_eq!(prepared.status, "pass", "{t:#?}");
+    assert!(prepared.job_id.is_some() && prepared.duration_ms.is_some());
+    assert_eq!(t.gates[0].status, "pass", "{t:#?}");
+    assert!(t.gates[0].key.is_some());
+    d.approve(
+        &fx,
+        &t.train_id,
+        t.train_hash.as_deref().unwrap(),
+        ApproveVia::Cli,
+    )
+    .await;
+    d.wait_job(&j.job_id, J::Landed).await;
+    d.shutdown().await;
+}
+
+/// A prepare that fails on the base too is nobody's fault: the members go
+/// back to `queued` together (not solo) with `prepare_failed`, `failed` after
+/// three attempts, and the base is probed again on every failure (no probe
+/// is ever remembered: a failure may be transient).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prepare_failing_on_the_base_requeues_the_members_then_fails_them() {
+    let fx = Fixture::new("");
+    let counter = fx.root.join("prepares");
+    commit_config(
+        &fx,
+        &prepare_toml("true", &format!("pwd >> {}; exit 1", counter.display())),
+    );
+    let (wa, a) = fx.branch("feat/a", "main", &[("a1.txt", "a\n")]);
+    let (wb, b) = fx.branch("feat/b", "main", &[("b1.txt", "b\n")]);
+    let d = Daemon::start(&fx, user_config(false)).await;
+    let ja = d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    let jb = d.enqueue_ok(&fx, &wb, "feat/b", &b, None).await;
+    let waiting = d
+        .wait_for("prepare_failed recorded", |s| {
+            s.jobs
+                .iter()
+                .any(|x| x.state == J::Queued && x.reason.as_deref() == Some("prepare_failed"))
+        })
+        .await;
+    let w = waiting
+        .jobs
+        .iter()
+        .find(|x| x.reason.as_deref() == Some("prepare_failed"))
+        .unwrap();
+    assert_eq!(w.detail.as_ref().unwrap()["base"], true, "{w:?}");
+    for j in [&ja, &jb] {
+        let failed = d.wait_job(&j.job_id, J::Failed).await;
+        assert_eq!(failed.reason.as_deref(), Some("prepare_failed"));
+        let detail = failed.detail.unwrap();
+        assert_eq!(detail["failures"], 3, "{detail}");
+        assert_eq!(detail["base"], true);
+        assert_eq!(detail["status"], "fail");
+        assert!(detail["job_id"].is_string() && detail["log_path"].is_string());
+        assert!(detail["error"].as_str().unwrap().contains("prepare"));
+    }
+    let st = d.status().await;
+    assert_eq!(
+        st.trains.len(),
+        3,
+        "one train per attempt: {:#?}",
+        st.trains
+    );
+    for t in &st.trains {
+        assert_eq!(t.state, T::Dissolved);
+        assert_eq!(t.members.len(), 2, "requeued together, never solo");
+        assert_eq!(t.prepare.as_ref().map(|p| p.status.as_str()), Some("fail"));
+    }
+    let dirs = prepare_dirs(&counter);
+    let probes = dirs.iter().filter(|l| l.ends_with("-base")).count();
+    assert_eq!(probes, 3, "no probe is remembered: {dirs:?}");
+    assert_eq!(dirs.len(), 6, "three trains and three probes: {dirs:?}");
+    let leftovers: Vec<_> = std::fs::read_dir(d.state.join("merge"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with("-base"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+    d.shutdown().await;
+}
+
+/// A prepare that fails only with one member's change is that member's
+/// fault: the pair splits, the good member reaches `ready`, the bad one fails
+/// with `prepare_failed` (`base: false`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prepare_failing_only_with_a_member_splits_the_train() {
+    let fx = Fixture::new("");
+    commit_config(&fx, &prepare_toml("true", "test ! -e bad.txt"));
+    let (wa, a) = fx.branch("feat/a", "main", &[("ok.txt", "ok\n")]);
+    let (wb, b) = fx.branch("feat/b", "main", &[("bad.txt", "bad\n")]);
+    let d = Daemon::start(&fx, user_config(false)).await;
+    let ja = d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    let jb = d.enqueue_ok(&fx, &wb, "feat/b", &b, None).await;
+    let ta = d
+        .wait_train("A alone ready", |t| {
+            t.state == T::Ready && t.members == vec![ja.job_id.clone()]
+        })
+        .await;
+    assert_eq!(ta.prepare.as_ref().map(|p| p.status.as_str()), Some("pass"));
+    // B's solo train is built only once A's train is no longer active (one
+    // train per target at a time): land A, then B prepares on the new base.
+    d.approve(
+        &fx,
+        &ta.train_id,
+        ta.train_hash.as_deref().unwrap(),
+        ApproveVia::Cli,
+    )
+    .await;
+    d.wait_job(&ja.job_id, J::Landed).await;
+    let fb = d.wait_job(&jb.job_id, J::Failed).await;
+    assert_eq!(fb.reason.as_deref(), Some("prepare_failed"));
+    let detail = fb.detail.unwrap();
+    assert_eq!(detail["base"], false, "{detail}");
+    assert_eq!(detail["status"], "fail");
+    assert!(detail["log_path"].is_string());
+    let st = d.status().await;
+    let pair = st.trains.iter().find(|t| t.members.len() == 2).unwrap();
+    assert_eq!(pair.state, T::Dissolved);
+    assert!(
+        pair.note
+            .as_deref()
+            .is_some_and(|n| n.ends_with("members split")),
+        "{pair:?}"
+    );
+    assert_eq!(
+        pair.prepare.as_ref().map(|p| p.status.as_str()),
+        Some("fail")
+    );
+    d.shutdown().await;
+}
+
+/// A prepare that leaves files the tree does not have: when only a member's
+/// change makes it do so the member fails with `prepare_dirty` and the paths;
+/// when the base does the same nobody is blamed and the member is requeued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prepare_that_dirties_the_tree_is_reported_with_the_paths() {
+    // Dirty only with the member's file.
+    let fx = Fixture::new("");
+    commit_config(
+        &fx,
+        &prepare_toml("true", "test ! -e n.txt || echo x > made.txt"),
+    );
+    let (wa, a) = fx.branch("feat/a", "main", &[("n.txt", "n\n")]);
+    let d = Daemon::start(&fx, user_config(false)).await;
+    let j = d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    let failed = d.wait_job(&j.job_id, J::Failed).await;
+    assert_eq!(
+        failed.reason.as_deref(),
+        Some("prepare_dirty"),
+        "{failed:?}"
+    );
+    let detail = failed.detail.unwrap();
+    assert_eq!(detail["paths"], serde_json::json!(["made.txt"]));
+    assert_eq!(detail["base"], false);
+    let st = d.status().await;
+    assert_eq!(st.trains.len(), 1, "{:#?}", st.trains);
+    assert_eq!(
+        st.trains[0].prepare.as_ref().map(|p| p.status.as_str()),
+        Some("dirty")
+    );
+    d.shutdown().await;
+
+    // Dirty on the base as well: an environment problem, requeued.
+    let fx = Fixture::new("");
+    commit_config(&fx, &prepare_toml("true", "echo x > made.txt"));
+    let (wa, a) = fx.branch("feat/a", "main", &[("n.txt", "n\n")]);
+    let d = Daemon::start(&fx, user_config(false)).await;
+    d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    let st = d
+        .wait_for("requeued with prepare_failed", |s| {
+            s.jobs
+                .iter()
+                .any(|x| x.reason.as_deref() == Some("prepare_failed"))
+        })
+        .await;
+    let detail = st.jobs[0].detail.clone().unwrap();
+    assert_eq!(detail["base"], true, "{detail}");
+    assert_eq!(detail["paths"], serde_json::json!(["made.txt"]));
+    assert!(
+        detail["error"].as_str().unwrap().contains("made.txt"),
+        "{detail}"
+    );
+    d.shutdown().await;
+}
+
+/// A train whose gates all hit the cache never runs its prepare: an already
+/// verified fast-forward costs nothing, not even an installation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_train_whose_gates_all_hit_skips_the_prepare() {
+    let fx = Fixture::new("");
+    let gate_runs = fx.root.join("gate-runs");
+    let prepares = fx.root.join("prepares");
+    let toml = format!(
+        "version = 1\n[gates.test]\ncmd = \"echo run >> {}\"\nhooks = [\"pre-push\"]\n\
+         paths = [\"src\"]\n[queue]\nprepare = \"echo run >> {}\"\n",
+        gate_runs.display(),
+        prepares.display()
+    );
+    commit_config(&fx, &toml);
+    let (wa, a) = fx.branch("feat/a", "main", &[("src/a.rs", "a\n")]);
+    mark_verified(&fx, &wa, "test");
+    let d = Daemon::start(&fx, user_config(false)).await;
+    d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    let t = d.wait_train("ready", ready).await;
+    assert_eq!(t.gates[0].status, "cached", "{t:#?}");
+    assert!(t.prepare.is_none(), "{t:#?}");
+    assert_eq!(runs(&prepares), 0, "the prepare did not run");
+    assert_eq!(runs(&gate_runs), 0, "no gate ran");
+    d.shutdown().await;
+}
+
+/// Cancelling a member while the prepare runs kills it and dissolves the
+/// train.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_a_member_kills_a_running_prepare() {
+    let fx = Fixture::new("");
+    let pidfile = fx.root.join("prepare.pid");
+    commit_config(
+        &fx,
+        &prepare_toml(
+            "true",
+            &format!("echo $$ > {}; sleep 60", pidfile.display()),
+        ),
+    );
+    let (wa, a) = fx.branch("feat/a", "main", &[("n.txt", "n\n")]);
+    let d = Daemon::start(&fx, user_config(false)).await;
+    let j = d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    let running = d
+        .wait_train("a running prepare", |t| {
+            t.prepare.as_ref().is_some_and(|p| p.status == "running")
+        })
+        .await;
+    assert_eq!(running.state, T::Verifying);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let pid: u32 = loop {
+        if let Some(pid) = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the prepare never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert!(matches!(
+        d.cancel(&j.job_id).await,
+        ServerMessage::QueueJob { .. }
+    ));
+    d.wait_job(&j.job_id, J::Cancelled).await;
+    d.wait_train("dissolved", |t| {
+        t.train_id == running.train_id && t.state == T::Dissolved
+    })
+    .await;
+    while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the prepare kept running after its train was dissolved"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    d.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// `--trust-member-config` (ADR-0018 section 6)
+// ---------------------------------------------------------------------------
+
+const GATE_FALSE: &str = "version = 1\n[gates.test]\ncmd = \"false\"\nhooks = [\"pre-push\"]\n";
+
+/// A `queue-enqueue` as the given surface, with extra client environment.
+async fn enqueue_trusting(
+    d: &Daemon,
+    fx: &Fixture,
+    wt: &std::path::Path,
+    (branch, sha): (&str, &str),
+    via: ApproveVia,
+    caller: sluice_gate_proto::Caller,
+    extra_env: &[(&str, &str)],
+) -> ServerMessage {
+    let mut env = fx.client_env();
+    for (k, v) in extra_env {
+        env.insert((*k).to_owned(), (*v).to_owned());
+    }
+    d.ask(&sluice_gate_proto::ClientMessage::QueueEnqueue {
+        id: 1,
+        request: sluice_gate_proto::EnqueueRequest {
+            repo: fx.common.clone(),
+            worktree: wt.to_path_buf(),
+            branch: branch.into(),
+            head_sha: sha.into(),
+            base: None,
+            caller,
+            session: None,
+            env,
+            via: Some(via),
+            trust_member_config: true,
+        },
+    })
+    .await
+}
+
+/// A `queue-retry` with `trust_member_config` as the given surface.
+async fn retry_trusting(
+    d: &Daemon,
+    fx: &Fixture,
+    job: &str,
+    head: &str,
+    via: ApproveVia,
+    extra_env: &[(&str, &str)],
+) -> ServerMessage {
+    let mut env = fx.client_env();
+    for (k, v) in extra_env {
+        env.insert((*k).to_owned(), (*v).to_owned());
+    }
+    d.ask(&sluice_gate_proto::ClientMessage::QueueRetry {
+        id: 6,
+        job_id: job.into(),
+        head_sha: head.into(),
+        via: Some(via),
+        trust_member_config: true,
+        env,
+    })
+    .await
+}
+
+fn refused_as_not_allowed(m: &ServerMessage) {
+    match m {
+        ServerMessage::Error { code, message, .. } => {
+            assert_eq!(*code, ErrorCode::NotAllowed, "{message}");
+            assert!(message.contains("reserved to a human"), "{message}");
+        }
+        other => panic!("expected not-allowed, got {other:?}"),
+    }
+}
+
+/// The flag is for humans at the CLI: refused over MCP and for an agent's
+/// environment, whatever `allow_agent_approval` says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trusting_the_members_config_is_refused_to_agents() {
+    use sluice_gate_proto::Caller;
+    let fx = Fixture::new(GATE_FALSE);
+    let (wa, a) = fx.branch("feat/a", "main", &[("a.txt", "a\n")]);
+    let (wb, b) = fx.branch("feat/b", "main", &[("b.txt", "b\n")]);
+    // Agents may approve: the flag is still not theirs.
+    let d = Daemon::start(&fx, user_config(true)).await;
+    let ja = d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    d.wait_job(&ja.job_id, J::Failed).await;
+
+    refused_as_not_allowed(
+        &enqueue_trusting(
+            &d,
+            &fx,
+            &wb,
+            ("feat/b", &b),
+            ApproveVia::Mcp,
+            Caller::Agent,
+            &[],
+        )
+        .await,
+    );
+    refused_as_not_allowed(
+        &enqueue_trusting(
+            &d,
+            &fx,
+            &wb,
+            ("feat/b", &b),
+            ApproveVia::Cli,
+            Caller::Human,
+            &[("CLAUDECODE", "1")],
+        )
+        .await,
+    );
+    refused_as_not_allowed(
+        &enqueue_trusting(
+            &d,
+            &fx,
+            &wb,
+            ("feat/b", &b),
+            ApproveVia::Cli,
+            Caller::Agent,
+            &[],
+        )
+        .await,
+    );
+    refused_as_not_allowed(&retry_trusting(&d, &fx, &ja.job_id, &a, ApproveVia::Mcp, &[]).await);
+    refused_as_not_allowed(
+        &retry_trusting(
+            &d,
+            &fx,
+            &ja.job_id,
+            &a,
+            ApproveVia::Cli,
+            &[("SLUICE_AGENT", "1")],
+        )
+        .await,
+    );
+    // Nothing was queued or requeued by the refused requests.
+    let st = d.status().await;
+    assert!(st.jobs.iter().all(|j| j.branch != "feat/b"), "{st:#?}");
+    assert_eq!(
+        st.jobs
+            .iter()
+            .find(|j| j.job_id == ja.job_id)
+            .unwrap()
+            .state,
+        J::Failed
+    );
+    d.shutdown().await;
+}
+
+/// The dead end: the target's gate always fails, the branch replaces it. A
+/// plain train fails, a trusted retry builds a solo train from the branch's
+/// own file, shows the diff, lands only after a human approval, and an
+/// agent (even with `allow_agent_approval`) cannot approve it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_human_can_land_a_fix_of_the_configuration_the_target_cannot_pass() {
+    let fx = Fixture::new(GATE_FALSE);
+    let (wa, a) = fx.branch("feat/a", "main", &[(".sluice.toml", GATE_TRUE)]);
+    let d = Daemon::start(&fx, user_config(true)).await;
+    let ja = d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    let failed = d.wait_job(&ja.job_id, J::Failed).await;
+    assert_eq!(failed.reason.as_deref(), Some("gate_failed"));
+    assert!(
+        d.status()
+            .await
+            .trains
+            .iter()
+            .all(|t| t.config_source.is_none()),
+        "an ordinary train has no config source"
+    );
+
+    let r = retry_trusting(&d, &fx, &ja.job_id, &a, ApproveVia::Cli, &[]).await;
+    assert!(matches!(r, ServerMessage::QueueJob { .. }), "{r:?}");
+    let t = d.wait_train("trusted train ready", ready).await;
+    assert_eq!(t.config_source.as_deref(), Some("member"), "{t:#?}");
+    assert_eq!(t.members, vec![ja.job_id.clone()]);
+    assert_eq!(t.gates.len(), 1);
+    assert_eq!(t.gates[0].status, "pass", "{t:#?}");
+    let diff = t.config_diff.as_deref().expect("the diff is shown");
+    assert!(diff.contains("-cmd = \"false\""), "{diff}");
+    assert!(diff.contains("+cmd = \"true\""), "{diff}");
+    let hash = t.train_hash.clone().unwrap();
+
+    // Not over MCP and not from an agent's terminal, `allow_agent_approval`
+    // notwithstanding; the train stays ready.
+    for r in [d.approve(&fx, &t.train_id, &hash, ApproveVia::Mcp).await, {
+        let mut env = fx.client_env();
+        env.insert("CLAUDECODE".into(), "1".into());
+        d.ask(&sluice_gate_proto::ClientMessage::QueueApprove {
+            id: 3,
+            train_id: t.train_id.clone(),
+            train_hash: hash.clone(),
+            via: ApproveVia::Cli,
+            env,
+        })
+        .await
+    }] {
+        match r {
+            ServerMessage::Error { code, message, .. } => {
+                assert_eq!(code, ErrorCode::NotAllowed, "{message}");
+                assert!(message.contains("own .sluice.toml"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(
+        d.wait_train("still ready", |x| x.train_id == t.train_id)
+            .await
+            .state,
+        T::Ready
+    );
+    assert_eq!(
+        fx.bare_ref("refs/heads/main").unwrap(),
+        fx.local_ref("origin/main").unwrap()
+    );
+
+    let ok = d.approve(&fx, &t.train_id, &hash, ApproveVia::Cli).await;
+    assert!(matches!(ok, ServerMessage::QueueApproved { .. }), "{ok:?}");
+    d.wait_job(&ja.job_id, J::Landed).await;
+    assert_eq!(fx.bare_ref("refs/heads/main").unwrap(), a);
+    d.shutdown().await;
+}
+
+/// The trust belongs to one `retry`: a plain retry goes back to the base's
+/// configuration. The two configs name their failing gate differently, so
+/// the failure says whose gates ran. A trusted train is alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plain_retry_clears_the_trust() {
+    use sluice_gate_proto::Caller;
+    let base = "version = 1\n[gates.basegate]\ncmd = \"false\"\nhooks = [\"pre-push\"]\n";
+    let member = "version = 1\n[gates.membergate]\ncmd = \"false\"\nhooks = [\"pre-push\"]\n";
+    let fx = Fixture::new(base);
+    let (wa, a) = fx.branch("feat/a", "main", &[(".sluice.toml", member)]);
+    let d = Daemon::start(&fx, user_config(false)).await;
+    // Enqueued with the flag by a human: the member's gate runs.
+    let m = enqueue_trusting(
+        &d,
+        &fx,
+        &wa,
+        ("feat/a", &a),
+        ApproveVia::Cli,
+        Caller::Human,
+        &[],
+    )
+    .await;
+    let ServerMessage::QueueJob { job, .. } = m else {
+        panic!("{m:?}");
+    };
+    let failed = d.wait_job(&job.job_id, J::Failed).await;
+    assert_eq!(
+        failed.detail.as_ref().unwrap()["gate"],
+        "membergate",
+        "{failed:?}"
+    );
+    let st = d.status().await;
+    let trusted: Vec<_> = st
+        .trains
+        .iter()
+        .filter(|t| t.config_source.as_deref() == Some("member"))
+        .collect();
+    assert_eq!(trusted.len(), 1, "{st:#?}");
+    assert_eq!(trusted[0].members.len(), 1);
+
+    // A plain retry builds an ordinary train again: the base's gates judge,
+    // so the member's own pre-push gate is one the train would not verify,
+    // and the job is refused at build time (no trusted train this time).
+    let r = d.retry(&job.job_id, &a).await;
+    assert!(matches!(r, ServerMessage::QueueJob { .. }), "{r:?}");
+    let st = d
+        .wait_for("refused under the base's gates", |s| {
+            s.jobs.iter().any(|j| {
+                j.job_id == job.job_id
+                    && j.state == J::Failed
+                    && j.reason.as_deref() == Some("hook_gate_unverified")
+            })
+        })
+        .await;
+    let trusted = st
+        .trains
+        .iter()
+        .filter(|t| t.config_source.as_deref() == Some("member"))
+        .count();
+    assert_eq!(trusted, 1, "the retry built no trusted train: {st:#?}");
+    d.shutdown().await;
+}
+
+/// A member whose `.sluice.toml` does not parse fails its job once, with the
+/// parse error; nothing is retried in a loop and no train is built.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invalid_member_config_fails_the_trusted_job_once() {
+    let fx = Fixture::new(GATE_FALSE);
+    let (wa, a) = fx.branch("feat/a", "main", &[("a.txt", "a\n")]);
+    let d = Daemon::start(&fx, user_config(false)).await;
+    let ja = d.enqueue_ok(&fx, &wa, "feat/a", &a, None).await;
+    d.wait_job(&ja.job_id, J::Failed).await;
+    std::fs::write(wa.join(".sluice.toml"), "bogus_key = 1\n").unwrap();
+    common::git_in(&wa, &fx.env, &["add", "-A"]);
+    common::git_in(&wa, &fx.env, &["commit", "-q", "-m", "broken config"]);
+    let head = common::git_in(&wa, &fx.env, &["rev-parse", "HEAD"]);
+    let trains_before = d.status().await.trains.len();
+    let r = retry_trusting(&d, &fx, &ja.job_id, &head, ApproveVia::Cli, &[]).await;
+    assert!(matches!(r, ServerMessage::QueueJob { .. }), "{r:?}");
+    let j = d
+        .wait_for("member_config_invalid", |s| {
+            s.jobs.iter().any(|j| {
+                j.job_id == ja.job_id
+                    && j.state == J::Failed
+                    && j.reason.as_deref() == Some("member_config_invalid")
+            })
+        })
+        .await;
+    let j = j.jobs.into_iter().find(|j| j.job_id == ja.job_id).unwrap();
+    let error = j.detail.as_ref().unwrap()["error"].as_str().unwrap();
+    assert!(
+        error.contains("invalid .sluice.toml on the branch"),
+        "{error}"
+    );
+    // No loop: still failed, same attempts, no new train.
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let st = d.status().await;
+    let again = st.jobs.iter().find(|x| x.job_id == ja.job_id).unwrap();
+    assert_eq!((again.state, again.attempts), (J::Failed, j.attempts));
+    assert_eq!(st.trains.len(), trains_before, "{st:#?}");
     d.shutdown().await;
 }

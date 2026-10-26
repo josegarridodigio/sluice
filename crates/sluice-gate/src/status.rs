@@ -99,6 +99,43 @@ fn pressure(psi: &PsiInfo) -> String {
     )
 }
 
+/// The `running:` and `queued:` sections of [`render`].
+fn render_jobs(out: &mut String, r: &StatusReport) {
+    use std::fmt::Write as _;
+    let _ = writeln!(out, "running:  {}", r.running.len());
+    for j in &r.running {
+        let _ = writeln!(
+            out,
+            "  {:<16} {:<20} weight {:<2} {:>8}  {} subscriber(s){}  job {}",
+            j.gate,
+            basename(&j.repo),
+            weight_text(j.weight, j.weight_cfg, j.weight_auto),
+            dur(j.elapsed_ms),
+            j.subscribers,
+            j.memory_text(),
+            j.job_id
+        );
+    }
+    let _ = writeln!(out, "queued:   {}", r.queued.len());
+    for (i, j) in r.queued.iter().enumerate() {
+        let detail = j.wait_detail_text();
+        let expected = j
+            .expected_ms
+            .map_or_else(String::new, |ms| format!("  expected {}", dur(ms)));
+        let memory = j.memory_text();
+        let _ = writeln!(
+            out,
+            "  #{:<3} {:<16} {:<20} weight {:<2} waiting {:>8}  ({}{detail}){expected}{memory}",
+            j.rank.unwrap_or(i + 1),
+            j.gate,
+            basename(&j.repo),
+            weight_text(j.weight, j.weight_cfg, j.weight_auto),
+            dur(j.waiting_ms),
+            reason(j.reason)
+        );
+    }
+}
+
 /// Renders the text form of a status report; `socket_fallback` is the
 /// reason the short socket fallback is in use, if it is.
 fn render(r: &StatusReport, log_path: &Path, socket_fallback: Option<&str>) -> String {
@@ -140,39 +177,10 @@ fn render(r: &StatusReport, log_path: &Path, socket_fallback: Option<&str>) -> S
         r.budget.used, r.budget.total
     );
     let _ = writeln!(out, "pressure: {}", pressure(&r.budget.psi));
-    let _ = writeln!(out, "running:  {}", r.running.len());
-    for j in &r.running {
-        let _ = writeln!(
-            out,
-            "  {:<16} {:<20} weight {:<2} {:>8}  {} subscriber(s)  job {}",
-            j.gate,
-            basename(&j.repo),
-            weight_text(j.weight, j.weight_cfg, j.weight_auto),
-            dur(j.elapsed_ms),
-            j.subscribers,
-            j.job_id
-        );
+    if let Some(m) = &r.budget.memory {
+        let _ = writeln!(out, "{}", m.status_line());
     }
-    let _ = writeln!(out, "queued:   {}", r.queued.len());
-    for (i, j) in r.queued.iter().enumerate() {
-        let detail = j
-            .wait_detail
-            .as_deref()
-            .map_or_else(String::new, |d| format!(": {d}"));
-        let expected = j
-            .expected_ms
-            .map_or_else(String::new, |ms| format!("  expected {}", dur(ms)));
-        let _ = writeln!(
-            out,
-            "  #{:<3} {:<16} {:<20} weight {:<2} waiting {:>8}  ({}{detail}){expected}",
-            j.rank.unwrap_or(i + 1),
-            j.gate,
-            basename(&j.repo),
-            weight_text(j.weight, j.weight_cfg, j.weight_auto),
-            dur(j.waiting_ms),
-            reason(j.reason)
-        );
-    }
+    render_jobs(&mut out, r);
     let t = &r.totals;
     let _ = writeln!(
         out,
@@ -327,6 +335,53 @@ mod tests {
             text.contains("waiting:  1m00s with jobs queued, 6.0s of it CPU-idle, 2 over-admitted"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn render_shows_memory_admission() {
+        use sluice_gate_proto::MemoryBudget;
+        let mut r = StatusReport::default();
+        let plain = render(&r, Path::new("/l"), None);
+        assert!(
+            !plain.contains("memory:") && !plain.contains("GiB"),
+            "{plain}"
+        );
+        r.budget.memory = Some(MemoryBudget {
+            available_bytes: 22 << 30,
+            reserve_bytes: 3 << 30,
+            headroom_bytes: 16 << 30,
+        });
+        r.running.push(RunningJob {
+            gate: "test".into(),
+            memory_bytes: Some(3 << 30),
+            memory_expected_bytes: Some(18 << 30),
+            memory_expected_learned: Some(true),
+            ..RunningJob::default()
+        });
+        r.running.push(RunningJob {
+            gate: "guess".into(),
+            memory_bytes: Some(1 << 30),
+            memory_expected_bytes: Some(9 << 30),
+            memory_expected_learned: Some(false),
+            ..RunningJob::default()
+        });
+        r.queued.push(QueuedJob {
+            gate: "waiting".into(),
+            wait_detail: Some("memory".into()),
+            memory_expected_bytes: Some(18 << 30),
+            memory_expected_learned: Some(true),
+            ..QueuedJob::default()
+        });
+        let text = render(&r, Path::new("/l"), None);
+        assert!(
+            text.contains(
+                "memory:   22.0 GiB available, 3.0 GiB reserved, 16.0 GiB still to grow in running jobs"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("mem 3.0 GiB/18.0 GiB"), "{text}");
+        assert!(text.contains("mem 1.0 GiB/~9.0 GiB"), "{text}");
+        assert!(text.contains("(budget: memory)  mem 18.0 GiB"), "{text}");
     }
 
     #[test]

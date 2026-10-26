@@ -4,11 +4,14 @@
 //! spaces):
 //!
 //! ```text
-//! 2026-10-22T10:00:00Z pid=4242 caller=agent hook=pre-commit gate=test tree=0123456789ab decision=hit exit=0 ms=12 cwd=/home/u/repo
+//! 2026-10-22T10:00:00Z pid=4242 caller=agent hook=pre-commit gate=test tree=0123456789ab key=abcdef012345 decision=hit exit=0 ms=12 cwd=/home/u/repo
 //! ```
 //!
-//! `hook` and `tree` are `-` when there is none. When the cache was off for
-//! the invocation, ` reason=<code>` follows `tree` (`skip-worktree`,
+//! `hook`, `tree` and `key` are `-` when there is none; `key` is the first 12
+//! hex digits of the cache key the invocation looked up (the queue-only
+//! namespaced key for a queue-only gate), so two lines can be compared
+//! without the cache directory. When the cache was off for
+//! the invocation, ` reason=<code>` follows `key` (`skip-worktree`,
 //! `unmerged`, `submodules`, `git-error`, `disabled`, ...); it is absent
 //! otherwise. `decision` is one of
 //! `hit`, `miss-run`, `miss-fail-fast`, `coalesced`, `in-process`, `nested`,
@@ -44,6 +47,8 @@ pub struct Entry<'a> {
     pub gate: &'a str,
     /// Working-tree hash, when known (shortened here).
     pub tree: Option<&'a str>,
+    /// Cache key, when derived (shortened here).
+    pub key: Option<&'a str>,
     /// Short code of why the cache was off (`skip-worktree`, ...), if it was.
     pub reason: Option<&'a str>,
     /// Decision keyword.
@@ -63,11 +68,14 @@ pub fn format_line(timestamp: &str, e: &Entry<'_>) -> String {
     let tree = e
         .tree
         .map_or_else(|| "-".to_owned(), |t| t.chars().take(12).collect());
+    let key = e
+        .key
+        .map_or_else(|| "-".to_owned(), |k| k.chars().take(12).collect());
     let reason = e
         .reason
         .map_or_else(String::new, |r| format!(" reason={}", clean(r)));
     format!(
-        "{timestamp} pid={} caller={} hook={} gate={} tree={tree}{reason} decision={} exit={} ms={} cwd={}",
+        "{timestamp} pid={} caller={} hook={} gate={} tree={tree} key={key}{reason} decision={} exit={} ms={} cwd={}",
         e.pid,
         e.caller,
         e.hook.map_or_else(|| "-".to_owned(), clean),
@@ -110,6 +118,7 @@ mod tests {
             hook: Some("pre-commit"),
             gate: "test",
             tree: Some("0123456789abcdef0123"),
+            key: Some("abcdef0123456789abcd"),
             reason: None,
             decision: "hit",
             exit: 0,
@@ -118,22 +127,23 @@ mod tests {
         };
         assert_eq!(
             format_line("T", &e),
-            "T pid=7 caller=agent hook=pre-commit gate=test tree=0123456789ab decision=hit exit=0 ms=12 cwd=/a b/c"
+            "T pid=7 caller=agent hook=pre-commit gate=test tree=0123456789ab key=abcdef012345 decision=hit exit=0 ms=12 cwd=/a b/c"
         );
         let e = Entry {
             hook: None,
             tree: None,
+            key: None,
             ..e
         };
         assert!(!format_line("T", &e).contains("reason="));
-        assert!(format_line("T", &e).contains("hook=- gate=test tree=- decision=hit"));
+        assert!(format_line("T", &e).contains("hook=- gate=test tree=- key=- decision=hit"));
         let e = Entry {
             reason: Some("skip-worktree"),
             ..e
         };
         assert!(
             format_line("T", &e)
-                .contains("hook=- gate=test tree=- reason=skip-worktree decision=hit")
+                .contains("hook=- gate=test tree=- key=- reason=skip-worktree decision=hit")
         );
     }
 }

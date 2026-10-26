@@ -24,7 +24,7 @@ Sluice never lands anything on its own: there is no auto-approval.
 ### enqueue
 
 ```
-sluice queue enqueue [BRANCH] [--base <ref>]
+sluice queue enqueue [BRANCH] [--base <ref>] [--trust-member-config]
 sluice: queued feat/login (job 1761...-a1b2c3) for origin/main, position 2
 ```
 
@@ -33,6 +33,8 @@ queued: the command refuses a detached HEAD and a worktree with staged or
 unstaged changes to tracked files (untracked files do not matter). It also fails
 when the branch already has an active job or equals the target. Later commits on
 the branch are not part of the job; run `retry` to pick them up.
+`--trust-member-config` is for humans, see
+[Fixing the queue's own configuration](#fixing-the-queues-own-configuration).
 
 `--base` says where the train lands:
 
@@ -81,6 +83,35 @@ row, marks the jobs `FAILED` with that reason. Fix the remote or the config, the
 Inside a repository only its own trains and jobs are shown. `--json` prints the
 `queue-status` payload as is (it carries `"schema": 1`).
 
+A gate that passed but wrote no cache marker (for example because it left untracked
+files) shows `test PASS (not cached: <reason>)`; the train still goes on. A member whose
+branch changes `.sluice.toml` is marked `changes .sluice.toml (this train runs the base's
+gates)`, both in `status` and in the plan the approval prints: the gates always come from
+the target, never from the branch. When the base has a `[queue] prepare`, the train shows its
+state (`prepare: running (job <id>)`, `prepare: pass 41.2s`, `prepare: fail (job <id>)`; absent
+when every gate hit the cache); see "Preparing the merge worktree".
+
+Reasons a job shows (`waiting:` for a job still `queued`, otherwise next to `FAILED`):
+
+| Reason | Meaning |
+|---|---|
+| `base_unavailable`, `base_config_invalid` | the target cannot be fetched, or its `.sluice.toml` does not parse; retried once per tick, `FAILED` after 3 |
+| `key_input_failed` | a gate's `key_inputs` command failed in the train's worktree; retried once per tick, `FAILED` after 3 |
+| `prepare_failed` | `[queue] prepare` failed. With `base: true` in the detail the target fails the same way (nobody's fault: the jobs wait as `queued`, retried once per tick, `FAILED` after 3); with `base: false` your change broke it and the job is `FAILED` |
+| `prepare_dirty` | `prepare` passed but left files that are neither in the commit nor git-ignored (the detail lists the paths); make it write only ignored files |
+| `gate_failed` | a gate failed, timed out, was killed or errored. A gate (or `prepare`) the kernel or `systemd-oomd` killed for lack of memory says `was killed for lack of memory` and carries `killed_by: "memory"` in the detail; do not retry it unchanged |
+| `gate_modified_tree` | the gates passed but edited tracked files of the train's worktree (the detail lists the gates and the paths); make the gate leave tracked files alone |
+| `hook_gate_unverified` | the branch's `.sluice.toml` asks the `pre-push` hook for gates the train does not verify (the train runs the target's configuration), so the push would be refused; detail `gates` and a `hint`. Land the configuration change first (its own train, or directly), or a human runs `sluice queue retry <job> --trust-member-config`. The other members of the train are requeued, not failed |
+| `member_config_invalid` | the merged `.sluice.toml` of a branch that changed it does not parse (the detail has the parse error), or a `--trust-member-config` job's file does not |
+| `conflict`, `merge_failed`, `dirty_merge` | the merge did not apply cleanly (`conflict` lists the paths) |
+| `push_rejected`, `pre_push_hook` | the remote or the repository's `pre-push` hook refused the push |
+| `target_checked_out`, `tree_mismatch`, `internal` | local target checked out at landing time; the merged tree differs from what git snapshots; an unexpected error |
+
+`sluice queue enqueue` without `--base` refuses a branch whose own `.sluice.toml` does not
+parse (`invalid_config: ...`): that file picks the default target, so a broken one must not
+silently fall back to the built-in defaults. Pass `--base` to enqueue anyway; the queue reads
+the gates from the target either way.
+
 ### approve
 
 ```
@@ -102,7 +133,10 @@ the train's current state and exits 1 (the daemon carries on; check
 
 - `sluice queue retry <JOB_ID>`: after rebasing or fixing a `conflict` or `failed`
   branch, run it in that repository. It re-reads the branch head and queues the job
-  again at the end of the line.
+  again at the end of the line. A plain retry always goes back to the target's
+  configuration; for a configuration that cannot pass see
+  [Fixing the queue's own configuration](#fixing-the-queues-own-configuration)
+  (`--trust-member-config`, humans only).
 - `sluice queue cancel <JOB_ID>`: cancels a job that has not been pushed; a train
   that contains it is rebuilt without it. A job that is already pushing is only
   cancelled if `reconcile` proves nothing landed.
@@ -129,12 +163,94 @@ It only runs when you ask for it. If the decision cannot be recorded, the train
 Messages start with `sluice: `. If the running daemon predates the queue, run
 `sluice daemon stop`; the next command starts a matching one.
 
+## Preparing the merge worktree
+
+A train's gates run in a fresh worktree made from git: it has none of the git-ignored
+files of your checkout, `node_modules` and virtual environments first of all, so
+`pnpm test` fails at once. `[queue] prepare` is the command that restores them. It runs
+once per train, in the train's worktree, before the gates:
+
+```toml
+[queue]
+prepare = "pnpm install --frozen-lockfile --prefer-offline"
+prepare_timeout = "10m"   # default
+prepare_weight = "auto"   # like a gate's weight
+```
+
+(`sluice init` writes it for the lockfile it finds at the root: pnpm, npm, yarn, bun, uv
+or poetry. It needs Sluice 0.6.0 on every machine that reads the file.) It goes through
+the daemon's scheduler like a gate (job name `queue:prepare`, the budget applies, it is
+killed when the train is dropped). A train whose gates all hit the cache never runs it.
+The command may only create git-ignored files: if the tree no longer matches the merge
+afterwards the train fails with `prepare_dirty`. `queue status` shows
+`prepare: pass 41.2s` on the train.
+
+When `prepare` fails Sluice does not guess whose fault it is: it runs the same command on
+the target's commit alone, in a throw-away worktree. If that fails too (registry down,
+missing tool), the jobs go back to `queued` with `prepare_failed` and are retried; if the
+target prepares fine, your change broke it, so the job fails (a train of several members
+is split first, as for a failing gate). Nothing is remembered: every prepare failure
+checks the target again, because an environment failure (registry down, timeout, out of
+memory) must never be blamed on a member just because the target prepared fine earlier.
+
+## Fixing the queue's own configuration
+
+The train runs the gates and the `[queue]` settings of the **target's** `.sluice.toml`,
+never the branch's own, so that a branch cannot choose the judges of its own change. The
+price is a dead end: if the target's configuration makes every train fail (a gate that
+cannot pass, a `prepare` that is wrong), the branch that fixes it cannot land through the
+queue, because the broken configuration judges it. The way out used to be a direct push to
+the target. For that case a human can say, explicitly:
+
+```sh
+sluice queue enqueue --trust-member-config        # a new job
+sluice queue retry <JOB_ID> --trust-member-config # a job that failed
+```
+
+What it does for that job only:
+
+- Its train is built from the **branch's** `.sluice.toml` (read at the branch's head):
+  gates, `gates` selection, `prepare`, timeouts, `audit_ref`. `remote` and `target` stay
+  what they were when the job was queued. A branch without the file runs no gates; an
+  invalid file fails the job once with `member_config_invalid` and the parse error. A
+  target whose own configuration does not parse does not stop it.
+- The job is always alone in its train, which records `config_source = member` and the
+  hash of the file. The hash enters the train hash, so a commit that changes the file
+  voids a plan you were shown. Ordinary trains are not affected.
+- `queue status` and the approval plan print `CONFIG FROM BRANCH <branch>: this train runs
+  the branch's own .sluice.toml` and the diff of the file against the target
+  (`git diff <base>...<branch> -- .sluice.toml`, or the whole file when the target has
+  none; capped at 64 KiB). The plan comes before the `Land this train? [y/N]` prompt;
+  read it. `--yes` still works from a script run by a human.
+- A plain `retry` (no flag) clears it: the next train uses the target's configuration
+  again.
+
+Security model: the branch picks its own judges, so a person must read what it picked.
+Both the flag and the approval of such a train are therefore refused, with `not-allowed`,
+to agents: over MCP (the tools do not offer the flag) and from a CLI whose environment is
+detected as an agent's, **even with `[queue] allow_agent_approval = true`**. The daemon
+checks this itself; deny `Bash(sluice queue enqueue:*)` and `Bash(sluice queue retry:*)`
+for agents too if you want the same defence in depth as for the approval command. The flag needs a
+daemon of this version (it announces the `queue-trust-config` feature); with an older one
+the CLI refuses instead of ignoring it. Once the fix has landed, ordinary trains are
+judged by the fixed file.
+
 ## What runs at push time
 
 The push is a regular `git push --atomic` from the merge worktree, so the repository's
-`pre-push` hook **runs**. A Sluice-based hook (`sluice run --hook pre-push test`) answers
-from the markers the train just produced and does not run anything again. A hook that
-declines fails the train (`pre_push_hook`) instead of being bypassed. Untracked or
+`pre-push` hook **runs**. A Sluice-based hook (`sluice run --hook pre-push test`) is
+answered by the daemon from the train: it recognises its own push (the hook's process
+descends from the push it started, in the worktree it holds, which still contains exactly
+the tree it verified) and replies `PASS (cached)` with `verified by merge train <id>`
+without running anything, whatever `PATH` or `CI` the hook sees. A gate the hook runs
+that the train did not verify fails the push at once (`pre_push_hook`) with a message
+such as `gate 'x' runs in the pre-push hook but merge train <id> did not verify it`:
+add it to `[queue] gates` (the gates with a `pre-push` hook are always included), or,
+when a member changes `.sluice.toml`, land that change first (the train runs the gates of
+the target's `.sluice.toml`). The answer is given only to the daemon's own push; a
+`sluice run` from anywhere else is never answered this way. A hook that
+declines fails the train (`pre_push_hook`) instead of being bypassed, and hooks that are
+not Sluice's run as always. Untracked or
 ignored files that gates leave in the merge worktree do not matter (they are not part of
 the commit); a modified tracked file dissolves the train. The push is
 protected by `--force-with-lease` on the target, and by default a `refs/sluice/landed/<sha>`
@@ -172,7 +288,8 @@ variables, `GIT_CONFIG_*`) is dropped.
   was pushed. Fix the credentials, `sluice queue retry` the jobs and approve the new train.
 - **A remote that stalls.** Every fetch and `ls-remote` is bounded by `network_timeout`
   (an unreachable remote leaves an approved train `approved`, checked again at the next
-  tick); the push by `push_timeout`, after which the train is `needs_reconcile` and
+  tick); the push by `push_timeout`, after which the train is `needs_reconcile` (its note
+  is `push_timeout: ` followed by the last lines the push or its `pre-push` hook printed) and
   `reconcile` (with the approver's stored env) tells whether it landed. A stalled remote
   never blocks other repositories' trains.
 - **What is never written.** Passwords, tokens and keys never reach the queue database,
@@ -187,11 +304,14 @@ Repository, `.sluice.toml` (read from the target commit, never from a queued bra
 [queue]
 remote = "origin"          # default "origin"
 target = "main"            # default: the remote's HEAD branch
-gates = ["test", "lint"]   # default: gates whose hooks contain pre-push, else every gate
+gates = ["test", "lint"]   # plus every gate whose hooks contain pre-push; default: those, else every gate
 max_train = 4              # 1 disables batching
 audit_ref = true           # push refs/sluice/landed/<sha> atomically with the target
 push_timeout = "10m"       # covers the pre-push hook and the transfer
 network_timeout = "60s"    # every other network call (fetch, ls-remote); the process group is killed on expiry
+prepare = "pnpm install --frozen-lockfile --prefer-offline"  # optional, needs 0.6.0: runs once per train before the gates
+prepare_timeout = "10m"    # default
+prepare_weight = "auto"    # integer >= 1 or "auto"
 ```
 
 User, `~/.config/sluice/config.toml`:

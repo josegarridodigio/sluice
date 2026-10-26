@@ -165,6 +165,31 @@ impl Git {
         core_git::run_output(&all, wt, &self.env).context("spawning git")
     }
 
+    /// Paths of `wt` that differ from its `HEAD` (`git status --porcelain
+    /// -z`; untracked, not ignored files too when `untracked`). Read from the
+    /// raw NUL-separated output: a trimmed text output loses the leading
+    /// space of a ` M path` line, and spaces or quotes in names survive.
+    ///
+    /// # Errors
+    ///
+    /// Spawn failure or a non-zero exit.
+    pub fn status_paths(&self, wt: &Path, untracked: bool) -> Result<Vec<String>> {
+        let mode = if untracked {
+            "--untracked-files=normal"
+        } else {
+            "--untracked-files=no"
+        };
+        let out = self.wt_out(wt, &["status", "--porcelain", "-z", mode])?;
+        if !out.status.success() {
+            bail!(
+                "git status in {}: {}",
+                wt.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(porcelain_z_paths(&out.stdout))
+    }
+
     /// Runs a network call `git --git-dir=<common> <args>` (hooks disabled)
     /// with the deadline; trimmed stdout.
     ///
@@ -422,8 +447,35 @@ pub fn worktree_git_dir(git: &Git, wt: &Path) -> Result<PathBuf> {
     )?))
 }
 
+/// The paths of `git status --porcelain -z` output: `XY path` entries; a
+/// rename or copy (`R`/`C` in either column) is followed by its source path,
+/// which is skipped.
+fn porcelain_z_paths(raw: &[u8]) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut entries = raw.split(|b| *b == 0).filter(|e| !e.is_empty());
+    while let Some(entry) = entries.next() {
+        let Some(path) = entry.get(3..) else { continue };
+        paths.push(String::from_utf8_lossy(path).into_owned());
+        if entry[..2].iter().any(|c| matches!(c, b'R' | b'C')) {
+            let _ = entries.next();
+        }
+    }
+    paths
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn porcelain_z_paths_keep_every_character() {
+        let raw = b" M a.txt\0M  dir/b c.txt\0R  new.txt\0old.txt\0?? u\0";
+        assert_eq!(
+            porcelain_z_paths(raw),
+            ["a.txt", "dir/b c.txt", "new.txt", "u"]
+        );
+        assert_eq!(porcelain_z_paths(b""), Vec::<String>::new());
+    }
+
     use super::*;
 
     #[test]

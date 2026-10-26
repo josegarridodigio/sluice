@@ -37,7 +37,7 @@ pub struct Migration {
 pub const CONTAINMENT_TABLE: &str = "containment_schema";
 
 /// `containment_schema` version this build reads and writes.
-pub const CONTAINMENT_SCHEMA_VERSION: u32 = 1;
+pub const CONTAINMENT_SCHEMA_VERSION: u32 = 2;
 
 /// Migration 0 -> 1 of the containment group: the `interventions` table
 /// (kills by the kernel OOM killer or `systemd-oomd` on Sluice's cgroups).
@@ -48,12 +48,32 @@ CREATE TABLE interventions (
 CREATE UNIQUE INDEX interventions_once ON interventions(at_ms, leaf, cause);
 ";
 
+/// Migration 1 -> 2 of the containment group (ADR-0019): `gate_memory`, the
+/// working set of finished runs that memory-aware admission learns from. A
+/// table of its own, not columns of `gate_stats`: that would need
+/// `sched_schema` 2, which released binaries refuse to open.
+const CONTAINMENT_2: &str = "
+CREATE TABLE gate_memory (
+  repo TEXT NOT NULL, gate TEXT NOT NULL, cmd_hash TEXT NOT NULL,
+  job_id TEXT NOT NULL, finished_at INTEGER NOT NULL, outcome TEXT NOT NULL,
+  anon_peak_bytes INTEGER NOT NULL, peak_bytes INTEGER,
+  oom_killed INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX gate_memory_key ON gate_memory(repo, gate, cmd_hash, finished_at);
+";
+
 /// The `containment_schema` migrations, in order.
-pub const CONTAINMENT_MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "containment interventions",
-    sql: CONTAINMENT_1,
-}];
+pub const CONTAINMENT_MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "containment interventions",
+        sql: CONTAINMENT_1,
+    },
+    Migration {
+        version: 2,
+        name: "gate memory working sets",
+        sql: CONTAINMENT_2,
+    },
+];
 
 /// Version table of the scheduler additions.
 pub const SCHED_TABLE: &str = "sched_schema";

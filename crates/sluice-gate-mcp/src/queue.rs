@@ -116,6 +116,25 @@ pub(crate) struct GateSchema {
     /// Run time in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Remark on the result, e.g. `not cached: the gate modified the tree`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// The preparation of a train's merge worktree (`[queue] prepare`).
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct PrepareSchema {
+    /// `running`, `pass`, `fail`, `timeout`, `killed`, `error` or `dirty`.
+    pub status: String,
+    /// Sluice job id of the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    /// Run time in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Log of the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
 }
 
 /// One merge-queue train.
@@ -166,6 +185,16 @@ pub(crate) struct TrainSchema {
     /// `[queue] network_timeout` of the base, in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_timeout_ms: Option<u64>,
+    /// State of the train's `[queue] prepare` run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepare: Option<PrepareSchema>,
+    /// `member` when the train runs its branch's own `.sluice.toml` (a human
+    /// asked for it with `--trust-member-config`); absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_source: Option<String>,
+    /// For such a train: the unified diff of `.sluice.toml` against the base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_diff: Option<String>,
 }
 
 /// `queue_status` result (`sluice queue status --json`).
@@ -349,6 +378,8 @@ pub(crate) fn enqueue_facts(
             .cloned(),
         env: allowlisted_env(env),
         via: Some(ApproveVia::Mcp),
+        // Never offered to agents: the daemon would refuse it.
+        trust_member_config: false,
     })
 }
 
@@ -402,6 +433,8 @@ pub(crate) fn send_retry(env: &EnvMap, dir: &Path, job_id: &str) -> Result<Queue
         job_id: job_id.to_owned(),
         head_sha,
         via: Some(ApproveVia::Mcp),
+        trust_member_config: false,
+        env: std::collections::BTreeMap::new(),
     };
     match request(env, &msg)? {
         ServerMessage::QueueJob { job, .. } => Ok(job),
@@ -557,14 +590,33 @@ fn conflict_paths(job: &QueueJobView) -> Vec<String> {
 
 /// The `error` field of a job's `detail` (base failures), first line only.
 fn detail_error(job: &QueueJobView) -> Option<&str> {
-    job.detail
-        .as_ref()
-        .and_then(|d| d.get("error"))
+    let detail = job.detail.as_ref()?;
+    // A prepare failure carries the run's message, not an `error`.
+    let prepare = job
+        .reason
+        .as_deref()
+        .is_some_and(|r| r.starts_with("prepare_"));
+    detail
+        .get("error")
+        .or_else(|| detail.get("message").filter(|_| prepare))
         .and_then(serde_json::Value::as_str)
         .and_then(|e| e.lines().next())
 }
 
-fn job_line(job: &QueueJobView, target: &str, out: &mut String) {
+/// True when the job's `detail` says its branch changes `.sluice.toml`.
+fn config_changed(job: &QueueJobView) -> bool {
+    job.detail
+        .as_ref()
+        .and_then(|d| d.get("config_changed"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Why a train that contains a job changing `.sluice.toml` is not judged by
+/// the branch's own gates.
+const CONFIG_CHANGED_TEXT: &str = "changes .sluice.toml (this train runs the base's gates)";
+
+fn job_line(job: &QueueJobView, target: &str, trusted: bool, out: &mut String) {
     let state = job_state_name(job.state);
     let _ = write!(out, "  {}  job {}  {state}", job.branch, job.job_id);
     if let (QueueJobState::Queued, Some(p)) = (job.state, job.position) {
@@ -591,6 +643,27 @@ fn job_line(job: &QueueJobView, target: &str, out: &mut String) {
             if let Some(e) = detail_error(job) {
                 let _ = write!(out, "  {e}");
             }
+            if let Some(d) = job
+                .detail
+                .as_ref()
+                .filter(|_| job.reason.as_deref() == Some("hook_gate_unverified"))
+            {
+                let names: Vec<&str> = d
+                    .get("gates")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect();
+                let _ = write!(
+                    out,
+                    "  pre-push gates not in the train: {}",
+                    names.join(", ")
+                );
+                if let Some(h) = d.get("hint").and_then(serde_json::Value::as_str) {
+                    let _ = write!(out, " ({h})");
+                }
+            }
             if job.state == QueueJobState::Failed {
                 let _ = write!(
                     out,
@@ -611,6 +684,12 @@ fn job_line(job: &QueueJobView, target: &str, out: &mut String) {
         }
         _ => {}
     }
+    if config_changed(job)
+        && !trusted
+        && !matches!(job.state, QueueJobState::Conflict | QueueJobState::Landed)
+    {
+        let _ = write!(out, "\n    {CONFIG_CHANGED_TEXT}");
+    }
     out.push('\n');
 }
 
@@ -626,10 +705,34 @@ fn gates_line(train: &QueueTrainView) -> Option<String> {
             if let Some(ms) = g.duration_ms.filter(|_| g.status != "cached") {
                 let _ = write!(s, " {}", crate::text::dur(ms));
             }
+            if let Some(note) = &g.note {
+                let _ = write!(s, " ({note})");
+            }
             s
         })
         .collect();
     Some(format!("  gates: {}\n", parts.join("  ")))
+}
+
+/// True for a train that runs its member's own `.sluice.toml`.
+fn trusted(train: &QueueTrainView) -> bool {
+    train.config_source.as_deref() == Some("member")
+}
+
+/// `  prepare: pass 41.2s`: the train's `[queue] prepare` run, when it had one.
+fn prepare_line(train: &QueueTrainView) -> Option<String> {
+    let p = train.prepare.as_ref()?;
+    let mut s = format!("  prepare: {}", p.status);
+    if let Some(ms) = p.duration_ms {
+        let _ = write!(s, " {}", crate::text::dur(ms));
+    }
+    if p.status != "pass"
+        && let Some(job) = &p.job_id
+    {
+        let _ = write!(s, " (job {job})");
+    }
+    s.push('\n');
+    Some(s)
 }
 
 /// Agent-facing summary of a `queue-status` report.
@@ -649,11 +752,21 @@ pub(crate) fn render_status(report: &QueueStatusReport) -> String {
         );
         for id in &t.members {
             match report.jobs.iter().find(|j| &j.job_id == id) {
-                Some(j) => job_line(j, &target, &mut out),
+                Some(j) => job_line(j, &target, trusted(t), &mut out),
                 None => {
                     let _ = writeln!(out, "  job {id}");
                 }
             }
+        }
+        if trusted(t) {
+            out.push_str(
+                "  CONFIG FROM BRANCH: this train runs the branch's own .sluice.toml (a human asked for \
+                 it); only a human at the CLI can approve it. The diff is in `sluice queue status` \
+                 and in this tool's structured result (config_diff)\n",
+            );
+        }
+        if let Some(p) = prepare_line(t) {
+            out.push_str(&p);
         }
         if let Some(g) = gates_line(t) {
             out.push_str(&g);
@@ -688,7 +801,7 @@ pub(crate) fn render_status(report: &QueueStatusReport) -> String {
     if !loose.is_empty() {
         out.push_str("jobs outside a train:\n");
         for j in loose {
-            job_line(j, &target_name(&j.remote, &j.target), &mut out);
+            job_line(j, &target_name(&j.remote, &j.target), false, &mut out);
         }
     }
     out
@@ -791,6 +904,44 @@ mod tests {
     }
 
     #[test]
+    fn status_text_shows_the_gate_note_and_the_config_edit() {
+        let mut j = job(QueueJobState::Ready);
+        j.detail = Some(serde_json::json!({"config_changed": true}));
+        let report = QueueStatusReport {
+            schema: 1,
+            trains: vec![QueueTrainView {
+                train_id: "t-1".into(),
+                members: vec!["j1".into()],
+                state: QueueTrainState::Ready,
+                gates: vec![TrainGate {
+                    gate: "test".into(),
+                    status: "pass".into(),
+                    note: Some("not cached: the gate modified the tree".into()),
+                    ..TrainGate::default()
+                }],
+                ..QueueTrainView::default()
+            }],
+            jobs: vec![j],
+        };
+        let t = render_status(&report);
+        assert!(
+            t.contains("gates: test PASS (not cached: the gate modified the tree)"),
+            "{t}"
+        );
+        assert!(
+            t.contains("changes .sluice.toml (this train runs the base's gates)"),
+            "{t}"
+        );
+        // The mirror accepts the new field.
+        let schema: TrainSchema =
+            serde_json::from_value(to_json(&report.trains[0])).expect("train mirror");
+        assert_eq!(
+            schema.gates[0].note.as_deref(),
+            Some("not cached: the gate modified the tree")
+        );
+    }
+
+    #[test]
     fn status_text_says_why_a_queued_job_waits() {
         let mut j = job(QueueJobState::Queued);
         j.reason = Some("base_unavailable".into());
@@ -864,5 +1015,41 @@ mod tests {
             jobs: vec![j],
         };
         let _: StatusSchema = serde_json::from_value(to_json(&s)).expect("status mirror");
+    }
+
+    #[test]
+    fn a_trusted_train_is_flagged_and_does_not_claim_the_bases_gates() {
+        let mut t = QueueTrainView {
+            train_id: "t-1".into(),
+            state: QueueTrainState::Ready,
+            members: vec!["j1".into()],
+            config_source: Some("member".into()),
+            config_diff: Some("+x".into()),
+            ..QueueTrainView::default()
+        };
+        let j = QueueJobView {
+            job_id: "j1".into(),
+            branch: "feat/a".into(),
+            state: QueueJobState::Ready,
+            detail: Some(serde_json::json!({"config_changed": true})),
+            ..QueueJobView::default()
+        };
+        let report = QueueStatusReport {
+            schema: 1,
+            trains: vec![t.clone()],
+            jobs: vec![j.clone()],
+        };
+        let text = render_status(&report);
+        assert!(text.contains("CONFIG FROM BRANCH"), "{text}");
+        assert!(text.contains("only a human at the CLI"), "{text}");
+        assert!(!text.contains("runs the base's gates"), "{text}");
+        let _: TrainSchema = serde_json::from_value(to_json(&t)).expect("train mirror");
+        t.config_source = None;
+        let plain = render_status(&QueueStatusReport {
+            schema: 1,
+            trains: vec![t],
+            jobs: vec![j],
+        });
+        assert!(!plain.contains("CONFIG FROM BRANCH"), "{plain}");
     }
 }

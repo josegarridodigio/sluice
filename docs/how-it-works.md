@@ -19,7 +19,11 @@ run at once, and it makes identical simultaneous requests share one run.
 - `sluice run <gate>` serves git hooks, humans and scripts. `sluice mcp` serves
   coding agents as an MCP server over stdio. Both talk to the same daemon and
   share cache, queue and logs.
-- The daemon is per user. It starts itself the first time a miss needs it and
+- The daemon is per user, and its environment is neutral: when a client starts it, the
+  variables that describe that client's own invocation (`GIT_*`, `CLAUDE*`, `SLUICE_JOB`,
+  `SLUICE_AGENT`, `SLUICE_CACHE`, `SLUICE_DISABLE`, `SLUICE_SESSION_LEAF`, `SLUICE_SHIM_DIR`,
+  `SLUICE_SHIMS`, `SLUICE_GUARD`, your `[agent_detection]` variables and the shim
+  directory in `PATH`) are removed; `CI`, `LC_*` and the rest are kept. It starts itself the first time a miss needs it and
   keeps running until `sluice daemon stop`. If it cannot be reached or started,
   `sluice run` runs the gate in-process under a file-lock semaphore instead, so
   a broken daemon never blocks a commit.
@@ -73,6 +77,18 @@ run at once, and it makes identical simultaneous requests share one run.
   (Linux PSI `some avg10` above 60 % CPU or 20 % memory by default, the
   `[admission]` table of the user config). While pressure blocks, the head of
   the queue is still admitted once it has waited `psi_max_wait`.
+- **Memory admission.** PSI only sees stalls that already happen, and a suite
+  that is still ramping up shows none. The daemon therefore learns each gate's
+  memory working set (`anon` plus swap of its job's cgroup, from the last runs)
+  and starts a job only when that expectation fits `MemAvailable` minus a
+  reserve (10 % of the machine's memory by default) and minus what the running
+  jobs are still expected to grow by. A job that waits only for memory shows
+  `(budget: memory)` in `sluice status`; the first job on an idle machine always
+  starts. If memory runs out anyway, gate processes are the preferred victims of
+  the kernel's OOM killer and of `systemd-oomd`, and a gate killed that way is
+  reported as such (`killed_by = "memory"`), not as a test failure
+  (`[admission] memory_aware`, `memory_reserve`, `memory_guard`; see
+  [debugging.md](debugging.md#a-gate-killed-for-lack-of-memory)).
 - **Coalescing.** Two requests for the same tree and gate share one run; the
   second waits for the first one's result. If a marker appears while a request
   is queued, it completes without running.

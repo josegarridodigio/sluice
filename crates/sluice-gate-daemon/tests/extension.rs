@@ -4,12 +4,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use sluice_gate_daemon::server::{
     self, AdmissionConfig, BoxFuture, DaemonConfig, DaemonHandle, Extension, ExtensionCtx,
-    LastSubscriberGone, UserConfig,
+    LastSubscriberGone, UserConfig, Vouch,
 };
 use sluice_gate_proto::{
     Caller, ClientMessage, ErrorCode, FEATURE_EXEC, FEATURE_QUEUE, FEATURE_QUEUE_ONLY, GateSpec,
@@ -32,6 +32,8 @@ struct FakeQueue {
     fail_start: bool,
     handle: OnceLock<DaemonHandle>,
     stopped: AtomicBool,
+    /// Peer pids `vouch_run` was asked with.
+    vouched: Mutex<Vec<Option<u32>>>,
 }
 
 impl Extension for FakeQueue {
@@ -83,6 +85,26 @@ impl Extension for FakeQueue {
                         ctx.client(),
                         ctx.peer_pid()
                     ),
+                }),
+                _ => None,
+            }
+        })
+    }
+
+    fn vouch_run<'a>(
+        &'a self,
+        request: &'a RunRequest,
+        peer_pid: Option<u32>,
+    ) -> BoxFuture<'a, Option<Vouch>> {
+        Box::pin(async move {
+            self.vouched.lock().unwrap().push(peer_pid);
+            match request.gate.name.as_str() {
+                "vouched" => Some(Vouch::Verified {
+                    train_id: "t-1".into(),
+                    job_id: Some("j-9".into()),
+                }),
+                "refused" => Some(Vouch::Refused {
+                    message: "not verified here".into(),
                 }),
                 _ => None,
             }
@@ -450,4 +472,63 @@ async fn handle_runs_gates_and_transactions() {
     }
     d.shutdown().await;
     assert!(*handle.shutdown().borrow(), "shutdown turned true");
+}
+
+/// An extension may answer a hook `run` itself: the reply is one `done`
+/// (no `queued`), `cached` with exit 0 for a verified gate and `error` for a
+/// refused one. Requests without a hook never reach it; hook requests it
+/// does not claim run normally.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_extension_can_vouch_for_a_hook_run() {
+    let fake = Arc::new(FakeQueue::default());
+    let d = start(vec![fake.clone()]).await;
+    let run = |gate: &str, hook: Option<&str>| {
+        let mut r = run_request(d.dir.path(), "true");
+        r.gate.name = gate.to_owned();
+        r.hook = hook.map(str::to_owned);
+        ClientMessage::Run { id: 5, request: r }
+    };
+
+    match d.ask(&run("vouched", Some("pre-push"))).await {
+        ServerMessage::Done {
+            id,
+            job_id,
+            outcome,
+        } => {
+            assert_eq!((id, job_id.as_str()), (5, "j-9"));
+            assert_eq!(outcome.status, OutcomeStatus::Cached);
+            assert_eq!(outcome.exit_code, Some(0));
+            assert!(!outcome.marker_written);
+            assert_eq!(
+                outcome.message,
+                "vouched: verified by merge train t-1 (job j-9)"
+            );
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    match d.ask(&run("refused", Some("pre-push"))).await {
+        ServerMessage::Done { outcome, .. } => {
+            assert_eq!(outcome.status, OutcomeStatus::Error);
+            assert_eq!(outcome.message, "not verified here");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    // Asked with the peer's pid (this process, on the same socket).
+    assert_eq!(
+        *fake.vouched.lock().unwrap(),
+        vec![Some(std::process::id()); 2]
+    );
+
+    // A hook run the extension does not claim goes the normal way.
+    assert!(matches!(
+        d.ask(&run("other", Some("pre-push"))).await,
+        ServerMessage::Queued { id: 5, .. }
+    ));
+    // Without a hook the extension is not even asked, whatever the gate.
+    assert!(matches!(
+        d.ask(&run("vouched", None)).await,
+        ServerMessage::Queued { id: 5, .. }
+    ));
+    assert_eq!(fake.vouched.lock().unwrap().len(), 3);
+    d.shutdown().await;
 }

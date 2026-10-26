@@ -113,12 +113,12 @@ pub const JOB_TRANSITIONS: &[(QueueJobState, QueueJobState, &str)] = &[
     (
         J::Verifying,
         J::Failed,
-        "gate failed in a single-member train",
+        "gate failed or modified the tree, or prepare failed (gate_failed, gate_modified_tree, prepare_failed, prepare_dirty) in a single-member train, or its branch's configuration asks the pre-push hook for gates the train does not verify, or does not parse (hook_gate_unverified, member_config_invalid)",
     ),
     (
         J::Verifying,
         J::Queued,
-        "multi-member train failed (split) or dissolved",
+        "multi-member train failed (split), dissolved, or its key inputs or the prepare of its base failed (key_input_failed, prepare_failed), or another member's configuration asks the pre-push hook for gates the train does not verify (hook_gate_unverified)",
     ),
     (
         J::Ready,
@@ -167,7 +167,7 @@ pub const JOB_TRANSITIONS: &[(QueueJobState, QueueJobState, &str)] = &[
     (
         J::Queued,
         J::Failed,
-        "no base after 3 attempts (base_unavailable, base_config_invalid)",
+        "no base after 3 attempts (base_unavailable, base_config_invalid, key_input_failed, prepare_failed), or at once a trusted job whose branch config is invalid (member_config_invalid)",
     ),
     (J::Queued, J::Cancelled, "queue cancel"),
     (J::Merging, J::Cancelled, "queue cancel"),
@@ -267,10 +267,16 @@ pub struct TrainHashInput<'a> {
     /// `gate=key` entries (any order; sorted here). An uncached gate uses
     /// `gate=-`.
     pub gate_keys: &'a [String],
+    /// Hash of the member's `.sluice.toml` blob (or `absent`) for a train built
+    /// with `--trust-member-config`; `None` for every ordinary train, whose
+    /// hash is then exactly what earlier releases computed.
+    pub config_hash: Option<&'a str>,
 }
 
 /// `sha256` of the fields of [`TrainHashInput`], each followed by a NUL,
-/// with a version prefix; gate keys are sorted first. Lowercase hex.
+/// with a version prefix; gate keys are sorted first. A train built from its
+/// member's own configuration appends the two fields `config` and its config
+/// hash after the gate keys; no other train does. Lowercase hex.
 #[must_use]
 pub fn train_hash(input: &TrainHashInput<'_>) -> String {
     let mut h = Sha256::new();
@@ -295,6 +301,10 @@ pub fn train_hash(input: &TrainHashInput<'_>) -> String {
     keys.sort();
     for k in &keys {
         field(k);
+    }
+    if let Some(config) = input.config_hash {
+        field("config");
+        field(config);
     }
     hex::encode(h.finalize())
 }
@@ -422,7 +432,39 @@ mod tests {
             merge_sha: "s",
             merge_tree: "t",
             gate_keys: keys,
+            config_hash: None,
         }
+    }
+
+    #[test]
+    fn an_ordinary_train_hash_is_the_encoding_of_earlier_releases() {
+        // Computed by hand from the encoding of design section 2: the fields
+        // `sluice-train-v1`, repo, remote, endpoint, target, base, each member's
+        // job and head, `|`, S, T and the sorted `gate=key` entries, each
+        // followed by a NUL byte, through sha256.
+        let members = vec![
+            ("j1".to_owned(), "h1".to_owned()),
+            ("j2".to_owned(), "h2".to_owned()),
+        ];
+        let keys = vec!["test=k1".to_owned(), "lint=k2".to_owned()];
+        assert_eq!(
+            train_hash(&sample(&members, &keys)),
+            "ae9a22c5a36cd1a8b9c3307bf73c2b2b9b4001d460515a612ff6969339245ff5"
+        );
+        // A trusted train appends `config` and the config hash.
+        let mut trusted = sample(&members, &keys);
+        trusted.config_hash = Some("cfg1");
+        assert_eq!(
+            train_hash(&trusted),
+            "5576ff07c65e8f3b4ed39e98065bfb3b2d8fa980c4cec02661de06e564ace8c9"
+        );
+        trusted.config_hash = Some("cfg2");
+        assert_ne!(
+            train_hash(&trusted),
+            "5576ff07c65e8f3b4ed39e98065bfb3b2d8fa980c4cec02661de06e564ace8c9"
+        );
+        trusted.config_hash = Some("absent");
+        assert_ne!(train_hash(&trusted), train_hash(&sample(&members, &keys)));
     }
 
     #[test]

@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use rusqlite::{OptionalExtension, Row, Transaction, params};
 use serde::{Deserialize, Serialize};
 use sluice_gate_daemon::server::{LeaseFence, StoreError};
-use sluice_gate_proto::{ApproveVia, Caller, QueueJobState, QueueTrainState, TrainGate};
+use sluice_gate_proto::{
+    ApproveVia, Caller, QueueJobState, QueueTrainState, TrainGate, TrainPrepare,
+};
 
 use crate::model::{
     job_state_str, job_transition_allowed, parse_job_state, parse_train_state, train_state_str,
@@ -133,16 +135,30 @@ impl Actor {
 }
 
 /// Train settings read from the base commit's `[queue]` at claim time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+///
+/// A missing field (or a whole unreadable value) falls back to the real
+/// `[queue]` defaults, never to zeros: a zero push timeout would kill the
+/// push after 1 ms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TrainSettings {
     /// `[queue] push_timeout` in milliseconds.
     pub push_timeout_ms: u64,
     /// `[queue] audit_ref`.
     pub audit_ref: bool,
-    /// `[queue] network_timeout` in milliseconds; `0` (rows written before
-    /// the setting existed) means the default.
-    #[serde(default)]
+    /// `[queue] network_timeout` in milliseconds; `0` also means the default.
     pub network_timeout_ms: u64,
+}
+
+impl Default for TrainSettings {
+    fn default() -> Self {
+        let q = sluice_gate_core::config::QueueConfig::default();
+        Self {
+            push_timeout_ms: u64::try_from(q.push_timeout.as_millis()).unwrap_or(u64::MAX),
+            audit_ref: q.audit_ref,
+            network_timeout_ms: u64::try_from(q.network_timeout.as_millis()).unwrap_or(u64::MAX),
+        }
+    }
 }
 
 impl TrainSettings {
@@ -197,6 +213,9 @@ pub struct JobRow {
     pub solo: bool,
     /// Enqueuer's allowlisted environment (credentials for fetches).
     pub env: EnvMap,
+    /// A human asked (`--trust-member-config`) that this job's train be built
+    /// from the branch's own `.sluice.toml`; the job is then always alone.
+    pub trust_config: bool,
     /// Enqueue time (unix ms).
     pub enqueued_at: u64,
     /// Last change (unix ms).
@@ -254,6 +273,15 @@ pub struct TrainRow {
     pub landed_at: Option<u64>,
     /// Note.
     pub note: Option<String>,
+    /// State of the `[queue] prepare` run (column added by an in-place
+    /// migration; never part of the train hash).
+    pub prepare: Option<TrainPrepare>,
+    /// `Some("member")` when the train runs its member's `.sluice.toml`
+    /// (column added by an in-place migration).
+    pub config_source: Option<String>,
+    /// For such a train: `sha256` of the member's config blob, or `absent`;
+    /// part of the train hash.
+    pub config_hash: Option<String>,
 }
 
 /// One `queue_push_markers` row.
@@ -292,6 +320,15 @@ pub struct MarkerRow {
 /// SQLite errors; [`Refusal::Schema`] when the tables are newer.
 pub fn init(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     tx.execute_batch(SCHEMA)?;
+    add_column_if_missing(tx, "queue_trains", "prepare", "TEXT")?;
+    add_column_if_missing(tx, "queue_trains", "config_source", "TEXT")?;
+    add_column_if_missing(tx, "queue_trains", "config_hash", "TEXT")?;
+    add_column_if_missing(
+        tx,
+        "queue_jobs",
+        "trust_config",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     let v: Option<i64> = tx
         .query_row("SELECT max(version) FROM queue_schema", [], |r| r.get(0))
         .optional()?
@@ -305,6 +342,30 @@ pub fn init(tx: &Transaction<'_>) -> rusqlite::Result<()> {
         }
         Some(v) if v > QUEUE_SCHEMA_VERSION => return Err(refuse(Refusal::Schema(v))),
         Some(_) => {}
+    }
+    Ok(())
+}
+
+/// Adds a column to a table created by an earlier release (nullable, or
+/// `NOT NULL` with a default); no
+/// `queue_schema` bump, older binaries ignore it (they name their columns).
+fn add_column_if_missing(
+    tx: &Transaction<'_>,
+    table: &str,
+    column: &str,
+    ty: &str,
+) -> rusqlite::Result<()> {
+    let present = {
+        let mut stmt = tx.prepare(&format!("PRAGMA table_info({table})"))?;
+        let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        let mut found = false;
+        for name in names {
+            found |= name? == column;
+        }
+        found
+    };
+    if !present {
+        tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"))?;
     }
     Ok(())
 }
@@ -325,9 +386,19 @@ fn json<T: Serialize>(v: &T) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "null".to_owned())
 }
 
+/// Parses a stored JSON column; absent or unreadable values give the type's
+/// default, an unreadable one is logged.
 fn from_json<T: for<'de> Deserialize<'de> + Default>(s: Option<String>) -> T {
-    s.and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let Some(text) = s else {
+        return T::default();
+    };
+    serde_json::from_str(&text).unwrap_or_else(|e| {
+        tracing::warn!(
+            "stored {} does not parse ({e}); using its default",
+            std::any::type_name::<T>()
+        );
+        T::default()
+    })
 }
 
 fn caller_str(c: Caller) -> &'static str {
@@ -347,7 +418,7 @@ fn via_str(v: ApproveVia) -> &'static str {
 
 const JOB_COLS: &str = "id, repo, worktree, branch, head_sha, remote, target, state, queue_order, \
      train_id, caller, session, reason, detail, cancel_requested, attempts, solo, env, \
-     enqueued_at, updated_at, finished_at";
+     enqueued_at, updated_at, finished_at, trust_config";
 
 fn job_from_row(r: &Row<'_>) -> rusqlite::Result<JobRow> {
     let caller: String = r.get(10)?;
@@ -379,12 +450,14 @@ fn job_from_row(r: &Row<'_>) -> rusqlite::Result<JobRow> {
         enqueued_at: u(r.get(18)?),
         updated_at: u(r.get(19)?),
         finished_at: r.get::<_, Option<i64>>(20)?.map(u),
+        trust_config: r.get::<_, i64>(21)? != 0,
     })
 }
 
 const TRAIN_COLS: &str = "id, repo, remote, target, endpoint_hash, base_sha, state, merge_sha, \
      merge_tree, worktree, gates, members, settings, train_hash, claim_token, approved_at, \
-     approved_via, approved_hash, push_env, created_at, updated_at, landed_at, note";
+     approved_via, approved_hash, push_env, created_at, updated_at, landed_at, note, prepare, \
+     config_source, config_hash";
 
 fn train_from_row(r: &Row<'_>) -> rusqlite::Result<TrainRow> {
     Ok(TrainRow {
@@ -419,6 +492,11 @@ fn train_from_row(r: &Row<'_>) -> rusqlite::Result<TrainRow> {
         updated_at: u(r.get(20)?),
         landed_at: r.get::<_, Option<i64>>(21)?.map(u),
         note: r.get(22)?,
+        prepare: r
+            .get::<_, Option<String>>(23)?
+            .and_then(|s| serde_json::from_str(&s).ok()),
+        config_source: r.get(24)?,
+        config_hash: r.get(25)?,
     })
 }
 
@@ -670,6 +748,8 @@ pub struct JobEdit {
     pub bump_attempts: bool,
     /// Set `solo`.
     pub solo: Option<bool>,
+    /// Set `trust_config` (`retry`).
+    pub trust_config: Option<bool>,
     /// Set `cancel_requested`.
     pub cancel_requested: Option<bool>,
     /// Audit note.
@@ -695,6 +775,8 @@ pub struct TrainEdit {
     pub void_approval: bool,
     /// `Some(x)` sets `note`.
     pub note: Option<Option<String>>,
+    /// `Some(x)` sets `prepare`.
+    pub prepare: Option<Option<TrainPrepare>>,
     /// Audit note.
     pub event_note: Option<String>,
 }
@@ -794,7 +876,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.tx.execute(
             &format!(
                 "INSERT INTO queue_jobs({JOB_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', \
-                 ?8, NULL, ?9, ?10, NULL, NULL, 0, 1, 0, ?11, ?12, ?12, NULL)"
+                 ?8, NULL, ?9, ?10, NULL, NULL, 0, 1, 0, ?11, ?12, ?12, NULL, ?13)"
             ),
             params![
                 new.id,
@@ -809,6 +891,7 @@ impl<'a, 'c> Writer<'a, 'c> {
                 new.session,
                 json(&new.env),
                 i(self.now),
+                i64::from(new.trust_config),
             ],
         )?;
         self.event(Some(&new.id), None, None, "queued", Some("enqueue"))?;
@@ -874,6 +957,9 @@ impl<'a, 'c> Writer<'a, 'c> {
         if let Some(s) = edit.solo {
             push("solo", Box::new(i64::from(s)));
         }
+        if let Some(t) = edit.trust_config {
+            push("trust_config", Box::new(i64::from(t)));
+        }
         if let Some(c) = edit.cancel_requested {
             push("cancel_requested", Box::new(i64::from(c)));
         }
@@ -922,8 +1008,10 @@ impl<'a, 'c> Writer<'a, 'c> {
     /// Records on a `queued` job why no train could be built for it
     /// (`reason`, `detail = {"error", "failures"}`), without a state change.
     /// `failures` counts consecutive attempts that failed for one of the
-    /// base reasons (`base_unavailable`, `base_config_invalid`); a claim or
-    /// a retry clears it. Returns the new count, or `None` when the job is no
+    /// base reasons (`base_unavailable`, `base_config_invalid`,
+    /// `key_input_failed`, `prepare_failed`); a claim (except one that follows
+    /// a `key_input_failed` or `prepare_failed`, whose count spans the attempts) or a retry clears
+    /// it. Returns the new count, or `None` when the job is no
     /// longer `queued`.
     ///
     /// # Errors
@@ -935,6 +1023,22 @@ impl<'a, 'c> Writer<'a, 'c> {
         reason: &str,
         error: &str,
     ) -> rusqlite::Result<Option<u32>> {
+        self.note_queued_failure_with(id, reason, error, &serde_json::Value::Null)
+    }
+
+    /// Like [`Writer::note_queued_failure`], with the keys of the object
+    /// `extra` added to the recorded detail (`job_id`, `log_path`, ...).
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn note_queued_failure_with(
+        &self,
+        id: &str,
+        reason: &str,
+        error: &str,
+        extra: &serde_json::Value,
+    ) -> rusqlite::Result<Option<u32>> {
         let Some(j) = job(self.tx, id)? else {
             return Ok(None);
         };
@@ -943,7 +1047,9 @@ impl<'a, 'c> Writer<'a, 'c> {
         }
         let previous = if matches!(
             j.reason.as_deref(),
-            Some("base_unavailable" | "base_config_invalid")
+            Some(
+                "base_unavailable" | "base_config_invalid" | "key_input_failed" | "prepare_failed"
+            )
         ) {
             j.detail
                 .as_ref()
@@ -955,7 +1061,10 @@ impl<'a, 'c> Writer<'a, 'c> {
             0
         };
         let failures = previous.saturating_add(1);
-        let detail = serde_json::json!({ "error": error, "failures": failures });
+        let mut detail = serde_json::json!({ "error": error, "failures": failures });
+        if let (Some(d), Some(e)) = (detail.as_object_mut(), extra.as_object()) {
+            d.extend(e.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
         self.tx.execute(
             "UPDATE queue_jobs SET reason = ?2, detail = ?3, updated_at = ?4 \
              WHERE id = ?1 AND state = 'queued'",
@@ -969,6 +1078,27 @@ impl<'a, 'c> Writer<'a, 'c> {
             Some(&format!("{reason} (attempt {failures})")),
         )?;
         Ok(Some(failures))
+    }
+
+    /// Replaces `reason` and `detail` of the job `id` while it is in `state`,
+    /// without a state change or an audit event (a stale remark of an
+    /// earlier attempt is dropped).
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn set_job_remark(
+        &self,
+        id: &str,
+        state: QueueJobState,
+        reason: Option<&str>,
+        detail: Option<&serde_json::Value>,
+    ) -> rusqlite::Result<()> {
+        self.tx.execute(
+            "UPDATE queue_jobs SET reason = ?2, detail = ?3 WHERE id = ?1 AND state = ?4",
+            params![id, reason, detail.map(json), job_state_str(state)],
+        )?;
+        Ok(())
     }
 
     /// Sets `cancel_requested` without a state change.
@@ -993,8 +1123,10 @@ impl<'a, 'c> Writer<'a, 'c> {
     pub fn insert_train(&self, t: &NewTrain) -> rusqlite::Result<()> {
         self.tx.execute(
             "INSERT INTO queue_trains(id, repo, remote, target, endpoint_hash, base_sha, state, \
-             worktree, gates, members, settings, claim_token, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'building', ?7, '[]', ?8, ?9, ?10, ?11, ?11)",
+             worktree, gates, members, settings, claim_token, created_at, updated_at, \
+             config_source, config_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'building', ?7, '[]', ?8, ?9, ?10, ?11, ?11, \
+             ?12, ?13)",
             params![
                 t.id,
                 path_str(&t.repo),
@@ -1007,6 +1139,8 @@ impl<'a, 'c> Writer<'a, 'c> {
                 json(&t.settings),
                 self.fence.token,
                 i(self.now),
+                t.config_source,
+                t.config_hash,
             ],
         )?;
         self.event(None, Some(&t.id), None, "building", Some("claimed"))
@@ -1055,6 +1189,9 @@ impl<'a, 'c> Writer<'a, 'c> {
         }
         if let Some(n) = &edit.note {
             push("note", Box::new(n.clone()));
+        }
+        if let Some(p) = &edit.prepare {
+            push("prepare", Box::new(p.as_ref().map(json)));
         }
         if let Some((via, hash, env)) = &edit.approve {
             push("approved_at", Box::new(i(self.now)));
@@ -1316,6 +1453,8 @@ pub struct NewJob {
     pub session: Option<String>,
     /// Allowlisted env.
     pub env: EnvMap,
+    /// `--trust-member-config` was given at enqueue.
+    pub trust_config: bool,
 }
 
 /// A train to insert.
@@ -1339,12 +1478,46 @@ pub struct NewTrain {
     pub members: Vec<String>,
     /// Settings.
     pub settings: TrainSettings,
+    /// `Some("member")` for a train built from its member's config.
+    pub config_source: Option<String>,
+    /// Hash of that config (`absent` when the member has none).
+    pub config_hash: Option<String>,
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use rusqlite::{Connection, TransactionBehavior};
+
+    #[test]
+    fn stored_settings_missing_fields_keep_the_real_defaults() {
+        let defaults = TrainSettings::default();
+        assert_eq!(defaults.push_timeout_ms, 600_000);
+        assert!(defaults.audit_ref);
+        assert_eq!(defaults.network_timeout_ms, 60_000);
+        // A row written before `network_timeout_ms` existed.
+        let old: TrainSettings = from_json(Some(
+            r#"{"push_timeout_ms":120000,"audit_ref":false}"#.to_owned(),
+        ));
+        assert_eq!(old.push_timeout_ms, 120_000);
+        assert!(!old.audit_ref);
+        assert_eq!(old.network_timeout_ms, 60_000);
+        // Fields missing altogether, an empty object, an absent column and
+        // an unreadable value all give the defaults, never a zero timeout.
+        for text in [
+            Some(r#"{"audit_ref":false}"#),
+            Some("{}"),
+            Some("not json"),
+            None,
+        ] {
+            let got: TrainSettings = from_json(text.map(str::to_owned));
+            assert_eq!(got.push_timeout_ms, 600_000, "{text:?}");
+            assert_eq!(
+                got.network_timeout(),
+                sluice_gate_core::config::DEFAULT_NETWORK_TIMEOUT
+            );
+        }
+    }
 
     pub(crate) fn conn() -> Connection {
         let c = Connection::open_in_memory().unwrap();
@@ -1385,6 +1558,7 @@ pub(crate) mod tests {
             caller: Caller::Agent,
             session: None,
             env: EnvMap::new(),
+            trust_config: false,
         }
     }
 
@@ -1556,6 +1730,8 @@ pub(crate) mod tests {
                 worktree: "/s/merge/t1".into(),
                 members: vec!["j1".into(), "j2".into()],
                 settings: TrainSettings::default(),
+                config_source: None,
+                config_hash: None,
             })?;
             for j in ["j1", "j2"] {
                 w.job_to(
@@ -1650,6 +1826,8 @@ pub(crate) mod tests {
                 worktree: "/s/merge/t1".into(),
                 members: vec!["j1".into(), "j2".into()],
                 settings: TrainSettings::default(),
+                config_source: None,
+                config_hash: None,
             })?;
             for j in ["j1", "j2"] {
                 w.job_to(
@@ -1665,6 +1843,157 @@ pub(crate) mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    fn columns(c: &mut Connection, table: &str) -> Vec<String> {
+        with(c, |tx| {
+            let mut stmt = tx.prepare(&format!("PRAGMA table_info({table})"))?;
+            stmt.query_map([], |r| r.get::<_, String>(1))?.collect()
+        })
+        .unwrap()
+    }
+
+    /// A database of an earlier release has no `prepare` column: `init` adds it
+    /// in place, any number of times, without bumping `queue_schema`.
+    #[test]
+    fn the_prepare_column_is_added_in_place_and_idempotently() {
+        let mut c = conn();
+        c.execute_batch(SCHEMA).unwrap();
+        c.execute("INSERT INTO queue_schema(version) VALUES (1)", [])
+            .unwrap();
+        assert!(!columns(&mut c, "queue_trains").contains(&"prepare".to_owned()));
+        with(&mut c, init).unwrap();
+        with(&mut c, init).unwrap();
+        assert!(columns(&mut c, "queue_trains").contains(&"prepare".to_owned()));
+        let v: i64 = with(&mut c, |tx| {
+            tx.query_row("SELECT max(version) FROM queue_schema", [], |r| r.get(0))
+        })
+        .unwrap();
+        assert_eq!(v, QUEUE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn the_trust_columns_are_added_in_place_and_round_trip() {
+        let mut c = conn();
+        c.execute_batch(SCHEMA).unwrap();
+        c.execute("INSERT INTO queue_schema(version) VALUES (1)", [])
+            .unwrap();
+        // A row written before the columns existed reads as untrusted.
+        c.execute(
+            "INSERT INTO queue_jobs(id, repo, worktree, branch, head_sha, remote, target, state, \
+             queue_order, caller, enqueued_at, updated_at) \
+             VALUES ('old', '/r/.git', '/r', 'b', 'h', 'origin', 'main', 'queued', 1, 'human', 1, 1)",
+            [],
+        )
+        .unwrap();
+        with(&mut c, init).unwrap();
+        with(&mut c, init).unwrap();
+        assert!(columns(&mut c, "queue_jobs").contains(&"trust_config".to_owned()));
+        for col in ["config_source", "config_hash"] {
+            assert!(columns(&mut c, "queue_trains").contains(&col.to_owned()));
+        }
+        let old = with(&mut c, |tx| job(tx, "old")).unwrap().unwrap();
+        assert!(!old.trust_config);
+        // A job enqueued with the flag, and a train built from member config.
+        let f = fence("tok");
+        let mut trusted = new_job("j1", "a");
+        trusted.trust_config = true;
+        with(&mut c, |tx| {
+            let w = Writer::new(tx, &f, Actor::Runner)?;
+            w.insert_job(&trusted)?;
+            w.insert_train(&NewTrain {
+                id: "t1".into(),
+                repo: "/r/.git".into(),
+                remote: "origin".into(),
+                target: "main".into(),
+                endpoint_hash: "e".into(),
+                base_sha: "b".into(),
+                worktree: "/s/merge/t1".into(),
+                members: vec!["j1".into()],
+                settings: TrainSettings::default(),
+                config_source: Some("member".into()),
+                config_hash: Some("abc".into()),
+            })
+        })
+        .unwrap();
+        let (j, t) = with(&mut c, |tx| {
+            Ok((job(tx, "j1")?.unwrap(), train(tx, "t1")?.unwrap()))
+        })
+        .unwrap();
+        assert!(j.trust_config);
+        assert_eq!(t.config_source.as_deref(), Some("member"));
+        assert_eq!(t.config_hash.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn the_prepare_view_round_trips_and_stays_when_the_state_changes() {
+        let mut c = conn();
+        let f = fence("tok");
+        two_member_train(&mut c, &f);
+        let t = with(&mut c, |tx| train(tx, "t1")).unwrap().unwrap();
+        assert_eq!(t.prepare, None);
+        let view = TrainPrepare {
+            status: "pass".into(),
+            job_id: Some("j-9".into()),
+            duration_ms: Some(1200),
+            log_path: Some("/l/j-9.log".into()),
+        };
+        with(&mut c, |tx| {
+            let w = Writer::new(tx, &f, Actor::Runner)?;
+            w.train_to(
+                "t1",
+                QueueTrainState::Building,
+                QueueTrainState::Verifying,
+                &TrainEdit {
+                    prepare: Some(Some(view.clone())),
+                    ..TrainEdit::default()
+                },
+            )?;
+            // Another edit leaves the column alone.
+            w.train_to(
+                "t1",
+                QueueTrainState::Verifying,
+                QueueTrainState::Verifying,
+                &TrainEdit::default(),
+            )
+        })
+        .unwrap();
+        let t = with(&mut c, |tx| train(tx, "t1")).unwrap().unwrap();
+        assert_eq!(t.prepare, Some(view));
+    }
+
+    #[test]
+    fn prepare_failures_are_counted_with_their_extra_detail() {
+        let mut c = conn();
+        with(&mut c, init).unwrap();
+        let f = fence("tok");
+        with(&mut c, |tx| {
+            Writer::new(tx, &f, Actor::Cli)?.insert_job(&new_job("j1", "a"))
+        })
+        .unwrap();
+        let note = |c: &mut Connection, job: &str| {
+            with(c, |tx| {
+                Writer::new(tx, &f, Actor::Runner)?.note_queued_failure_with(
+                    "j1",
+                    "prepare_failed",
+                    "prepare fail (exit code 1)",
+                    &serde_json::json!({"job_id": job, "base": true}),
+                )
+            })
+            .unwrap()
+        };
+        assert_eq!(note(&mut c, "a"), Some(1));
+        assert_eq!(note(&mut c, "b"), Some(2));
+        let j = with(&mut c, |tx| job(tx, "j1")).unwrap().unwrap();
+        assert_eq!(
+            j.detail,
+            Some(serde_json::json!({
+                "error": "prepare fail (exit code 1)",
+                "failures": 2,
+                "job_id": "b",
+                "base": true
+            }))
+        );
     }
 
     fn env_column(c: &mut Connection, table: &str, col: &str, id: &str) -> Option<String> {

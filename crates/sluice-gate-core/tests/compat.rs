@@ -533,3 +533,89 @@ fn auto_weight_fixture_parses() {
     assert_eq!(cfg.gates["test"].weight.ceiling(20), 10);
     assert_eq!(cfg.gates["build"].weight.ceiling(20), 8);
 }
+
+/// ADR-0018: the `[queue] prepare*` keys parse, and a config without them
+/// keeps the defaults.
+#[test]
+fn queue_prepare_fixture_parses() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/unreleased/queue-prepare.toml");
+    let text = fs::read_to_string(&path).unwrap();
+    let cfg = RepoConfig::parse(&text, &path).unwrap();
+    assert_eq!(
+        cfg.queue.prepare.as_deref(),
+        Some("pnpm install --frozen-lockfile --prefer-offline")
+    );
+    assert_eq!(cfg.queue.prepare_timeout, Duration::from_mins(15));
+    assert_eq!(
+        serde_json::to_value(cfg.queue.prepare_weight).unwrap(),
+        json!(2)
+    );
+    let plain = RepoConfig::parse("version = 1\n", &path).unwrap();
+    assert!(plain.queue.prepare.is_none());
+    assert!(plain.queue.prepare_weight.is_auto());
+}
+
+/// ADR-0019: `[containment] gates_oom_score_adj` parses as `"auto"` or a
+/// number; a user config without it keeps `"auto"` (800).
+#[test]
+fn containment_gates_oom_score_adj_fixture_parses() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/unreleased/containment-gates-oom-score-adj.toml");
+    let text = fs::read_to_string(&path).unwrap();
+    let cfg = UserConfig::parse(&text, &path).unwrap();
+    assert_eq!(cfg.containment.gates_oom_score_adj.resolve(), 600);
+    let plain = UserConfig::parse("version = 1\n", &path).unwrap();
+    assert_eq!(plain.containment.gates_oom_score_adj.resolve(), 800);
+}
+
+/// ADR-0019 piece 5: the optional ceiling of `jobs/` parses as sizes and is
+/// unset by default.
+#[test]
+fn containment_gates_memory_max_fixture_parses() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/unreleased/containment-gates-memory-max.toml");
+    let text = fs::read_to_string(&path).unwrap();
+    let cfg = UserConfig::parse(&text, &path).unwrap();
+    assert_eq!(cfg.containment.gates_memory_max_bytes(), Some(20 << 30));
+    assert_eq!(cfg.containment.gates_memory_swap_max_bytes(), Some(2 << 30));
+    let plain = UserConfig::parse("version = 1\n", &path).unwrap();
+    assert_eq!(plain.containment.gates_memory_max_bytes(), None);
+    assert_eq!(plain.containment.gates_memory_swap_max_bytes(), None);
+}
+
+/// ADR-0019: `[admission] memory_aware` and `memory_reserve` parse; a user
+/// config without them keeps memory-aware admission on with an `"auto"`
+/// reserve (a tenth of the machine's memory).
+#[test]
+fn admission_memory_fixture_parses() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/unreleased/admission-memory.toml");
+    let text = fs::read_to_string(&path).unwrap();
+    let cfg = UserConfig::parse(&text, &path).unwrap();
+    assert!(cfg.admission.memory_aware);
+    assert_eq!(cfg.admission.memory_reserve_bytes(30 << 30), 3 << 30);
+    let plain = UserConfig::parse("version = 1\n", &path).unwrap();
+    assert!(plain.admission.memory_aware);
+    assert_eq!(plain.admission.memory_reserve_bytes(30 << 30), 3 << 30);
+    let off = UserConfig::parse(
+        "version = 1\n[admission]\nmemory_reserve = \"auto\"\n",
+        &path,
+    )
+    .unwrap();
+    assert_eq!(off.admission.memory_reserve_bytes(20 << 30), 2 << 30);
+}
+
+/// ADR-0019 piece 7: `[admission] memory_guard` parses and is off without
+/// the key.
+#[test]
+fn admission_memory_guard_fixture_parses() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/unreleased/admission-memory-guard.toml");
+    let text = fs::read_to_string(&path).unwrap();
+    let cfg = UserConfig::parse(&text, &path).unwrap();
+    assert!(cfg.admission.memory_guard);
+    assert_eq!(cfg.admission.memory_reserve_bytes(30 << 30), 3 << 30);
+    let plain = UserConfig::parse("version = 1\n", &path).unwrap();
+    assert!(!plain.admission.memory_guard);
+}

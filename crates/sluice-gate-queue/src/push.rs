@@ -216,8 +216,15 @@ pub enum PushEnd {
         /// Captured stderr.
         stderr: String,
     },
-    /// `push_timeout` expired; the group was terminated.
-    TimedOut,
+    /// `push_timeout` expired; the group was terminated. What the push (and
+    /// its `pre-push` hook) printed before that, as far as the pipes were
+    /// drained.
+    TimedOut {
+        /// Captured stdout.
+        stdout: String,
+        /// Captured stderr.
+        stderr: String,
+    },
 }
 
 /// A spawned push.
@@ -322,13 +329,50 @@ impl PushProcess {
                 let pgid = i32::try_from(self.pid).unwrap_or(i32::MAX);
                 sluice_gate_daemon::executor::terminate_group(pgid, Duration::from_secs(2)).await;
                 let _ = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
-                self.out.abort();
-                self.err.abort();
-                PushEnd::TimedOut
+                // The pipes close when the group dies: a short bounded wait
+                // keeps what the hook printed (a process that escaped the
+                // group and holds a pipe open only costs this wait).
+                let drain = Duration::from_secs(2);
+                let stdout = drained(&mut self.out, drain).await;
+                let stderr = drained(&mut self.err, drain).await;
+                PushEnd::TimedOut { stdout, stderr }
             }
         }
     }
 }
+
+/// The output of a reader task within `limit`; the task is aborted (and the
+/// output lost) when it does not finish in time.
+async fn drained(task: &mut tokio::task::JoinHandle<String>, limit: Duration) -> String {
+    if let Ok(joined) = tokio::time::timeout(limit, &mut *task).await {
+        joined.unwrap_or_default()
+    } else {
+        task.abort();
+        String::new()
+    }
+}
+
+/// The note of a push that hit `push_timeout`: `push_timeout`, followed by
+/// the last lines the push printed (stderr, then stdout) when there are any.
+#[must_use]
+pub fn timeout_note(stdout: &str, stderr: &str) -> String {
+    let mut text = tail(stderr, TIMEOUT_TAIL_LINES);
+    if text.is_empty() {
+        text = tail(stdout, TIMEOUT_TAIL_LINES);
+    }
+    if text.is_empty() {
+        return "push_timeout".to_owned();
+    }
+    // Bounded: the note lands in the train row, its events and `status`.
+    let text: String = text.chars().take(TIMEOUT_TAIL_CHARS).collect();
+    format!("push_timeout: {text}")
+}
+
+/// Lines of the killed push's output kept in the `push_timeout` note.
+const TIMEOUT_TAIL_LINES: usize = 20;
+
+/// Characters of those lines kept.
+const TIMEOUT_TAIL_CHARS: usize = 4000;
 
 /// Lands a train on a local branch: `update-ref` compare-and-swap from
 /// `base_sha` to `s`, then the audit ref. Hooks disabled. `Ok(false)` when
@@ -362,6 +406,7 @@ pub fn land_local(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     const T: &str = "refs/heads/main";
 
@@ -509,6 +554,25 @@ mod tests {
             classify(Some(1), out, "", T),
             PushVerdict::Ambiguous(_)
         ));
+    }
+
+    #[test]
+    fn the_timeout_note_keeps_the_tail_of_the_output() {
+        assert_eq!(timeout_note("", ""), "push_timeout");
+        assert_eq!(timeout_note("\n  \n", "\n"), "push_timeout");
+        let err: String = (1..=30).fold(String::new(), |mut s, n| {
+            let _ = writeln!(s, "line {n}");
+            s
+        });
+        let note = timeout_note("stdout text\n", &err);
+        assert!(note.starts_with("push_timeout: line 11\n"), "{note}");
+        assert!(note.ends_with("line 30"), "{note}");
+        assert!(!note.contains("line 10\n"));
+        assert!(!note.contains("stdout text"));
+        // With nothing on stderr, stdout is used.
+        assert_eq!(timeout_note("only out\n", ""), "push_timeout: only out");
+        let long = "x".repeat(10_000);
+        assert!(timeout_note("", &long).chars().count() < 4100);
     }
 
     #[test]

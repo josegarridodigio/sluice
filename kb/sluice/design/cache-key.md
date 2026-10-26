@@ -101,6 +101,17 @@ wrong index or worktree, a pitfall both gate-cache and mergetrain document.
 Note the difference from gate-cache, which leaves the child env untouched:
 Sluice runs gates from a daemon, so it must rebuild the env anyway.
 
+The `key_inputs` commands run with that same environment and nothing else:
+`key::collect_inputs` clears the inherited environment before applying the
+gate's child env (the sanitised caller env plus the gate's `env` table), so
+what an input prints depends only on the map it is given, never on the
+process that derives the key (a client, the daemon, a train push). Every
+caller passes a complete env, `PATH` included. The key format is unchanged
+(v1); only an input whose output depended on a variable that is not in the
+gate's env sees a different key. The daemon's own environment is made neutral
+by `env::daemon_env` (ADR-0018 section 1), so a train derives keys in the
+same environment a client would.
+
 ## Key
 
 ```

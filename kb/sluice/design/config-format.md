@@ -56,6 +56,9 @@ max_train = 4
 audit_ref = true
 push_timeout = "10m"
 network_timeout = "60s"
+# prepare = "pnpm install --frozen-lockfile --prefer-offline"   # >= 0.6.0: once per train, before the gates
+# prepare_timeout = "10m"           # >= 0.6.0
+# prepare_weight = "auto"           # >= 0.6.0: integer >= 1 or "auto", like a gate weight
 ```
 
 Field reference:
@@ -70,7 +73,7 @@ Field reference:
 | `gates.<name>.weight` | int ≥ 1 or `"auto"` | 1 | Budget units consumed while running; a ceiling that learned weights lower. `"auto"` (0.4.0, ADR-0015) is `ceil(budget / 2)` of the admitting daemon. Omitted stays 1. Other strings are rejected: `invalid weight "x": use an integer >= 1 or "auto"`. |
 | `gates.<name>.timeout` | duration | `30m` | Execution time only; queue wait does not count. Formats: `90s`, `5m`, `1h`. |
 | `gates.<name>.hooks` | list | `[]` | Hook names this gate is meant for. Free-form, but `pre-commit` and `pre-push` are recognised by `sluice hook print`. |
-| `gates.<name>.key_inputs` | list of commands | `[]` | Each command's stdout (via `sh -c` in the worktree root, stderr discarded) is part of the key. Keep them fast; they run on every invocation that consults the cache, including hits. A failing command makes the run uncached (notice on stderr), never a gate failure. |
+| `gates.<name>.key_inputs` | list of commands | `[]` | Each command's stdout (via `sh -c` in the worktree root, with exactly the gate's environment and nothing inherited from the process that derives the key, stderr discarded) is part of the key. Keep them fast; they run on every invocation that consults the cache, including hits. A failing command makes the run uncached (notice on stderr), never a gate failure. |
 | `gates.<name>.key_files` | list of paths | `[]` | Relative to repo root. Content hash is part of the key. For files git ignores. Missing file hashes as "absent". |
 | `gates.<name>.env` | table | `{}` | Added to the gate's environment and to the key. |
 | `gates.<name>.depends_on` | list | `[]` | Gate names; validated (must exist, no self-reference) but not scheduled in v1. |
@@ -80,10 +83,13 @@ Field reference:
 | `gates.<name>.paths_ignore` | list of patterns | `[]` | Requires Sluice >= 0.3.0. Entries matching any of these are removed from the scope (never `.sluice.toml`). Alone, it scopes "everything except". |
 | `queue.remote` | string | `origin` | Remote of the default merge-queue target (Phase 6, [[sluice/design/merge-queue.md]]). Must not be empty, start with `-` or contain whitespace/control characters (it reaches git as an argument); at enqueue it must also be a configured remote of the repository (`invalid_remote`). |
 | `queue.target` | string | the remote's HEAD branch | Default target branch for `sluice queue enqueue`. |
-| `queue.gates` | list | gates with a `pre-push` hook, else every gate | Gates a train must pass; each must exist. |
+| `queue.gates` | list | gates with a `pre-push` hook, else every gate | Gates a train must pass; each must exist. The gates whose `hooks` contain `pre-push` are always added (the repository's hook runs them during the train's push and is answered from the train; ADR-0018 section 3). |
 | `queue.max_train` | int ≥ 1 | 4 | Jobs combined into one train; 1 disables batching. |
 | `queue.audit_ref` | bool | `true` | Push `refs/sluice/landed/<sha>` atomically with the target. |
 | `queue.push_timeout` | duration | `10m` | Limit for the push, including the repository's `pre-push` hook. |
+| `queue.prepare` | string | unset | Needs sluice ≥ 0.6.0 (older binaries refuse the file: ``unknown field `prepare` ``). Command run with `sh -c` once per train in the merge worktree, before the keys are derived and the gates run ([[sluice/design/merge-queue.md]] section 5 step 4b; [[sluice/design/adr/0018-queue-trusted-push-and-prepare.md]] section 5). Must not be empty after trimming. |
+| `queue.prepare_timeout` | duration > 0 | `10m` | Needs ≥ 0.6.0. Limit of the prepare job and of the base probe that attributes its failure. |
+| `queue.prepare_weight` | int ≥ 1 or `"auto"` | `"auto"` | Needs ≥ 0.6.0. Budget units of the prepare job, same syntax and learning as a gate's `weight`. |
 | `queue.network_timeout` | duration > 0 | `60s` | Limit of every other network call of the queue (`fetch` of the base, `ls-remote` checks at enqueue, in the ready watch, before the push, in reconcile); on expiry git's process group is killed and the call fails. For the base fetch it is read from Sluice's last fetched base (else the remote-tracking branch) of the target, never from a member. |
 
 Rules:
@@ -105,7 +111,8 @@ Rules:
   built-in `[queue]` defaults. Validation errors (at parse): `queue.max_train must be
   >= 1`, `queue.remote <must not be empty | must not start with '-' | must
   not contain whitespace or control characters>`, `queue.network_timeout
-  must be > 0`, `queue.gates names an unknown gate "<name>"`. The per-user
+  must be > 0`, `queue.prepare must not be empty`, `queue.prepare_timeout must be
+  > 0`, `queue.prepare_weight must be >= 1`, `queue.gates names an unknown gate "<name>"`. The per-user
   queue keys below (`enabled`, `allow_agent_approval`, `tick`, `retention`)
   are rejected here as unknown fields, and `queue.remote` and the other
   repo keys are rejected in the user file.
@@ -158,6 +165,9 @@ overcommit = 1.5           # 0.3.0, ADR-0011 M3: over-admission cap = floor(over
 cpu_some_avg10_low = 25.0  # over-admit only below this CPU some avg10 (percent)
 memory_some_avg10_low = 5.0  # ... and below this memory some avg10 (percent)
 overcommit_interval = "5s" # at most one over-admission per interval, none sooner after a PSI resume (must be > 0)
+memory_aware = true        # 0.6.0, ADR-0019: admit by learned memory, not only by CPU; false = CPU-only admission
+memory_reserve = "auto"    # 0.6.0: memory left for the desktop and the agents: "auto" (10 % of MemTotal) or a size such as "3G"
+memory_guard = false       # 0.6.0: opt-in, cancel Sluice's own largest gate job under real memory exhaustion
 
 [mcp]
 progress_interval = "15s"  # progress notifications while verify runs (floored at 1s, re-read per call)
@@ -177,6 +187,9 @@ learned_weights = true     # 0.3.0, ADR-0011 M2: gates hold P75 of their measure
 fairness = "lane"          # 0.3.0, ADR-0011 M5: lane (worktrees take turns) | off
 human_first = true         # 0.3.0, ADR-0011 M6: human-waited jobs before agent jobs
 order = "fifo"             # 0.3.0, ADR-0011 M7: fifo | sjf (shortest expected job first with ageing)
+
+[containment]                      # 0.5.0, all optional; keys, defaults and validation: [[sluice/design/containment.md]] section 7
+enabled = true                     # false: no cgroups (0.4.1 behaviour); gates_oom_score_adj = "auto", gates_memory_max = "" and gates_memory_swap_max = "" (0.6.0)
 
 [agent_detection]
 env_any_set = ["CLAUDECODE"]      # any of these set and non-empty => agent (SLUICE_AGENT is the override, see below)
@@ -223,7 +236,9 @@ means defaults); unknown fields are errors; validation: `daemon.budget >= 1`,
 `admission.psi_max_wait > 0`, `admission.cpu_some_avg10_max`,
 `memory_some_avg10_max`, `cpu_some_avg10_low` and `memory_some_avg10_low` in
 `[0, 100]`, `admission.overcommit` in `[1.0, 4.0]`,
-`admission.overcommit_interval > 0`, `scheduler.fairness` one of `lane`/`off`,
+`admission.overcommit_interval > 0`, `admission.memory_reserve` `"auto"` or a size
+(`"3G"`, `"512M"`; `admission.memory_reserve "x" must be "auto" or a size such as "3G"`),
+`scheduler.fairness` one of `lane`/`off`,
 `scheduler.order` one of `fifo`/`sjf`, `budget_share_max >= 1`, `debug.level` a valid
 `EnvFilter` directive (`info`, `debug`, `sluice_gate_daemon=debug,info`; the error names the
 file and the value). `sluice daemon restart [--debug]` applies a changed `[debug]` section;
@@ -237,9 +252,13 @@ commands are allowed`.
 Entries are command words compared after the guard's equivalences
 (`npm run build`, `pnpm build`, `yarn build` all mean `run build`); the
 default list is `docker build`, `docker buildx build`, `docker compose build`,
-`run build`, `cargo build`, `cargo test`, `cargo clippy`, `cargo nextest`,
+`run build`, `cargo build`, `cargo test`, `cargo clippy`, `cargo check`, `cargo doc`, `cargo nextest`,
 `go build`, `go test`, `make`, `gradle`, `mvn`, `tsc`, `vite build`,
-`webpack`, `next build`, `pytest`, `jest`, `vitest`. The plugin guard
+`webpack`, `next build`, `pytest`, `jest`, `vitest`, `ng build|test|lint|e2e`,
+`nx run|run-many|affected|build|test|lint|e2e`, `turbo run|build|test|lint`,
+`playwright test`, `cypress run`, `react-scripts build|test`, `astro build`,
+`nuxt build`, `dotnet build|test`, `bazel build|test`, `ninja`, `cmake --build`
+(`DEFAULT_HEAVY_COMMANDS` in `heavy.rs` is the authority). The plugin guard
 (`sluice guard`) and `sluice exec` re-read `[agent]` per call; an invalid user
 config makes the guard skip every rewrite. The `[queue]` keys have no validation
 beyond their types; the runner floors `tick` at 50 ms, and `retention = "0s"`

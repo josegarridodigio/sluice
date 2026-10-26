@@ -449,6 +449,66 @@ fn cg_exec_runs_the_command_even_when_the_move_fails() {
     assert_eq!(usage.status.code(), Some(2));
 }
 
+/// `oom_score_adj` of this test process, which `cg-exec` children inherit.
+fn inherited_oom_score_adj() -> i64 {
+    fs::read_to_string("/proc/self/oom_score_adj")
+        .expect("procfs")
+        .trim()
+        .parse()
+        .expect("a number")
+}
+
+/// What `sluice cg-exec <leaf> [--oom-score-adj N] -- cat /proc/self/oom_score_adj` prints.
+fn adj_seen_by_child(leaf: &Path, adj: Option<&str>) -> i64 {
+    let mut cmd = Command::new(SLUICE);
+    cmd.arg("cg-exec").arg(leaf);
+    if let Some(adj) = adj {
+        cmd.args(["--oom-score-adj", adj]);
+    }
+    let out = cmd
+        .args(["--", "cat", "/proc/self/oom_score_adj"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+}
+
+#[test]
+fn cg_exec_raises_the_oom_score_adj_and_never_lowers_it() {
+    let inherited = inherited_oom_score_adj();
+    // An unwritable leaf (a directory named `cgroup.procs`) does not stop
+    // the adj: both steps fail open, independently.
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("cgroup.procs")).unwrap();
+    assert_eq!(
+        adj_seen_by_child(dir.path(), Some("800")),
+        inherited.max(800)
+    );
+    // A missing leaf, and a value below the inherited one: the inherited
+    // value stays (an unprivileged process cannot lower its adj).
+    assert_eq!(
+        adj_seen_by_child(Path::new("/nonexistent/leaf"), Some("0")),
+        inherited.max(0)
+    );
+    // The no-leaf spelling used when containment is unavailable.
+    assert_eq!(
+        adj_seen_by_child(Path::new("-"), Some("800")),
+        inherited.max(800)
+    );
+    // Without the option nothing is touched.
+    assert_eq!(adj_seen_by_child(Path::new("-"), None), inherited);
+    // Out of range is a usage error, not a silent clamp.
+    let bad = Command::new(SLUICE)
+        .args(["cg-exec", "-", "--oom-score-adj", "1001", "--", "true"])
+        .output()
+        .unwrap();
+    assert_eq!(bad.status.code(), Some(2));
+}
+
 #[test]
 fn hidden_from_help() {
     let out = Command::new(SLUICE).arg("--help").output().unwrap();

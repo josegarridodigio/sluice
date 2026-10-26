@@ -60,7 +60,13 @@ from bypassing the queue (documented, enforced by the forge, not by Sluice).
 - **Train hash**: `sha256(repo, remote, endpoint_hash, target, base_sha, [(job_id, head_sha)…],
   S, T, sorted gate keys)`. Shown at approval and stored with it; re-checked before push. Encoding (`model::train_hash`): the
   prefix `sluice-train-v1`, then each field NUL-terminated, a `|` field after the members, and the
-  gate keys as `gate=key` (`gate=-` for an uncached gate), sorted.
+  gate keys as `gate=key` (`gate=-` for an uncached gate), sorted. A train built from its member's
+  own `.sluice.toml` (`--trust-member-config`, section 5 step 2) appends two more fields after the
+  gate keys: `config` and the `config_hash` (`sha256` of the config blob, or `absent`). No other
+  train has them, so ordinary hashes are byte-identical to those of earlier releases and a ready
+  train's approval survives an upgrade (`TrainHashInput.config_hash`, `None` for ordinary trains).
+  A commit that changes the member's file changes `head_sha` and so the train anyway; the config
+  hash makes the binding explicit.
 - **Lease**: the daemon's existing lease row (`lease.name = 'daemon'`, random token). The runner
   only works while the heartbeat succeeds; every queue write first checks that the lease row still
   carries its token (`Writer::new`, else the write is refused as lease lost); train updates are a
@@ -94,13 +100,13 @@ Side exits: `conflict`, `failed`, `cancelled`, `needs_reconcile`. Exact transiti
 |---|---|---|---|
 | — | queued | `queue enqueue` | CLI / MCP client (agent or human) |
 | queued | merging | claim into a train (one `BEGIN IMMEDIATE` with job selection) | runner |
-| queued | failed | 3 consecutive failures to prepare the base (`base_unavailable`, `base_config_invalid`) | runner |
+| queued | failed | 3 consecutive failures to prepare the base (`base_unavailable`, `base_config_invalid`), to derive the keys in the merge worktree (`key_input_failed`), or to run `[queue] prepare` on the base too (`prepare_failed`, `base: true`); at once, with no retry, for a trusted job (`--trust-member-config`) whose branch `.sluice.toml` does not parse (`member_config_invalid`, `detail.error` the parse error) | runner |
 | merging | verifying | its merge applied cleanly | runner |
 | merging | conflict | `git merge` conflicted (with base or earlier members; reason `conflict`, `merge_failed` or `dirty_merge`); the job leaves the train (`train_id` cleared) | runner |
 | merging | failed | internal error while building the train (reason `internal`; a `verifying` job fails the same way) | runner |
 | verifying | ready | every gate passed or hit | runner |
-| verifying | failed | a gate failed / timed out / was killed / errored and the train has a single surviving member (reason `gate_failed`), or `tree_mismatch` (checked before any gate runs) | runner |
-| verifying | queued | multi-member train failed: members split (section 5, step 7) | runner |
+| verifying | failed | a gate failed / timed out / was killed / errored and the train has a single surviving member (reason `gate_failed`); the gates passed but left tracked files modified (reason `gate_modified_tree`); `[queue] prepare` failed or left the tree changed while the base prepares (reason `prepare_failed` / `prepare_dirty`, `base: false`; step 4b); or `tree_mismatch` (checked before any gate runs); its merged `.sluice.toml` asks the `pre-push` hook for gates the train does not verify (reason `hook_gate_unverified`) or does not parse (`member_config_invalid`), for the members that changed it (step 5b) | runner |
+| verifying | queued | multi-member train failed (`gate_failed`, `gate_modified_tree`, `prepare_failed`, `prepare_dirty`): members split (section 5, steps 4b and 7); or a `key_inputs` command failed in the merge worktree (reason `key_input_failed`) or `[queue] prepare` fails on the base as well (reason `prepare_failed`, `base: true`): train dissolved, members not split (section 7); or another member's merged configuration is rejected (`hook_gate_unverified` / `member_config_invalid`, step 5b): the train is dissolved, the members that did not change it requeued, not split | runner |
 | ready | approved | `queue approve <train>` with matching train hash | human (CLI); an agent (MCP, or the CLI from an agent's environment) only if allowed |
 | ready, approved | queued | base moved, member cancelled, `stale_plan` (train hash changed or a cancel pending), `endpoint_changed`, merge worktree changed; approval voided | runner |
 | approved | pushing | marker + pin ref written, lease re-checked | runner |
@@ -111,7 +117,7 @@ Side exits: `conflict`, `failed`, `cancelled`, `needs_reconcile`. Exact transiti
 | pushing | needs_reconcile | ambiguous push failure, or daemon start finds the train `pushing` | runner / daemon start |
 | pushing | cancelled | definitive rejection (nothing landed) while `cancel_requested` | runner |
 | needs_reconcile | landed / ready / queued / cancelled | decision table, section 6 | `queue reconcile` |
-| conflict, failed | queued | `queue retry <job>` re-reads the branch head | client |
+| conflict, failed | queued | `queue retry <job>` re-reads the branch head; `--trust-member-config` sets the job's `trust_config`, a plain retry clears it | client |
 | any pre-`pushing` state | cancelled | `queue cancel <job>`; in `merging`/`verifying` the train is rebuilt without it | client |
 | merging, verifying | queued | daemon start finds an unfinished train (it is dissolved) | daemon start |
 
@@ -162,7 +168,8 @@ CREATE TABLE queue_trains (
   train_hash TEXT, claim_token TEXT NOT NULL,
   approved_at INTEGER, approved_via TEXT,            -- cli|mcp
   approved_hash TEXT, push_env TEXT,                 -- JSON allowlist from the approving client
-  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, landed_at INTEGER, note TEXT);
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, landed_at INTEGER, note TEXT,
+  prepare TEXT);                                     -- JSON {status, job_id, duration_ms, log_path} of the [queue] prepare run; nullable
 CREATE TABLE queue_push_markers (
   train_id TEXT PRIMARY KEY, sha TEXT NOT NULL, base_sha TEXT NOT NULL,
   remote TEXT NOT NULL, endpoint_hash TEXT NOT NULL, push_refs TEXT NOT NULL,  -- JSON
@@ -172,6 +179,13 @@ CREATE TABLE queue_events (                          -- append-only audit trail
   at INTEGER NOT NULL, job_id TEXT, train_id TEXT, from_state TEXT, to_state TEXT NOT NULL,
   actor TEXT NOT NULL, note TEXT);                   -- runner|cli|mcp|reconcile|daemon-start
 ```
+
+`queue_trains.prepare` is not in the original `CREATE TABLE`: `store::init` adds it to a
+database of an earlier release with `PRAGMA table_info` then `ALTER TABLE ... ADD COLUMN`
+(idempotent, no `queue_schema` bump; an older binary names its columns and ignores it). It is
+the train's view of its prepare run (`TrainPrepare`, an optional `prepare` field of
+`QueueTrainView`: `running`, `pass`, `fail`, `timeout`, `killed`, `error`, or `dirty` for a
+pass that left the tree changed) and never enters the train hash.
 
 Credentials do not outlive their use: `queue_jobs.env` is set to `NULL` when the job
 reaches `landed` or `cancelled`, and `queue_trains.push_env` when the train reaches
@@ -202,8 +216,8 @@ dissolves an unfinished build and parks an unfinished push).
    oldest first, the runner spawns one task (busy key per group) that runs step 2 for it
    (fetch, config), then in one
    `BEGIN IMMEDIATE`: verifies the lease token, re-reads the queued jobs of that target and
-   takes up to `[queue] max_train` (default 4) of them by `queue_order` (a `solo` job only alone, and the batch
-   stops before a `solo` job), creates the train row, moves them to `merging` with
+   takes up to `[queue] max_train` (default 4) of them by `queue_order` (a `solo` or trusted job only alone, and the batch
+   stops before one), creates the train row, moves them to `merging` with
    `claim_token`. No train is built while an older train of the same target is
    `building`/`verifying`/`ready`/`approved`/`pushing`/`needs_reconcile`.
 2. **Trusted config.** Remote target: `git fetch --no-tags --quiet --no-write-fetch-head -- <push
@@ -215,11 +229,29 @@ dissolves an unfinished build and parks an unfinished push).
    `refs/heads/<target>` (no fetch; later "ls-remote" checks read the local ref). Read
    `[queue]` and the gate definitions from `git show <base_sha>:.sluice.toml`, never from a
    member branch. A member that changes `.sluice.toml` is flagged `config_changed` in the plan
-   (job `detail = {"config_changed": true}`). A base without `.sluice.toml` has no gates and
+   (job `detail = {"config_changed": true}`; `git diff --quiet <base>...<head> -- .sluice.toml`,
+   three dots: what the member changed since it forked, not what the base changed meanwhile;
+   the flag is merged into the detail, so a later gate failure keeps it; `queue status`, the
+   approval plan and MCP show `changes .sluice.toml (this train runs the base's gates)`). A base without `.sluice.toml` has no gates and
    the default `[queue]` settings; an invalid one (or a failed fetch) leaves the jobs `queued`
    with the reason recorded (section 7, "Base unavailable"), retried at most once per tick,
    and `failed` after 3 consecutive failures. `push_timeout`, `audit_ref` and
    `network_timeout` are stored with the train (`settings`).
+
+   **Trusted job** (`queue_jobs.trust_config`, set by a human's `--trust-member-config`,
+   ADR-0018 section 6). When the first queued job of the group is trusted, the runner reads
+   `git show <head_sha>:.sluice.toml` instead of the base's file: absent means no gates and the
+   defaults, an invalid file fails the job at once with `member_config_invalid` (no retry loop,
+   no network). The base is still fetched, but its config is not read, so a broken base file does
+   not stop the trusted job. Gates, the `[queue] gates` selection, `prepare` and its timeouts,
+   `push_timeout`, `network_timeout` and `audit_ref` come from that file; `remote` and `target`
+   stay as resolved at enqueue. The claim takes that job alone (`max = 1`), and refuses to claim
+   when the first queued job is not the one the config was read for. The train records
+   `config_source = member` and `config_hash`; the hash enters the train hash (section 2). The
+   prepare attribution probe of step 4b runs the member's own prepare command on the base
+   (it compares like with like). The vouch (section 6) needs nothing special: the train's gates
+   are what it verified; for a trusted train the refusal never claims "the train runs the base's
+   gates" (`config_changed` is ignored there).
 3. **Worktree.** `git worktree add --detach <state>/merge/<train-id> <base_sha>`, then
    `git worktree lock --reason "sluice merge queue"` (two steps: `add --lock --reason` needs
    git 2.33, the minimum is 2.31); all git calls with `-c core.hooksPath=/dev/null`, every
@@ -239,16 +271,77 @@ dissolves an unfinished build and parks an unfinished push).
    `dirty_merge` and the dirty paths in `detail`. No member left → the train is `dissolved`.
    Survivors → `verifying`. The train keeps every claimed member in `members`; the hash uses
    the survivors.
+4b. **Prepare** (only when the base's `[queue]` has `prepare`; otherwise nothing changes).
+   A fresh worktree has none of the git-ignored dependencies (`node_modules`, `.venv`) the
+   gates need, so the base's `[queue] prepare` command runs once per train, after the merges
+   and before the keys (the checks below are in the order the runner does them):
+   a. *Fast path.* Take the snapshot (step 5), derive the keys and look them up as in
+      steps 5 and 6; if every selected gate hits (or there is no gate) the train goes on
+      without preparing: an already verified fast-forward costs nothing, not even an
+      installation. A key derivation that fails here is not an error yet: the prepare may be
+      what makes it work.
+   b. *The job.* Otherwise one `RunRequest` through `submit_run_owned`: gate name
+      `queue:prepare` (gate names match `[a-z0-9][a-z0-9_-]*`, so no gate can collide with it;
+      the learned weight is keyed by repo, name and command like any gate's), `cmd` =
+      `prepare`, `key`/`tree`/`committed_tree` none, `no_marker`, `cache = false`, `weight`
+      from `prepare_weight` (resolved like a gate's, `auto` included), `timeout` from
+      `prepare_timeout` (always set, never 0), `cwd` = the merge worktree, `child_env` like the
+      gates, `caller = human`, `session = "queue:<train-id>"`. The train stays `verifying`
+      (no new state); its `prepare` column shows `running` with the job id, then the result.
+      It is awaited under the same cancellation rule as the gates: a member cancelled meanwhile
+      dissolves the train, and dropping the subscription kills the job.
+   c. *Clean tree.* After a pass the worktree must still snapshot to `T` (the same assertion
+      as step 5, which also covers untracked files that are not git-ignored); otherwise the
+      prepare is `dirty` and handled as a failure with the paths of
+      `git status --porcelain`. A prepare may only create ignored files.
+   d. *Keys.* The keys are derived after it (a `key_inputs` that needs the installed tools
+      works); a key input that still fails is `key_input_failed` (section 7).
+   e. *Attribution of a failure* (`fail`, `timeout`, `killed`, `error`, `dirty`). A prepare
+      fails because a member broke it (lockfile out of sync) or because of the environment
+      (registry down, missing tool, broken base). The runner decides by a fact: it runs the
+      same command on the **base alone** in a probe worktree `<state>/merge/<train>-base`
+      (`git worktree add --detach` at `base_sha`, locked, hooks disabled, same limits, same
+      cleanliness rule; removed afterwards, and swept like a merge worktree: a `-base` path is
+      owned by the train it is named for). Nothing is
+      remembered: every prepare failure probes the base afresh (a remembered pass would blame
+      the members for a later environment failure on the same base: registry down, timeout,
+      memory kill). The base fails too: nobody's fault, the train is dissolved and every member
+      goes back to `queued` (not `solo`) with reason `prepare_failed` and `detail = {"error",
+      "job_id", "status", "exit_code", "log_path", "message", "base": true, "base_job_id",
+      "failures": n}` (`paths` too for a dirty prepare), paced and counted like
+      `base_unavailable`, `failed` after 3 attempts. The base prepares: a member's fault; a
+      single member is `failed` with `prepare_failed` (`prepare_dirty` for a dirty tree,
+      `paths` in the detail) and `base: false`; several split into solo trains, exactly like
+      a gate failure (the `Failure` of step 7). When the probe cannot be set up (the probe
+      worktree cannot be created) there is no fact to attribute by and the train is requeued
+      as an environment failure.
 5. **Key.** `T = git rev-parse S^{tree}`. Take `tree::snapshot_entries` of the clean worktree (the same
    code path as every client) and assert it equals `T` (a mismatch, e.g. from eol filters,
    makes the train fail with `tree_mismatch`, never silently uncached). For each queue gate
-   (`[queue] gates`, else the gates whose `hooks` contain `pre-push`, else every gate)
+   (`[queue] gates` plus every gate whose `hooks` contain `pre-push`, else the `pre-push`
+   gates, else every gate: the `[queue] gates` order first, then the added `pre-push` gates by
+   name, no duplicates; `runner::select_gates`; the push's hook runs the `pre-push` gates and
+   the daemon answers them from the train, section 6, so the train must have verified them)
    derive the key with the shared `lookup::key_tree` + `lookup::derive_key_at` from `T` (or, for a gate with `paths`/`paths_ignore`, the scope hash of the snapshot entries; [[sluice/design/path-scoped-keys.md]] section 7), the base config's gate
    (name, normalised cmd, env), `key_inputs` run in the merge worktree and `key_files` read
    there (no extra arguments; a gate with `cache = false` has no key, always runs and enters
-   the hash as `<gate>=-`). Markers live in the repo's common dir, so keys computed by agents' `verify` calls
+   the hash as `<gate>=-`). A `key_inputs` command (or `key_files` entry) that fails in the
+   merge worktree is reason `key_input_failed`, an environment failure (section 7), never
+   `internal`. Markers live in the repo's common dir, so keys computed by agents' `verify` calls
    on the same tree hit: a fast-forwarded single-member train that the agent already
    verified needs no run at all.
+   *Hook gates (step 5b, `runner::reject_hook_gates`, `hookcheck`).* Right after the snapshot
+   assertion and before preparing or running anything, the runner parses the **merged**
+   worktree's `.sluice.toml` (the file the push's `pre-push` hook will read) and compares
+   `gates_for_hook("pre-push")` with the gate names the train selected (those of the config the
+   train uses: the base's, or the member's for a trusted train, which cannot mismatch). A gate
+   the train will not verify would make the hook fail fast after a human approved, so the
+   train ends at once: members whose job detail has `config_changed` fail with
+   `hook_gate_unverified` (detail `{"gates": [...], "hint"}`: land the configuration change
+   first, or a human retries with `--trust-member-config`), the other members are requeued
+   (dissolved, not split). A merged config that does not parse fails the `config_changed`
+   members with `member_config_invalid` and the parse error. No gate ran and no approval was
+   needed. If no member changed the configuration the check is skipped (nobody to blame).
 6. **Run through Sluice.** `MarkerStore::lookup` per key; all hits (or no gate at all, e.g. a base without `.sluice.toml`) →
    `ready` immediately.
    Otherwise submit one `RunRequest` per missing gate through `DaemonHandle::submit_run`
@@ -256,14 +349,28 @@ dissolves an unfinished build and parks an unfinished push).
    `key`/`tree` = derived, `committed_tree = T`, `caller = human`, `session =
    "queue:<train-id>"`, `child_env` = sanitised daemon env. Jobs enter the scheduler like any
    other (weight, budget, repo cap, coalescing, double-check before start, marker on pass).
+   The runs are submitted with `DaemonHandle::submit_run_owned`: dropping the subscription
+   (the first failure, a cancelled member, daemon stop) cancels the job whatever
+   `last_subscriber_gone` says, since the worktree it runs in is about to be removed.
    Gates run concurrently; the first failure unsubscribes the rest. Gate statuses in the
    train view: `cached` (marker hit before any run), `running` (with the sluice job id),
    then `pass`, `cached` (hit found by the scheduler), `fail`, `timeout`, `killed`, `error`.
+   A `pass` whose outcome says `marker_written = false` with a reason (typically "the gate
+   modified the tree": it left untracked files) carries the optional `TrainGate.note =
+   "not cached: <reason>"`, shown as `pass (not cached: …)` by `queue status` and MCP; the
+   train goes on. The note never enters the train hash (only the gate names and keys do).
+   After every gate that had to run passed, the runner checks `git status --porcelain
+   --untracked-files=no` of the merge worktree: a non-empty answer means a gate edited
+   tracked files, which the pre-push check would dissolve and the rebuild repeat, so the train
+   fails with reason `gate_modified_tree` (detail `{"gates": [the gates that ran], "paths":
+   [...]}`) and is handled exactly like a gate failure (step 7).
 7. **Outcome.** Decided in one write transaction (`runner::finish_train`), which re-reads
    the members: a member that left `verifying` meanwhile (cancelled) dissolves the train
    and re-queues the others (never an `internal` failure). All pass/cached → train `ready`,
    `train_hash` computed, `queue status` shows the plan. A failure in a train with a single surviving member → job `failed`, reason `gate_failed` (detail:
-   `gate`, `job_id`, `status`, `exit_code`, `log_path`, `message`). A failure with several surviving members → v1 splits: every member returns to `queued`
+   `gate`, `job_id`, `status`, `exit_code`, `log_path`, `message`) or `gate_modified_tree`
+   (detail: `gates`, `paths`), merged into any detail the job already carries
+   (`config_changed`). A failure with several surviving members → v1 splits: every member returns to `queued`
    with the flag `solo`, so the next trains contain one job each (linear isolation). Stretch
    (optional, not v1): bisection of the failing train and re-run of the survivors as a fresh
    train, plus detection of a semantic-conflict pair, as in mergetrain.
@@ -316,17 +423,54 @@ Then:
    `GIT_TERMINAL_PROMPT=0`, plus the approver's allowlist (`SSH_AUTH_SOCK`, `SSH_AGENT_PID`,
    `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `SSH_ASKPASS`, `HOME`, `PATH`, `TERM`; `git::ENV_ALLOWLIST`).
    The repository's `pre-push` hook **runs** (user decision, section 14): the push is a
-   regular push from the merge worktree with the repository's `core.hooksPath`, so a
-   Sluice-based hook answers from the markers the train just produced (the daemon's env
-   carries no agent marker, so the human policy `wait` applies and the hook never
-   fails fast). A hook that declines (`git` exits 1 with no ref line in the porcelain
+   regular push from the merge worktree with the repository's `core.hooksPath`. A
+   Sluice-based hook (`sluice run --hook pre-push <gate>`) is **answered by the daemon from
+   the train's record**, not by a re-derived cache key (ADR-0018 section 3; before, the hook
+   derived its key in the push's environment, where `key_inputs` such as `node --version`
+   follow the approver's `PATH` and `CI` can turn the cache off, missed, and re-ran the whole
+   suite inside `push_timeout`). `Extension::vouch_run` is consulted for every `run` request
+   that carries a `hook` (and only those, so `verify` and plain runs pay nothing) before the
+   scheduler or the marker double-check; the queue answers when **all** hold:
+   - a train is `pushing` whose merge worktree is the request's `toplevel` and whose
+     repository is its `common_dir` (both canonicalised);
+   - the peer process (`SO_PEERCRED`) descends from the marker's `push_pid` (walk of the
+     `/proc/<pid>/stat` parent chain, at most 64 steps, stopping at pid 1) and that pid still
+     has the marker's `push_start_ticks` (no pid reuse); a push pid not yet recorded is
+     waited for up to 2 s (it is written right after the spawn);
+   - the daemon's own check of the worktree gives `HEAD == S` and no change to tracked
+     files (`status --porcelain --untracked-files=no`, the rule of the pre-push checks:
+     untracked output a gate left does not change what is pushed; run off the async
+     threads).
+
+   Then the reply is one `done` (no `queued` first; the client reads until `done`): a gate the
+   train verified (`pass` or `cached` in its gate views) gets `cached`, exit 0, message
+   `<gate>: verified by merge train <id> (job <job>)`, no marker written; any other gate gets
+   `error` with `gate '<g>' runs in the pre-push hook but merge train <id> did not verify
+   it` and a hint (a member changes `.sluice.toml` and the train runs the base's gates; else add
+   the gate to `[queue] gates` or give it the `pre-push` hook). The hook exits non-zero at
+   once, so the push fails definitively as `pre_push_hook` (the hook's output, message
+   included, is the job's detail) instead of timing out into `needs_reconcile`. A worktree
+   that no longer holds `S`/`T` is answered with `error` too (`the merge worktree of train <id>
+   no longer holds the verified tree`). Any other condition that does not hold (no such
+   train, peer not a descendant of the push, a database or git error) sends the request the
+   normal way. The daemon logs `push hook vouched: train=.. gate=.. verdict=..` at `info`.
+   Why this is safe: it states a fact about the daemon's own locked worktree, which holds
+   exactly the verified `S`, checked by process ancestry and by the daemon's own snapshot; it
+   lets nobody skip a gate anywhere else (a `sluice run` from any other process or directory
+   goes the normal way), and hooks that are not Sluice's keep their say. It works with older
+   hook clients (daemon side only; the client prints the message on stderr from this
+   version). A hook that declines (`git` exits 1 with no ref line in the porcelain
    output, no `fatal:` line, no git `error:` line other than `failed to push some refs`,
    which must be present; the hook's stderr is captured) is a definitive rejection:
    jobs `failed` with reason `pre_push_hook` and the hook output in `detail`; the marker is
    deleted. The push has `[queue] push_timeout` (default `10m`); on expiry the process
    group is terminated (`terminate_group`, SIGTERM then SIGKILL after 2 s), the process is
-   reaped and the train goes to `needs_reconcile` with note `push_timeout`, like any other
-   ambiguous end.
+   reaped, the readers of its pipes get a bounded 2 s to drain, and the train goes to
+   `needs_reconcile` with note `push_timeout: <last 20 lines the push printed>` (just
+   `push_timeout` when it printed nothing; at most 4000 characters), like any other
+   ambiguous end. Train settings stored without a field (an older row) or unreadable fall
+   back to the real `[queue]` defaults (10 min, `audit_ref`, 60 s) with a `warn` log, never to
+   zeros.
    Local target: no push process; the same transaction's follow-up is
    `git update-ref -m "sluice: land <train-id>" refs/heads/<target> <S> <base_sha>` plus
    `git update-ref refs/sluice/landed/<S> <S>`, run with hooks disabled (there is no
@@ -397,6 +541,37 @@ over `ReconcileInput`; `reconcile::gather` collects the facts.
   consecutive failure the jobs become `failed` with the same reason and detail
   (`Writer::note_queued_failure`, `runner::MAX_PREPARE_FAILURES`); `queue retry` re-queues
   them with the reason cleared.
+- **Key inputs fail in the merge worktree** (`key_inputs` exits non-zero or cannot run, a
+  `key_files` entry cannot be read; reason `key_input_failed`): an environment failure,
+  nobody's fault, and every member would hit it. The train is dissolved (not split, not solo)
+  and its members go back to `queued` with `reason = key_input_failed`, `detail = {"error":
+  "gate <name>: <error>", "failures": n}`, through the same machinery as a base that cannot
+  be prepared: paced one attempt per `[queue] tick`, counted across the attempts (a claim
+  after a `key_input_failed` keeps the count; deriving the keys clears it), `failed` with the
+  same reason after the third (`Writer::note_queued_failure`,
+  `runner::MAX_PREPARE_FAILURES`). `queue status` shows `waiting: key_input_failed <error>`.
+- **`[queue] prepare` fails** (step 4b): `prepare_failed` / `prepare_dirty`. Probed on the
+  base; the base fails too: members requeued (not solo) with `prepare_failed`, `base: true`,
+  paced and counted like a key-input failure (a claim after a `prepare_failed` keeps the
+  count; deriving the keys clears it), `failed` after 3; the base prepares: the single member
+  is `failed`, a pair splits. `queue status` shows `prepare: pass 41.2s` /
+  `prepare: running (job <id>)` / `prepare: fail (job <id>)` on the train and `waiting:
+  prepare_failed <error> (see 'sluice logs <job>')` on a requeued job. Edge cases: a prepare
+  that dirties the tree also on the base is an environment failure (requeued with the
+  paths); every failure probes the base again (no probe is remembered), which costs one prepare
+  per failure; with no
+  gate selected the fast path always holds, so a base without gates never prepares.
+- **The merged config asks the `pre-push` hook for unverified gates** (`hook_gate_unverified`,
+  step 5b): found at build time, with no gate run and no approval; only the members that
+  changed `.sluice.toml` fail, the others are requeued. `queue status` shows the gate names
+  and the hint (CLI and MCP).
+- **A gate leaves tracked files modified** (`gate_modified_tree`): see step 6; the member
+  fails, or the train splits, like for a failing gate. Untracked or ignored output only
+  produces the `not cached` note.
+- **Invalid `.sluice.toml` on the enqueued head**: the head's config only picks the default
+  target. An enqueue without `--base` is refused with `bad-request` and a message starting
+  `invalid_config:`; with `--base` the head's config is not read. A file that is absent
+  gives the built-in defaults, as before.
 - **Merge conflict**: job `conflict` with paths; the agent rebases its branch and calls
   `queue retry <job>`, which re-reads `refs/heads/<branch>` and re-queues (new `queue_order`).
 - **Runner death mid-train**: daemon start dissolves `building`/`verifying` trains (jobs
@@ -438,7 +613,15 @@ force every hook client to restart the daemon for a feature most repositories do
 
 Client: `queue-enqueue {repo, worktree, branch, head_sha, base?, caller, session, env, via?}`
 (`base` as typed by the user; the daemon resolves it against the repository, section 2), `queue-status {repo?}`, `queue-approve {train_id, train_hash, via: cli|mcp, env}`,
-`queue-retry {job_id, head_sha, via?}`, `queue-cancel {job_id, via?}`, `queue-reconcile {repo?}`.
+`queue-retry {job_id, head_sha, via?, trust_member_config?, env?}`, `queue-cancel {job_id, via?}`, `queue-reconcile {repo?}`.
+`queue-enqueue` and `queue-retry` gain the optional boolean `trust_member_config` (omitted when
+false); `queue-retry` also gains the optional `env` (the agent-detection variables, sent only with
+the flag). The daemon announces the feature `queue-trust-config` in `welcome.features`; a client
+that does not see it refuses the flag instead of sending a request an old daemon would silently
+ignore. Train views gain the optional `config_source` (`"member"` only for a trusted train) and
+`config_diff` (the unified diff `git diff <base_sha>...<head> -- .sluice.toml`, or, when the base has
+no such file, a note followed by the whole member file; capped at 64 KiB with a truncation note;
+computed by `queue-status` for trusted trains that are `verifying` or `ready`).
 The optional `via` (`cli`|`mcp`, absent = `cli`) is the `queue_events.actor` of the
 request. Train views carry the base's `push_timeout_ms` and `network_timeout_ms`.
 Server: `queue-job {job}`, `queue-status {schema: 1, trains, jobs}`, `queue-approved {train}`,
@@ -463,6 +646,7 @@ train t-1761…-9f2e01  origin/main  base 4e1c9a0  READY (awaiting approval)
 $ sluice queue approve t-1761…-9f2e01      # prints the plan, asks 'Land this train? [y/N]' on a TTY
 sluice: landed 3b7d2f1 on origin/main (train t-1761…-9f2e01)
 $ sluice queue retry …77d0e4 | cancel <job> | reconcile | status --json
+$ sluice queue enqueue --trust-member-config   # humans only, also on retry (section 12)
 ```
 
 `enqueue` refuses a worktree with staged or unstaged changes to tracked files (untracked files
@@ -499,7 +683,17 @@ and again by the daemon; its wait has the same bound as the CLI's), `queue_retry
 `not-found` for a job of another repository). The server
 instructions say: enqueue after `verify` passes, then stop; after a conflict or failure fix
 the branch and call `queue_retry` (a new `queue_enqueue` would be `duplicate-branch`);
-never approve.
+never approve. The MCP tools do not offer `trust_member_config`; `queue_status` text prints
+`CONFIG FROM BRANCH` for a trusted train and says that the diff is in `sluice queue status` and in
+the structured `config_diff`.
+
+**`--trust-member-config`** (human bootstrap, section 12). `sluice queue enqueue
+--trust-member-config` and `sluice queue retry <job> --trust-member-config` send the flag together
+with the agent-detection variables (like the approval) and require the daemon feature. `queue
+status` prints, under the train, `CONFIG FROM BRANCH <branch>: this train runs the branch's own
+.sluice.toml` and the indented diff; the approval plan prints the same before the TTY prompt;
+`--yes` still works for a human without a TTY. A trusted train's job lines never say "this train runs
+the base's gates".
 
 **Agent approval through the CLI** (alpha review finding 2). Without `[queue]
 allow_agent_approval = true` the daemon also refuses (`not-allowed`) a `queue-approve` with
@@ -549,16 +743,22 @@ New crate `sluice-gate-queue` (async, tokio; keeps `sluice-gate-core` sync-only)
 [queue]
 remote = "origin"          # default "origin"
 target = "main"            # default: the remote's HEAD branch
-gates = ["test", "lint"]   # default: gates whose hooks contain pre-push, else every gate
+gates = ["test", "lint"]   # plus every gate whose hooks contain pre-push (the push's hook runs them);
+                           # default: those gates, else every gate
 max_train = 4              # 1 disables batching
 audit_ref = true           # push refs/sluice/landed/<sha> atomically with the target
 push_timeout = "10m"       # covers the pre-push hook and the transfer
 network_timeout = "60s"    # fetch / ls-remote deadline (process group killed)
+prepare = "pnpm install --frozen-lockfile --prefer-offline"  # optional, needs 0.6.0: once per train, before the gates
+prepare_timeout = "10m"    # default 10m, > 0
+prepare_weight = "auto"    # integer >= 1 or "auto", like a gate's weight
 ```
 
 Validation of `[queue]` (the file is rejected otherwise): `max_train >= 1`, `network_timeout
 > 0`, `remote` non-empty, without whitespace or control characters and not starting with `-`,
-every name in `gates` defined in the same file; unknown keys are rejected.
+every name in `gates` defined in the same file, `prepare` not empty after trimming,
+`prepare_timeout > 0`, `prepare_weight >= 1` or `"auto"`; unknown keys are rejected (so a
+binary older than 0.6.0 rejects a file that sets `prepare*`).
 
 User config `[queue]`: `allow_agent_approval = false`, `enabled = true` (a user-level kill
 switch), `tick = "5s"`, `retention = "30d"` (section 4). `allow_agent_approval` is only a user-config key: in `.sluice.toml`
@@ -574,6 +774,17 @@ agents can write) can never grant approval rights.
   rule `Bash(sluice queue approve:*)` for agents. An agent with shell access and push
   credentials can still `git push` directly; protected branches on the forge are the real
   enforcement.
+- **Human bootstrap of the configuration** (ADR-0018 section 6). Gates and `[queue]` come from
+  the base so that a branch cannot choose its own judges; if the base's configuration makes every
+  train fail, the only way out was a direct push. `--trust-member-config` builds one job's train from
+  the member's file instead. It is stricter than approval: the daemon refuses it with `not-allowed`
+  for `via: mcp`, for a CLI request whose environment is detected as an agent's (the same
+  `agent::detect` as the approval, `extension::trust_refusal`), and for an enqueue that declares
+  `caller: agent`, **regardless of `allow_agent_approval`**. Approving a train whose
+  `config_source` is `member` has the same rule, even when agents may approve ordinary trains. The
+  job is alone in its train, the diff of the file is shown before the prompt, and the config hash
+  binds the approval. Like all environment checks it stops an agent's honest shell, not a hostile one
+  (an agent controls its environment): deny the commands in the agent's permissions too.
 - Pushes use the user's own credentials, taken from the approving client's env allowlist
   (`SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `SSH_ASKPASS`, `HOME`,
   `PATH`, `TERM`; `sluice_gate_queue::git::ENV_ALLOWLIST`, mirrored by the CLI and MCP clients
@@ -594,9 +805,12 @@ before sending), stored with the train (`push_env`) until it lands, is
   remote` is a configured remote name that never starts with `-` (section 2), and
   user-derived positional arguments follow `--`.
 - Hooks are disabled in the merge worktree for merge and ref operations. The push runs the
-  repository's `pre-push` hook on purpose (user decision): a Sluice-based hook answers from
-  the markers; any other hook keeps its say, and a hook that declines fails the train
-  rather than being bypassed.
+  repository's `pre-push` hook on purpose (user decision): a Sluice-based hook is answered
+  from the train's own record (section 6) and any other hook keeps its say; a hook that
+  declines fails the train rather than being bypassed. That answer is not a way around a
+  gate: it is given only to a process descending from the daemon's own push, in the
+  daemon's own worktree, while the daemon's snapshot of it is the verified tree, and it
+  names the train and job that ran the gate; a gate the train did not run is refused.
 
 ## 13. Acceptance tests
 
@@ -642,27 +856,35 @@ three attempts, MCP retry/cancel after a conflict.
 | 6 | Reconcile row 8 | Back to `ready`, approval voided: a new approval is required |
 | 7 | Audit ref | Pushed by default, `[queue] audit_ref = false` disables it |
 | 8 | Reconcile trigger | Only on command (`sluice queue reconcile`); daemon start only parks trains |
-| 9 | `pre-push` hook on push | **The hook runs** (no `--no-verify`); a Sluice hook hits the cache, a declining hook fails the train (section 6) |
+| 9 | `pre-push` hook on push | **The hook runs** (no `--no-verify`); a Sluice hook is answered by the daemon from the train (ADR-0018, section 6), a declining hook fails the train |
 
-Answers 2 and 9 changed the draft; the rest confirmed it.
+| 10 | Dead end when the base's configuration cannot pass (2026-10-26) | **Human bootstrap**: `--trust-member-config` on `enqueue`/`retry` builds that job's train from the member's `.sluice.toml`; alone, diff shown, refused to agents and MCP whatever `allow_agent_approval` says; a plain retry clears it (ADR-0018 section 6) |
+
+Answers 2 and 9 changed the draft; the rest confirmed it. Answer 5 has the single, explicit,
+human-only exception of answer 10.
 
 ## 15. Request handling (as implemented)
 
 - `queue-enqueue`: `repo` must be a git common dir and `head_sha` a commit of it; the branch
   must be non-empty and not `HEAD` (`bad-request`); the base is resolved (section 2; a branch
   equal to the target or a checked-out local target → `not-allowed`, any other unusable base
-  → `bad-request`). Duplicate active branch
+  → `bad-request`). With `trust_member_config`, first refused with `not-allowed` for `via: mcp`, an
+  agent-detected `env` or `caller: agent` (`allow_agent_approval` does not matter). Duplicate active branch
   → `duplicate-branch`. The stored `env` is the allowlist only. Paths are canonicalised.
   The audit actor is `via` (`mcp` from the MCP tools, `cli` otherwise); the same holds for
   `queue-retry` and `queue-cancel`.
 - `queue-approve`: `via: mcp` without the user config's `allow_agent_approval` →
   `not-allowed` (checked by the daemon whatever the MCP server did); unknown train →
   `not-found`; a `dissolved` train → `stale-plan` (it was rebuilt; the old plan is void);
+  a train with `config_source = member` through MCP or an agent-detected CLI → `not-allowed`
+  (whatever `allow_agent_approval` says, checked before the state);
   another non-`ready` state → `conflict-state`; a hash that differs from the stored one or
   from the hash recomputed from the rows → `stale-plan`.
 - `queue-retry`: unknown job → `not-found`; a `head_sha` that is not a commit → `bad-request`;
   only `conflict`/`failed` jobs (`conflict-state` otherwise); re-queued at the back with the
-  new head, `attempts + 1`, `solo`, `reason` and `detail` cleared.
+  new head, `attempts + 1`, `solo`, `reason` and `detail` cleared, `trust_config` set to the
+  request's `trust_member_config` (so a plain retry clears it; the flag is refused like an
+  enqueue's, with the request's `env`).
 - `queue-cancel`: see section 3; `landed`/`cancelled` → `conflict-state`.
 - `queue-reconcile`: one result per `needs_reconcile` train; a refusal reports
   `decision: refused` and its reason.

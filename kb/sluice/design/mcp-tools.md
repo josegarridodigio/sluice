@@ -45,7 +45,17 @@ Facts relied on: [[sluice/research/claude-code-facts.md]]. Library notes:
   user said so; never push to the target branch; on a conflict or failed
   gate rebase or fix, commit, `verify`, then `queue_retry` (the job keeps
   the branch, so `queue_enqueue` would answer `duplicate-branch`);
-  `queue_cancel` withdraws a job; error codes start the message.
+  `queue_cancel` withdraws a job; error codes start the message. Since 0.6.0
+  the instructions also say what each queue reason asks of the agent
+  (`prepare_failed` waiting with `base: true`: wait or tell the human; `base:
+  false`, `prepare_dirty`, `gate_modified_tree`, `member_config_invalid`: fix and
+  `queue_retry`; `key_input_failed`: tell the human; `pre_push_hook`: read the
+  hook's output; `hook_gate_unverified`, `config_changed`: the branch changes
+  `.sluice.toml`, tell the human, never use or ask to approve a
+  `--trust-member-config` train), that a gate result `KILLED for lack of memory`
+  is not retried unchanged (reduce its footprint or tell the human), and that a
+  gate `status` shows waiting for memory is only queued. A unit test
+  (`instructions_carry_the_queue_guidance`) pins the key phrases.
 
 ## Tools
 
@@ -142,7 +152,11 @@ e2e   FAIL exit=1 12.3s (job 1761â€¦) log=/home/u/.local/state/sluice/logs/1761â
 pass has no `duration_ms` (a daemon-side `cached` answer carries the
 `done` job's id and prints `PASS (cached)` without the age);
 `not_cached_reason`, `message` and `tail` (failing, timed-out and killed
-gates) appear when relevant; the text tail is `--- last <n> lines of
+gates) appear when relevant; a gate killed for lack of memory (ADR-0019) is
+`killed` with the text line `KILLED for lack of memory after 41.2s (job <id>)
+log=<path>: <the daemon's message, with the job peak and the memory available>`,
+`message` set and `killed_by: "memory"` (absent on any other kill, which prints
+`KILLED after <t> (job <id>) log=<path>`); the text tail is `--- last <n> lines of
 <path> ---` with `n` the real count (`defaults.tail_lines` /
 `cache.tail_lines`); a cancelled gate carries the message `the verification
 was cancelled` unless it is an early-verdict one; the report carries `cancelled: true` after a
@@ -171,7 +185,13 @@ last_run?, message?, scope?: {files, total, hash}}]}` for its current tree
 enabled whatever the environment; `gates` is empty and `tree_unknown`
 set when the tree is unknown), and the text marks that repository's jobs
 with `*`. A non-repository directory is `invalid_params`. Never starts
-the daemon. Text mode mirrors `sluice status`.
+the daemon. The text is a shorter form of `sluice status` (daemon, budget, jobs with
+their reason, totals, the containment block). It prints what the CLI text prints for
+memory, through the same helpers of `sluice-gate-proto` (`MemoryBudget::status_line`,
+`RunningJob::memory_text`, `QueuedJob::memory_text`, `QueuedJob::wait_detail_text`): the
+`memory:` line, `mem <now>/<expected>` per running job, and `(budget: memory)  mem
+<expected>` for a queued gate that waits for memory. The structured report carries the
+same data (`queued[].wait_detail = "memory"`, `budget.memory`, `running[].memory_bytes`).
 
 ### `gate_list`
 
@@ -250,7 +270,11 @@ $CLAUDE_CODE_SESSION_ID, env, via: mcp}`. A branch equal to the target, a
 base that is not a branch and an already active branch are refused by the
 daemon (`not-allowed`, `bad-request`, `duplicate-branch`). A job in
 `conflict` or `failed` still holds its branch: the way back is
-`queue_retry`, not a new `queue_enqueue`.
+`queue_retry`, not a new `queue_enqueue`. A branch whose own `.sluice.toml` does
+not parse is refused by the daemon with `bad-request` and a message starting
+`invalid_config:` when no `base` is given (that file picks the default target).
+The tool never sends `trust_member_config` (human only, see merge-queue.md
+section 12).
 
 Text: `queued <branch> (job <id>) for <remote>/<target>, position N` (no
 `position` when the job is not queued: `, state <state>`), then one line
@@ -267,7 +291,13 @@ its members (`<branch>  job <id>  <state>`, queued position, `CONFLICT
 <paths>` with `rebase '<branch>' onto <target>, run `verify`, then call
 queue_retry with job_id <id>`, failure reasons and, for a `failed` job, `fix
 and commit on '<branch>', run `verify`, then call queue_retry with job_id
-<id>`), its gates (`test PASS 12.4s`, `lint CACHED`), and a
+<id>`), its gates (`test PASS 12.4s`, `lint CACHED`, `test PASS (not cached:
+<reason>)`), the train's `prepare:` line (`prepare: pass 41.2s`, `prepare: fail
+(job <id>)`), the note `changes .sluice.toml (this train runs the base's gates)`
+on a member whose branch changes the configuration, for a `hook_gate_unverified`
+failure the gates that are not in the train and the hint, for a train built
+with `--trust-member-config` the line `CONFIG FROM BRANCH: ... only a human at
+the CLI can approve it` (the diff is in `structured_content.config_diff`), and a
 state line: `ready; a human approves with `sluice queue approve <id>``,
 `approved; the daemon is pushing`, `landed <sha7>`, `push outcome unknown; a
 human runs `sluice queue reconcile``; jobs outside any train follow under
@@ -313,7 +343,8 @@ train view.
 
 ### `queue_retry`
 
-Inputs: `working_directory`, `job_id`. Fetches `queue-status` for the
+Inputs: `working_directory`, `job_id` (no trust flag: a retry through MCP always
+goes back to the target's configuration). Fetches `queue-status` for the
 repository (`not-found` when the job is not one of its jobs), re-reads
 `refs/heads/<job branch>^{commit}` in that repository like `sluice queue
 retry` (`unknown-branch` when the branch is gone) and sends `queue-retry

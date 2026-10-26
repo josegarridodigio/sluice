@@ -456,7 +456,7 @@ fn client_log_records_the_reason_when_the_cache_is_off() {
     assert!(!lines[0].contains("reason="), "{}", lines[0]);
     assert_eq!(field(&lines[1], "reason"), "skip-worktree", "{}", lines[1]);
     assert!(
-        lines[1].contains(" tree=- reason=skip-worktree decision="),
+        lines[1].contains(" tree=- key=- reason=skip-worktree decision="),
         "{}",
         lines[1]
     );

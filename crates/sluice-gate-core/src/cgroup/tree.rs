@@ -28,13 +28,17 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::config::{ContainmentConfig, EnvMap};
 
 use super::detect::{
-    Capabilities, Controllers, PressurePolicy, leaf_controllers, manager_cgroup_dir,
+    Capabilities, Controllers, PressurePolicy, derive_gates_policy, leaf_controllers,
+    manager_cgroup_dir,
 };
 use super::systemd::{self, OomProperties, ScopeSpec};
 use super::{CGROUP_MOUNT, CgResult, CgroupError, MAX_SESSION_ID};
 
 /// Extended attribute that asks `systemd-oomd` to avoid killing a cgroup.
 pub const OOMD_AVOID_XATTR: &str = "user.oomd_avoid";
+/// Extended attribute that makes `systemd-oomd` ignore a cgroup as a
+/// candidate (never chosen, unlike `avoid`, which only reorders).
+pub const OOMD_OMIT_XATTR: &str = "user.oomd_omit";
 
 /// Names of the unit and cgroup directories of one Sluice tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,8 +254,16 @@ pub struct TreeSettings {
     pub memory_high: Option<u64>,
     /// Opt-in `memory.max` per session, bytes.
     pub memory_max: Option<u64>,
+    /// Optional `memory.max` of `jobs/` (ADR-0019 piece 5), bytes; `None`
+    /// writes `max`, so removing the key undoes a previous value.
+    pub gates_memory_max: Option<u64>,
+    /// Optional `memory.swap.max` of `jobs/`, bytes; `None` writes `max`.
+    pub gates_memory_swap_max: Option<u64>,
     /// Own memory pressure policy of the agents scope.
     pub oom: Option<OomProperties>,
+    /// Own memory pressure policy of the daemon (gates') scope: the agents'
+    /// limit with a shorter duration, present exactly when `oom` is.
+    pub daemon_oom: Option<OomProperties>,
 }
 
 impl TreeSettings {
@@ -268,6 +280,8 @@ impl TreeSettings {
     ) -> Self {
         let cpu = caps.controllers.cpu;
         let weight = |w: u32| cpu.then_some(w);
+        let oomd = caps.oomd_policy_enabled(cfg);
+        let gates = derive_gates_policy(pressure);
         Self {
             slice_weight: weight(cfg.slice_cpu_weight),
             daemon_weight: weight(cfg.gates_cpu_weight),
@@ -281,9 +295,19 @@ impl TreeSettings {
                 .map(|p| u64::from(p) * u64::from(cpus.max(1)) * 10_000),
             memory_high: cfg.memory_high_bytes().filter(|_| caps.controllers.memory),
             memory_max: cfg.memory_max_bytes().filter(|_| caps.controllers.memory),
-            oom: caps.oomd_policy_enabled(cfg).then_some(OomProperties {
+            gates_memory_max: cfg
+                .gates_memory_max_bytes()
+                .filter(|_| caps.controllers.memory),
+            gates_memory_swap_max: cfg
+                .gates_memory_swap_max_bytes()
+                .filter(|_| caps.controllers.memory),
+            oom: oomd.then_some(OomProperties {
                 limit_percent: pressure.limit_percent,
                 duration: Some(pressure.duration),
+            }),
+            daemon_oom: oomd.then_some(OomProperties {
+                limit_percent: gates.limit_percent,
+                duration: Some(gates.duration),
             }),
         }
     }
@@ -311,8 +335,11 @@ pub struct Tree {
 /// [`CgroupError::Io`] (permission denied, read-only, no such file, busy).
 pub fn write_control(dir: &Path, name: &str, value: &str) -> CgResult<()> {
     let path = dir.join(name);
+    // Truncating is what `echo value > file` does; cgroupfs ignores it, and a
+    // plain file (tests, fixtures) then holds exactly the value written.
     fs::OpenOptions::new()
         .write(true)
+        .truncate(true)
         .open(&path)
         .and_then(|mut f| f.write_all(value.as_bytes()))
         .map_err(|e| CgroupError::io("writing cgroup file", path, e))
@@ -419,18 +446,43 @@ pub fn read_usage(dir: &Path) -> Usage {
     }
 }
 
-/// Sets `user.oomd_avoid=1` on `dir`. `true` when it was set; unsupported
-/// filesystems and permission failures return `false` silently.
+/// Sets the oomd xattr `name` (`user.oomd_avoid` or `user.oomd_omit`) to `1`
+/// on `dir`. `true` when it was set; unsupported filesystems (`EOPNOTSUPP`)
+/// and permission failures return `false` silently.
+#[must_use]
+pub fn set_oomd_xattr(dir: &Path, name: &str) -> bool {
+    rustix::fs::setxattr(dir, name, b"1", rustix::fs::XattrFlags::empty()).is_ok()
+}
+
+/// Reads the oomd xattr `name` back (`true` when set to `1`).
+#[must_use]
+pub fn has_oomd_xattr(dir: &Path, name: &str) -> bool {
+    let mut buf = [0u8; 4];
+    rustix::fs::getxattr(dir, name, &mut buf).is_ok_and(|n| n >= 1 && buf[0] == b'1')
+}
+
+/// Sets `user.oomd_avoid=1` on `dir` (see [`set_oomd_xattr`]).
 #[must_use]
 pub fn set_oomd_avoid(dir: &Path) -> bool {
-    rustix::fs::setxattr(dir, OOMD_AVOID_XATTR, b"1", rustix::fs::XattrFlags::empty()).is_ok()
+    set_oomd_xattr(dir, OOMD_AVOID_XATTR)
 }
 
 /// Reads `user.oomd_avoid` back (`true` when set to `1`).
 #[must_use]
 pub fn has_oomd_avoid(dir: &Path) -> bool {
-    let mut buf = [0u8; 4];
-    rustix::fs::getxattr(dir, OOMD_AVOID_XATTR, &mut buf).is_ok_and(|n| n >= 1 && buf[0] == b'1')
+    has_oomd_xattr(dir, OOMD_AVOID_XATTR)
+}
+
+/// Sets `user.oomd_omit=1` on `dir` (see [`set_oomd_xattr`]).
+#[must_use]
+pub fn set_oomd_omit(dir: &Path) -> bool {
+    set_oomd_xattr(dir, OOMD_OMIT_XATTR)
+}
+
+/// Reads `user.oomd_omit` back (`true` when set to `1`).
+#[must_use]
+pub fn has_oomd_omit(dir: &Path) -> bool {
+    has_oomd_xattr(dir, OOMD_OMIT_XATTR)
 }
 
 fn wait_for(path: &Path, timeout: Duration) -> bool {
@@ -509,6 +561,7 @@ impl Tree {
         first_leaf: &str,
         pid: u32,
         nodes: &[&str],
+        omit_first_leaf: bool,
     ) -> CgResult<()> {
         self.ensure_slice()?;
         if !scope_dir.join("cgroup.procs").exists() {
@@ -535,6 +588,12 @@ impl Tree {
         }
         let leaf = scope_dir.join(first_leaf);
         make_dir(&leaf)?;
+        if omit_first_leaf {
+            // Before anything moves in: oomd must never pick the daemon (a
+            // dead daemon abandons its running jobs). Unsupported filesystems
+            // are tolerated.
+            let _ = set_oomd_omit(&leaf);
+        }
         // A process that is not in the scope yet (a second start finding the
         // scope alive) may live where a direct write is refused, for example
         // a login session scope: `move_pid` then asks the manager.
@@ -563,22 +622,60 @@ impl Tree {
     ///
     /// Tool or filesystem errors; the caller keeps running uncontained.
     pub fn ensure_daemon_scope(&self, pid: u32) -> CgResult<()> {
-        let spec = ScopeSpec {
+        let spec = self.daemon_spec(pid);
+        let scope_dir = self.layout.daemon_scope_dir();
+        let reused = scope_dir.join("cgroup.procs").exists();
+        self.ensure_scope(&spec, &scope_dir, "daemon", pid, &["jobs"], true)?;
+        if let (true, Some(oom)) = (reused, spec.oom) {
+            // A scope that outlived its daemon (jobs kept it alive) may come
+            // from a version without the policy: align it at runtime. Best
+            // effort, like the rest of the policy (inert without oomd).
+            let _ = systemd::set_scope_properties(
+                &self.env,
+                &spec.name,
+                &systemd::oom_assignments(&oom),
+            );
+        }
+        // Best effort like the policy: a ceiling that cannot be written must
+        // not stop the daemon from containing its jobs.
+        let _ = self.apply_gates_ceiling();
+        Ok(())
+    }
+
+    /// Writes the optional ceiling of the gates on `jobs/` and only there:
+    /// never on a job leaf (the leaf's own `oom.group` makes the kernel kill
+    /// the one job) and never on the scope or above (the daemon is in it).
+    /// Unset writes `max`, which undoes a value from an earlier config. A
+    /// kernel without the memory controller has no such file: skipped.
+    ///
+    /// # Errors
+    ///
+    /// [`CgroupError::Io`] when a present control file refuses the write.
+    pub fn apply_gates_ceiling(&self) -> CgResult<()> {
+        let jobs = self.layout.jobs_dir();
+        let value = |b: Option<u64>| b.map_or_else(|| "max".to_owned(), |b| b.to_string());
+        write_if_present(&jobs, "memory.max", &value(self.settings.gates_memory_max))?;
+        write_if_present(
+            &jobs,
+            "memory.swap.max",
+            &value(self.settings.gates_memory_swap_max),
+        )?;
+        Ok(())
+    }
+
+    /// The daemon scope's unit: with the gates' own memory pressure policy
+    /// (the agents' limit, a shorter duration) exactly when the agents'
+    /// policy is created, so oomd tries the gates first.
+    fn daemon_spec(&self, pid: u32) -> ScopeSpec {
+        ScopeSpec {
             name: self.layout.daemon_scope.clone(),
             slice: self.layout.slice.clone(),
             pids: vec![pid],
             description: "Sluice daemon and gate jobs".to_owned(),
             cpu_weight: self.settings.daemon_weight,
             cpu_quota_usec_per_sec: None,
-            oom: None,
-        };
-        self.ensure_scope(
-            &spec,
-            &self.layout.daemon_scope_dir(),
-            "daemon",
-            pid,
-            &["jobs"],
-        )
+            oom: self.settings.daemon_oom,
+        }
     }
 
     /// Creates the agents scope adopting the `holder` process (a tiny process
@@ -604,6 +701,7 @@ impl Tree {
             "holder",
             holder_pid,
             &[],
+            false,
         )
     }
 
@@ -666,6 +764,14 @@ impl Tree {
         }
         let dir = self.layout.jobs_dir().join(job_id);
         make_dir(&dir)?;
+        // A kill inside the job (the kernel's, global or in-cgroup, or the
+        // oomd one) takes the whole job: a suite whose worker was killed
+        // must not go on and report "a test failed" (ADR-0019 piece 2). Only
+        // on the leaf: on `jobs/` or above it would widen the kill (the
+        // kernel picks the highest ancestor with the flag).
+        // Best effort: a kernel or delegation without the file just keeps
+        // the per-process kill.
+        let _ = write_if_present(&dir, "memory.oom.group", "1");
         Ok(Leaf {
             dir,
             unit: self.layout.daemon_scope.clone(),
@@ -928,7 +1034,10 @@ mod tests {
                 cpu_quota_usec_per_sec: None,
                 memory_high: None,
                 memory_max: None,
+                gates_memory_max: None,
+                gates_memory_swap_max: None,
                 oom: None,
+                daemon_oom: None,
             },
             EnvMap::new(),
         );
@@ -959,6 +1068,100 @@ mod tests {
     }
 
     #[test]
+    fn a_job_leaf_gets_oom_group_and_nothing_above_it_does() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = Layout {
+            mount: root.path().to_path_buf(),
+            user_manager: root.path().to_path_buf(),
+            slice: "x.slice".into(),
+            daemon_scope: "x-daemon.scope".into(),
+            agents_scope: "x-agents.scope".into(),
+        };
+        let tree = Tree::new(
+            layout.clone(),
+            TreeSettings {
+                slice_weight: None,
+                daemon_weight: None,
+                agents_weight: None,
+                ui_weight: 400,
+                tools_weight: 25,
+                pids_max: None,
+                cpu_quota_usec_per_sec: None,
+                memory_high: None,
+                memory_max: None,
+                gates_memory_max: None,
+                gates_memory_swap_max: None,
+                oom: None,
+                daemon_oom: None,
+            },
+            EnvMap::new(),
+        );
+        // A real cgroup directory has the file the moment it is created;
+        // here it is put there before the leaf is asked for.
+        let jobs = layout.jobs_dir();
+        fs::create_dir_all(jobs.join("j1")).unwrap();
+        fs::write(jobs.join("j1/memory.oom.group"), "0\n").unwrap();
+        fs::write(jobs.join("memory.oom.group"), "0\n").unwrap();
+        let leaf = tree.job_leaf("j1").unwrap();
+        assert_eq!(
+            fs::read_to_string(leaf.dir.join("memory.oom.group"))
+                .unwrap()
+                .trim(),
+            "1"
+        );
+        assert_eq!(
+            fs::read_to_string(jobs.join("memory.oom.group")).unwrap(),
+            "0\n",
+            "jobs/ is never written"
+        );
+        // Without the file (no memory controller) the leaf is still made and
+        // the file is not invented.
+        let leaf = tree.job_leaf("j2").unwrap();
+        assert!(leaf.dir.is_dir());
+        assert!(!leaf.dir.join("memory.oom.group").exists());
+    }
+
+    #[test]
+    fn the_ceiling_is_written_on_jobs_only_and_unset_means_max() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = Layout {
+            mount: root.path().to_path_buf(),
+            user_manager: root.path().to_path_buf(),
+            slice: "x.slice".into(),
+            daemon_scope: "x-daemon.scope".into(),
+            agents_scope: "x-agents.scope".into(),
+        };
+        let mut settings = settings_with_policies(None, None);
+        settings.gates_memory_max = Some(20 << 30);
+        settings.gates_memory_swap_max = Some(1 << 30);
+        let tree = Tree::new(layout.clone(), settings.clone(), EnvMap::new());
+        let jobs = layout.jobs_dir();
+        let scope = layout.daemon_scope_dir();
+        fs::create_dir_all(jobs.join("j1")).unwrap();
+        for dir in [&jobs, &scope, &jobs.join("j1")] {
+            for f in ["memory.max", "memory.swap.max"] {
+                fs::write(dir.join(f), "max\n").unwrap();
+            }
+        }
+        let read = |dir: &Path, f: &str| fs::read_to_string(dir.join(f)).unwrap();
+        tree.apply_gates_ceiling().unwrap();
+        assert_eq!(read(&jobs, "memory.max"), (20u64 << 30).to_string());
+        assert_eq!(read(&jobs, "memory.swap.max"), (1u64 << 30).to_string());
+        for untouched in [scope, jobs.join("j1")] {
+            assert_eq!(read(&untouched, "memory.max"), "max\n");
+            assert_eq!(read(&untouched, "memory.swap.max"), "max\n");
+        }
+        // removing the key undoes the value
+        settings.gates_memory_max = None;
+        settings.gates_memory_swap_max = None;
+        Tree::new(layout, settings, EnvMap::new())
+            .apply_gates_ceiling()
+            .unwrap();
+        assert_eq!(read(&jobs, "memory.max"), "max");
+        assert_eq!(read(&jobs, "memory.swap.max"), "max");
+    }
+
+    #[test]
     fn bad_names_never_touch_the_filesystem() {
         let tree = Tree::new(
             Layout::with_prefix(Path::new("/nonexistent"), 1, "x"),
@@ -972,7 +1175,10 @@ mod tests {
                 cpu_quota_usec_per_sec: None,
                 memory_high: None,
                 memory_max: None,
+                gates_memory_max: None,
+                gates_memory_swap_max: None,
                 oom: None,
+                daemon_oom: None,
             },
             EnvMap::new(),
         );
@@ -1020,15 +1226,107 @@ mod tests {
                 duration: Some(Duration::from_secs(5))
             })
         );
+        assert_eq!(
+            full.daemon_oom,
+            Some(OomProperties {
+                limit_percent: 30,
+                duration: Some(Duration::from_secs(3))
+            }),
+            "same limit, half the duration, rounded up"
+        );
         let nocpu =
             TreeSettings::from_config(&cfg, &evaluate(facts("memory pids", true, 255)), p, 8);
         assert_eq!(nocpu.slice_weight, None);
         assert_eq!(nocpu.cpu_quota_usec_per_sec, None);
         assert_eq!(nocpu.oom, None, "systemd 255 has no per-unit duration");
+        assert_eq!(nocpu.daemon_oom, None);
         let nomem = TreeSettings::from_config(&cfg, &evaluate(facts("cpu pids", true, 259)), p, 8);
         assert_eq!(nomem.oom, None);
+        assert_eq!(nomem.daemon_oom, None);
         let noopt =
             TreeSettings::from_config(&cfg, &evaluate(facts("cpu memory pids", false, 259)), p, 8);
         assert_eq!(noopt.oom, None, "no systemd-oomd, no policy");
+        assert_eq!(
+            noopt.daemon_oom, None,
+            "the gates' policy follows the agents'"
+        );
+        let off = ContainmentConfig {
+            memory_policy: crate::config::MemoryPolicy::None,
+            ..cfg.clone()
+        };
+        let disabled =
+            TreeSettings::from_config(&off, &evaluate(facts("cpu memory pids", true, 259)), p, 8);
+        assert_eq!((disabled.oom, disabled.daemon_oom), (None, None));
+    }
+
+    fn settings_with_policies(
+        agents: Option<OomProperties>,
+        daemon: Option<OomProperties>,
+    ) -> TreeSettings {
+        TreeSettings {
+            slice_weight: None,
+            daemon_weight: Some(50),
+            agents_weight: None,
+            ui_weight: 400,
+            tools_weight: 25,
+            pids_max: None,
+            cpu_quota_usec_per_sec: None,
+            memory_high: None,
+            memory_max: None,
+            gates_memory_max: None,
+            gates_memory_swap_max: None,
+            oom: agents,
+            daemon_oom: daemon,
+        }
+    }
+
+    #[test]
+    fn the_daemon_scope_carries_the_gates_policy_only_when_supported() {
+        let layout = Layout::with_prefix(Path::new("/nonexistent"), 1000, "x");
+        let oom = OomProperties {
+            limit_percent: 30,
+            duration: Some(Duration::from_secs(3)),
+        };
+        let with = Tree::new(
+            layout.clone(),
+            settings_with_policies(
+                Some(OomProperties {
+                    duration: Some(Duration::from_secs(5)),
+                    ..oom
+                }),
+                Some(oom),
+            ),
+            EnvMap::new(),
+        );
+        let joined = systemd::start_transient_scope_args(&with.daemon_spec(7)).join(" ");
+        assert!(
+            joined.contains("ManagedOOMMemoryPressure s kill"),
+            "{joined}"
+        );
+        assert!(joined.contains("ManagedOOMMemoryPressureDurationUSec t 3000000"));
+        assert!(joined.contains(&format!(
+            "ManagedOOMMemoryPressureLimit u {}",
+            systemd::percent_to_fixed(30)
+        )));
+        let without = Tree::new(layout, settings_with_policies(None, None), EnvMap::new());
+        let plain = systemd::start_transient_scope_args(&without.daemon_spec(7)).join(" ");
+        assert!(!plain.contains("ManagedOOM"), "{plain}");
+        assert!(plain.contains("CPUWeight t 50"));
+    }
+
+    #[test]
+    fn the_daemon_leaf_is_omitted_before_the_daemon_moves_in() {
+        let root = tempfile::tempdir().unwrap();
+        let leaf = root.path().join("daemon");
+        fs::create_dir(&leaf).unwrap();
+        if !set_oomd_omit(&leaf) {
+            println!("skipped: the temporary directory's filesystem has no user xattrs");
+            return;
+        }
+        assert!(has_oomd_omit(&leaf));
+        assert!(!has_oomd_avoid(&leaf), "omit is its own attribute");
+        // an unsupported or missing target is tolerated, never a panic
+        assert!(!set_oomd_omit(&root.path().join("missing")));
+        assert!(!has_oomd_omit(&root.path().join("missing")));
     }
 }

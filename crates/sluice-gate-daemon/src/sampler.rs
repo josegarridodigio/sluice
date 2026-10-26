@@ -10,6 +10,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 
+use crate::memory::WorkingSet;
+
 /// Clock ticks per second of `/proc/<pid>/stat` times (`USER_HZ`, 100 on
 /// every Linux architecture Sluice supports).
 pub const USER_HZ: u64 = 100;
@@ -306,6 +308,14 @@ pub struct JobUsage {
     observed: u32,
     /// CPU `some avg10` below 10 when the job started (fallback check).
     pub calm_at_start: bool,
+    /// Working set at the last memory sample, bytes.
+    mem_now: u64,
+    /// Largest sampled working set, bytes.
+    mem_peak: u64,
+    /// Largest `memory.peak` read (page cache included).
+    cgroup_peak: Option<u64>,
+    /// Memory samples taken.
+    mem_samples: u32,
 }
 
 impl JobUsage {
@@ -326,6 +336,31 @@ impl JobUsage {
         if let Some(t) = leader {
             self.leader_ticks = self.leader_ticks.max(t);
         }
+    }
+
+    /// Adds one tick's memory reading (ADR-0019): the last value and the
+    /// running peak of the working set.
+    pub fn observe_memory(&mut self, ws: WorkingSet) {
+        self.mem_samples += 1;
+        self.mem_now = ws.bytes;
+        self.mem_peak = self.mem_peak.max(ws.bytes);
+        self.cgroup_peak = self.cgroup_peak.max(ws.peak);
+    }
+
+    /// Working set at the last sample; `None` before the first.
+    pub fn memory_now(&self) -> Option<u64> {
+        (self.mem_samples > 0).then_some(self.mem_now)
+    }
+
+    /// Largest sampled working set; `None` when nothing was sampled or it
+    /// never exceeded zero (nothing to learn from).
+    pub fn memory_peak(&self) -> Option<u64> {
+        (self.mem_peak > 0).then_some(self.mem_peak)
+    }
+
+    /// Largest `memory.peak` read from the job's cgroup.
+    pub fn cgroup_peak(&self) -> Option<u64> {
+        self.cgroup_peak
     }
 
     /// Mean runnable threads so far over `wall_ms`; `None` before a sample.
@@ -553,6 +588,29 @@ mod tests {
         assert_eq!(d.run_delay_ms, Some(1_000));
         assert_eq!(d.demand_milli, 2_750);
         assert!((u.demand_so_far(2_000).unwrap() - 2.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn job_usage_keeps_the_last_and_the_largest_working_set() {
+        let ws = |bytes, peak| WorkingSet { bytes, peak };
+        let mut u = JobUsage::default();
+        assert_eq!(
+            (u.memory_now(), u.memory_peak(), u.cgroup_peak()),
+            (None, None, None)
+        );
+        u.observe_memory(ws(0, None));
+        assert_eq!(u.memory_now(), Some(0), "sampled, and empty");
+        assert_eq!(u.memory_peak(), None, "nothing to learn from zeros");
+        u.observe_memory(ws(300, Some(900)));
+        u.observe_memory(ws(700, Some(1_500)));
+        u.observe_memory(ws(200, Some(1_400)));
+        assert_eq!(u.memory_now(), Some(200), "the last sample");
+        assert_eq!(u.memory_peak(), Some(700), "the running peak");
+        assert_eq!(u.cgroup_peak(), Some(1_500), "memory.peak never goes down");
+        // A job with no leaf has no memory.peak.
+        let mut v = JobUsage::default();
+        v.observe_memory(ws(5, None));
+        assert_eq!(v.cgroup_peak(), None);
     }
 
     #[test]

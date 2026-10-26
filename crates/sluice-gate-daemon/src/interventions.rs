@@ -5,7 +5,11 @@
 //!
 //! - [`MemoryWatcher`]: the `oom_kill` and `oom_group_kill` counters of
 //!   `memory.events` in the leaves under the agents scope and `jobs/` (the
-//!   kernel OOM killer acted inside that cgroup);
+//!   kernel OOM killer acted, counted in the victim's cgroup also when the
+//!   kill was a global one). A job leaf is removed when its job ends, so the
+//!   daemon reads it itself at that moment ([`MemoryWatcher::settle_job`]) and
+//!   the watcher keeps a backstop on the counters of `jobs/` and of the daemon
+//!   scope, which outlive their children ([`MemoryWatcher::backstop`]);
 //! - [`parse_oomd_journal`]: `systemd-oomd` lines of the journal that name a
 //!   Sluice cgroup (`Killed <path> due to memory pressure ...`).
 //!
@@ -17,7 +21,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use sluice_gate_core::cgroup::tree::{MemoryEvents, parse_memory_events};
+use sluice_gate_core::cgroup::tree::parse_memory_events;
 
 /// Cause recorded for an `oom_kill` increment.
 pub const CAUSE_OOM_KILL: &str = "oom_kill";
@@ -27,6 +31,8 @@ pub const CAUSE_OOM_GROUP_KILL: &str = "oom_group_kill";
 pub const CAUSE_OOMD_PRESSURE: &str = "oomd_memory_pressure";
 /// Cause recorded for a `systemd-oomd` kill on swap usage.
 pub const CAUSE_OOMD_SWAP: &str = "oomd_swap";
+/// Cause recorded when the Sluice memory guard cancels one of Sluice's own jobs.
+pub const CAUSE_SLUICE_MEMORY_GUARD: &str = "sluice_memory_guard";
 
 /// One recorded intervention.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +74,80 @@ pub fn leaf_identity(scope_dir: &Path, dir: &Path) -> (Option<String>, String) {
 pub struct MemoryWatcher {
     seen: BTreeMap<PathBuf, (u64, u64)>,
     primed: bool,
+    backstop: Option<Backstop>,
+}
+
+/// `[oom_kill, oom_group_kill]`.
+type Kills = [u64; 2];
+
+fn kills_of(dir: &Path) -> Option<Kills> {
+    let text = fs::read_to_string(dir.join("memory.events")).ok()?;
+    let e = parse_memory_events(&text);
+    Some([e.oom_kill, e.oom_group_kill])
+}
+
+fn sub(a: Kills, b: Kills) -> Kills {
+    [a[0].saturating_sub(b[0]), a[1].saturating_sub(b[1])]
+}
+
+fn add(a: Kills, b: Kills) -> Kills {
+    [a[0] + b[0], a[1] + b[1]]
+}
+
+/// State of the aggregate counters: `memory.events` of `jobs/` and of the
+/// daemon scope count the kills of every descendant, also of the leaves that
+/// were removed since, so growth no leaf explained is a job that died
+/// unseen.
+#[derive(Debug)]
+struct Backstop {
+    jobs_dir: PathBuf,
+    scope_dir: PathBuf,
+    last_jobs: Option<Kills>,
+    last_scope: Option<Kills>,
+    /// Kills of job leaves already turned into rows since the last pass.
+    explained: Kills,
+    /// Unexplained growth of `jobs/` and of the scope outside `jobs/` left
+    /// at the previous pass (reported when it is still there at the next, so
+    /// a leaf read a moment later does not make a false report).
+    pending_jobs: Kills,
+    pending_scope: Kills,
+}
+
+/// One row per counter of `now` that exceeds `before`.
+fn growth_rows(
+    scope: &Path,
+    dir: &Path,
+    now_ms: u64,
+    before: Kills,
+    now: Kills,
+) -> Vec<InterventionRow> {
+    let (session, leaf) = leaf_identity(scope, dir);
+    let mut rows = Vec::new();
+    for (cause, n, b, what) in [
+        (
+            CAUSE_OOM_KILL,
+            now[0],
+            before[0],
+            "process(es) killed by the kernel OOM killer",
+        ),
+        (
+            CAUSE_OOM_GROUP_KILL,
+            now[1],
+            before[1],
+            "group kill(s) by the kernel OOM killer",
+        ),
+    ] {
+        if n > b {
+            rows.push(InterventionRow {
+                at_ms: now_ms,
+                session: session.clone(),
+                leaf: leaf.clone(),
+                cause: cause.to_owned(),
+                detail: Some(format!("{} {what}", n - b)),
+            });
+        }
+    }
+    rows
 }
 
 impl MemoryWatcher {
@@ -77,6 +157,24 @@ impl MemoryWatcher {
         Self::default()
     }
 
+    /// A watcher that also keeps the aggregate counters of `jobs_dir` and
+    /// `scope_dir` ([`MemoryWatcher::backstop`]).
+    #[must_use]
+    pub fn with_backstop(jobs_dir: PathBuf, scope_dir: PathBuf) -> Self {
+        Self {
+            backstop: Some(Backstop {
+                jobs_dir,
+                scope_dir,
+                last_jobs: None,
+                last_scope: None,
+                explained: [0; 2],
+                pending_jobs: [0; 2],
+                pending_scope: [0; 2],
+            }),
+            ..Self::default()
+        }
+    }
+
     /// Reads `memory.events` of each of `leaves` (`(scope_dir, leaf_dir)`
     /// pairs) and returns one row per counter that grew since the last poll.
     /// Leaves that disappeared are forgotten.
@@ -84,53 +182,124 @@ impl MemoryWatcher {
         let mut rows = Vec::new();
         let mut alive: BTreeMap<PathBuf, (u64, u64)> = BTreeMap::new();
         for (scope, dir) in leaves {
-            let Ok(text) = fs::read_to_string(dir.join("memory.events")) else {
+            let Some(now) = kills_of(dir) else {
                 continue;
             };
-            let MemoryEvents {
-                oom_kill,
-                oom_group_kill,
-                ..
-            } = parse_memory_events(&text);
             let previous = match self.seen.get(dir) {
                 Some(p) => Some(*p),
                 None if self.primed => Some((0, 0)),
                 None => None,
             };
-            alive.insert(dir.clone(), (oom_kill, oom_group_kill));
+            alive.insert(dir.clone(), (now[0], now[1]));
             let Some((kill0, group0)) = previous else {
                 continue;
             };
-            let (session, leaf) = leaf_identity(scope, dir);
-            for (cause, now, before, what) in [
-                (
-                    CAUSE_OOM_KILL,
-                    oom_kill,
-                    kill0,
-                    "process(es) killed by the kernel OOM killer",
-                ),
-                (
-                    CAUSE_OOM_GROUP_KILL,
-                    oom_group_kill,
-                    group0,
-                    "group kill(s) by the kernel OOM killer",
-                ),
-            ] {
-                if now > before {
-                    rows.push(InterventionRow {
-                        at_ms: now_ms,
-                        session: session.clone(),
-                        leaf: leaf.clone(),
-                        cause: cause.to_owned(),
-                        detail: Some(format!("{} {what}", now - before)),
-                    });
-                }
+            let grown = growth_rows(scope, dir, now_ms, [kill0, group0], now);
+            if let Some(b) = &mut self.backstop
+                && dir.parent() == Some(b.jobs_dir.as_path())
+            {
+                b.explained = add(b.explained, sub(now, [kill0, group0]));
             }
+            rows.extend(grown);
         }
         self.seen = alive;
         self.primed = true;
         rows
     }
+
+    /// Settles a job leaf the daemon read itself at the end of its job (the
+    /// leaf is removed right after, so the periodic poll would never see
+    /// it): the rows for what grew beyond what [`MemoryWatcher::poll`]
+    /// already reported, and the kills counted as explained for
+    /// [`MemoryWatcher::backstop`].
+    pub fn settle_job(
+        &mut self,
+        scope: &Path,
+        dir: &Path,
+        now_ms: u64,
+        kills: (u64, u64),
+    ) -> Vec<InterventionRow> {
+        let before = self.seen.remove(dir).unwrap_or((0, 0));
+        let now = [kills.0, kills.1];
+        let grown = sub(now, [before.0, before.1]);
+        if let Some(b) = &mut self.backstop {
+            b.explained = add(b.explained, grown);
+        }
+        growth_rows(scope, dir, now_ms, [before.0, before.1], now)
+    }
+
+    /// Rows for kills that happened under `jobs/` (or elsewhere in the
+    /// daemon scope) that no job leaf explained: a gate job died of OOM and
+    /// its leaf was gone before anybody read it. Growth is reported when it
+    /// is still unexplained at the next pass. The first pass only takes the
+    /// baseline.
+    pub fn backstop(&mut self, now_ms: u64) -> Vec<InterventionRow> {
+        let Some(b) = &mut self.backstop else {
+            return Vec::new();
+        };
+        let (Some(jobs), Some(scope)) = (kills_of(&b.jobs_dir), kills_of(&b.scope_dir)) else {
+            return Vec::new();
+        };
+        let (Some(last_jobs), Some(last_scope)) = (b.last_jobs, b.last_scope) else {
+            b.last_jobs = Some(jobs);
+            b.last_scope = Some(scope);
+            b.explained = [0; 2];
+            return Vec::new();
+        };
+        let jobs_delta = sub(jobs, last_jobs);
+        let scope_delta = sub(scope, last_scope);
+        // Kills in the scope that were not in `jobs/`: `daemon/` itself.
+        let outside = sub(scope_delta, jobs_delta);
+        let jobs_left = sub(add(b.pending_jobs, jobs_delta), b.explained);
+        let scope_left = add(b.pending_scope, outside);
+        let mut rows = Vec::new();
+        let (report_jobs, keep_jobs) = settle_pending(b.pending_jobs, jobs_left);
+        b.pending_jobs = keep_jobs;
+        let (report_scope, keep_scope) = settle_pending(b.pending_scope, scope_left);
+        b.pending_scope = keep_scope;
+        let (jobs_dir, scope_dir) = (b.jobs_dir.clone(), b.scope_dir.clone());
+        rows.extend(unmatched_rows(
+            &jobs_dir,
+            &scope_dir,
+            now_ms,
+            report_jobs,
+            "a gate job died of OOM (job unknown)",
+        ));
+        rows.extend(unmatched_rows(
+            &scope_dir.join("daemon"),
+            &scope_dir,
+            now_ms,
+            report_scope,
+            "a process of the daemon's own cgroup died of OOM",
+        ));
+        b.last_jobs = Some(jobs);
+        b.last_scope = Some(scope);
+        b.explained = [0; 2];
+        rows
+    }
+}
+
+/// `(to report now, to keep for the next pass)` of an unexplained count:
+/// reported when it was already unexplained at the previous pass.
+fn settle_pending(previous: Kills, left: Kills) -> (Kills, Kills) {
+    let report: Kills = std::array::from_fn(|k| if previous[k] > 0 { left[k] } else { 0 });
+    let keep: Kills = std::array::from_fn(|k| if report[k] > 0 { 0 } else { left[k] });
+    (report, keep)
+}
+
+fn unmatched_rows(
+    dir: &Path,
+    scope: &Path,
+    now_ms: u64,
+    kills: Kills,
+    what: &str,
+) -> Vec<InterventionRow> {
+    let mut rows = growth_rows(scope, dir, now_ms, [0; 2], kills);
+    for row in &mut rows {
+        let n = row.detail.take().unwrap_or_default();
+        row.detail = Some(format!("{what}: {n}"));
+    }
+    rows
 }
 
 /// Leaf cgroups to watch: `s-*/{ui,tools}` under `agents_dir` and every
@@ -241,6 +410,16 @@ pub fn parse_oomd_journal(text: &str) -> Vec<InterventionRow> {
         });
     }
     rows
+}
+
+/// The first `systemd-oomd` kill in `text` (journal output) that names the
+/// leaf of job `job_id` (`jobs/<id>`).
+#[must_use]
+pub fn find_job_kill(text: &str, job_id: &str) -> Option<InterventionRow> {
+    let leaf = format!("jobs/{job_id}");
+    parse_oomd_journal(text)
+        .into_iter()
+        .find(|r| r.leaf == leaf)
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -384,5 +563,126 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].leaf, "s-x/ui");
         assert_eq!(rows[0].session.as_deref(), Some("x"));
+    }
+
+    fn set_events(dir: &Path, kill: u64, group: u64) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("memory.events"), events(kill, group)).unwrap();
+    }
+
+    /// `daemon.scope/{jobs,daemon}` with counters, and a backstop watcher.
+    fn backstop_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, MemoryWatcher) {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = dir.path().join("daemon.scope");
+        let jobs = scope.join("jobs");
+        set_events(&scope, 0, 0);
+        set_events(&jobs, 0, 0);
+        set_events(&scope.join("daemon"), 0, 0);
+        let w = MemoryWatcher::with_backstop(jobs.clone(), scope.clone());
+        (dir, scope, jobs, w)
+    }
+
+    #[test]
+    fn growth_of_jobs_without_a_job_record_is_reported_once_it_persists() {
+        let (_dir, scope, jobs, mut w) = backstop_fixture();
+        assert!(w.backstop(1000).is_empty(), "baseline");
+        // A job died and its leaf is gone: only the aggregates moved.
+        set_events(&jobs, 2, 1);
+        set_events(&scope, 2, 1);
+        assert!(w.backstop(2000).is_empty(), "first sight is held back");
+        let rows = w.backstop(3000);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].leaf, "jobs");
+        assert_eq!(rows[0].cause, CAUSE_OOM_KILL);
+        assert_eq!(rows[0].at_ms, 3000);
+        let detail = rows[0].detail.as_deref().unwrap();
+        assert!(
+            detail.starts_with("a gate job died of OOM (job unknown)"),
+            "{detail}"
+        );
+        assert!(detail.contains("2 process(es)"), "{detail}");
+        assert_eq!(rows[1].cause, CAUSE_OOM_GROUP_KILL);
+        // Reported once.
+        assert!(w.backstop(4000).is_empty());
+        assert!(w.backstop(5000).is_empty());
+    }
+
+    #[test]
+    fn a_job_record_explains_the_growth_of_the_aggregates() {
+        let (_dir, scope, jobs, mut w) = backstop_fixture();
+        let _ = w.poll(&[], 500);
+        assert!(w.backstop(1000).is_empty());
+        // The job ended: the daemon read its leaf and settled it.
+        set_events(&jobs, 1, 0);
+        set_events(&scope, 1, 0);
+        let job = jobs.join("j1");
+        let rows = w.settle_job(&scope, &job, 1500, (1, 0));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].leaf, "jobs/j1");
+        assert_eq!(rows[0].cause, CAUSE_OOM_KILL);
+        assert!(w.backstop(2000).is_empty());
+        assert!(w.backstop(3000).is_empty(), "nothing left over");
+    }
+
+    #[test]
+    fn a_leaf_the_poll_already_reported_is_not_reported_again_at_the_end() {
+        let (_dir, scope, jobs, mut w) = backstop_fixture();
+        let job = jobs.join("j1");
+        set_events(&job, 0, 0);
+        let target = (scope.clone(), job.clone());
+        assert!(w.poll(std::slice::from_ref(&target), 500).is_empty());
+        assert!(w.backstop(600).is_empty());
+        set_events(&job, 1, 0);
+        set_events(&jobs, 1, 0);
+        set_events(&scope, 1, 0);
+        // The 10 s poll sees the leaf while the job still runs...
+        let rows = w.poll(std::slice::from_ref(&target), 1000);
+        assert_eq!(rows.len(), 1);
+        assert!(w.backstop(1000).is_empty(), "explained by the leaf");
+        // ...and the end-of-job read (once per job) adds nothing.
+        assert!(w.settle_job(&scope, &job, 1500, (1, 0)).is_empty());
+        assert!(w.backstop(3000).is_empty());
+        assert!(w.backstop(4000).is_empty());
+    }
+
+    #[test]
+    fn a_kill_outside_jobs_is_the_daemons_own_cgroup() {
+        let (_dir, scope, _jobs, mut w) = backstop_fixture();
+        assert!(w.backstop(1000).is_empty());
+        set_events(&scope, 1, 0);
+        assert!(w.backstop(2000).is_empty());
+        let rows = w.backstop(3000);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].leaf, "daemon");
+        assert!(
+            rows[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("daemon's own cgroup")
+        );
+    }
+
+    #[test]
+    fn a_watcher_without_backstop_or_unreadable_files_reports_nothing() {
+        let mut plain = MemoryWatcher::new();
+        assert!(plain.backstop(1000).is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = MemoryWatcher::with_backstop(dir.path().join("jobs"), dir.path().join("s"));
+        assert!(w.backstop(1000).is_empty());
+    }
+
+    #[test]
+    fn the_journal_line_of_a_job_is_found_by_its_leaf() {
+        let text = format!(
+            "1729782400.5 host systemd-oomd[812]: Killed {UM}/sluice.slice/sluice-daemon.scope/jobs/j9 due to memory pressure for {UM}/sluice.slice/sluice-daemon.scope being 40% > 30% for > 3s\n\
+             1729782401.0 host systemd-oomd[812]: Killed {UM}/sluice.slice/sluice-daemon.scope/jobs/j10 due to memory pressure for x\n"
+        );
+        let row = find_job_kill(&text, "j9").unwrap();
+        assert_eq!(row.leaf, "jobs/j9");
+        assert_eq!(row.cause, CAUSE_OOMD_PRESSURE);
+        assert_eq!(row.at_ms, 1_729_782_400_500);
+        assert_eq!(find_job_kill(&text, "j1"), None, "no prefix matches");
+        assert_eq!(find_job_kill("", "j9"), None);
     }
 }

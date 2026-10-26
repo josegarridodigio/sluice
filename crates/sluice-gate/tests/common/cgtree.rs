@@ -51,6 +51,19 @@ impl TestTree {
             );
             return None;
         }
+        // Run as a Sluice gate (dogfooding: `verify` of this repository), the
+        // test's processes live in that daemon's delegated `jobs/<id>` leaf and
+        // cannot be moved into a test tree: the fixtures need the test to sit
+        // in the user manager like an agent session does.
+        let own = fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+        if own.contains("/sluice-daemon.scope/jobs/") {
+            println!(
+                "skipped: the test runs inside a Sluice gate job ({}); its processes \
+                 cannot be moved into a test tree",
+                own.trim()
+            );
+            return None;
+        }
         let uid = caps.facts.uid;
         // One prefix per tree: tests of one process run in parallel and must
         // not share (or stop) each other's units.

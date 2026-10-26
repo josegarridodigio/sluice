@@ -360,6 +360,39 @@ pub fn set_slice_properties(env: &EnvMap, slice: &str, assignments: &[String]) -
     run_checked("systemctl", &args, env, TOOL_TIMEOUT).map(|_| ())
 }
 
+/// The `systemctl set-property` assignments of a memory pressure policy
+/// (`ManagedOOMMemoryPressure=kill`, limit in percent, duration in whole
+/// seconds when known), for a scope that already exists.
+#[must_use]
+pub fn oom_assignments(oom: &OomProperties) -> Vec<String> {
+    let mut out = vec![
+        "ManagedOOMMemoryPressure=kill".to_owned(),
+        format!("ManagedOOMMemoryPressureLimit={}%", oom.limit_percent),
+    ];
+    if let Some(d) = oom.duration {
+        out.push(format!(
+            "ManagedOOMMemoryPressureDurationSec={}s",
+            d.as_secs().max(1)
+        ));
+    }
+    out
+}
+
+/// Sets runtime properties on an existing scope with
+/// `systemctl --user set-property --runtime`.
+///
+/// # Errors
+///
+/// A bad scope name, or tool errors.
+pub fn set_scope_properties(env: &EnvMap, scope: &str, assignments: &[String]) -> CgResult<()> {
+    if !scope.ends_with(".scope") || scope.contains(['/', ' ']) {
+        return Err(CgroupError::Invalid(format!("scope name {scope:?}")));
+    }
+    let mut args = vec!["--user", "set-property", "--runtime", scope];
+    args.extend(assignments.iter().map(String::as_str));
+    run_checked("systemctl", &args, env, TOOL_TIMEOUT).map(|_| ())
+}
+
 /// `AttachProcessesToUnit(unit, subpath, pids)`: moves processes of the same
 /// user into `subpath` (relative to the unit's cgroup, for example
 /// `/s-abc/ui`) of a delegated, active unit.
@@ -552,6 +585,31 @@ mod tests {
         )));
         assert!(joined.contains("ManagedOOMMemoryPressureDurationUSec t 5000000"));
         assert!(joined.ends_with(" 0"));
+    }
+
+    #[test]
+    fn oom_assignments_for_an_existing_scope() {
+        let a = oom_assignments(&OomProperties {
+            limit_percent: 30,
+            duration: Some(Duration::from_secs(3)),
+        });
+        assert_eq!(
+            a,
+            [
+                "ManagedOOMMemoryPressure=kill",
+                "ManagedOOMMemoryPressureLimit=30%",
+                "ManagedOOMMemoryPressureDurationSec=3s"
+            ]
+        );
+        let no_duration = oom_assignments(&OomProperties {
+            limit_percent: 20,
+            duration: None,
+        });
+        assert_eq!(no_duration.len(), 2);
+        assert!(matches!(
+            set_scope_properties(&EnvMap::new(), "a/b.scope", &[]),
+            Err(CgroupError::Invalid(_))
+        ));
     }
 
     #[test]
