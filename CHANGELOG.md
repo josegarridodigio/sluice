@@ -13,7 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-## [0.6.1] - 2026-10-26
+- The merge trains' `PATH` keeps the daemon's own directories after the login
+  shell's: a login profile that rewrites `PATH` (`/etc/profile` under `bash -l`)
+  made 0.6.1 drop every directory only the daemon's starter had (an activated
+  virtualenv, a direnv shell), and trains failed with `key_input_failed`
+  (exit 127). 0.6.1 was tagged but never released (its release workflow failed
+  on this); 0.6.2 ships its changes.
+
+## [0.6.1] - 2026-10-26 (tagged, not released)
 
 ### Added
 
