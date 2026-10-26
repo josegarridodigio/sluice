@@ -1131,6 +1131,25 @@ fn sample_tick(shared: &Shared) -> bool {
     changed
 }
 
+/// The memory the gates may use: the machine's `meminfo`, capped by the
+/// limited cgroups above the daemon and by the gates' own ceiling on
+/// `jobs/` (ADR-0019; a container or a unit with `MemoryMax=` has far less
+/// than the machine's `MemAvailable`). `None` when `meminfo` is unreadable.
+fn gates_memory(shared: &Shared) -> Option<memory::MemInfo> {
+    let info = memory::read_meminfo(&shared.config.proc_root)?;
+    let jobs = shared
+        .containment
+        .as_ref()
+        .map(|c| c.tree().layout.jobs_dir());
+    let extra: Vec<&Path> = jobs.iter().map(PathBuf::as_path).collect();
+    Some(memory::cap_by_cgroups(
+        info,
+        &shared.config.proc_root,
+        Path::new(sluice_gate_core::cgroup::CGROUP_MOUNT),
+        &extra,
+    ))
+}
+
 /// The memory guard's second (ADR-0019 piece 7): reads `meminfo`, the
 /// pressure and the running jobs' latest working sets, asks [`Guard`] and
 /// cancels the job it chooses. A no-op unless `[admission] memory_guard`.
@@ -1139,7 +1158,7 @@ fn guard_tick(shared: &Shared, now: u64) {
     if !a.memory_guard {
         return;
     }
-    let Some(info) = memory::read_meminfo(&shared.config.proc_root) else {
+    let Some(info) = gates_memory(shared) else {
         return;
     };
     let jobs: Vec<GuardJob> = {
@@ -1404,7 +1423,7 @@ fn admit(shared: &Shared, now: u64) -> Vec<(String, sched::Admission)> {
         let u = lock(&shared.util);
         (u.idle_cpus(), u.sampled_at())
     };
-    let facts = memory::facts(a, memory::read_meminfo(&shared.config.proc_root));
+    let facts = memory::facts(a, gates_memory(shared));
     let started = {
         let mut st = shared.state();
         // The working set each running job had at its last sample.

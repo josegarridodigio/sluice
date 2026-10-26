@@ -152,3 +152,20 @@ status example, stays as documented).
 
 Verification: `cargo fmt` and `cargo check --workspace --all-targets -j 4`: clean. The
 suite, clippy and `fmt --check` belong to the final `verify` of the branch.
+
+## Container tests follow-up (lead)
+
+The container tests ([[sluice/research/memory-gates-w6-container-tests.md]]) found
+that memory admission read the machine's `/proc/meminfo` even when the daemon runs
+under a cgroup memory limit (a container, a CI job, a unit with `MemoryMax=`): in a
+2 GiB container it saw about 23 GiB free and admitted four gates that needed 3 GiB.
+`memory::cap_by_cgroups` now caps `MemTotal` and `MemAvailable` by every limited
+cgroup from the daemon's own up to the root and by the gates' `jobs/` ceiling; the
+admission pass and the guard use it (`server::gates_memory`). Unit test
+`limited_cgroups_above_the_daemon_and_the_gates_ceiling_cap_the_memory`. ADR-0019's
+consequences now say that `oom_score_adj` orders the victims without guaranteeing
+that nothing else dies (a fast OOM acts several times before memory is freed).
+Docs: `kb/sluice/design/scheduler.md`, `docs/configuration.md`,
+`docs/how-it-works.md`. Not done (documented limitation): with containment off, a
+gate killed by the kernel is reported as an ordinary `exit=137`, since there is no
+job cgroup whose counters could attribute it.

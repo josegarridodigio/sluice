@@ -80,7 +80,8 @@ run at once, and it makes identical simultaneous requests share one run.
 - **Memory admission.** PSI only sees stalls that already happen, and a suite
   that is still ramping up shows none. The daemon therefore learns each gate's
   memory working set (`anon` plus swap of its job's cgroup, from the last runs)
-  and starts a job only when that expectation fits `MemAvailable` minus a
+  and starts a job only when that expectation fits `MemAvailable` (capped by
+  any cgroup memory limit above the daemon) minus a
   reserve (10 % of the machine's memory by default) and minus what the running
   jobs are still expected to grow by. A job that waits only for memory shows
   `(budget: memory)` in `sluice status`; the first job on an idle machine always

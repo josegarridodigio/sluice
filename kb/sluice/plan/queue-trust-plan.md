@@ -205,7 +205,7 @@ except W6d):
   `user.oomd_omit` on `daemon/`, doctor line. Tests T-W6-10, 13.
 - **W6d — bounded live tests** T-W6-14/16 on the developer machine and on the second
   machine of the incident (consent for both given 2026-10-26; S5 §9 safeguards; on the
-  second machine only while no heavy gate runs there), T-W6-15/17–19 only in a disposable VM; they confirm
+  second machine only while no heavy gate runs there), T-W6-15/17/19 in containers (done), the rest only in a disposable VM; they confirm
   piece 3's shape or switch it to variant B. **Done for T-W6-14/16** on both machines:
   [[sluice/research/memory-gates-w6d-oomd-spike.md]] (piece 3 as designed).
 - Optional ceiling `gates_memory_max` / `gates_memory_swap_max` (opt-in, empty default),
@@ -242,7 +242,7 @@ with a test, and document it.
 | W4 | done | [[sluice/changes/queue-trust-w4-prepare.md]] |
 | W5 | done | [[sluice/changes/queue-trust-w5-bootstrap.md]] |
 | W1–W5 verification | done | [[sluice/changes/queue-trust-verification-w1-w5.md]] |
-| W6 | W6a–W6e done (the VM-only tests T-W6-15/17–19 stay open) | [[sluice/changes/queue-trust-w6a-memory-outcome.md]], [[sluice/changes/queue-trust-w6b-memory-admission.md]], [[sluice/changes/queue-trust-w6c-oomd-policy.md]], [[sluice/changes/queue-trust-w6e-memory-guard.md]] |
+| W6 | W6a–W6e done; T-W6-15/17/19 done in containers ([[sluice/research/memory-gates-w6-container-tests.md]]), zram, other kernels, global OOM and T-W6-18 stay open | [[sluice/changes/queue-trust-w6a-memory-outcome.md]], [[sluice/changes/queue-trust-w6b-memory-admission.md]], [[sluice/changes/queue-trust-w6c-oomd-policy.md]], [[sluice/changes/queue-trust-w6e-memory-guard.md]] |
 | Docs sync | done (agent surfaces, full audit of docs against code; ADR-0019 piece 5 found unimplemented, then implemented) | [[sluice/changes/queue-trust-docs-sync.md]] |
 | Review fixes | done (two independent reviews: base-probe memo removed, build-time `hook_gate_unverified`, memory admission exemption only when nothing runs, guard by wall time, ...) | [[sluice/changes/queue-trust-review-fixes.md]] |
 | Final | verification green 2026-10-26 (fmt, clippy, whole suite through Sluice); commits and issue replies await the user | |

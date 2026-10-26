@@ -126,7 +126,12 @@ therefore takes an optional `Snapshot.memory: Option<MemoryFacts
 every plan is exactly the one CPU-only admission produces (differential test).
 
 **Inputs.** `MemAvailable` and `MemTotal` of `<proc_root>/meminfo`, read at each
-admission pass; `reserve = [admission] memory_reserve` (`auto` = 10 % of
+admission pass and capped by every cgroup with a numeric `memory.max` from the
+daemon's own cgroup (`<proc_root>/self/cgroup`) up to the root, and by the gates'
+`jobs/` ceiling (`[containment] gates_memory_max`): such a cgroup caps the total
+at `memory.max` and the available memory at `memory.max - memory.current`
+(`memory::cap_by_cgroups`; in a container or a unit with `MemoryMax=` the
+machine's figures are far too large, found by the container tests of ADR-0019); `reserve = [admission] memory_reserve` (`auto` = 10 % of
 `MemTotal`, a size like `3G` otherwise: what the desktop, the agents and the
 page cache need to stay alive; deliberately not learned). Per running job its
 current working set (`cur`) and expected peak `E`; per queued job `E`.

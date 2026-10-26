@@ -109,8 +109,17 @@ on by default; never kill the agent; memory experiments only bounded or in a VM.
 - Two 18 GiB suites never start together on a 30 GiB machine; the second waits with
   `wait_detail = memory` and starts when the first ends.
 - When memory still runs out (a gate outgrows its history, agents grow), the kernel and
-  oomd pick the gate, which dies whole and explains itself; agents and the desktop are the
-  last candidates instead of the first.
+  oomd pick the gate first, which dies whole and explains itself. This orders the victims;
+  it does not guarantee that nothing else dies: in a fast OOM the kernel acts several
+  times within a fraction of a second, before the first victim's memory is freed, and can
+  take the next candidates too (measured in containers,
+  [[sluice/research/memory-gates-w6-container-tests.md]]). Admission (piece 1) is what
+  keeps the machine out of that state.
+- The memory admission and the guard use the memory the gates may really have: the
+  machine's `MemAvailable` capped by every limited cgroup above the daemon (a container,
+  a CI job, a unit with `MemoryMax=`) and by the gates' own ceiling (found by the
+  container tests: with the machine's figure the daemon in a 2 GiB container admitted
+  four gates that needed 3 GiB).
 - ADR-0017 point 4 becomes: "no memory limit by default; gate jobs are admitted by learned
   memory, are the preferred victims (`oom_score_adj`, `oom.group` on the job leaf, an oomd
   policy acting before the agents'), and the agents' policy is the second line". S5's
@@ -136,5 +145,13 @@ on by default; never kill the agent; memory experiments only bounded or in a VM.
 
 - ~~Shape of the oomd policy~~: decided by T-W6-14/16 on two machines (2026-10-26),
   [[sluice/research/memory-gates-w6d-oomd-spike.md]].
-- T-W6-15/17–19 (systemd 255 image, global OOM with `oom.group` and adj, swap/zram
-  variants) need a disposable VM.
+- ~~T-W6-15 (systemd 255), T-W6-17 (memcg OOM with `oom.group` and adj), T-W6-19 (admission end to
+  end, swap on/off)~~: done in containers, 2026-10-26,
+  [[sluice/research/memory-gates-w6-container-tests.md]]. Confirmed: systemd 255 rejects the per-unit
+  duration (`systemd-run` fails) and its first victim between two scopes is not controllable, so the
+  policy stays off below 257; `oom.group` kills the whole job leaf and the leaf's `memory.events`
+  is sound evidence, but the adj only orders victims (the adj-300 process also died); admission waits
+  with `wait_detail: memory` and nothing starves. New: Sluice trusts the host's `/proc/meminfo`, which
+  is wrong inside a memory-limited container (admission never waits there).
+- Still open: global OOM (not memcg) with `oom.group` and adj, zram, other kernels, and T-W6-18; they
+  need a disposable VM or a dedicated machine.

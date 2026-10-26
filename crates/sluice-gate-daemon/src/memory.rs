@@ -2,8 +2,11 @@
 //!
 //! Three small pieces, all over plain files so tests use fake trees:
 //!
-//! - the machine's memory from `<proc_root>/meminfo` ([`read_meminfo`],
-//!   [`facts`]);
+//! - the memory the gates may use: `<proc_root>/meminfo`, capped by every
+//!   limited cgroup above the daemon and by the gates' own ceiling
+//!   ([`read_meminfo`], [`cap_by_cgroups`], [`facts`]); in a container, a CI
+//!   job or a unit with `MemoryMax=` the machine's `MemAvailable` is far
+//!   more than the daemon can have;
 //! - a running job's working set, sampled every second: `anon` of the job
 //!   leaf's `memory.stat` plus `memory.swap.current` (page cache is left out
 //!   on purpose: `MemAvailable` already counts it as available, so counting
@@ -66,6 +69,56 @@ pub fn parse_meminfo(text: &str) -> Option<MemInfo> {
 #[must_use]
 pub fn read_meminfo(proc_root: &Path) -> Option<MemInfo> {
     parse_meminfo(&std::fs::read_to_string(proc_root.join("meminfo")).ok()?)
+}
+
+/// `memory.max` and `memory.current` of a cgroup directory, bytes; `None`
+/// when it has no numeric limit (`max`, or no memory controller there).
+fn cgroup_limit(dir: &Path) -> Option<(u64, u64)> {
+    let max: u64 = std::fs::read_to_string(dir.join("memory.max"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let current: u64 = std::fs::read_to_string(dir.join("memory.current"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some((max, current))
+}
+
+/// `info` capped by memory limits: every cgroup from the daemon's own
+/// (`<proc_root>/self/cgroup`, a cgroup v2 path under `mount`) up to the
+/// root, plus `extra` (the gates' `jobs/` directory, whose `memory.max` is
+/// `[containment] gates_memory_max`). A limited cgroup caps the total at its
+/// `memory.max` and the available memory at `memory.max - memory.current`.
+/// Without a readable own cgroup only `extra` applies.
+#[must_use]
+pub fn cap_by_cgroups(info: MemInfo, proc_root: &Path, mount: &Path, extra: &[&Path]) -> MemInfo {
+    let own = std::fs::read_to_string(proc_root.join("self/cgroup"))
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("0::"))
+                .map(|p| p.trim().trim_start_matches('/').to_owned())
+        });
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(rel) = own.filter(|r| !r.is_empty()) {
+        let mut dir = mount.join(rel);
+        while dir.starts_with(mount) && dir != mount {
+            dirs.push(dir.clone());
+            if !dir.pop() {
+                break;
+            }
+        }
+    }
+    dirs.extend(extra.iter().map(|p| p.to_path_buf()));
+    dirs.iter()
+        .filter_map(|d| cgroup_limit(d))
+        .fold(info, |acc, (max, current)| MemInfo {
+            total_bytes: acc.total_bytes.min(max),
+            available_bytes: acc.available_bytes.min(max.saturating_sub(current)),
+        })
 }
 
 /// The facts of one admission pass: the machine's memory and the reserve of
@@ -202,6 +255,50 @@ mod tests {
         let p = root.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, text).unwrap();
+    }
+
+    #[test]
+    fn limited_cgroups_above_the_daemon_and_the_gates_ceiling_cap_the_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let (proc_root, mount) = (dir.path().join("proc"), dir.path().join("cg"));
+        let machine = MemInfo {
+            total_bytes: 30 * GIB,
+            available_bytes: 22 * GIB,
+        };
+        // No readable own cgroup: nothing caps (a fake `proc_root`).
+        assert_eq!(cap_by_cgroups(machine, &proc_root, &mount, &[]), machine);
+        write(&proc_root, "self/cgroup", "0::/box/daemon\n");
+        // Unlimited ancestors (`max`) cap nothing.
+        write(&mount, "box/memory.max", "max\n");
+        write(&mount, "box/memory.current", "1\n");
+        assert_eq!(cap_by_cgroups(machine, &proc_root, &mount, &[]), machine);
+        // A container-like limit of 2 GiB with 1.5 GiB used.
+        write(&mount, "box/memory.max", &format!("{}\n", 2 * GIB));
+        write(&mount, "box/memory.current", &format!("{}\n", 3 * GIB / 2));
+        assert_eq!(
+            cap_by_cgroups(machine, &proc_root, &mount, &[]),
+            MemInfo {
+                total_bytes: 2 * GIB,
+                available_bytes: GIB / 2,
+            }
+        );
+        // The gates' ceiling on `jobs/` caps what the gates may still take.
+        write(&mount, "jobs/memory.max", &format!("{GIB}\n"));
+        write(&mount, "jobs/memory.current", &format!("{}\n", 3 * GIB / 4));
+        let jobs = mount.join("jobs");
+        assert_eq!(
+            cap_by_cgroups(machine, &proc_root, &mount, &[jobs.as_path()]),
+            MemInfo {
+                total_bytes: GIB,
+                available_bytes: GIB / 4,
+            }
+        );
+        // Over its limit (it can happen for a moment): nothing available.
+        write(&mount, "box/memory.current", &format!("{}\n", 3 * GIB));
+        assert_eq!(
+            cap_by_cgroups(machine, &proc_root, &mount, &[]).available_bytes,
+            0
+        );
     }
 
     fn sample(gib: u64, killed: bool) -> PeakSample {
