@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Fixed
+
+## [0.6.1] - 2026-10-26
+
+### Added
+
 - `[queue] tool_env` (`"login-shell"`, the default, or `"daemon"`) and `[queue]
   tool_path` in the user config: where merge trains get the environment of their
   tools. `sluice status` shows `tool env: login shell` or `daemon (<reason>)`
@@ -506,7 +514,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PSI thresholds must be percentages (rejected at config load otherwise).
 - Findings of the Phase 1, 2, 3 and 4 reconciliation passes.
 
-[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/josegarridodigio/sluice/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/josegarridodigio/sluice/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/josegarridodigio/sluice/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/josegarridodigio/sluice/compare/v0.4.0...v0.4.1
