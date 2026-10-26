@@ -35,4 +35,5 @@ Decision: [[sluice/design/adr/0020-tool-environment-of-trains.md]]. Branch
 | Task | Status |
 |---|---|
 | Implementation | done (see [[sluice/changes/queue-env-login-shell.md]]) |
-| Live check | pending |
+| Live check | done 2026-10-26: on the second machine an isolated daemon started with PATH=/usr/bin:/bin (no node) ran a train gate using `node --version` (command and key_inputs) to READY, `tool env: login shell` |
+| Cold-start memory prior | done ([[sluice/changes/memory-cold-start-prior.md]]) |
