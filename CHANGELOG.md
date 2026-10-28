@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Fixed
+
+## [0.8.0] - 2026-10-28
+
+### Added
+
 - **The queue lands through a pull request where the target refuses direct pushes**
   (ADR-0025, issue #5). `[queue] land = "pull-request"` (default `push`; in the target
   commit's `.sluice.toml` or the user config, never from a queued branch; one-way key:
@@ -693,7 +701,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PSI thresholds must be percentages (rejected at config load otherwise).
 - Findings of the Phase 1, 2, 3 and 4 reconciliation passes.
 
-[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/josegarridodigio/sluice/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/josegarridodigio/sluice/compare/v0.6.3...v0.7.0
 [0.6.3]: https://github.com/josegarridodigio/sluice/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/josegarridodigio/sluice/compare/v0.6.1...v0.6.2
