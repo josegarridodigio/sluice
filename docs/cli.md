@@ -725,9 +725,10 @@ repository has (and none for the others) and sets `core.hooksPath` to it through
 hook then goes through `sluice hooks run`, which executes the hook the
 repository would have run without Sluice (husky, lefthook, pre-commit or plain
 hooks): same arguments, stdin, working directory, environment and exit code.
-Nothing in the repository changes. A husky or plain hook that Sluice
-understands completely runs its commands as units through the daemon (queue,
-budget, cache for checks); every other hook is delegated untouched
+Nothing in the repository changes. A husky, plain, lefthook or pre-commit hook
+that Sluice understands completely runs its commands as units through the daemon
+(queue, budget, cache for checks; lefthook's and pre-commit's through their own
+CLIs); every other hook is delegated untouched
 (`SLUICE_HOOKS_DELEGATE=1` forces delegation; see [hooks](hooks.md)).
 `off` removes the include and the managed files; the repository's own
 `core.hooksPath` applies again. Exit codes: 0, 1 on an error (not in a git
@@ -736,7 +737,9 @@ repository, git failure).
 `status` also lists every hook the repository has, as `units` (with each unit's
 kind, `mutating` or `check`, and command) or `delegate` (with the reason); in
 `--json` that is the `hooks` array (`{hook, mode, reason}` or `{hook, mode,
-units: [{index, kind, command}]}`). It reports whether the entry point is `effective`: Sluice's directory is
+units: [{index, kind, command}], requires?}`; `requires` is the run-time
+condition of a lefthook or pre-commit hook, which is delegated when it does not
+hold). It reports whether the entry point is `effective`: Sluice's directory is
 the value `git config core.hooksPath` returns. When it is not (the include was
 removed, a later include or a worktree config wins), `problem` says why and
 `sluice hooks on` repairs it. Re-run `on` after a manager installs a new hook:

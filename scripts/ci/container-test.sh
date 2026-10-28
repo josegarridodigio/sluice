@@ -16,13 +16,15 @@ ubuntu | debian)
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
     apt-get install -y -qq --no-install-recommends \
-        git gcc make libc6-dev curl ca-certificates tar procps coreutils >/dev/null
+        git gcc make libc6-dev curl ca-certificates tar procps coreutils \
+        python3 python3-venv >/dev/null
     ;;
 fedora)
-    dnf install -y -q git gcc make curl ca-certificates tar procps-ng coreutils findutils
+    dnf install -y -q git gcc make curl ca-certificates tar procps-ng coreutils findutils python3
     ;;
 alpine)
-    apk add --no-cache git gcc musl-dev make curl ca-certificates tar procps coreutils >/dev/null
+    apk add --no-cache git gcc musl-dev make curl ca-certificates tar procps coreutils \
+        python3 py3-pip >/dev/null
     ;;
 *)
     echo "unsupported distribution: $ID" >&2
@@ -44,6 +46,10 @@ cd /work
 git config --global --add safe.directory '*'
 git config --global user.name ci
 git config --global user.email ci@example.invalid
+
+# The hook managers of the real-tool tests (lefthook, pre-commit).
+sh /work/scripts/ci/install-hook-managers.sh /opt/hook-managers
+export PATH="/opt/hook-managers/bin:$PATH"
 
 echo "distribution: $PRETTY_NAME"
 git --version

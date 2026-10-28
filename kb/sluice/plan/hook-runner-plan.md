@@ -67,6 +67,6 @@ each wave (fmt, clippy, test), then Matrix on the branch before any release.
 | Wave | Status |
 |---|---|
 | H1 | done (verified through Sluice: fmt, clippy, test) |
-| H2 | H2a (husky and plain units, caching, status) done, verified through Sluice; H2b (lefthook, pre-commit adapters) pending |
+| H2 | H2a (husky and plain units, caching, status) done, verified through Sluice; H2b (lefthook and pre-commit adapters) done, verified through Sluice; real-tool tests pending in CI/Matrix |
 | H3 | pending |
 | H4 | pending |

@@ -45,6 +45,15 @@ pub struct Unit {
     /// relative, resolved against the working directory).
     pub path_prepend: Vec<String>,
     pub kind: Kind,
+    /// Keep git's own variables (`GIT_INDEX_FILE`, ...) in the unit's
+    /// environment. Mutating units always do; a manager that asks git itself
+    /// what is staged (lefthook, pre-commit) needs them even for a check.
+    pub git_env: bool,
+    /// Commands whose output joins the cache key (tool version, effective
+    /// configuration). Only checks use them.
+    pub key_inputs: Vec<String>,
+    /// Files (relative to the worktree root) whose content joins the key.
+    pub key_files: Vec<PathBuf>,
 }
 
 impl Unit {
@@ -55,6 +64,20 @@ impl Unit {
     }
 }
 
+/// What must hold when the hook runs for its units to behave exactly like the
+/// manager's own whole-hook run; when it does not, the hook is delegated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Precondition {
+    /// lefthook's `pre-commit`: something is staged (a command that finds no
+    /// staged file is skipped, which `--command` reports as a failure) and no
+    /// file is partially staged (lefthook hides the unstaged half while it
+    /// runs).
+    StagedNotPartial,
+    /// pre-commit's commit stages: no tracked file differs from the index
+    /// (`pre-commit run` stashes unstaged changes on every invocation).
+    WorktreeEqualsIndex,
+}
+
 /// What to run for a hook: lists of units joined by `&&` (one element for a
 /// plain command), executed in order with `sh -e` semantics ([`super::runner`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +86,12 @@ pub struct Program {
     /// The file ends with `exit 0`: the hook's status is 0 unless an earlier
     /// line already ended it.
     pub exit_ok: bool,
+    /// lefthook and pre-commit run every unit even after a failure and fail
+    /// at the end: a unit that exits 1 does not stop the hook. Any other
+    /// code (a crash, pre-commit's 3) ends it at once with that code.
+    pub keep_going: bool,
+    /// Checked just before the first unit starts.
+    pub precondition: Option<Precondition>,
 }
 
 impl Program {

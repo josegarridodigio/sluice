@@ -2,8 +2,10 @@
 //!
 //! The principle of ADR-0021: understand the hook completely or delegate it.
 //! Every way out is a [`Plan::Delegate`] with a reason that `sluice hooks
-//! status` shows. lefthook and pre-commit are not adapted yet (wave H2b) and
-//! delegate.
+//! status` shows. husky and plain hooks are adapted here; lefthook and
+//! pre-commit have their own adapters ([`super::lefthook`],
+//! [`super::precommit`]). An adapter only produces a [`Program`]; the runner,
+//! the cache and the fail-open paths are shared.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,6 +17,7 @@ use super::classify;
 use super::delegate::{Manager, detect};
 use super::grammar::{self, Script};
 use super::units::{Kind, Plan, Program, Unit};
+use super::{lefthook, precommit};
 
 /// Hooks that receive data on stdin. A unit runs as a daemon job without the
 /// hook's stdin, so such a hook is only run as units when it has one.
@@ -44,10 +47,8 @@ pub fn plan(input: &Input<'_>) -> Plan {
     let planned = match manager {
         Manager::Husky => husky(input),
         Manager::Plain => plain(input),
-        Manager::Lefthook | Manager::PreCommit => Err(format!(
-            "{} hooks are delegated (their units come in a later wave)",
-            manager.label()
-        )),
+        Manager::Lefthook => lefthook::plan(input),
+        Manager::PreCommit => precommit::plan(input),
         Manager::None => Err("no hook manager recognised".to_owned()),
     };
     match planned.and_then(|p| check_stdin(input.hook, p)) {
@@ -158,6 +159,7 @@ fn build(
             {
                 return Err("already runs sluice".to_owned());
             }
+            let kind = classify::classify(&cmd.argv, input.root);
             units.push(Unit {
                 manager,
                 hook: input.hook.to_owned(),
@@ -166,7 +168,10 @@ fn build(
                 argv: cmd.argv.clone(),
                 cwd: input.root.to_path_buf(),
                 path_prepend: path_prepend.iter().map(|p| (*p).to_owned()).collect(),
-                kind: classify::classify(&cmd.argv, input.root),
+                kind,
+                git_env: kind == Kind::Mutating,
+                key_inputs: Vec::new(),
+                key_files: Vec::new(),
             });
         }
         lists.push(units);
@@ -174,6 +179,8 @@ fn build(
     Ok(Program {
         lists,
         exit_ok: script.exit_ok,
+        keep_going: false,
+        precondition: None,
     })
 }
 
@@ -195,7 +202,12 @@ pub fn describe(hook: &str, plan: &Plan) -> serde_json::Value {
                     })
                 })
                 .collect();
-            serde_json::json!({"hook": hook, "mode": "units", "units": units})
+            let mut entry = serde_json::json!({"hook": hook, "mode": "units", "units": units});
+            if let Some(pre) = program.precondition {
+                // Otherwise the hook is delegated at run time.
+                entry["requires"] = pre.describe().into();
+            }
+            entry
         }
     }
 }
@@ -342,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn lefthook_and_pre_commit_delegate_for_now() {
+    fn lefthook_without_a_binary_delegates_with_a_reason() {
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "lefthook.yml", "pre-commit: {}\n");
         write(

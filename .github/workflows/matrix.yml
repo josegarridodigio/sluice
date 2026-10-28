@@ -79,6 +79,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: git-${{ env.GIT_VERSION }}
+      - name: Install lefthook and pre-commit
+        run: |
+          scripts/ci/install-hook-managers.sh "$HOME/.local"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       # The core crate wraps git; the CLI crate drives it end to end; the queue
       # crate runs worktrees, merges and pushes (git 2.33-only flags broke it).
       - run: cargo test --locked --no-fail-fast -p sluice-gate-core -p sluice-gate -p sluice-gate-queue
@@ -93,4 +97,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: aarch64
+      - name: Install lefthook and pre-commit
+        run: |
+          scripts/ci/install-hook-managers.sh "$HOME/.local"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: cargo test --workspace --locked

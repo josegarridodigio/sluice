@@ -57,8 +57,8 @@ common git directory.
 ## What runs
 
 Two things can happen to a hook, decided each time git runs it, from the files as
-they are at that moment: Sluice runs its **units** ("Units", husky and plain
-hooks only), or it **delegates** the hook untouched. `sluice hooks status` shows
+they are at that moment: Sluice runs its **units** ("Units", "Units: lefthook",
+"Units: pre-commit"), or it **delegates** the hook untouched. `sluice hooks status` shows
 which, and why, for every hook of the repository. This section describes
 delegation, which is also the fallback of units.
 
@@ -98,8 +98,7 @@ shebang. Also delegated: a plain hook with several lines and no `set -e`; a hook
 whose command is `sluice` itself (it is already routed); husky when `HUSKY` is
 set, `~/.config/husky/init.sh` or `~/.huskyrc` exists, or `_/h` is not the
 version whose behaviour Sluice knows; a hook that receives stdin (`pre-push`,
-`post-rewrite`, ...) with any unit that is not a recognised read-only check; lefthook and pre-commit (their
-units come later); `SLUICE_HOOKS_DELEGATE=1` or `SLUICE_DISABLE=1`; and any
+`post-rewrite`, ...) with any unit that is not a recognised read-only check; `SLUICE_HOOKS_DELEGATE=1` or `SLUICE_DISABLE=1`; and any
 case where the daemon cannot be reached or started, or the repository cannot be
 resolved, before the first unit runs (the whole hook is delegated, never part
 of it).
@@ -159,6 +158,119 @@ when there is one it is only read for its settings.
 hook pre-commit: 2 unit(s) run through the queue: mutating lint-staged; check npm run lint
 hook commit-msg: delegated (.husky/commit-msg line 1: uses the hook's arguments ($1, "$@"))
 ```
+
+## Units: lefthook
+
+lefthook's own CLI runs each unit, so templates, `env`, `timeout` and the rest
+of a job's semantics are lefthook's. Sluice asks lefthook for its effective
+configuration (`lefthook dump --format json`: `extends`, `lefthook-local` and
+already-cloned `remotes` merged) and runs, for every **named** command or job,
+in lefthook's sequential order (`jobs` as written, then `commands` by
+`priority`, leading number, name):
+
+```sh
+lefthook run <hook> --command <name> --no-auto-install --skip-lfs
+```
+
+The binary is found as the hook script finds it, as far as Sluice models it:
+`$LEFTHOOK_BIN`, else `lefthook` on `PATH`. Any other route (the `lefthook:`
+config value, a path baked at install time, `node_modules` layouts, `go tool`,
+`bundle exec`, ...) delegates, as does a version that is not 2.x from 2.2.2 (the
+flags were read from that source) or a `dump` that fails.
+
+**The skip problem.** lefthook exits 1 with `no job matching` when the selected
+job is skipped, and a skipped job cannot be told from a failed one. So a hook is
+run as units only when no job can be skipped, and is delegated when it has any of:
+`skip`/`only` (hook or job), `exclude_tags`, `LEFTHOOK_EXCLUDE`; a file template
+(`{staged_files}`, `{all_files}`, `{push_files}`, `{files}`, `{0}`/`{1}`..., any
+`{word}`) or a filter (`glob`, `exclude`, `root`, `files`, `file_types`; each can
+empty the file list); `pre-push` (it skips a command with no files to push). In
+`pre-commit`, lefthook also skips every command when nothing is staged, so the units are used only
+if something is staged when the hook starts. The dominant real-world shape
+(`glob` plus `{staged_files}`) is therefore delegated; a command such as `run:
+npm test` or `run: cargo test` is run as a unit.
+
+Also delegated: unnamed jobs, `scripts`, `setup`, `piped`, `follow` (not
+modelled), `group`/nested jobs, `interactive`, `use_stdin`, `stage_fixed`
+(lefthook stages after all jobs and hides the unstaged half of partially staged
+files; per-command runs would not keep that), `fail_on_changes`, `remotes`, `rc`,
+a configuration with a name used twice or an order lefthook leaves undefined,
+unknown options, the hooks lefthook runs git-lfs for (`post-checkout`,
+`post-commit`, `post-merge`: `--skip-lfs` would drop it), `LEFTHOOK=0`, and a
+`pre-commit` with a partially staged file (while it runs lefthook hides the
+unstaged half; the guard is lefthook's to run once).
+
+`parallel: true` only changes concurrency: the units run one after another. The
+hook's git arguments are not passed: with no template a job cannot read them.
+
+Each unit sees git's own variables (lefthook asks git for the staged files).
+Its kind comes from classifying the job's `run` text like a husky command
+(unrecognised or with a redirection or pipe: mutating, uncached; a recognised
+read-only tool, or `&&` list of them, with no `env` expansion: check). A check is cached by the working tree and a
+key that adds the lefthook version and a hash of `lefthook dump`, so any change
+of configuration (including an untracked `lefthook-local.yml`) is a different
+key. Exit codes: lefthook returns 0 or 1. Every unit runs even after a failure
+(lefthook's sequential mode does) and the hook then exits 1; any other code
+(Sluice never emits 3 here) ends the hook at once with it.
+
+## Units: pre-commit
+
+pre-commit's own CLI runs each unit. Sluice reads `.pre-commit-config.yaml`
+(the path the installed stub bakes in with `--config=`) and runs, for each hook
+at the git hook's stage, in file order:
+
+```sh
+<launcher> run <id> --hook-stage <stage> --config=<config>
+```
+
+`<launcher>` is the stub's own: `$INSTALL_PYTHON -mpre_commit` while that path is
+executable, else `pre-commit` on `PATH`; with neither the hook is delegated (the
+stub would fail). Only `pre-commit` and `pre-merge-commit` are adapted: their
+`hook-impl` run takes no arguments and reads no stdin. `pre-push` (refs from
+stdin), `commit-msg`, `prepare-commit-msg` (the message file), `post-*` and
+`pre-rebase` are delegated.
+
+A hook belongs to the stage through `stages` (legacy `commit`, `push`,
+`merge-commit` understood), else the top-level `default_stages`, else every
+stage. A `repo: local` hook is placed from the config. A remote hook (`repo:
+<url>`) is placed only when its config entry lists `stages` (its manifest, which
+Sluice does not read, otherwise decides); without it the whole hook is
+delegated, since `pre-commit run <id>` for a hook that is not at the stage fails.
+
+**The stash.** `pre-commit run` stashes the unstaged changes of tracked files on
+every invocation (`git checkout -- .`, then a patch re-applied). One unit per hook
+would stash once per hook, and Sluice never edits the index or tree itself. So the
+units are used only while no tracked file differs from the index (the stash is
+then a no-op, and the working tree equals the tree the cache key describes);
+otherwise the whole hook is delegated and pre-commit stashes once, as before.
+
+Also delegated: `fail_fast` (top-level or hook), an id selecting more than one
+hook (ids are not unique; an alias counts), `repo: meta`, `minimum_pre_commit_version`
+above 4.7.0 (the version read), `SKIP` set, YAML merge keys (`<<`) or values
+that YAML 1.1 would read differently (`always_run: yes`), unknown config keys.
+
+**Caching.** A hook is a cacheable check only if it is `repo: local`, `language:
+system` (or `unsupported`), `always_run: true` (otherwise pre-commit skips it,
+successfully, when no staged file matches, and a cached pass would claim a run
+that never happened), `pass_filenames: false`, no `log_file`, and its `entry`
+(one simple command, `args` appended) is a recognised read-only tool. Its key adds
+the configuration file's bytes and the pre-commit version. Everything else, every
+fixer and every remote hook, is mutating: it always runs and is never cached.
+Every unit sees git's own variables.
+
+Exit codes: pre-commit returns 1 for a failure and 3 for an internal error. Every
+unit runs after a failure and the hook then exits 1; any other code (3, 130) ends the hook at
+once with the unit's own code. Sluice never emits 3 on this path, so a 3 is always
+pre-commit's.
+
+## Compatibility
+
+| Manager | Runs as units | Always delegated | Cached |
+|---|---|---|---|
+| husky 9 | simple commands and `&&` lists in `.husky/<hook>` | any shell construct, `$1`, `HUSKY`, `init.sh`, `~/.huskyrc`, stdin hooks with a non-check unit | recognised read-only commands |
+| plain hooks | the same grammar, with `set -e` for several lines | the same | the same |
+| lefthook 2.x | named commands and jobs with no skip rule, template, filter or `stage_fixed`; `pre-commit` with files staged and none partially | `pre-push`, LFS hooks, unnamed jobs, scripts, `setup`, `piped`, groups, `use_stdin`, remotes, `rc`, `lefthook:` | `run` text made of read-only tools, keyed by tree, version and `dump` |
+| pre-commit 4.x | hooks of `pre-commit` and `pre-merge-commit`, `repo: local` or remote with explicit `stages`, while the worktree equals the index | other stages, `fail_fast`, ambiguous ids, `meta`, remote hooks without `stages`, `SKIP` | `language: system` + `always_run` + `pass_filenames: false` + read-only `entry` |
 
 ## Worktrees and husky
 

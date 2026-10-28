@@ -19,6 +19,12 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # The real-tool tests of the hook runner (lefthook 2.2.2, pre-commit
+      # 4.7.0) skip themselves when the tools are missing.
+      - name: Install lefthook and pre-commit
+        run: |
+          scripts/ci/install-hook-managers.sh "$HOME/.local"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace

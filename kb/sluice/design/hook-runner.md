@@ -1,5 +1,5 @@
 ---
-title: "Design: the hooks entry point and the unit runner (waves H1, H2a)"
+title: "Design: the hooks entry point and the unit runner (waves H1, H2a, H2b)"
 tags: [sluice, design, hooks, husky, lefthook, pre-commit]
 ---
 
@@ -216,3 +216,67 @@ directly with `sh -c`; a daemon that dies or refuses uses `run_queued`'s in-proc
 `hooks status [--json]` gains one entry per hook the repository has (`plan::plan` with the same
 inputs a run would use; `SLUICE_HOOKS_DELEGATE`/`SLUICE_DISABLE` shown as the reason). No doctor
 change.
+
+## H2b: units for lefthook and pre-commit
+
+Two adapters (`hookentry/lefthook.rs`, `hookentry/precommit.rs`) that only produce a
+`Program`; the runner, cache, daemon path and fail-open paths are H2a's. Shared helpers:
+`tooling.rs` (PATH lookup, `capture`, version parse, shell words, SHA-256), `precond.rs`.
+
+### Model changes (`units.rs`)
+
+`Unit` gains `git_env` (keep git's variables: true for mutating units as before, and for
+every lefthook and pre-commit unit, because those managers ask git what is staged),
+`key_inputs` and `key_files` (the gate fields of the same name: tool version, configuration).
+`Program` gains `keep_going` (run every unit, fail at the end) and `precondition`
+(`Precondition::{StagedNotPartial, WorktreeEqualsIndex}`, checked by `precond::check` from
+`git status --porcelain -uno` in the hook's own environment, right after planning and before the
+daemon is contacted; false means delegate). `runner::execute_all` implements `keep_going`: code 0
+goes on, code 1 is remembered, any other code ends the hook with it; the hook exits 1 if any unit
+returned 1.
+
+### lefthook
+
+`plan` order: hook gate (`pre-push` and the git-lfs hooks delegate), environment (`LEFTHOOK=0|false`,
+`LEFTHOOK_EXCLUDE`), binary (`$LEFTHOOK_BIN`, else `lefthook` on `PATH`; the script's other discovery
+routes delegate), `lefthook version` (2.x from 2.2.2), `lefthook dump --format json`, hook options,
+jobs. Selection is `--command <name>`: v2.2.2 merges it into `--job` and matches job names, for jobs
+and commands alike. **Skip vs failure**: `RunHook` fails with `no job matching` when every selected job is
+skipped, and a job skipped for no files cannot be told from a failure (both exit 1), so a hook is
+only run as units when no selected job can be skipped: no `skip`/`only`/`exclude_tags`/
+`LEFTHOOK_EXCLUDE`, no file template (`{word}`) or filter (`glob`, `exclude`, `root`, `files`,
+`file_types`, hook-level `files`/`exclude`), and for `pre-commit` something staged
+(`build_command.go:53-69` skips a command with no staged file that matches). Partial staging is
+the other `pre-commit` per-invocation effect (`guard.go`: hides the unstaged half, runs, restores):
+the precondition requires that no file be partially staged, so the guard is a no-op and the worktree
+equals what the key describes. `stage_fixed` delegates (staging happens after all jobs; per-command
+runs would stage between jobs and the guard would run N times). Order: `jobs` as written, then
+`commands` as `CommandsToJobs` sorts them (priority ascending, zeros after; then leading number,
+then name); ties are an unstable sort there, so they delegate; non-ASCII names delegate.
+Kind: `grammar::parse(run)`, every command `classify`-ed `Check`, no `env` value with `$`.
+Key: tree snapshot + unit name + command + `key_inputs = [<bin> version, printf %s <sha256 of
+dump>]`. The dump hash covers `extends`, `lefthook-local` and cloned remotes (remotes delegate
+anyway); script files are not covered because scripts delegate.
+
+### pre-commit
+
+`plan` order: hook (`pre-commit`, `pre-merge-commit` only; the others need refs, stdin or a message
+file), `SKIP`, the stub in the underlying hooks directory (`INSTALL_PYTHON`, `--config=`,
+`--hook-type=`, nothing else), launcher (`INSTALL_PYTHON -mpre_commit` while executable, else
+`pre-commit` on `PATH`), YAML through `serde_norway` into JSON values (merge keys, non-string
+scalars where a string or boolean is needed, unknown keys: delegate), stage membership, ids. The
+stash decision is `Precondition::WorktreeEqualsIndex`: `run` without `--files` stashes on every
+invocation (`staged_files_only`), so the per-id units are only used when it would be a no-op;
+otherwise delegate and let pre-commit stash once. A skipped hook exits 0, so a cached pass would be
+a lie unless the hook cannot be skipped: `always_run: true` is required for a check. Remote hooks:
+placed only with explicit `stages` in the config entry (the manifest is in a clone Sluice does not
+read), uncached.
+
+### Not modelled, on purpose
+
+lefthook: skip detection by output, `scripts`, groups, `setup`, `piped`, remotes, binary routes other
+than `LEFTHOOK_BIN` and `PATH`, `pre-push`. pre-commit: the manifest of remote hooks (so remote hooks
+without `stages` delegate), `pre-push` (first-usable-ref rule and from/to refs), commit-msg style
+stages, `fail_fast`, `meta`. Each is a delegation with its reason in `hooks status`; a later wave can
+lift one at a time with measurements.
+

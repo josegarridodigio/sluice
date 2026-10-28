@@ -34,6 +34,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delegates the whole hook untouched as before. `sluice hooks status` shows
   for each hook whether it runs as units or is delegated, and why. See
   `docs/hooks.md`.
+- The hook runner runs lefthook and pre-commit hooks as units too (ADR-0021, wave
+  H2b), each through the manager's own CLI. lefthook 2.x: every named command or job
+  runs as `lefthook run <hook> --command <name> --no-auto-install --skip-lfs`, from
+  the effective `lefthook dump`, when none of them can be skipped (no `skip`/`only`,
+  file template or filter; `pre-push`, groups, `scripts`, `stage_fixed`, remotes and
+  the like delegate). pre-commit 4.x: every hook at the `pre-commit` or
+  `pre-merge-commit` stage runs as `pre-commit run <id> --hook-stage <stage>` with
+  the stub's launcher and config while the worktree equals the index (pre-commit
+  stashes unstaged changes on every run); remote hooks need `stages` in the config
+  entry. Fixers and remote hooks always run; only read-only checks (lefthook `run`
+  text of recognised tools; pre-commit `language: system` + `always_run` +
+  `pass_filenames: false`) are cached, keyed by tree, tool version and
+  configuration. See `docs/hooks.md`.
 
 ### Changed
 

@@ -38,6 +38,7 @@ use sluice_gate_proto::client;
 
 use super::delegate::Manager;
 use super::plan::{self, Input};
+use super::precond;
 use super::units::{Kind, Plan, Program, Unit};
 
 /// Environment variable that forces delegation of every hook.
@@ -99,6 +100,12 @@ pub fn try_units(hook: &str, dir: &Path, cwd: &Path, env: &EnvMap) -> Option<Exi
         }
         return None;
     };
+    if let Some(pre) = program.precondition
+        && let Err(why) = precond::check(pre, &root, env)
+    {
+        tracing::debug!(%hook, %why, "delegating: precondition");
+        return None;
+    }
     let prepared = match prepare(&root, env) {
         Ok(p) => p,
         Err(why) => {
@@ -124,6 +131,9 @@ fn execute(program: &Program, hook: &str, prep: &Prepared) -> ExitCode {
         program.unit_count(),
         manager.label()
     );
+    if program.keep_going {
+        return execute_all(program, hook, prep, manager);
+    }
     let mut status = 0;
     for list in &program.lists {
         let outcome = run_list(list, hook, prep);
@@ -136,6 +146,21 @@ fn execute(program: &Program, hook: &str, prep: &Prepared) -> ExitCode {
         status = 0;
     }
     finish(manager, hook, status)
+}
+
+/// lefthook and pre-commit: every unit runs; a unit that exits 1 fails the
+/// hook at the end (their own whole-hook runs report 0 or 1), any other code
+/// ends the hook at once with that code.
+fn execute_all(program: &Program, hook: &str, prep: &Prepared, manager: Manager) -> ExitCode {
+    let mut failed = false;
+    for unit in program.units() {
+        match run_one(unit, hook, prep) {
+            0 => {}
+            1 => failed = true,
+            other => return finish(manager, hook, other),
+        }
+    }
+    finish(manager, hook, u8::from(failed))
 }
 
 /// husky prints a line on stdout when the user file fails; so do we.
@@ -187,8 +212,8 @@ fn gate_of(unit: &Unit, env: &EnvMap) -> Gate {
         weight: Weight::Auto,
         timeout: Duration::ZERO,
         hooks: Vec::new(),
-        key_inputs: Vec::new(),
-        key_files: Vec::new(),
+        key_inputs: unit.key_inputs.clone(),
+        key_files: unit.key_files.clone(),
         env: gate_env,
         depends_on: Vec::new(),
         cache: unit.kind == Kind::Check,
@@ -198,12 +223,12 @@ fn gate_of(unit: &Unit, env: &EnvMap) -> Gate {
     }
 }
 
-/// Runs one unit and returns its exit code. A mutating unit keeps the
-/// variables git sets for the hook (it may edit or read the index it names).
+/// Runs one unit and returns its exit code. A unit with `git_env` (every
+/// mutating one) keeps the variables git sets for the hook: it may edit or
+/// read the index the commit uses.
 fn run_one(unit: &Unit, hook: &str, prep: &Prepared) -> u8 {
     let gate = gate_of(unit, &prep.env);
-    let keep_git_env = unit.kind == Kind::Mutating;
-    match prep.repo.select_unit(&unit.name(), gate, keep_git_env) {
+    match prep.repo.select_unit(&unit.name(), gate, unit.git_env) {
         Ok(res) => crate::run::run_unit(res, hook),
         Err(e) => {
             eprintln!(
@@ -263,6 +288,9 @@ mod tests {
             cwd: PathBuf::from("/r"),
             path_prepend: prepend.iter().map(|p| (*p).to_owned()).collect(),
             kind,
+            git_env: kind == Kind::Mutating,
+            key_inputs: Vec::new(),
+            key_files: Vec::new(),
         }
     }
 

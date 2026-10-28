@@ -24,9 +24,13 @@ pub mod classify;
 pub mod delegate;
 pub mod gitcfg;
 pub mod grammar;
+pub mod lefthook;
 pub mod plan;
+pub mod precommit;
+pub mod precond;
 pub mod runner;
 pub mod script;
+pub mod tooling;
 pub mod units;
 
 pub use delegate::run;
@@ -214,6 +218,9 @@ fn print_plans(plans: &[(&'static str, units::Plan)]) {
                     program.unit_count(),
                     kinds.join("; ")
                 );
+                if let Some(pre) = program.precondition {
+                    println!("    (delegated at run time unless {})", pre.describe());
+                }
             }
         }
     }
