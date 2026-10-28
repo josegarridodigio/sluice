@@ -1,0 +1,12 @@
+# Written for the release after 0.7.0 (ADR-0025): `[queue] land`, how a verified
+# train reaches the target, "push" (default) or "pull-request". Not a recording
+# of a released binary; 0.7.0 and older reject this file because the `[queue]`
+# table refuses unknown keys. The same key in the user config is the default
+# for repositories that do not set it (fixture queue-land-user.toml).
+version = 1
+
+[gates.test]
+cmd = "true"
+
+[queue]
+land = "pull-request"

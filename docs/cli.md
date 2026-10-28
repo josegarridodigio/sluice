@@ -1004,7 +1004,7 @@ Show trains, their members, gates, conflicts and queued jobs.
 ```text
 Show trains, their members, gates, conflicts and queued jobs.
 
-Inside a repository only its own trains and jobs are listed. With --json the `queue-status` payload is printed verbatim (it carries `schema: 1`).
+Inside a repository only its own trains and jobs are listed. With --json the `queue-status` payload is printed verbatim (it carries `schema: 1`). For a train that waits for its pull request (`awaiting_merge`) it first reads the pull request with your own `gh` (read-only, a few seconds at most, cached briefly) and tells the daemon, so a merged or closed pull request shows up.
 
 Usage: sluice queue status [OPTIONS]
 
@@ -1030,6 +1030,8 @@ Approve a ready train: print the plan and land it.
 
 On a terminal it asks `Land this train? [y/N]`; without one it requires --yes. The train hash that was displayed is sent along, so a train that changed in the meantime is refused (stale-plan, exit 4). Agents must not run this command.
 
+A train that lands through a pull request (`[queue] land = "pull-request"`) is pushed to `sluice/train/<id>` and this command then opens its pull request with your own `gh` (finding it when it already exists). Running it again on such a train whose pull request could not be opened finishes the job. Sluice never merges: the forge and you do.
+
 Usage: sluice queue approve [OPTIONS] <TRAIN_ID>
 
 Arguments:
@@ -1039,6 +1041,9 @@ Arguments:
 Options:
       --yes
           Do not ask for confirmation (required without a terminal)
+
+      --auto-merge
+          Pull-request landing only: also arm the forge's auto-merge on the pull request (`gh pr merge --auto --merge --match-head-commit <S>`). The forge merges when its own rules are met; admin rights are never used
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1084,7 +1089,7 @@ Cancel a job that has not been pushed.
 ```text
 Cancel a job that has not been pushed.
 
-A job that is pushing is only cancelled if `sluice queue reconcile` proves that nothing landed.
+A job that is pushing is only cancelled if `sluice queue reconcile` proves that nothing landed. A job whose train waits for its pull request (`awaiting_merge`) is withdrawn too: the train is dissolved, the pull request Sluice opened is closed with your own `gh` and the `sluice/train/<id>` branch it pushed is deleted (a pull request somebody else opened is left alone). The MCP `queue_cancel` is refused for such a job.
 
 Usage: sluice queue cancel <JOB_ID>
 
@@ -1109,7 +1114,7 @@ Resolve trains whose push outcome is unknown (`needs_reconcile`).
 ```text
 Resolve trains whose push outcome is unknown (`needs_reconcile`).
 
-Reads the remote and prints one line per train: the decision (landed, ready, queued, cancelled or refused) and the reason. It never pushes.
+Reads the remote and prints one line per train: the decision (landed, ready, queued, cancelled or refused) and the reason. It never pushes. For trains that land through a pull request (`awaiting_merge`) it also reads each pull request with your own `gh` and tells the daemon (merged, closed, head changed, ...); a human running it opens a missing pull request too.
 
 Usage: sluice queue reconcile
 
@@ -1134,7 +1139,8 @@ Besides the basics, the zero-config checks are:
 | `hooks` | Where the clone's hooks stand. With the entry point on (`sluice hooks on`): `ok` when it is effective and complete, `fail` with the reason when something displaced it or a hook of the repository has no Sluice script (fix: `sluice hooks on`). Otherwise: `ok` when a hook in the hooks directory (`core.hooksPath` or `.git/hooks`) calls sluice (for a husky v9 runner, `.husky/_` with an `h` file, the scripts it executes, `.husky/<hook>`, are inspected) or when the lefthook or pre-commit configuration calls sluice; `fail` when a hook manager (husky, lefthook, pre-commit) owns hooks that do not call sluice, or `.sluice.toml` has gates with hooks and the hook files do not call sluice (suggests `sluice hooks on`); `warn` when no hook calls sluice and there are hook files or gates with hooks to judge; `ok` when there is nothing to route. |
 | `repo-config` | Where `.sluice.toml` stands. Besides `ok` (parses) and `fail` (does not parse, or missing): in a clone with no `.sluice.toml` whose hooks go through Sluice it is `ok`, "gates are derived from the hooks (n unit(s) can be verified, m left out; see 'sluice gate list')". With the entry point off a missing `.sluice.toml` still fails. |
 | `cache` | In a repository: `warn` when the index has skip-worktree or assume-unchanged entries (it names up to 5 paths): the tree cannot be hashed, so the cache is disabled for this worktree. The detail gives `git update-index --no-skip-worktree <path>` / `--no-assume-unchanged <path>`. `ok` otherwise. |
-| `target-protection` | In a repository whose `[queue]` remote and target are known (the configured `target`, else the remote's HEAD as already fetched), shows the last answer the forge gave at a `queue enqueue` (kept 30 days): `ok` when the target accepts direct pushes, `warn` when it requires a pull request or is protected (the queue cannot land there, see [Targets protected against direct pushes](merge-queue.md#targets-protected-against-direct-pushes)). Doctor never asks the forge itself; with no recorded answer the check is not shown. |
+| `target-protection` | In a repository whose `[queue]` remote and target are known (the configured `target`, else the remote's HEAD as already fetched), shows the last answer the forge gave at a `queue enqueue` (kept 30 days): `ok` when the target accepts direct pushes, `warn` when it requires a pull request or is protected and `[queue] land` is `push` (the queue cannot land there; see [Targets protected against direct pushes](merge-queue.md#targets-protected-against-direct-pushes)); with `land = "pull-request"` the protection is expected and the check is `ok`. Doctor never asks the forge itself; with no recorded answer the check is not shown. |
+| `queue-pr-branches` | From the running daemon's store (no network; not shown without a daemon or when nothing applies): `ok` with the number of trains waiting for their pull request (`awaiting_merge`), `warn` listing the `sluice/train/<id>` branches that dissolved pull-request trains left behind (a closed pull request, a cleanup that failed), with the `git push <remote> --delete <branch>` that removes them (see [Landing through a pull request](merge-queue.md#landing-through-a-pull-request)). |
 | `init` | In a git repository without `.sluice.toml`: `ok`, with the hint `run 'sluice init --dry-run'`. |
 
 The `containment` group (JSON `group: "containment"`; the S4 messages of

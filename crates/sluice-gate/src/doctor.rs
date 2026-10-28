@@ -581,6 +581,7 @@ fn check_repo(env: &EnvMap, paths: &RepoPaths) -> Vec<Check> {
         out.extend(check_train_tools(env, cfg));
         out.extend(target::check_target(env, paths, cfg));
     }
+    out.extend(check_pr_branches(env, paths));
     out.push(check_hooks(env, paths, config.as_ref().ok()));
     out.push(check_markers(paths));
     out.push(check_cache(env, paths));
@@ -662,6 +663,27 @@ fn train_tool_path(env: &EnvMap) -> Option<String> {
         .and_then(client::Client::status)
         .ok()?;
     report.queue?.tool_env?.path
+}
+
+/// `queue-pr-branches` for this repository, from the running daemon's store
+/// (no network; silent without a daemon).
+fn check_pr_branches(env: &EnvMap, paths: &RepoPaths) -> Option<Check> {
+    let socket = socket_to_contact(env)
+        .ok()
+        .flatten()
+        .filter(|s| s.exists())?;
+    let conn = client::connect(&socket).ok()?;
+    if !conn.supports(FEATURE_QUEUE) {
+        return None;
+    }
+    let msg = ClientMessage::QueueStatus {
+        id: 1,
+        repo: Some(paths.common_dir.clone()),
+    };
+    match conn.request(&msg) {
+        Ok(ServerMessage::QueueStatus { status, .. }) => target::pr_branches_check(&status),
+        _ => None,
+    }
 }
 
 /// `train-tools`: warns when a `key_inputs` command of this repository's

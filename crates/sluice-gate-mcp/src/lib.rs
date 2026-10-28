@@ -88,7 +88,12 @@ tracked files: commit the result or fix the gate) and `member_config_invalid` (t
 `.sluice.toml` does not parse) are yours to fix; `key_input_failed` is the environment's: tell the \
 human; `pre_push_hook`: the repository's hook declined, read its output; `target_protected`: the forge \
 refuses direct pushes to the target: tell the human, do not retry (a `queue_enqueue` result with \
-a warning about the target is for the human too; the job is queued anyway). `hook_gate_unverified` and `config_changed` mean the branch changes `.sluice.toml`, which \
+a warning about the target is for the human too; the job is queued anyway). A job or train \
+`awaiting_merge` means a human approved it and its pull request (not you) is the way it lands: \
+wait, or tell the human; never merge, close or push to the pull request or its `sluice/train/*` \
+branch, and never cancel it (`queue_cancel` is refused for it). `pr_closed` (the pull request \
+was closed without merging, or its branch is gone): tell the human, do not retry. \
+`hook_gate_unverified` and `config_changed` mean the branch changes `.sluice.toml`, which \
 the target's configuration judges: tell the human to land it first or retry with \
 `--trust-member-config`; never use that flag or ask for such a train to be approved. \
 A gate result `KILLED for lack of memory` is not a failure to retry unchanged: reduce the gate's \
@@ -1534,7 +1539,14 @@ impl Server {
         let env = Arc::clone(&self.env);
         let report = blocking(move || {
             let paths = queue::discover(&env, &dir)?;
-            queue::fetch_status(&env, Some(paths.common_dir))
+            let common = paths.common_dir;
+            let report = queue::fetch_status(&env, Some(common.clone()))?;
+            // Trains waiting for a pull request: read it (read-only) and
+            // report it, then show what the daemon decided.
+            if queue::refresh_pull_requests(&env, &report) {
+                return queue::fetch_status(&env, Some(common));
+            }
+            Ok(report)
         })
         .await?;
         match report {
@@ -2129,6 +2141,9 @@ mod schema_tests {
             "waiting for memory",
             "STALLED",
             "probably hung",
+            "awaiting_merge",
+            "never merge, close or push to the pull request",
+            "`pr_closed`",
         ] {
             assert!(INSTRUCTIONS.contains(needle), "missing '{needle}'");
         }

@@ -68,7 +68,8 @@ pub(crate) struct JobSchema {
     /// Target branch.
     pub target: String,
     /// `queued`, `merging`, `verifying`, `ready`, `approved`, `pushing`,
-    /// `landed`, `conflict`, `failed`, `cancelled`, `needs_reconcile`.
+    /// `landed`, `conflict`, `failed`, `cancelled`, `needs_reconcile`,
+    /// `awaiting_merge`.
     pub state: String,
     /// Train the job belongs to, once claimed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -156,7 +157,7 @@ pub(crate) struct TrainSchema {
     /// Commit the members were merged onto.
     pub base_sha: String,
     /// `building`, `verifying`, `ready`, `approved`, `pushing`, `landed`,
-    /// `dissolved`, `needs_reconcile`.
+    /// `dissolved`, `needs_reconcile`, `awaiting_merge`.
     pub state: String,
     /// Member job ids, in merge order.
     pub members: Vec<String>,
@@ -200,6 +201,49 @@ pub(crate) struct TrainSchema {
     /// For such a train: the unified diff of `.sluice.toml` against the base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_diff: Option<String>,
+    /// `pull-request` for a train that lands through a pull request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub land: Option<String>,
+    /// The pull request of such a train.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<PullRequestSchema>,
+}
+
+/// The pull request of a train that lands through one (ADR-0025).
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct PullRequestSchema {
+    /// The train's branch.
+    pub branch: String,
+    /// Pull request number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<u64>,
+    /// Pull request address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Sluice's client opened it.
+    #[serde(default)]
+    pub created_by_sluice: bool,
+    /// `armed` or `failed` when the human asked for auto-merge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_merge: Option<String>,
+    /// When the train started waiting for the merge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// When a client last reported the pull request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
+    /// What the forge last said: `open`, `merged` or `closed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_state: Option<String>,
+    /// Commits the target gained since the train was built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_moved: Option<u64>,
+    /// Remark of the last report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Sluice deleted the branch.
+    #[serde(default)]
+    pub branch_deleted: bool,
 }
 
 /// `queue_status` result (`sluice queue status --json`).
@@ -263,6 +307,55 @@ pub(crate) fn request(env: &EnvMap, msg: &ClientMessage) -> Result<ServerMessage
     }
 }
 
+/// Reads the pull request of every train of `report` that waits for its
+/// merge with the caller's own `gh` (read-only, bounded, cached briefly) and
+/// tells the daemon what it says. True when the daemon was told something
+/// (the report should be read again). Never opens, closes or merges.
+pub(crate) fn refresh_pull_requests(env: &EnvMap, report: &QueueStatusReport) -> bool {
+    let waiting: Vec<&QueueTrainView> = report
+        .trains
+        .iter()
+        .filter(|t| t.state == QueueTrainState::AwaitingMerge && t.pr.is_some())
+        .collect();
+    if waiting.is_empty() {
+        return false;
+    }
+    let facts: Vec<sluice_gate_core::forge::PrFact> = std::thread::scope(|scope| {
+        let handles: Vec<_> = waiting
+            .iter()
+            .map(|t| {
+                let tref = sluice_gate_core::forge::landing::TrainRef {
+                    train_id: t.train_id.clone(),
+                    repo: t.repo.clone(),
+                    remote: t.remote.clone(),
+                    merge_sha: t.merge_sha.clone().unwrap_or_default(),
+                };
+                scope.spawn(move || sluice_gate_core::forge::landing::observe(env, &tref))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .zip(&waiting)
+            .map(|(h, t)| {
+                h.join().unwrap_or_else(|_| {
+                    sluice_gate_core::forge::PrFact::of(
+                        &t.train_id,
+                        sluice_gate_core::forge::PrObservation::Unreachable {
+                            reason: "reading the pull request failed".into(),
+                        },
+                    )
+                })
+            })
+            .collect()
+    });
+    let msg = ClientMessage::QueuePrFacts {
+        id: 1,
+        facts,
+        env: BTreeMap::new(),
+    };
+    request(env, &msg).is_ok()
+}
+
 /// `queue-status` for one repository (`None`: all).
 pub(crate) fn fetch_status(
     env: &EnvMap,
@@ -306,15 +399,27 @@ pub(crate) fn send_approval(
                 ),
             )
         })?;
+    // A pull-request landing is opened with a human's own forge login: the
+    // daemon refuses it for MCP, and so does this client, with the way out.
+    if train.land.is_some() {
+        return Err(failure(
+            "not-allowed",
+            format!(
+                "train {train_id} lands through a pull request, which only a human at \
+                 `sluice queue approve` opens; tell the human"
+            ),
+        ));
+    }
     let msg = ClientMessage::QueueApprove {
         id: 1,
         train_id: train_id.to_owned(),
         train_hash: hash,
         via: ApproveVia::Mcp,
         env: allowlisted_env(env),
+        pr_landing: false,
     };
     match request(env, &msg)? {
-        ServerMessage::QueueApproved { train, .. } => Ok((paths.common_dir, train)),
+        ServerMessage::QueueApproved { train, .. } => Ok((paths.common_dir, *train)),
         other => Err(failure(
             "internal",
             format!("unexpected reply to queue-approve: {other:?}"),
@@ -518,6 +623,15 @@ fn target_name(remote: &str, target: &str) -> String {
     }
 }
 
+/// How the daemon says the job's target lands (ADR-0025).
+fn land_of(job: &QueueJobView) -> sluice_gate_core::config::Land {
+    if job.land.as_deref() == Some("pull-request") {
+        sluice_gate_core::config::Land::PullRequest
+    } else {
+        sluice_gate_core::config::Land::Push
+    }
+}
+
 /// Warnings about the target of a queued job (ADR-0025), probed with the
 /// server's own environment: the forge's protection as `gh` reports it and
 /// what the queue learned from a refused push. Blocking.
@@ -526,7 +640,14 @@ pub(crate) fn enqueue_warnings(env: &EnvMap, dir: &Path, job: &QueueJobView) -> 
         .learned_protection
         .as_ref()
         .map(|l| (l.first_seen.as_str(), l.evidence.as_str()));
-    sluice_gate_core::forge::enqueue_warnings(env, dir, &job.remote, &job.target, learned)
+    sluice_gate_core::forge::enqueue_warnings(
+        env,
+        dir,
+        &job.remote,
+        &job.target,
+        learned,
+        land_of(job),
+    )
 }
 
 /// The structured reply of an enqueue: the job and its warnings.
@@ -583,6 +704,7 @@ pub(crate) fn job_state_name(s: QueueJobState) -> &'static str {
         QueueJobState::Failed => "failed",
         QueueJobState::Cancelled => "cancelled",
         QueueJobState::NeedsReconcile => "needs_reconcile",
+        QueueJobState::AwaitingMerge => "awaiting_merge",
         QueueJobState::Unknown => "unknown",
     }
 }
@@ -597,6 +719,7 @@ pub(crate) fn train_state_name(s: QueueTrainState) -> &'static str {
         QueueTrainState::Landed => "landed",
         QueueTrainState::Dissolved => "dissolved",
         QueueTrainState::NeedsReconcile => "needs_reconcile",
+        QueueTrainState::AwaitingMerge => "awaiting_merge",
         QueueTrainState::Unknown => "unknown",
     }
 }
@@ -700,7 +823,12 @@ fn job_line(job: &QueueJobView, target: &str, trusted: bool, out: &mut String) {
                     let _ = write!(out, " ({h})");
                 }
             }
-            if job.state == QueueJobState::Failed
+            if job.state == QueueJobState::Failed && job.reason.as_deref() == Some("pr_closed") {
+                out.push_str(
+                    "\n    the pull request was closed without merging (or its branch deleted): \
+                     tell the human, do not retry or reopen it",
+                );
+            } else if job.state == QueueJobState::Failed
                 && job.reason.as_deref() == Some("target_protected")
             {
                 out.push_str(
@@ -778,6 +906,33 @@ fn prepare_line(train: &QueueTrainView) -> Option<String> {
     Some(s)
 }
 
+/// What an agent reads under a train that waits for its pull request.
+fn awaiting_text(t: &QueueTrainView) -> String {
+    let mut out = String::from(
+        "  a human approved this train and its pull request is the way it lands: wait, or tell \
+         the human; never merge, close or push to the pull request or its branch\n",
+    );
+    let Some(pr) = &t.pr else {
+        return out;
+    };
+    match (pr.number, &pr.url) {
+        (Some(n), Some(url)) => {
+            let _ = writeln!(out, "  pull request: #{n} {url}");
+        }
+        _ => out.push_str("  pull request: not opened yet (a human opens it)\n"),
+    }
+    if let Some(n) = pr.target_moved.filter(|n| *n > 0) {
+        let _ = writeln!(
+            out,
+            "  target moved {n} commit(s) since the train was built (the forge's rules decide)"
+        );
+    }
+    if let Some(note) = &pr.note {
+        let _ = writeln!(out, "  note: {note}");
+    }
+    out
+}
+
 /// Agent-facing summary of a `queue-status` report.
 pub(crate) fn render_status(report: &QueueStatusReport) -> String {
     if report.trains.is_empty() && report.jobs.is_empty() {
@@ -833,6 +988,7 @@ pub(crate) fn render_status(report: &QueueStatusReport) -> String {
             QueueTrainState::NeedsReconcile => {
                 out.push_str("  push outcome unknown; a human runs `sluice queue reconcile`\n");
             }
+            QueueTrainState::AwaitingMerge => out.push_str(&awaiting_text(t)),
             _ => {}
         }
     }
@@ -865,6 +1021,10 @@ pub(crate) fn approve_text(train: &QueueTrainView, timed_out: bool) -> String {
         ),
         QueueTrainState::Dissolved => format!(
             "failed: train {} was dissolved before it landed; see `queue_status` for the members\n",
+            train.train_id
+        ),
+        QueueTrainState::AwaitingMerge => format!(
+            "train {} waits for its pull request to be merged; tell the human\n",
             train.train_id
         ),
         s if timed_out => format!(
@@ -1124,5 +1284,75 @@ mod tests {
             jobs: vec![j],
         });
         assert!(!plain.contains("CONFIG FROM BRANCH"), "{plain}");
+    }
+
+    fn waiting_train() -> QueueTrainView {
+        QueueTrainView {
+            train_id: "t-1".into(),
+            remote: "origin".into(),
+            target: "main".into(),
+            base_sha: "4e1c9a0ffff".into(),
+            state: QueueTrainState::AwaitingMerge,
+            members: vec!["j1".into()],
+            land: Some("pull-request".into()),
+            pr: Some(sluice_gate_proto::PullRequestView {
+                branch: "sluice/train/t-1".into(),
+                number: Some(12),
+                url: Some("https://github.com/example/repo/pull/12".into()),
+                created_by_sluice: true,
+                auto_merge: sluice_gate_core::forge::AutoMerge::Armed,
+                target_moved: Some(2),
+                note: Some("pr_head_changed".into()),
+                ..sluice_gate_proto::PullRequestView::default()
+            }),
+            ..QueueTrainView::default()
+        }
+    }
+
+    #[test]
+    fn a_waiting_train_tells_the_agent_to_wait_and_never_to_touch_the_pull_request() {
+        let report = QueueStatusReport {
+            schema: 1,
+            trains: vec![waiting_train()],
+            jobs: vec![job(QueueJobState::AwaitingMerge)],
+        };
+        let text = render_status(&report);
+        for want in [
+            "AWAITING_MERGE",
+            "job j1  awaiting_merge",
+            "never merge, close or push to the pull request or its branch",
+            "pull request: #12 https://github.com/example/repo/pull/12",
+            "target moved 2 commit(s)",
+            "note: pr_head_changed",
+        ] {
+            assert!(text.contains(want), "{want}\n{text}");
+        }
+        // The structured view keeps parsing as the published mirror.
+        let _: StatusSchema = serde_json::from_value(to_json(&report)).expect("schema mirror");
+    }
+
+    #[test]
+    fn pr_closed_says_tell_the_human_and_not_retry() {
+        let mut j = job(QueueJobState::Failed);
+        j.reason = Some("pr_closed".into());
+        let mut out = String::new();
+        job_line(&j, "origin/main", false, &mut out);
+        assert!(out.contains("(pr_closed)"), "{out}");
+        assert!(out.contains("tell the human, do not retry"), "{out}");
+        assert!(!out.contains("call queue_retry"), "{out}");
+    }
+
+    #[test]
+    fn a_pull_request_train_is_refused_before_it_reaches_the_daemon_text() {
+        let t = approve_text(&waiting_train(), false);
+        assert!(t.contains("waits for its pull request"), "{t}");
+        assert_eq!(
+            train_state_name(QueueTrainState::AwaitingMerge),
+            "awaiting_merge"
+        );
+        assert_eq!(
+            job_state_name(QueueJobState::AwaitingMerge),
+            "awaiting_merge"
+        );
     }
 }

@@ -129,6 +129,10 @@ fix it, commit, `queue_retry`; a branch that changes
 `.sluice.toml` (`hook_gate_unverified`, `config_changed`) is for the human.
 `--trust-member-config` is human-only: never use it and never ask to approve
 such a train; explain it to the human.
+A job or train `awaiting_merge` means a human approved it and its pull request
+(not you) is the way it lands: wait, or tell the human. Never merge, close or
+push to that pull request or its `sluice/train/*` branch, and do not cancel it
+(`queue_cancel` is refused). `pr_closed`: tell the human, do not retry.
 
 Never approve a train: not with `queue_approve`, not with
 `sluice queue approve` in Bash, unless the human told you to in this

@@ -1,0 +1,8 @@
+# Written for the release after 0.7.0 (ADR-0025): the user config's `[queue]
+# land`, the default of repositories whose target commit does not set it. Not a
+# recording of a released binary; 0.7.0 and older reject this file because the
+# user `[queue]` table refuses unknown keys.
+version = 1
+
+[queue]
+land = "pull-request"

@@ -25,6 +25,7 @@ through Sluice, Matrix on the branch before a release (watched job by job).
 | 5 | Who talks to the forge with the user's `gh` (keyring login) | The client: `approve` opens the PR, `status`/`reconcile` read it |
 | 6 | Commit status on the PR | Later, opt-in |
 | 7 | Release | Q1-Q4 together, one release |
+| 8 | Next train while a PR waits | Waits for the PR to be merged or closed (ADR-0025 amendment) |
 
 ## Waves
 
@@ -34,7 +35,7 @@ through Sluice, Matrix on the branch before a release (watched job by job).
 | Q2 | S1: shadow time, extra-resources and duration rules, head-delay counter, switch (ADR-0023) | done, verified through Sluice ([[sluice/changes/queue-q2-backfilling.md]]) |
 | Q3 | S2: stall detection and reporting, longest quiet window per job (ADR-0024) | done, verified through Sluice ([[sluice/changes/queue-q3-stalled-jobs.md]]) |
 | Q4a | S3: target probe at enqueue (warn only), offline doctor check, `target_protected` reason and learned signal (ADR-0025 1-2) | done, verified through Sluice ([[sluice/changes/queue-q4a-protected-targets.md]]) |
-| Q4b | S3: `land = "pull-request"`: branch push, `awaiting_merge`, client opens and reads the PR, reconcile table (ADR-0025 3-7) | pending |
+| Q4b | S3: `land = "pull-request"`: branch push, `awaiting_merge`, client opens and reads the PR, reconcile table (ADR-0025 3-7) | done, verified through Sluice ([[sluice/changes/queue-q4b-pull-request-landing.md]]) |
 
 ## Evidence (a second machine, 12 threads, 30 GiB, 2026-10-28, daemon 0.6.3)
 

@@ -380,6 +380,73 @@ impl Git {
             .collect())
     }
 
+    /// Full SHA of the tree of `rev` (`rev^{tree}`); `None` when it does not
+    /// resolve.
+    ///
+    /// # Errors
+    ///
+    /// Spawn failure.
+    pub fn tree_of(&self, common: &Path, rev: &str) -> Result<Option<String>> {
+        let spec = format!("{rev}^{{tree}}");
+        let out = self.repo_out(
+            common,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &spec,
+            ],
+        )?;
+        Ok(out
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned()))
+    }
+
+    /// Number of commits in `base..tip`; `None` when git cannot tell.
+    ///
+    /// # Errors
+    ///
+    /// Spawn failure.
+    pub fn count_commits(&self, common: &Path, base: &str, tip: &str) -> Result<Option<u64>> {
+        let range = format!("{base}..{tip}");
+        let out = self.repo_out(common, &["rev-list", "--count", &range])?;
+        Ok(out
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().parse().ok())
+            .flatten())
+    }
+
+    /// Deletes `branch` on `url` only while it is still at `sha`
+    /// (`push --force-with-lease=<ref>:<sha> :<ref>`), with the push
+    /// deadline `timeout`. Never touches the index or the working tree.
+    ///
+    /// # Errors
+    ///
+    /// The remote refused, cannot be reached, or the deadline expired.
+    pub fn delete_remote_branch(
+        &self,
+        common: &Path,
+        url: &str,
+        branch: &str,
+        sha: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        let reference = format!("refs/heads/{branch}");
+        let lease = format!("--force-with-lease={reference}:{sha}");
+        let delete = format!(":{reference}");
+        self.with_network_timeout(timeout)
+            .net(
+                common,
+                url,
+                &["push", "--porcelain", &lease, "--", url, &delete],
+            )
+            .with_context(|| format!("git push --delete {branch} to {}", strip_userinfo(url)))?;
+        Ok(())
+    }
+
     /// The branch `HEAD` points to on `url` (`ls-remote --symref`, with the
     /// deadline); `None` when the remote does not say.
     ///

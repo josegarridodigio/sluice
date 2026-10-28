@@ -421,7 +421,10 @@ enum QueueCommand {
     /// Show trains, their members, gates, conflicts and queued jobs.
     ///
     /// Inside a repository only its own trains and jobs are listed. With --json the
-    /// `queue-status` payload is printed verbatim (it carries `schema: 1`).
+    /// `queue-status` payload is printed verbatim (it carries `schema: 1`). For a
+    /// train that waits for its pull request (`awaiting_merge`) it first reads the
+    /// pull request with your own `gh` (read-only, a few seconds at most, cached
+    /// briefly) and tells the daemon, so a merged or closed pull request shows up.
     Status {
         /// Print machine-readable JSON instead of text.
         #[arg(long)]
@@ -432,12 +435,23 @@ enum QueueCommand {
     /// On a terminal it asks `Land this train? [y/N]`; without one it requires --yes.
     /// The train hash that was displayed is sent along, so a train that changed in the
     /// meantime is refused (stale-plan, exit 4). Agents must not run this command.
+    ///
+    /// A train that lands through a pull request (`[queue] land = "pull-request"`) is
+    /// pushed to `sluice/train/<id>` and this command then opens its pull request with
+    /// your own `gh` (finding it when it already exists). Running it again on such a
+    /// train whose pull request could not be opened finishes the job. Sluice never
+    /// merges: the forge and you do.
     Approve {
         /// Train id, as shown by `sluice queue status`.
         train_id: String,
         /// Do not ask for confirmation (required without a terminal).
         #[arg(long)]
         yes: bool,
+        /// Pull-request landing only: also arm the forge's auto-merge on the pull
+        /// request (`gh pr merge --auto --merge --match-head-commit <S>`). The forge
+        /// merges when its own rules are met; admin rights are never used.
+        #[arg(long)]
+        auto_merge: bool,
     },
     /// Re-queue a conflicted or failed job with the current head of its branch.
     ///
@@ -455,7 +469,11 @@ enum QueueCommand {
     /// Cancel a job that has not been pushed.
     ///
     /// A job that is pushing is only cancelled if `sluice queue reconcile` proves
-    /// that nothing landed.
+    /// that nothing landed. A job whose train waits for its pull request
+    /// (`awaiting_merge`) is withdrawn too: the train is dissolved, the pull request
+    /// Sluice opened is closed with your own `gh` and the `sluice/train/<id>` branch
+    /// it pushed is deleted (a pull request somebody else opened is left alone). The MCP
+    /// `queue_cancel` is refused for such a job.
     Cancel {
         /// Job id, as shown by `sluice queue status`.
         job_id: String,
@@ -463,7 +481,10 @@ enum QueueCommand {
     /// Resolve trains whose push outcome is unknown (`needs_reconcile`).
     ///
     /// Reads the remote and prints one line per train: the decision (landed, ready,
-    /// queued, cancelled or refused) and the reason. It never pushes.
+    /// queued, cancelled or refused) and the reason. It never pushes. For trains that
+    /// land through a pull request (`awaiting_merge`) it also reads each pull request
+    /// with your own `gh` and tells the daemon (merged, closed, head changed, ...); a
+    /// human running it opens a missing pull request too.
     Reconcile,
 }
 
@@ -703,7 +724,11 @@ fn main() -> ExitCode {
                 trust_member_config,
             } => queue::enqueue(branch.as_deref(), base.as_deref(), trust_member_config),
             QueueCommand::Status { json } => queue::status(json),
-            QueueCommand::Approve { train_id, yes } => queue::approve(&train_id, yes),
+            QueueCommand::Approve {
+                train_id,
+                yes,
+                auto_merge,
+            } => queue::approve(&train_id, yes, auto_merge),
             QueueCommand::Retry {
                 job_id,
                 trust_member_config,

@@ -1926,6 +1926,7 @@ async fn a_human_can_land_a_fix_of_the_configuration_the_target_cannot_pass() {
             train_hash: hash.clone(),
             via: ApproveVia::Cli,
             env,
+            pr_landing: true,
         })
         .await
     }] {

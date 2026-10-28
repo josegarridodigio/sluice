@@ -37,7 +37,7 @@ status`, `client.log` and `daemon.log` lines, and the wording of errors.
 | Markers and miss records | `format` | 1 |
 | Cache key | prefix `sluice-cache-v1` | v1 |
 | Daemon protocol | `protocol` in `hello` / `welcome` | 1 |
-| Daemon features | `welcome.features` | `["exec", "queue-only", "queue"]` (0.2.0: `["queue"]`) |
+| Daemon features | `welcome.features` | `["exec", "queue-only", "queue"]` (0.2.0: `["queue"]`; later releases add `queue-trust-config` and `queue-pr-landing`) |
 | Status JSON | `schema` | 1 |
 | Queue status JSON | `schema` | 1 |
 | Database | tables `schema`, `queue_schema` and `sched_schema` | 1, 1 and 1 (`containment_schema` is 2 from 0.6.0 and 3 from the next release; older binaries ignore it) |
@@ -142,6 +142,23 @@ They are one-way like the 0.6.0 keys: 0.6.0 and older binaries reject a user con
 has them (fixture `crates/sluice-gate-core/tests/fixtures/unreleased/queue-tool-env.toml`).
 The status JSON gains the optional `queue.tool_env` (`source`, `reason`, `path`), which
 older clients ignore.
+
+The release after 0.7.0 adds `[queue] land = "push" | "pull-request"` (ADR-0025), in `.sluice.toml` and in
+the user config. It is one-way like the 0.6.0 keys: 0.7.0 and older binaries reject a file that has it
+(fixtures `crates/sluice-gate-core/tests/fixtures/unreleased/queue-land.toml` and `queue-land-user.toml`).
+Without it nothing changes: the queue pushes. The queue status JSON gains the states `awaiting_merge` (jobs
+and trains), the optional `land` and `pr` of a train (the pull request: `branch`, `number`, `url`,
+`created_by_sluice`, `auto_merge`, `since`, `observed_at`, `observed_state`, `target_moved`, `note`,
+`branch_deleted`), the reasons `pr_closed` and `land_needs_remote`, and the `queue-reconcile` decisions
+`awaiting_merge` and `failed`; the enqueue reply may carry `land`. Older clients show an unknown state for
+`awaiting_merge` (they parse it as `unknown`; schema stays 1). The protocol gains, additively, the message
+`queue-pr-facts` (a client reports what its own forge CLI says about the pull request of a waiting train),
+the field `pr_landing` of the train approval request and the feature `queue-pr-landing` in
+`welcome.features`: a client that does not see the feature never sends the facts, and a daemon refuses to take
+a pull-request train from a client that does not send `pr_landing` (an older `sluice queue` or the MCP
+approval tool) instead of ignoring it. The database gains nullable columns `pr_*` on `queue_push_markers`
+(older binaries name their columns and never read them). A train that is `awaiting_merge` when an older
+daemon starts is not understood by it.
 
 The release after 0.7.0 adds the user config key `[scheduler] backfill` (ADR-0023). It
 is one-way like the 0.6.0 keys: 0.7.0 and older binaries reject a user config that has

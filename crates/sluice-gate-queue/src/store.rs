@@ -18,6 +18,9 @@ use sluice_gate_proto::{
     ApproveVia, Caller, QueueJobState, QueueTrainState, TrainGate, TrainPrepare,
 };
 
+use sluice_gate_core::config::Land;
+use sluice_gate_core::forge::AutoMerge;
+
 use crate::model::{
     job_state_str, job_transition_allowed, parse_job_state, parse_train_state, train_state_str,
     train_transition_allowed,
@@ -160,6 +163,9 @@ pub struct TrainSettings {
     pub audit_ref: bool,
     /// `[queue] network_timeout` in milliseconds; `0` also means the default.
     pub network_timeout_ms: u64,
+    /// How the train lands (ADR-0025): from the target commit's `[queue]
+    /// land` (or the user config's), never from a member.
+    pub land: Land,
 }
 
 impl Default for TrainSettings {
@@ -169,6 +175,7 @@ impl Default for TrainSettings {
             push_timeout_ms: u64::try_from(q.push_timeout.as_millis()).unwrap_or(u64::MAX),
             audit_ref: q.audit_ref,
             network_timeout_ms: u64::try_from(q.network_timeout.as_millis()).unwrap_or(u64::MAX),
+            land: Land::Push,
         }
     }
 }
@@ -323,6 +330,36 @@ pub struct MarkerRow {
     pub push_start_ticks: Option<u64>,
     /// Write time.
     pub written_at: u64,
+    /// The pull-request side of a train that lands through one.
+    pub pr: PrColumns,
+}
+
+/// The pull-request columns of a marker (added in place; ADR-0025). Empty
+/// for a train that lands by push.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PrColumns {
+    /// `sluice/train/<id>`: set when the train lands through a pull request.
+    pub branch: Option<String>,
+    /// Pull request number.
+    pub number: Option<u64>,
+    /// Pull request address.
+    pub url: Option<String>,
+    /// Sluice's client opened it.
+    pub created: bool,
+    /// What the approver's client did about auto-merge.
+    pub auto_merge: AutoMerge,
+    /// When the train started waiting for the merge (unix ms).
+    pub since: Option<u64>,
+    /// When a client last reported it (unix ms).
+    pub observed_at: Option<u64>,
+    /// What the forge last said (`open`, `merged`, `closed`).
+    pub observed_state: Option<String>,
+    /// Commits the target gained since the base, as last measured.
+    pub target_moved: Option<u64>,
+    /// Remark of the last report.
+    pub note: Option<String>,
+    /// Sluice deleted the remote branch.
+    pub branch_deleted: bool,
 }
 
 /// Creates the tables (idempotent) and checks `queue_schema`.
@@ -342,6 +379,9 @@ pub fn init(tx: &Transaction<'_>) -> rusqlite::Result<()> {
         "trust_config",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    for (column, ty) in MARKER_PR_COLUMNS {
+        add_column_if_missing(tx, "queue_push_markers", column, ty)?;
+    }
     let v: Option<i64> = tx
         .query_row("SELECT max(version) FROM queue_schema", [], |r| r.get(0))
         .optional()?
@@ -358,6 +398,22 @@ pub fn init(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     }
     Ok(())
 }
+
+/// Columns of `queue_push_markers` added for pull-request landing
+/// (ADR-0025): nullable, or `NOT NULL` with a default.
+const MARKER_PR_COLUMNS: [(&str, &str); 11] = [
+    ("pr_branch", "TEXT"),
+    ("pr_number", "INTEGER"),
+    ("pr_url", "TEXT"),
+    ("pr_created", "INTEGER NOT NULL DEFAULT 0"),
+    ("pr_auto_merge", "TEXT"),
+    ("pr_since", "INTEGER"),
+    ("pr_observed_at", "INTEGER"),
+    ("pr_observed_state", "TEXT"),
+    ("pr_target_moved", "INTEGER"),
+    ("pr_note", "TEXT"),
+    ("pr_branch_deleted", "INTEGER NOT NULL DEFAULT 0"),
+];
 
 /// Adds a column to a table created by an earlier release (nullable, or
 /// `NOT NULL` with a default); no
@@ -514,7 +570,25 @@ fn train_from_row(r: &Row<'_>) -> rusqlite::Result<TrainRow> {
 }
 
 const MARKER_COLS: &str = "train_id, sha, base_sha, remote, endpoint_hash, push_refs, audit_ref, \
-     pin_ref, claim_token, push_pid, push_start_ticks, written_at";
+     pin_ref, claim_token, push_pid, push_start_ticks, written_at, pr_branch, pr_number, pr_url, \
+     pr_created, pr_auto_merge, pr_since, pr_observed_at, pr_observed_state, pr_target_moved, \
+     pr_note, pr_branch_deleted";
+
+fn auto_merge_str(a: AutoMerge) -> Option<&'static str> {
+    match a {
+        AutoMerge::NotRequested => None,
+        AutoMerge::Armed => Some("armed"),
+        AutoMerge::Failed => Some("failed"),
+    }
+}
+
+fn parse_auto_merge(s: Option<&str>) -> AutoMerge {
+    match s {
+        Some("armed") => AutoMerge::Armed,
+        Some("failed") => AutoMerge::Failed,
+        _ => AutoMerge::NotRequested,
+    }
+}
 
 fn marker_from_row(r: &Row<'_>) -> rusqlite::Result<MarkerRow> {
     Ok(MarkerRow {
@@ -532,6 +606,19 @@ fn marker_from_row(r: &Row<'_>) -> rusqlite::Result<MarkerRow> {
             .and_then(|p| u32::try_from(p).ok()),
         push_start_ticks: r.get::<_, Option<i64>>(10)?.map(u),
         written_at: u(r.get(11)?),
+        pr: PrColumns {
+            branch: r.get(12)?,
+            number: r.get::<_, Option<i64>>(13)?.map(u),
+            url: r.get(14)?,
+            created: r.get::<_, i64>(15)? != 0,
+            auto_merge: parse_auto_merge(r.get::<_, Option<String>>(16)?.as_deref()),
+            since: r.get::<_, Option<i64>>(17)?.map(u),
+            observed_at: r.get::<_, Option<i64>>(18)?.map(u),
+            observed_state: r.get(19)?,
+            target_moved: r.get::<_, Option<i64>>(20)?.map(u),
+            note: r.get(21)?,
+            branch_deleted: r.get::<_, i64>(22)? != 0,
+        },
     })
 }
 
@@ -1358,7 +1445,8 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.tx.execute(
             &format!(
                 "INSERT INTO queue_push_markers({MARKER_COLS}) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10, ?11, NULL, NULL, 0, \
+                 NULL, NULL, NULL, NULL, NULL, NULL, 0)"
             ),
             params![
                 m.train_id,
@@ -1371,6 +1459,7 @@ impl<'a, 'c> Writer<'a, 'c> {
                 m.pin_ref,
                 self.fence.token,
                 i(self.now),
+                m.pr.branch,
             ],
         )?;
         Ok(())
@@ -1434,6 +1523,35 @@ impl<'a, 'c> Writer<'a, 'c> {
         Ok(())
     }
 
+    /// Writes the pull-request columns of a train's marker (all of them).
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn set_pr(&self, train_id: &str, pr: &PrColumns) -> rusqlite::Result<()> {
+        self.tx.execute(
+            "UPDATE queue_push_markers SET pr_branch = ?2, pr_number = ?3, pr_url = ?4, \
+             pr_created = ?5, pr_auto_merge = ?6, pr_since = ?7, pr_observed_at = ?8, \
+             pr_observed_state = ?9, pr_target_moved = ?10, pr_note = ?11, \
+             pr_branch_deleted = ?12 WHERE train_id = ?1",
+            params![
+                train_id,
+                pr.branch,
+                pr.number.map(i),
+                pr.url,
+                i64::from(pr.created),
+                auto_merge_str(pr.auto_merge),
+                pr.since.map(i),
+                pr.observed_at.map(i),
+                pr.observed_state,
+                pr.target_moved.map(i),
+                pr.note,
+                i64::from(pr.branch_deleted),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Deletes a train's marker.
     ///
     /// # Errors
@@ -1473,6 +1591,7 @@ impl<'a, 'c> Writer<'a, 'c> {
                     | QueueJobState::Approved
                     | QueueJobState::Pushing
                     | QueueJobState::NeedsReconcile
+                    | QueueJobState::AwaitingMerge
             );
             if !requeue_from {
                 continue;
@@ -2327,6 +2446,7 @@ pub(crate) mod tests {
             push_pid: None,
             push_start_ticks: None,
             written_at: 0,
+            pr: PrColumns::default(),
         };
         with(&mut c, |tx| {
             Writer::new(tx, &f, Actor::Runner)?.insert_marker(&m)

@@ -20,14 +20,17 @@
 //! - `hookcheck`: a merged config asking the `pre-push` hook for unverified gates.
 //! - `trust`: the member's own configuration for `--trust-member-config`.
 //! - `vouch`: the answer to the repository's `pre-push` hook during the train's push.
+//! - [`pr`]: the reconcile tables of `land = "pull-request"` (ADR-0025).
 //! - [`extension`]: [`QueueExtension`], the `Extension` implementation.
 //!
 //! Design: `kb/sluice/design/merge-queue.md`.
 
+mod awaiting;
 pub mod extension;
 pub mod git;
 mod hookcheck;
 pub mod model;
+pub mod pr;
 mod prepare;
 pub mod push;
 pub mod reconcile;

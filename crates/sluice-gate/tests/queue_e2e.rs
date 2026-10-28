@@ -656,6 +656,7 @@ fn acceptance_5_base_moved_dissolves_old_plan_is_stale_new_one_lands() {
             train_hash: old_hash,
             via: ApproveVia::Cli,
             env: std::collections::BTreeMap::new(),
+            pr_landing: true,
         })
         .expect("reply");
     evidence("5 old hash over the socket", &format!("{reply:?}"));
@@ -1494,4 +1495,80 @@ fn trusting_the_members_config_gets_past_a_broken_target_config() {
     let out = q.approve(&t);
     assert!(out.status.success(), "{}", show(&out));
     q.wait("landed", |v| job_is(v, &ja, "landed"));
+}
+
+// ------------------------------------------- landing through a pull request
+
+/// ADR-0025: with `land = "pull-request"` an approval pushes
+/// `sluice/train/<id>`, never the target. Here the remote is a local path, so
+/// the client has no forge to open the pull request on: the train must stay
+/// `awaiting_merge` with a note, and nobody but a human finishes it.
+#[test]
+fn a_pull_request_landing_pushes_the_branch_and_waits_even_without_a_forge() {
+    let q = Q::new(&format!("{GATE}\n[queue]\nland = \"pull-request\"\n"));
+    let base = q.bare_ref("refs/heads/main").unwrap();
+    let (wa, _a) = q.worktree("feat/a", &[("n.txt", "n\n")]);
+    let ja = q.enqueue(&wa, &[]);
+    let t = q.wait_ready("ready", |_| true);
+    assert_eq!(t["land"], "pull-request", "{t:#}");
+
+    let out = q.approve(&t);
+    evidence("pr approve", &show(&out));
+    // The branch was pushed, then the pull request could not be opened.
+    assert_eq!(out.status.code(), Some(1), "{}", show(&out));
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(err.contains("pull request could not be opened"), "{err}");
+    assert!(err.contains("sluice queue reconcile"), "{err}");
+    let id = train_id(&t).to_owned();
+    let st = q.status();
+    let tv = train(&st, &id);
+    assert_eq!(tv["state"], "awaiting_merge", "{st:#}");
+    let s = tv["merge_sha"].as_str().unwrap().to_owned();
+    assert_eq!(
+        q.bare_ref(&format!("refs/heads/sluice/train/{id}"))
+            .unwrap(),
+        s
+    );
+    assert_eq!(q.bare_ref("refs/heads/main").unwrap(), base);
+    assert!(job_is(&st, &ja, "awaiting_merge"), "{st:#}");
+    let text = q.status_text();
+    evidence("pr status", &text);
+    for want in [
+        "AWAITING MERGE (pull request)",
+        "pull request: not opened yet",
+        "forge_unreachable",
+        "Sluice never merges",
+    ] {
+        assert!(text.contains(want), "{want}\n{text}");
+    }
+
+    // An agent cannot finish it: the pull request is a human's act.
+    let out = q.approve_with(&t, &[("CLAUDECODE", "1")]);
+    assert_eq!(out.status.code(), Some(4), "{}", show(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("reserved to humans"),
+        "{}",
+        show(&out)
+    );
+    // A human running reconcile tries again (and fails the same way here).
+    let out = q.run(&["queue", "reconcile"]);
+    assert_eq!(out.status.code(), Some(1), "{}", show(&out));
+
+    // Withdrawing it dissolves the train; with no forge to read, Sluice has
+    // no proof that the pull request is closed and leaves the branch.
+    let out = q.run(&["queue", "cancel", &ja]);
+    evidence("pr cancel", &show(&out));
+    assert!(out.status.success(), "{}", show(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("the train branch was left"),
+        "{}",
+        show(&out)
+    );
+    let st = q.status();
+    assert!(job_is(&st, &ja, "cancelled"), "{st:#}");
+    assert_eq!(train(&st, &id)["state"], "dissolved");
+    assert!(
+        q.bare_ref(&format!("refs/heads/sluice/train/{id}"))
+            .is_some()
+    );
 }

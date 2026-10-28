@@ -32,6 +32,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use sluice_gate_core::forge::{AutoMerge, PrFact};
 use sluice_gate_core::key::CacheKey;
 use sluice_gate_core::tree::TreeHash;
 
@@ -60,6 +61,13 @@ pub const FEATURE_QUEUE_ONLY: &str = "queue-only";
 /// `queue-enqueue` and `queue-retry` (ADR-0018 section 6). A client refuses the
 /// flag when the daemon does not list it, instead of having it ignored.
 pub const FEATURE_QUEUE_TRUST_CONFIG: &str = "queue-trust-config";
+
+/// Feature announced by a daemon that lands trains through pull requests
+/// (`[queue] land = "pull-request"`, ADR-0025): the `awaiting_merge` states,
+/// the `queue-pr-facts` message and `pr_landing` on `queue-approve`. A client
+/// that does not see it refuses `--auto-merge`; a daemon refuses to land such
+/// a train for a client that does not send `pr_landing`.
+pub const FEATURE_QUEUE_PR_LANDING: &str = "queue-pr-landing";
 
 /// Value of [`RunningJob::kind`] / [`QueuedJob::kind`] for `sluice exec` jobs.
 pub const JOB_KIND_EXEC: &str = "exec";
@@ -193,6 +201,11 @@ pub enum ClientMessage {
         /// Allowlisted environment of the approving client, used for the push.
         #[serde(default)]
         env: BTreeMap<String, String>,
+        /// The client opens the pull request of a train that lands through
+        /// one (`sluice queue` of this version). A daemon refuses such a
+        /// train without it; omitted from the wire when false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pr_landing: bool,
     },
     /// Merge queue: re-queue a `conflict` or `failed` job. Reply: `queue-job`.
     QueueRetry {
@@ -235,6 +248,23 @@ pub enum ClientMessage {
         /// Restrict to one repository (its git common dir); `None` means all.
         #[serde(default)]
         repo: Option<PathBuf>,
+    },
+    /// Merge queue: what a client's own forge CLI says about the pull
+    /// requests of `awaiting_merge` trains (ADR-0025). Facts, not
+    /// decisions: the daemon decides. Only sent to a daemon announcing
+    /// [`FEATURE_QUEUE_PR_LANDING`]. Reply: `queue-reconcile` (one result per
+    /// fact).
+    QueuePrFacts {
+        /// Client-chosen request id.
+        #[serde(default)]
+        id: u64,
+        /// One report per train.
+        facts: Vec<PrFact>,
+        /// Allowlisted environment of the client (git credentials), used
+        /// only to delete the branch of a train a human cancelled once the
+        /// client closed its pull request; omitted from the wire when empty.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        env: BTreeMap<String, String>,
     },
 }
 
@@ -625,7 +655,7 @@ pub enum ServerMessage {
         #[serde(default)]
         id: u64,
         /// The train after approval.
-        train: QueueTrainView,
+        train: Box<QueueTrainView>,
     },
     /// Reply to `queue-reconcile`.
     QueueReconcile {
@@ -1391,6 +1421,9 @@ pub enum QueueJobState {
     Cancelled,
     /// Push outcome unknown; waiting for `queue-reconcile`.
     NeedsReconcile,
+    /// Landing through a pull request (ADR-0025): the verified commit is on
+    /// its `sluice/train/<id>` branch and the forge (a human) merges.
+    AwaitingMerge,
     /// A state this client does not know (sent by a newer daemon).
     #[serde(other)]
     Unknown,
@@ -1417,6 +1450,9 @@ pub enum QueueTrainState {
     Dissolved,
     /// Push outcome unknown; waiting for `queue-reconcile`.
     NeedsReconcile,
+    /// Landing through a pull request: pushed to `sluice/train/<id>`, waiting
+    /// for the forge to merge it.
+    AwaitingMerge,
     /// A state this client does not know (sent by a newer daemon).
     #[serde(other)]
     Unknown,
@@ -1475,6 +1511,11 @@ pub struct QueueJobView {
     /// push before (ADR-0025). Additive: older clients ignore it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub learned_protection: Option<LearnedProtection>,
+    /// Only in the reply to `queue-enqueue`: `"pull-request"` when the
+    /// target's configuration lands trains through a pull request (ADR-0025).
+    /// Additive: older clients ignore it, older daemons never send it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub land: Option<String>,
 }
 
 /// A push to a target that the forge refused as protected, remembered per
@@ -1596,6 +1637,51 @@ pub struct QueueTrainView {
     /// a note, when the base has none), capped at 64 KiB with a truncation note.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_diff: Option<String>,
+    /// `"pull-request"` for a train that lands through a pull request
+    /// (ADR-0025); absent for a push.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub land: Option<String>,
+    /// The pull request of such a train, once its branch was pushed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<PullRequestView>,
+}
+
+/// The pull-request side of a train (columns of `queue_push_markers`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PullRequestView {
+    /// The train's branch (`sluice/train/<id>`).
+    pub branch: String,
+    /// Pull request number, once known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub number: Option<u64>,
+    /// Pull request address, once known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Sluice's client opened it (it did not exist before).
+    pub created_by_sluice: bool,
+    /// What the approver's client did about auto-merge.
+    #[serde(skip_serializing_if = "AutoMerge::is_default")]
+    pub auto_merge: AutoMerge,
+    /// When the train started waiting for the merge (RFC 3339).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// When a client last reported the pull request (RFC 3339).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
+    /// What the forge last said: `open`, `merged` or `closed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_state: Option<String>,
+    /// Commits the target gained since the train was built, as of the last
+    /// report (the train is not requeued: the forge's rules decide).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_moved: Option<u64>,
+    /// Remark of the last report (`forge_unreachable: ...`,
+    /// `pr_head_changed`, `tree_differs_from_verified`, ...).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Sluice deleted the branch (a dissolved train).
+    pub branch_deleted: bool,
 }
 
 /// Decision taken by `queue-reconcile` for one train.
@@ -1612,6 +1698,11 @@ pub enum ReconcileDecision {
     Cancelled,
     /// No decision possible yet; the train is unchanged (see `reason`).
     Refused,
+    /// The train waits for its pull request to be merged (unchanged, or
+    /// continued after an interrupted push; `reason` is the remark).
+    AwaitingMerge,
+    /// The members failed (`pr_closed`); `retry` is the way back.
+    Failed,
     /// A decision this client does not know (sent by a newer daemon).
     #[serde(other)]
     Unknown,
@@ -1889,6 +1980,7 @@ mod tests {
             updated_at: "t".into(),
             finished_at: None,
             learned_protection: None,
+            land: None,
         }
     }
 
@@ -1922,6 +2014,8 @@ mod tests {
             prepare: None,
             config_source: None,
             config_diff: None,
+            land: None,
+            pr: None,
         }
     }
 
@@ -1993,9 +2087,78 @@ mod tests {
         assert_eq!(back, view);
     }
 
+    /// The merge-queue client messages of [`client_round_trip`].
+    fn queue_client_messages() -> Vec<ClientMessage> {
+        vec![
+            ClientMessage::QueueEnqueue {
+                id: 5,
+                request: EnqueueRequest {
+                    repo: "/abs/.git".into(),
+                    worktree: "/abs/wt".into(),
+                    branch: "feat/login".into(),
+                    head_sha: TREE.into(),
+                    base: Some("origin/main".into()),
+                    caller: Caller::Agent,
+                    session: Some("s1".into()),
+                    env: BTreeMap::from([("SSH_AUTH_SOCK".into(), "/a".into())]),
+                    via: Some(ApproveVia::Mcp),
+                    trust_member_config: false,
+                },
+            },
+            ClientMessage::QueueStatus {
+                id: 6,
+                repo: Some("/abs/.git".into()),
+            },
+            ClientMessage::QueueStatus { id: 6, repo: None },
+            ClientMessage::QueueApprove {
+                id: 7,
+                train_id: "t-1".into(),
+                train_hash: KEY.into(),
+                via: ApproveVia::Mcp,
+                env: BTreeMap::from([("HOME".into(), "/h".into())]),
+                pr_landing: true,
+            },
+            ClientMessage::QueuePrFacts {
+                id: 11,
+                facts: vec![PrFact::of(
+                    "t-1",
+                    sluice_gate_core::forge::PrObservation::Missing,
+                )],
+                env: BTreeMap::new(),
+            },
+            ClientMessage::QueueRetry {
+                id: 8,
+                job_id: "j".into(),
+                head_sha: TREE.into(),
+                via: None,
+                trust_member_config: false,
+                env: BTreeMap::new(),
+            },
+            ClientMessage::QueueRetry {
+                id: 8,
+                job_id: "j".into(),
+                head_sha: TREE.into(),
+                via: Some(ApproveVia::Mcp),
+                trust_member_config: true,
+                env: BTreeMap::from([("CLAUDECODE".into(), "1".into())]),
+            },
+            ClientMessage::QueueCancel {
+                id: 9,
+                job_id: "j".into(),
+                via: None,
+            },
+            ClientMessage::QueueCancel {
+                id: 9,
+                job_id: "j".into(),
+                via: Some(ApproveVia::Mcp),
+            },
+            ClientMessage::QueueReconcile { id: 10, repo: None },
+        ]
+    }
+
     #[test]
     fn client_round_trip() {
-        let msgs = vec![
+        let mut msgs = vec![
             ClientMessage::Hello {
                 protocol: 1,
                 client: "c".into(),
@@ -2029,61 +2192,8 @@ mod tests {
                 id: 1,
                 reason: None,
             },
-            ClientMessage::QueueEnqueue {
-                id: 5,
-                request: EnqueueRequest {
-                    repo: "/abs/.git".into(),
-                    worktree: "/abs/wt".into(),
-                    branch: "feat/login".into(),
-                    head_sha: TREE.into(),
-                    base: Some("origin/main".into()),
-                    caller: Caller::Agent,
-                    session: Some("s1".into()),
-                    env: BTreeMap::from([("SSH_AUTH_SOCK".into(), "/a".into())]),
-                    via: Some(ApproveVia::Mcp),
-                    trust_member_config: false,
-                },
-            },
-            ClientMessage::QueueStatus {
-                id: 6,
-                repo: Some("/abs/.git".into()),
-            },
-            ClientMessage::QueueStatus { id: 6, repo: None },
-            ClientMessage::QueueApprove {
-                id: 7,
-                train_id: "t-1".into(),
-                train_hash: KEY.into(),
-                via: ApproveVia::Mcp,
-                env: BTreeMap::from([("HOME".into(), "/h".into())]),
-            },
-            ClientMessage::QueueRetry {
-                id: 8,
-                job_id: "j".into(),
-                head_sha: TREE.into(),
-                via: None,
-                trust_member_config: false,
-                env: BTreeMap::new(),
-            },
-            ClientMessage::QueueRetry {
-                id: 8,
-                job_id: "j".into(),
-                head_sha: TREE.into(),
-                via: Some(ApproveVia::Mcp),
-                trust_member_config: true,
-                env: BTreeMap::from([("CLAUDECODE".into(), "1".into())]),
-            },
-            ClientMessage::QueueCancel {
-                id: 9,
-                job_id: "j".into(),
-                via: None,
-            },
-            ClientMessage::QueueCancel {
-                id: 9,
-                job_id: "j".into(),
-                via: Some(ApproveVia::Mcp),
-            },
-            ClientMessage::QueueReconcile { id: 10, repo: None },
         ];
+        msgs.extend(queue_client_messages());
         for m in msgs {
             let line = encode(&m).unwrap();
             assert!(line.ends_with('\n') && line.matches('\n').count() == 1);
@@ -2197,7 +2307,7 @@ mod tests {
             },
             ServerMessage::QueueApproved {
                 id: 8,
-                train: train_view(),
+                train: Box::new(train_view()),
             },
             ServerMessage::QueueReconcile {
                 id: 9,

@@ -5,12 +5,16 @@
 //! [`probe_target`] answers "does this target accept direct pushes?" as a
 //! [`Protection`]; it is advisory (a warning, never a refusal) and never an
 //! error: whatever cannot be checked is [`Protection::Unknown`] with the
-//! reason. [`Forge`] is the interface a later wave grows with pull-request
-//! calls (`ensure_pr`, `pr_state`); GitLab and others plug in behind it.
+//! reason. [`Forge`] is the interface of everything the queue asks a forge:
+//! the probe, and the pull-request calls of `land = "pull-request"`
+//! (`ensure_pr`, `pr_state`, `arm_auto_merge`, `close_pr`; [`landing`] drives
+//! them for the clients). GitLab and others plug in behind it.
 
 pub mod cache;
 mod exec;
 mod github;
+pub mod landing;
+pub mod pr;
 mod remote;
 
 use std::path::Path;
@@ -20,8 +24,10 @@ use serde::{Deserialize, Serialize};
 
 pub use exec::Budget;
 pub use github::{GitHub, Reply, decide, parse_reply};
+pub use pr::{AutoMerge, Member, PrFact, PrObservation, PrSpec, PullRequest, describe};
 pub use remote::{RemoteUrl, hostname_of, parse as parse_remote};
 
+use crate::config::Land;
 use crate::git::{self, EnvMap};
 
 /// Time the whole probe may take (identify the remote, up to three API
@@ -43,14 +49,47 @@ pub enum Protection {
     Unknown(String),
 }
 
-/// What a forge can be asked. The pull-request calls come with the landing
-/// wave.
+/// What a forge can be asked. Every call runs in the caller's environment
+/// (the user's own CLI login); none of them merges (ADR-0025).
 pub trait Forge {
     /// Display name (`GitHub`).
     fn name(&self) -> &'static str;
 
     /// Read-only probe of the protection of `target` (a short branch name).
     fn probe_protection(&self, target: &str, budget: &Budget) -> Protection;
+
+    /// Read-only: the pull request whose head is `branch` (any state), if
+    /// there is one.
+    ///
+    /// # Errors
+    ///
+    /// Why the forge could not be asked.
+    fn pr_state(&self, branch: &str, budget: &Budget) -> Result<Option<PullRequest>, String>;
+
+    /// Find-or-create: the pull request of `spec.head`, opened when none
+    /// exists. The flag says whether this call opened it.
+    ///
+    /// # Errors
+    ///
+    /// Why it could not be found or opened.
+    fn ensure_pr(&self, spec: &PrSpec, budget: &Budget) -> Result<(PullRequest, bool), String>;
+
+    /// Arms the forge's auto-merge on pull request `number`, only for the
+    /// head commit `head` (`gh pr merge --auto --match-head-commit`). The
+    /// forge merges when its own rules are met; this never merges by itself
+    /// and never uses admin rights.
+    ///
+    /// # Errors
+    ///
+    /// Why the forge refused.
+    fn arm_auto_merge(&self, number: u64, head: &str, budget: &Budget) -> Result<(), String>;
+
+    /// Closes pull request `number` with `comment`.
+    ///
+    /// # Errors
+    ///
+    /// Why it could not be closed.
+    fn close_pr(&self, number: u64, comment: &str, budget: &Budget) -> Result<(), String>;
 }
 
 /// Identifies the forge of `remote` (a remote name of the repository at
@@ -75,15 +114,15 @@ pub fn last_known(
     cache::last(env, &key)
 }
 
-/// The cache key of `target` on `remote`, with the forge host and the
-/// repository path, or why the target cannot be probed.
-fn target_key(
+/// The forge host and the repository path (`owner/repo`) of `remote`'s push
+/// URL (the alias of an ssh remote resolved through `ssh -G`), or why the
+/// remote is not one a forge can be asked about.
+fn locate_remote(
     env: &EnvMap,
     cwd: &Path,
     remote: &str,
-    target: &str,
     budget: &Budget,
-) -> Result<(String, String, String), Protection> {
+) -> Result<(String, String), Protection> {
     if remote.is_empty() {
         return Err(Protection::Unknown("the target is a local branch".into()));
     }
@@ -105,8 +144,21 @@ fn target_key(
     } else {
         parsed.host.clone()
     };
-    let key = format!("{host}/{}#{target}", parsed.path);
-    Ok((key, host, parsed.path))
+    Ok((host, parsed.path))
+}
+
+/// The cache key of `target` on `remote`, with the forge host and the
+/// repository path, or why the target cannot be probed.
+fn target_key(
+    env: &EnvMap,
+    cwd: &Path,
+    remote: &str,
+    target: &str,
+    budget: &Budget,
+) -> Result<(String, String, String), Protection> {
+    let (host, path) = locate_remote(env, cwd, remote, budget)?;
+    let key = format!("{host}/{path}#{target}");
+    Ok((key, host, path))
 }
 
 fn probe_target_at(env: &EnvMap, cwd: &Path, remote: &str, target: &str, now: u64) -> Protection {
@@ -123,28 +175,30 @@ fn probe_target_at(env: &EnvMap, cwd: &Path, remote: &str, target: &str, now: u6
     result
 }
 
-fn probe_forge(
-    env: &EnvMap,
-    cwd: &Path,
-    host: &str,
-    path: &str,
-    target: &str,
-    budget: &Budget,
-) -> Protection {
+/// Why `host`/`path` cannot be reached through `gh`, or `None` when it can
+/// be tried: only GitHub (github.com, or a host `gh` holds a login for) and
+/// a plain `owner/repo` path.
+fn unusable(env: &EnvMap, cwd: &Path, host: &str, path: &str, budget: &Budget) -> Option<String> {
     if matches!(host, "gitlab.com" | "codeberg.org" | "bitbucket.org") {
-        return Protection::Unknown(format!(
+        return Some(format!(
             "{host} cannot be queried yet (only GitHub can); a refused push is still learned"
         ));
     }
     if host != "github.com" && !GitHub::logged_in(env, cwd, host, budget) {
-        return Protection::Unknown(format!(
+        return Some(format!(
             "{host} is not a forge Sluice can query (no gh login for it)"
         ));
     }
     let segments: Vec<&str> = path.split('/').collect();
     if segments.len() != 2 || segments.contains(&"") {
-        return Protection::Unknown(format!("cannot tell owner/repo from the path '{path}'"));
+        return Some(format!("cannot tell owner/repo from the path '{path}'"));
     }
+    None
+}
+
+/// The caller's environment with the variables that keep `gh` and `git`
+/// from prompting.
+fn call_env(env: &EnvMap) -> EnvMap {
     let mut call_env = env.clone();
     for (k, v) in [
         ("GH_PROMPT_DISABLED", "1"),
@@ -153,18 +207,43 @@ fn probe_forge(
     ] {
         call_env.insert(k.to_owned(), v.to_owned());
     }
-    GitHub::new(&call_env, cwd, host, path).probe_protection(target, budget)
+    call_env
 }
 
-/// Where the user is told the queue's limits for such a target.
-const DOCS: &str = "see docs/merge-queue.md";
+fn probe_forge(
+    env: &EnvMap,
+    cwd: &Path,
+    host: &str,
+    path: &str,
+    target: &str,
+    budget: &Budget,
+) -> Protection {
+    if let Some(why) = unusable(env, cwd, host, path, budget) {
+        return Protection::Unknown(why);
+    }
+    GitHub::new(&call_env(env), cwd, host, path).probe_protection(target, budget)
+}
+
+/// What the user is told to do about such a target.
+const DOCS: &str = "set [queue] land = \"pull-request\" to land through a pull request; see \
+                    docs/merge-queue.md";
 
 /// The warnings an enqueue to `target` (`origin/main`) shows: the probe's
 /// verdict and, when a push to it was refused before, that fact
-/// (`learned` = date and evidence). Empty for an open target.
+/// (`learned` = date and evidence). Empty for an open target, and for a
+/// repository that lands through a pull request (`land`): a target that
+/// refuses direct pushes is then what the queue expects.
 #[must_use]
-pub fn warnings(target: &str, probe: &Protection, learned: Option<(&str, &str)>) -> Vec<String> {
+pub fn warnings(
+    target: &str,
+    probe: &Protection,
+    learned: Option<(&str, &str)>,
+    land: Land,
+) -> Vec<String> {
     let mut out = Vec::new();
+    if land == Land::PullRequest {
+        return out;
+    }
     // The probe names the protection when it can; the learned fact speaks
     // when it cannot (open or unknown).
     if let (Some((since, evidence)), Protection::Open | Protection::Unknown(_)) = (learned, probe) {
@@ -176,11 +255,11 @@ pub fn warnings(target: &str, probe: &Protection, learned: Option<(&str, &str)>)
     match probe {
         Protection::Open => {}
         Protection::PullRequestRequired(e) => out.push(format!(
-            "{target} requires a pull request ({e}); the queue cannot land on this target; {DOCS}"
+            "{target} requires a pull request ({e}); the queue cannot land on this target by push; {DOCS}"
         )),
         Protection::Protected(e) => out.push(format!(
             "{target} is protected ({e}); a direct push may be refused, and then the queue cannot \
-             land on this target; {DOCS}"
+             land on this target by push; {DOCS}"
         )),
         Protection::Unknown(r) => out.push(format!("could not check {target}: {r}")),
     }
@@ -190,7 +269,8 @@ pub fn warnings(target: &str, probe: &Protection, learned: Option<(&str, &str)>)
 /// The warnings for an enqueue to `remote`/`target` of the repository at
 /// `cwd`: probes the forge with the caller's `env` and adds what the queue
 /// learned (`learned` = RFC 3339 time and evidence of an earlier refusal).
-/// A local target (empty `remote`) has no forge and no warning.
+/// A local target (empty `remote`) has no forge and no warning, and neither
+/// has a repository that lands through a pull request.
 #[must_use]
 pub fn enqueue_warnings(
     env: &EnvMap,
@@ -198,13 +278,14 @@ pub fn enqueue_warnings(
     remote: &str,
     target: &str,
     learned: Option<(&str, &str)>,
+    land: Land,
 ) -> Vec<String> {
-    if remote.is_empty() {
+    if remote.is_empty() || land == Land::PullRequest {
         return Vec::new();
     }
     let probe = probe_target(env, cwd, remote, target);
     let day = learned.map(|(since, e)| (since.split('T').next().unwrap_or(since), e));
-    warnings(&format!("{remote}/{target}"), &probe, day)
+    warnings(&format!("{remote}/{target}"), &probe, day, land)
 }
 
 #[cfg(test)]
@@ -218,7 +299,7 @@ mod tests {
     #[test]
     fn an_open_target_has_no_warning() {
         assert_eq!(
-            warnings("origin/main", &Protection::Open, None),
+            warnings("origin/main", &Protection::Open, None, Land::Push),
             Vec::<String>::new()
         );
     }
@@ -229,6 +310,7 @@ mod tests {
             "origin/main",
             &some("a ruleset requires a pull request"),
             None,
+            Land::Push,
         );
         assert_eq!(w.len(), 1);
         assert!(
@@ -236,13 +318,16 @@ mod tests {
             "{w:?}"
         );
         assert!(
-            w[0].contains("the queue cannot land on this target; see docs/merge-queue.md"),
+            w[0].contains(
+                "the queue cannot land on this target by push; set [queue] land = \"pull-request\""
+            ),
             "{w:?}"
         );
         let w = warnings(
             "origin/main",
             &Protection::Protected("status checks".into()),
             None,
+            Land::Push,
         );
         assert!(w[0].contains("is protected (status checks)"), "{w:?}");
         assert!(w[0].contains("cannot land"), "{w:?}");
@@ -254,6 +339,7 @@ mod tests {
             "origin/main",
             &Protection::Unknown("gh is not installed".into()),
             None,
+            Land::Push,
         );
         assert_eq!(w, ["could not check origin/main: gh is not installed"]);
     }
@@ -261,17 +347,22 @@ mod tests {
     #[test]
     fn a_learned_fact_speaks_when_the_probe_cannot() {
         let learned = Some(("2026-10-28", "GH006: Protected branch update failed"));
-        let w = warnings("origin/main", &Protection::Unknown("no gh".into()), learned);
+        let w = warnings(
+            "origin/main",
+            &Protection::Unknown("no gh".into()),
+            learned,
+            Land::Push,
+        );
         assert_eq!(w.len(), 2);
         assert!(
             w[0].contains("refused a direct push on 2026-10-28"),
             "{w:?}"
         );
         assert!(w[0].contains("GH006"), "{w:?}");
-        let w = warnings("origin/main", &Protection::Open, learned);
+        let w = warnings("origin/main", &Protection::Open, learned, Land::Push);
         assert_eq!(w.len(), 1);
         // The probe's own protection is not said twice.
-        let w = warnings("origin/main", &some("rule"), learned);
+        let w = warnings("origin/main", &some("rule"), learned, Land::Push);
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("requires a pull request"), "{w:?}");
     }
@@ -280,7 +371,30 @@ mod tests {
     fn a_local_target_has_no_forge_and_no_warning() {
         let env = EnvMap::new();
         assert_eq!(
-            enqueue_warnings(&env, Path::new("/"), "", "main", None),
+            enqueue_warnings(&env, Path::new("/"), "", "main", None, Land::Push),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_repository_that_lands_through_a_pull_request_expects_the_protection() {
+        let learned = Some(("2026-10-28", "GH006: Protected branch update failed"));
+        for probe in [some("rule"), Protection::Protected("checks".into())] {
+            assert_eq!(
+                warnings("origin/main", &probe, learned, Land::PullRequest),
+                Vec::<String>::new()
+            );
+        }
+        let env = EnvMap::new();
+        assert_eq!(
+            enqueue_warnings(
+                &env,
+                Path::new("/"),
+                "origin",
+                "main",
+                None,
+                Land::PullRequest
+            ),
             Vec::<String>::new()
         );
     }

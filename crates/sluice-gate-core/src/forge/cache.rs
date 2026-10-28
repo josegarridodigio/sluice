@@ -93,3 +93,75 @@ pub fn store(env: &EnvMap, key: &str, result: &Protection, now: u64) {
         let _ = std::fs::remove_file(&tmp);
     }
 }
+
+/// How long a pull request read is reused (`queue status` polls).
+pub const PR_TTL_SECS: u64 = 20;
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PrFile {
+    entries: BTreeMap<String, PrEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PrEntry {
+    at: u64,
+    pr: Option<super::PullRequest>,
+}
+
+fn pr_path(env: &EnvMap) -> PathBuf {
+    crate::dirs::cache_dir(env).join("forge-pr.json")
+}
+
+fn pr_read(env: &EnvMap) -> PrFile {
+    std::fs::read_to_string(pr_path(env))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// The pull request read for `key` (`host/owner/repo#branch`) less than
+/// [`PR_TTL_SECS`] ago: `Some(None)` is "there was none".
+#[must_use]
+pub fn load_pr(env: &EnvMap, key: &str, now: u64) -> Option<Option<super::PullRequest>> {
+    let file = pr_read(env);
+    let e = file.entries.get(key)?;
+    (now.saturating_sub(e.at) < PR_TTL_SECS).then(|| e.pr.clone())
+}
+
+/// Stores a definitive read (best effort); stale entries are dropped.
+pub fn store_pr(env: &EnvMap, key: &str, pr: Option<&super::PullRequest>, now: u64) {
+    let mut file = pr_read(env);
+    file.entries
+        .retain(|_, e| now.saturating_sub(e.at) < PR_TTL_SECS * 30);
+    file.entries.insert(
+        key.to_owned(),
+        PrEntry {
+            at: now,
+            pr: pr.cloned(),
+        },
+    );
+    store_pr_file(env, &file);
+}
+
+/// Forgets a read (after the caller changed the pull request).
+pub fn forget_pr(env: &EnvMap, key: &str) {
+    let mut file = pr_read(env);
+    if file.entries.remove(key).is_some() {
+        store_pr_file(env, &file);
+    }
+}
+
+fn store_pr_file(env: &EnvMap, file: &PrFile) {
+    let target = pr_path(env);
+    let Some(dir) = target.parent() else { return };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let tmp = dir.join(format!("forge-pr.{}.tmp", std::process::id()));
+    let Ok(text) = serde_json::to_string(file) else {
+        return;
+    };
+    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &target).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}

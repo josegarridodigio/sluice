@@ -10,7 +10,7 @@ use sluice_gate_daemon::server::{
     BoxFuture, DaemonHandle, Extension, ExtensionCtx, StoreError, Vouch,
 };
 use sluice_gate_proto::{
-    ApproveVia, ClientMessage, EnqueueRequest, ErrorCode, FEATURE_QUEUE,
+    ApproveVia, ClientMessage, EnqueueRequest, ErrorCode, FEATURE_QUEUE, FEATURE_QUEUE_PR_LANDING,
     FEATURE_QUEUE_TRUST_CONFIG, LearnedProtection, QUEUE_STATUS_SCHEMA_VERSION, QueueJobState as J,
     QueueJobView, QueueStatusReport, QueueSummary, QueueTrainState as T, QueueTrainView,
     ReconcileDecision, ReconcileResult, RunRequest, ServerMessage,
@@ -22,6 +22,7 @@ use crate::reconcile::{Decision, TrainFacts, decide, gather};
 use crate::runner::{self, CONFIG_SOURCE_MEMBER, Core, current_hash, is_trusted, store_msg};
 use crate::store::{self, Actor, JobEdit, JobRow, NewJob, Refusal, TrainEdit, TrainRow};
 use crate::target;
+use sluice_gate_core::config::Land;
 
 /// Options of the extension.
 #[derive(Debug, Clone, Default)]
@@ -57,7 +58,7 @@ impl QueueExtension {
     }
 }
 
-fn err(id: u64, code: ErrorCode, message: impl Into<String>) -> ServerMessage {
+pub(crate) fn err(id: u64, code: ErrorCode, message: impl Into<String>) -> ServerMessage {
     ServerMessage::Error {
         id,
         code,
@@ -65,7 +66,7 @@ fn err(id: u64, code: ErrorCode, message: impl Into<String>) -> ServerMessage {
     }
 }
 
-fn store_err(id: u64, e: &StoreError) -> ServerMessage {
+pub(crate) fn store_err(id: u64, e: &StoreError) -> ServerMessage {
     let code = match store::refusal(e) {
         Some(Refusal::NotFound(_)) => ErrorCode::NotFound,
         Some(Refusal::State(_)) => ErrorCode::ConflictState,
@@ -103,6 +104,7 @@ fn job_view(tx: &rusqlite::Transaction<'_>, j: &JobRow) -> rusqlite::Result<Queu
         updated_at: rfc3339(j.updated_at),
         finished_at: j.finished_at.map(rfc3339),
         learned_protection: None,
+        land: None,
     })
 }
 
@@ -119,7 +121,7 @@ fn train_view(t: &TrainRow) -> QueueTrainView {
         gates: t.gates.clone(),
         train_hash: if matches!(
             t.state,
-            T::Ready | T::Approved | T::Pushing | T::Landed | T::NeedsReconcile
+            T::Ready | T::Approved | T::Pushing | T::Landed | T::NeedsReconcile | T::AwaitingMerge
         ) {
             t.train_hash.clone()
         } else {
@@ -139,10 +141,30 @@ fn train_view(t: &TrainRow) -> QueueTrainView {
         config_source: t.config_source.clone(),
         // Filled by `status`, which runs git for it.
         config_diff: None,
+        land: (t.settings.land == Land::PullRequest).then(|| t.settings.land.as_str().to_owned()),
+        pr: None,
     }
 }
 
-fn job_reply(core: &Core, id: u64, job_id: &str) -> ServerMessage {
+/// The pull-request side of a train's view, from its marker.
+pub(crate) fn pr_view(m: &store::MarkerRow) -> Option<sluice_gate_proto::PullRequestView> {
+    let pr = &m.pr;
+    Some(sluice_gate_proto::PullRequestView {
+        branch: pr.branch.clone()?,
+        number: pr.number,
+        url: pr.url.clone(),
+        created_by_sluice: pr.created,
+        auto_merge: pr.auto_merge,
+        since: pr.since.map(rfc3339),
+        observed_at: pr.observed_at.map(rfc3339),
+        observed_state: pr.observed_state.clone(),
+        target_moved: pr.target_moved,
+        note: pr.note.clone(),
+        branch_deleted: pr.branch_deleted,
+    })
+}
+
+pub(crate) fn job_reply(core: &Core, id: u64, job_id: &str) -> ServerMessage {
     match core.read(|tx| match store::job(tx, job_id)? {
         Some(j) => Ok(Some(job_view(tx, &j)?)),
         None => Ok(None),
@@ -167,7 +189,11 @@ fn canonical(p: &Path) -> PathBuf {
 
 impl Extension for QueueExtension {
     fn features(&self) -> &[&'static str] {
-        &[FEATURE_QUEUE, FEATURE_QUEUE_TRUST_CONFIG]
+        &[
+            FEATURE_QUEUE,
+            FEATURE_QUEUE_TRUST_CONFIG,
+            FEATURE_QUEUE_PR_LANDING,
+        ]
     }
 
     fn on_start<'a>(&'a self, handle: &'a DaemonHandle) -> BoxFuture<'a, anyhow::Result<()>> {
@@ -224,7 +250,8 @@ impl Extension for QueueExtension {
                 | ClientMessage::QueueApprove { id, .. }
                 | ClientMessage::QueueRetry { id, .. }
                 | ClientMessage::QueueCancel { id, .. }
-                | ClientMessage::QueueReconcile { id, .. } => *id,
+                | ClientMessage::QueueReconcile { id, .. }
+                | ClientMessage::QueuePrFacts { id, .. } => *id,
                 _ => return None,
             };
             let Some(core) = self.core.get() else {
@@ -250,7 +277,17 @@ impl Extension for QueueExtension {
                     train_hash,
                     via,
                     env,
-                } => approve(core, id, &train_id, &train_hash, via, &env),
+                    pr_landing,
+                } => {
+                    let a = Approval {
+                        train_id: &train_id,
+                        hash: &train_hash,
+                        via,
+                        env: &env,
+                        pr_landing,
+                    };
+                    approve(core, id, &a)
+                }
                 ClientMessage::QueueRetry {
                     id,
                     job_id,
@@ -269,7 +306,10 @@ impl Extension for QueueExtension {
                     retry(core, id, &r).await
                 }
                 ClientMessage::QueueCancel { id, job_id, via } => {
-                    cancel(core, id, &job_id, actor_of(via))
+                    cancel(core, id, &job_id, via).await
+                }
+                ClientMessage::QueuePrFacts { id, facts, env } => {
+                    crate::awaiting::pr_facts(core, id, &facts, &env).await
                 }
                 ClientMessage::QueueReconcile { id, repo } => {
                     reconcile(core, id, repo.as_deref()).await
@@ -373,6 +413,67 @@ fn start_recovery(core: &Core) -> anyhow::Result<()> {
     .map_err(|e| anyhow!(store_msg(&e)))
 }
 
+/// What an enqueue resolves to: the head commit, the target, the endpoint
+/// the learned protection facts hang on, and the target's `land`.
+type ResolvedEnqueue = (String, target::Target, Option<String>, Option<Land>);
+
+/// Checks and resolves an enqueue request (blocking: runs git).
+fn resolve_enqueue(
+    g2: &crate::git::Git,
+    r2: &Path,
+    branch: &str,
+    head: &str,
+    base: Option<&str>,
+) -> Result<ResolvedEnqueue, (ErrorCode, String)> {
+    if !r2.join("objects").is_dir() {
+        return Err((
+            ErrorCode::BadRequest,
+            format!("{} is not a git common dir", r2.display()),
+        ));
+    }
+    if branch.trim().is_empty() || branch == "HEAD" {
+        return Err((
+            ErrorCode::BadRequest,
+            "a branch is required (detached HEAD?)".to_owned(),
+        ));
+    }
+    let Some(full) = g2.resolve_commit(r2, head).ok().flatten() else {
+        return Err((
+            ErrorCode::BadRequest,
+            format!("{head} is not a commit of {}", r2.display()),
+        ));
+    };
+    // The head's config only picks the default target: an explicit base
+    // does not need it, so an unparsable file is refused only without one.
+    let defaults = match target::defaults_at(g2, r2, &full) {
+        Ok(d) => d,
+        Err(e) if base.is_none_or(|b| b.trim().is_empty()) => {
+            return Err((ErrorCode::BadRequest, e.to_string()));
+        }
+        Err(_) => sluice_gate_core::config::QueueConfig::default(),
+    };
+    // Remote queries of the resolution (`ls-remote`) are bounded by the
+    // head's `[queue] network_timeout`: a stall only delays this request.
+    let g2 = g2.with_network_timeout(defaults.network_timeout);
+    match target::resolve(&g2, r2, branch, base, &defaults) {
+        Ok(t) => {
+            // The endpoint the learned `target_protected` facts hang on.
+            let endpoint = (!t.is_local())
+                .then(|| target::endpoint_hash(&g2, r2, &t.remote).ok())
+                .flatten();
+            Ok((full, t, endpoint, defaults.land))
+        }
+        Err(e) => Err((
+            if e.is_policy() {
+                ErrorCode::NotAllowed
+            } else {
+                ErrorCode::BadRequest
+            },
+            e.to_string(),
+        )),
+    }
+}
+
 async fn enqueue(core: &Arc<Core>, id: u64, req: EnqueueRequest) -> ServerMessage {
     if req.trust_member_config {
         let via = req.via.unwrap_or(ApproveVia::Cli);
@@ -394,56 +495,10 @@ async fn enqueue(core: &Arc<Core>, id: u64, req: EnqueueRequest) -> ServerMessag
         req.base.clone(),
     );
     let resolved = tokio::task::spawn_blocking(move || {
-        if !r2.join("objects").is_dir() {
-            return Err((
-                ErrorCode::BadRequest,
-                format!("{} is not a git common dir", r2.display()),
-            ));
-        }
-        if branch.trim().is_empty() || branch == "HEAD" {
-            return Err((
-                ErrorCode::BadRequest,
-                "a branch is required (detached HEAD?)".to_owned(),
-            ));
-        }
-        let Some(full) = g2.resolve_commit(&r2, &head).ok().flatten() else {
-            return Err((
-                ErrorCode::BadRequest,
-                format!("{head} is not a commit of {}", r2.display()),
-            ));
-        };
-        // The head's config only picks the default target: an explicit base
-        // does not need it, so an unparsable file is refused only without one.
-        let defaults = match target::defaults_at(&g2, &r2, &full) {
-            Ok(d) => d,
-            Err(e) if base.as_deref().is_none_or(|b| b.trim().is_empty()) => {
-                return Err((ErrorCode::BadRequest, e.to_string()));
-            }
-            Err(_) => sluice_gate_core::config::QueueConfig::default(),
-        };
-        // Remote queries of the resolution (`ls-remote`) are bounded by the
-        // head's `[queue] network_timeout`: a stall only delays this request.
-        let g2 = g2.with_network_timeout(defaults.network_timeout);
-        match target::resolve(&g2, &r2, &branch, base.as_deref(), &defaults) {
-            Ok(t) => {
-                // The endpoint the learned `target_protected` facts hang on.
-                let endpoint = (!t.is_local())
-                    .then(|| target::endpoint_hash(&g2, &r2, &t.remote).ok())
-                    .flatten();
-                Ok((full, t, endpoint))
-            }
-            Err(e) => Err((
-                if e.is_policy() {
-                    ErrorCode::NotAllowed
-                } else {
-                    ErrorCode::BadRequest
-                },
-                e.to_string(),
-            )),
-        }
+        resolve_enqueue(&g2, &r2, &branch, &head, base.as_deref())
     })
     .await;
-    let (head_sha, tgt, endpoint) = match resolved {
+    let (head_sha, tgt, endpoint, base_land) = match resolved {
         Ok(Ok(v)) => v,
         Ok(Err((ecode, why))) => return err(id, ecode, why),
         Err(e) => return err(id, ErrorCode::Internal, e.to_string()),
@@ -465,6 +520,10 @@ async fn enqueue(core: &Arc<Core>, id: u64, req: EnqueueRequest) -> ServerMessag
     match core.write(actor, |w| {
         let j = w.insert_job(&new)?;
         let mut view = job_view(w.tx(), &j)?;
+        // What the target's configuration says (or the user's), for the
+        // client's warnings: advisory, the train reads it again when built.
+        let land = Land::effective(base_land, core.handle.config().queue.land);
+        view.land = (land == Land::PullRequest).then(|| land.as_str().to_owned());
         if let Some(hash) = &endpoint {
             view.learned_protection =
                 store::protected_target(w.tx(), hash, &j.target)?.map(|p| LearnedProtection {
@@ -498,7 +557,9 @@ async fn status(core: &Arc<Core>, id: u64, repo: Option<&Path>) -> ServerMessage
                     to_diff.push((trains.len(), t.repo.clone(), t.base_sha.clone(), head));
                 }
             }
-            trains.push(train_view(&t));
+            let mut view = train_view(&t);
+            view.pr = store::marker(tx, &t.id)?.as_ref().and_then(pr_view);
+            trains.push(view);
         }
         Ok((
             QueueStatusReport {
@@ -607,14 +668,47 @@ pub fn trust_refusal(
     }))
 }
 
-fn approve(
-    core: &Core,
-    id: u64,
-    train_id: &str,
-    hash: &str,
+/// The fields of a `queue-approve` request.
+struct Approval<'a> {
+    train_id: &'a str,
+    hash: &'a str,
     via: ApproveVia,
-    env: &EnvMap,
-) -> ServerMessage {
+    env: &'a EnvMap,
+    /// The client opens the pull request of a pull-request landing.
+    pr_landing: bool,
+}
+
+/// Why a train that lands through a pull request cannot be taken by this
+/// client, or `None`. Opening the pull request (and arming auto-merge) uses
+/// the human's own forge login, so it is a human's act at a client of this
+/// version: `[queue] allow_agent_approval` never lifts it.
+fn pr_landing_refusal(
+    config: &sluice_gate_core::config::UserConfig,
+    a: &Approval<'_>,
+) -> Option<String> {
+    if let Some(origin) = agent_origin(config, a.via, a.env) {
+        let who = match origin {
+            Origin::Mcp => "this request comes through MCP".to_owned(),
+            Origin::Agent(rule) => format!("this client is an agent ({rule})"),
+        };
+        return Some(format!(
+            "train {} lands through a pull request, which is opened with the human's own \
+             forge login: only a human at the CLI can take it, and {who}. \
+             [queue] allow_agent_approval does not change this",
+            a.train_id
+        ));
+    }
+    (!a.pr_landing).then(|| {
+        format!(
+            "train {} lands through a pull request and this client cannot open it; use a \
+             `sluice` that knows `{FEATURE_QUEUE_PR_LANDING}`",
+            a.train_id
+        )
+    })
+}
+
+fn approve(core: &Core, id: u64, a: &Approval<'_>) -> ServerMessage {
+    let (train_id, hash, via, env) = (a.train_id, a.hash, a.via, a.env);
     if let Some(refusal) = agent_approval_refusal(core.handle.config(), via, env) {
         return err(id, ErrorCode::NotAllowed, refusal);
     }
@@ -654,6 +748,11 @@ fn approve(
                 crate::model::train_state_str(t.state)
             ))));
         }
+        if t.settings.land == Land::PullRequest
+            && let Some(refusal) = pr_landing_refusal(core.handle.config(), a)
+        {
+            return Err(store::refuse(Refusal::NotAllowed(refusal)));
+        }
         let jobs = store::train_jobs(w.tx(), &t)?;
         let current = current_hash(&t, &jobs, J::Ready);
         if t.train_hash.as_deref() != Some(hash) || current.as_deref() != Some(hash) {
@@ -678,7 +777,7 @@ fn approve(
     match r {
         Ok(Some(t)) => ServerMessage::QueueApproved {
             id,
-            train: train_view(&t),
+            train: Box::new(train_view(&t)),
         },
         Ok(None) => err(id, ErrorCode::NotFound, format!("no train {train_id}")),
         Err(e) => store_err(id, &e),
@@ -764,7 +863,13 @@ async fn retry(core: &Arc<Core>, id: u64, req: &Retry<'_>) -> ServerMessage {
     }
 }
 
-fn cancel(core: &Core, id: u64, job_id: &str, actor: Actor) -> ServerMessage {
+async fn cancel(core: &Arc<Core>, id: u64, job_id: &str, via: Option<ApproveVia>) -> ServerMessage {
+    let actor = actor_of(via);
+    if let Ok(Some(j)) = core.read(|tx| store::job(tx, job_id))
+        && j.state == J::AwaitingMerge
+    {
+        return crate::awaiting::cancel(core, id, &j, actor, via).await;
+    }
     let r = core.write(actor, |w| {
         let Some(j) = store::job(w.tx(), job_id)? else {
             return Err(store::refuse(Refusal::NotFound(format!(
@@ -824,33 +929,7 @@ async fn reconcile(core: &Arc<Core>, id: u64, repo: Option<&Path>) -> ServerMess
     };
     let mut results = Vec::new();
     for (t, jobs, m) in trains {
-        let env = t.push_env.clone().unwrap_or_default();
-        let git = core
-            .git_for(&env)
-            .with_network_timeout(t.settings.network_timeout());
-        let t2 = t.clone();
-        let push = m
-            .as_ref()
-            .and_then(|m| m.push_pid.map(|p| (p, m.push_start_ticks)));
-        let cancel_requested = jobs.iter().any(|j| j.cancel_requested);
-        let input = tokio::task::spawn_blocking(move || {
-            let s = t2.merge_sha.clone().unwrap_or_default();
-            gather(
-                &git,
-                &TrainFacts {
-                    repo: &t2.repo,
-                    remote: &t2.remote,
-                    target: &t2.target,
-                    endpoint_hash: &t2.endpoint_hash,
-                    merge_sha: &s,
-                    base_sha: &t2.base_sha,
-                    push,
-                    cancel_requested,
-                },
-            )
-        })
-        .await;
-        let Ok(input) = input else {
+        let Some(decision) = gather_decision(core, &t, &jobs, m.as_ref()).await else {
             results.push(ReconcileResult {
                 train_id: t.id.clone(),
                 decision: ReconcileDecision::Refused,
@@ -858,8 +937,7 @@ async fn reconcile(core: &Arc<Core>, id: u64, repo: Option<&Path>) -> ServerMess
             });
             continue;
         };
-        let decision = decide(&input);
-        tracing::info!(train = %t.id, ?input, ?decision, "reconcile");
+        tracing::info!(train = %t.id, ?decision, "reconcile");
         let applied = apply_decision(core, &t, &decision);
         // Pin ref and worktree go only once the decision is recorded: a
         // refused write leaves the train `needs_reconcile`, and the next
@@ -869,6 +947,10 @@ async fn reconcile(core: &Arc<Core>, id: u64, repo: Option<&Path>) -> ServerMess
             (_, Err(e)) => (ReconcileDecision::Refused, Some(store_msg(&e))),
             (Decision::Refuse(r), Ok(())) => (ReconcileDecision::Refused, Some((*r).to_owned())),
             (Decision::Landed(n), Ok(())) => (ReconcileDecision::Landed, n.map(str::to_owned)),
+            (Decision::AwaitingMerge, Ok(())) => (
+                ReconcileDecision::AwaitingMerge,
+                Some("the train branch is on the remote".into()),
+            ),
             (Decision::Ready, Ok(())) => (ReconcileDecision::Ready, None),
             (Decision::Queued, Ok(())) => (ReconcileDecision::Queued, None),
             (Decision::Cancelled, Ok(())) => (ReconcileDecision::Cancelled, None),
@@ -881,11 +963,15 @@ async fn reconcile(core: &Arc<Core>, id: u64, repo: Option<&Path>) -> ServerMess
                 t.id.clone(),
             );
             let keep_wt = matches!(decision, Decision::Ready);
+            // A train waiting for its merge keeps its pin ref until it ends.
+            let keep_pin = matches!(decision, Decision::AwaitingMerge);
             let _ = tokio::task::spawn_blocking(move || {
-                let _ = git.repo(
-                    &repo,
-                    &["update-ref", "-d", &format!("refs/sluice/pending/{tid}")],
-                );
+                if !keep_pin {
+                    let _ = git.repo(
+                        &repo,
+                        &["update-ref", "-d", &format!("refs/sluice/pending/{tid}")],
+                    );
+                }
                 if !keep_wt {
                     git.remove_worktree(&repo, &wt);
                 }
@@ -901,6 +987,66 @@ async fn reconcile(core: &Arc<Core>, id: u64, repo: Option<&Path>) -> ServerMess
     ServerMessage::QueueReconcile { id, results }
 }
 
+/// Reads the remote and decides for one `needs_reconcile` train: the
+/// push-landing table of [`decide`], or the branch table of a pull-request
+/// landing ([`crate::pr::decide_branch`]). `None` when the reading task
+/// failed.
+async fn gather_decision(
+    core: &Arc<Core>,
+    t: &TrainRow,
+    jobs: &[JobRow],
+    m: Option<&store::MarkerRow>,
+) -> Option<Decision> {
+    let env = t.push_env.clone().unwrap_or_default();
+    let git = core
+        .git_for(&env)
+        .with_network_timeout(t.settings.network_timeout());
+    let t2 = t.clone();
+    let push = m.and_then(|m| m.push_pid.map(|p| (p, m.push_start_ticks)));
+    let cancel_requested = jobs.iter().any(|j| j.cancel_requested);
+    tokio::task::spawn_blocking(move || {
+        let s = t2.merge_sha.clone().unwrap_or_default();
+        if t2.settings.land == Land::PullRequest {
+            let branch = sluice_gate_core::forge::landing::branch_of(&t2.id);
+            let facts = crate::pr::TrainFacts {
+                repo: &t2.repo,
+                remote: &t2.remote,
+                target: &t2.target,
+                endpoint_hash: &t2.endpoint_hash,
+                branch: &branch,
+                merge_sha: &s,
+                merge_tree: t2.merge_tree.as_deref(),
+                base_sha: &t2.base_sha,
+            };
+            let input = crate::pr::gather_branch(&git, &facts, push, cancel_requested);
+            tracing::info!(train = %t2.id, ?input, "reconcile (pull-request landing)");
+            return match crate::pr::decide_branch(&input) {
+                crate::pr::BranchDecision::Refuse(why) => Decision::Refuse(why),
+                crate::pr::BranchDecision::AwaitMerge => Decision::AwaitingMerge,
+                crate::pr::BranchDecision::Ready => Decision::Ready,
+                crate::pr::BranchDecision::Cancelled => Decision::Cancelled,
+            };
+        }
+        let input = gather(
+            &git,
+            &TrainFacts {
+                repo: &t2.repo,
+                remote: &t2.remote,
+                target: &t2.target,
+                endpoint_hash: &t2.endpoint_hash,
+                merge_sha: &s,
+                base_sha: &t2.base_sha,
+                push,
+                cancel_requested,
+            },
+        );
+        tracing::info!(train = %t2.id, ?input, "reconcile");
+        decide(&input)
+    })
+    .await
+    .ok()
+}
+
 fn apply_decision(core: &Core, t: &TrainRow, d: &Decision) -> Result<(), StoreError> {
     if matches!(d, Decision::Refuse(_)) {
         return Ok(());
@@ -911,9 +1057,14 @@ fn apply_decision(core: &Core, t: &TrainRow, d: &Decision) -> Result<(), StoreEr
             .iter()
             .filter(|j| j.state == J::NeedsReconcile)
             .collect();
-        w.delete_marker(&t.id)?;
+        // The marker of a pull-request landing names the branch and the pull
+        // request: it stays while the train waits for its merge.
+        if !matches!(d, Decision::AwaitingMerge) {
+            w.delete_marker(&t.id)?;
+        }
         match d {
             Decision::Refuse(_) => Ok(()),
+            Decision::AwaitingMerge => crate::awaiting::resume_waiting(w, t, &parked),
             Decision::Landed(note) => {
                 for j in &parked {
                     w.job_to(
@@ -974,4 +1125,64 @@ fn apply_decision(core: &Core, t: &TrainRow, d: &Decision) -> Result<(), StoreEr
             ),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sluice_gate_core::config::UserConfig;
+
+    #[test]
+    fn the_daemon_announces_pull_request_landing() {
+        let ext = QueueExtension::default();
+        let features = ext.features();
+        assert!(features.contains(&FEATURE_QUEUE_PR_LANDING), "{features:?}");
+        assert!(features.contains(&FEATURE_QUEUE));
+        assert_eq!(FEATURE_QUEUE_PR_LANDING, "queue-pr-landing");
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> EnvMap {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    fn approval(via: ApproveVia, env: &EnvMap, pr_landing: bool) -> Approval<'_> {
+        Approval {
+            train_id: "t-1",
+            hash: "h",
+            via,
+            env,
+            pr_landing,
+        }
+    }
+
+    #[test]
+    fn a_pull_request_landing_is_for_a_human_with_a_client_that_can_open_it() {
+        let mut user = UserConfig::default();
+        let human = env(&[]);
+        assert_eq!(
+            pr_landing_refusal(&user, &approval(ApproveVia::Cli, &human, true)),
+            None
+        );
+        // A client that cannot open the pull request is refused, not ignored.
+        let why = pr_landing_refusal(&user, &approval(ApproveVia::Cli, &human, false)).unwrap();
+        assert!(why.contains("queue-pr-landing"), "{why}");
+        // MCP never, with or without the capability.
+        for capable in [false, true] {
+            let why = pr_landing_refusal(&user, &approval(ApproveVia::Mcp, &human, capable));
+            assert!(why.unwrap().contains("MCP"));
+        }
+        // An agent at the CLI never, and enabling agent approval for pushes
+        // changes nothing.
+        let agent = env(&[("CLAUDECODE", "1")]);
+        user.queue.allow_agent_approval = true;
+        let why = pr_landing_refusal(&user, &approval(ApproveVia::Cli, &agent, true)).unwrap();
+        assert!(why.contains("agent"), "{why}");
+        assert!(
+            why.contains("allow_agent_approval does not change this"),
+            "{why}"
+        );
+    }
 }

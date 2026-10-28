@@ -51,6 +51,9 @@ pub enum Decision {
     Queued,
     /// Nothing landed and a cancel was pending.
     Cancelled,
+    /// A pull-request landing whose branch is on the remote: the train goes
+    /// on to wait for the merge ([`crate::pr::decide_branch`]).
+    AwaitingMerge,
 }
 
 /// The decision table; the first matching row wins.

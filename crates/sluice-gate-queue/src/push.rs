@@ -270,6 +270,23 @@ pub fn push_args(remote: &str, target: &str, base_sha: &str, s: &str, audit: boo
     v
 }
 
+/// Arguments of the push of a train's branch (pull-request landing,
+/// ADR-0025): `S` to `refs/heads/<branch>` with a lease on the branch not
+/// existing, no audit ref (the branch is the record).
+#[must_use]
+pub fn branch_push_args(remote: &str, branch: &str, s: &str) -> Vec<String> {
+    vec![
+        "push".to_owned(),
+        "--porcelain".to_owned(),
+        "--no-follow-tags".to_owned(),
+        "--recurse-submodules=no".to_owned(),
+        format!("--force-with-lease=refs/heads/{branch}:"),
+        "--".to_owned(),
+        remote.to_owned(),
+        format!("{s}:refs/heads/{branch}"),
+    ]
+}
+
 /// End of a push process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PushEnd {

@@ -83,6 +83,13 @@ e2e   FAIL exit=1 12.3s (job 1761...) log=/home/u/.local/state/sluice/logs/1761.
   `sluice queue approve <train id>`. Tell the human and stop.
 - Train `needs_reconcile`: a push was interrupted; a human runs
   `sluice queue reconcile`. Do nothing.
+- `awaiting_merge` (job and train): the repository lands through a pull request
+  (`[queue] land = "pull-request"`). A human approved, the verified commit is on
+  a `sluice/train/<id>` branch and the pull request is how it reaches the
+  target. `queue_status` shows its number, how far the target moved and the
+  last remark. Wait, or tell the human; never merge, close or push to the pull
+  request or its branch, and do not cancel the job (refused over MCP). Sluice
+  itself never merges.
 
 Reasons, with what you do:
 
@@ -99,6 +106,7 @@ Reasons, with what you do:
 | `hook_gate_unverified`, `config_changed` | the branch changes `.sluice.toml`; the target's configuration judges the train, so a gate the `pre-push` hook asks for may not be verified. `config_changed` is the warning shown on the member | tell the human: land the configuration change first, or the human runs `sluice queue retry <job> --trust-member-config` |
 | `pre_push_hook` | the repository's `pre-push` hook declined during the push | read its output in the detail |
 | `target_protected` | the forge refuses direct pushes to the target (protected branch, pull request required); the queue cannot land there | tell the human; do not retry |
+| `pr_closed` | pull-request landing: the pull request was closed without merging, or its branch is gone; a human decided | tell the human; do not retry or reopen it |
 | `push_rejected`, `target_checked_out`, `tree_mismatch`, `internal` | the remote refused the push, the target is checked out locally, the merged tree differs from what git snapshots, an unexpected error | tell the human |
 
 `--trust-member-config` (on `sluice queue enqueue` and `sluice queue retry`)

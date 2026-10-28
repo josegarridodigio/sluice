@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, anyhow};
 use rusqlite::Transaction;
 use serde_json::json;
-use sluice_gate_core::config::{Gate, REPO_CONFIG_FILE, RepoConfig};
+use sluice_gate_core::config::{Gate, Land, REPO_CONFIG_FILE, RepoConfig};
 use sluice_gate_core::env::LOGIN_ENV_DEADLINE;
 use sluice_gate_core::git::RepoPaths;
 use sluice_gate_core::key::CacheKey;
@@ -34,10 +34,12 @@ use crate::model::{TrainHashInput, train_hash};
 use crate::prepare;
 use crate::push::{self, PushEnd, PushVerdict};
 use crate::store::{
-    self, Actor, JobEdit, JobRow, MarkerRow, NewTrain, TrainEdit, TrainRow, TrainSettings, Writer,
+    self, Actor, JobEdit, JobRow, MarkerRow, NewTrain, PrColumns, TrainEdit, TrainRow,
+    TrainSettings, Writer,
 };
 use crate::target::endpoint;
 use crate::toolenv::{self, ToolEnvSource};
+use sluice_gate_core::forge::landing;
 
 /// Shared state of the queue inside one daemon.
 #[derive(Debug)]
@@ -633,6 +635,9 @@ async fn prepare_and_claim(
         }
     };
     let id = train_id();
+    // How the train lands comes from the target commit's configuration or the
+    // user's, never from a member (not even a trusted one).
+    let land = train_land(base_config.as_ref(), core.handle.config());
     // The base's gates and `[queue]`, or the member's for a trusted job
     // (`remote` and `target` stay as resolved at enqueue).
     let (config, trust) = match member {
@@ -646,11 +651,7 @@ async fn prepare_and_claim(
         None => (base_config, None),
     };
     let queue = config.as_ref().map(|c| c.queue.clone()).unwrap_or_default();
-    let settings = TrainSettings {
-        push_timeout_ms: u64::try_from(queue.push_timeout.as_millis()).unwrap_or(u64::MAX),
-        audit_ref: queue.audit_ref,
-        network_timeout_ms: u64::try_from(queue.network_timeout.as_millis()).unwrap_or(u64::MAX),
-    };
+    let settings = train_settings(&queue, land);
     let max = if trust.is_some() {
         1
     } else {
@@ -680,6 +681,22 @@ async fn prepare_and_claim(
             tracing::debug!("claim refused: {}", store_msg(&e));
             None
         }
+    }
+}
+
+/// The train's landing mode: the target commit's `[queue] land`, else the
+/// user config's, else `push` (ADR-0025).
+fn train_land(base: Option<&RepoConfig>, user: &sluice_gate_core::config::UserConfig) -> Land {
+    Land::effective(base.and_then(|c| c.queue.land), user.queue.land)
+}
+
+/// The settings a train keeps from its `[queue]` table.
+fn train_settings(queue: &sluice_gate_core::config::QueueConfig, land: Land) -> TrainSettings {
+    TrainSettings {
+        push_timeout_ms: u64::try_from(queue.push_timeout.as_millis()).unwrap_or(u64::MAX),
+        audit_ref: queue.audit_ref,
+        network_timeout_ms: u64::try_from(queue.network_timeout.as_millis()).unwrap_or(u64::MAX),
+        land,
     }
 }
 
@@ -2157,6 +2174,13 @@ enum PreCheck {
 }
 
 fn pre_push_checks(git: &Git, t: &TrainRow, s: &str) -> PreCheck {
+    if t.settings.land == Land::PullRequest && t.remote.is_empty() {
+        return PreCheck::FailMembers(
+            "land_needs_remote",
+            "[queue] land = \"pull-request\" needs a remote target: a local branch has no forge"
+                .into(),
+        );
+    }
     let head = git
         .wt(&t.worktree, &["rev-parse", "HEAD"])
         .unwrap_or_default();
@@ -2202,7 +2226,6 @@ fn pre_push_checks(git: &Git, t: &TrainRow, s: &str) -> PreCheck {
     }
 }
 
-#[allow(clippy::too_many_lines, reason = "section 6 steps 1-3, in order")]
 async fn push_train(core: &Arc<Core>, id: &str) -> Result<()> {
     let (t, jobs) = core
         .read(|tx| {
@@ -2274,27 +2297,7 @@ async fn push_train(core: &Arc<Core>, id: &str) -> Result<()> {
         blocking(move || g2.repo(&repo, &["update-ref", &pin2, &s2])).await??;
     }
     // 2. Marker + pushing, one transaction.
-    let audit = t.settings.audit_ref;
-    let target_ref = format!("refs/heads/{}", t.target);
-    let audit_ref = format!("refs/sluice/landed/{s}");
-    let mut push_refs = vec![target_ref.clone()];
-    if audit {
-        push_refs.push(audit_ref.clone());
-    }
-    let marker = MarkerRow {
-        train_id: id.to_owned(),
-        sha: s.clone(),
-        base_sha: t.base_sha.clone(),
-        remote: t.remote.clone(),
-        endpoint_hash: t.endpoint_hash.clone(),
-        push_refs,
-        audit_ref: audit.then(|| audit_ref.clone()),
-        pin_ref: pin.clone(),
-        claim_token: String::new(),
-        push_pid: None,
-        push_start_ticks: None,
-        written_at: 0,
-    };
+    let marker = build_marker(&t, &s, &pin);
     let wrote = core.write_durable(Actor::Runner, |w| {
         // Re-read inside the transaction: fenced on the members' state and
         // on `cancel_requested = 0`.
@@ -2317,22 +2320,84 @@ async fn push_train(core: &Arc<Core>, id: &str) -> Result<()> {
         let _ = blocking(move || g2.repo(&repo, &["update-ref", "-d", &pin2])).await;
         return Ok(());
     }
-    tracing::info!(train = %id, target = %t.target, "pushing");
+    tracing::info!(train = %id, target = %t.target, land = t.settings.land.as_str(), "pushing");
     // 3. Push (or local ref update).
-    let verdict = if t.remote.is_empty() {
-        let (g2, t2, s2) = (git.clone(), t.clone(), s.clone());
-        match blocking(move || {
-            push::land_local(&g2, &t2.repo, &t2.id, &t2.target, &t2.base_sha, &s2, audit)
-        })
-        .await?
-        {
-            Ok(true) => PushVerdict::Landed,
-            Ok(false) => PushVerdict::Moved("update-ref compare-and-swap failed".into()),
-            Err(e) => PushVerdict::Ambiguous(format!("{e:#}")),
-        }
+    let verdict = run_push(core, &t, &git, &s).await?;
+    tracing::info!(train = %id, ?verdict, "push ended");
+    apply_verdict(core, &t, &verdict).await
+}
+
+/// The write-ahead marker of a train about to be pushed. A pull-request
+/// landing pushes `sluice/train/<id>` (no audit ref: the branch is the
+/// record) and names the branch in the marker.
+fn build_marker(t: &TrainRow, s: &str, pin: &str) -> MarkerRow {
+    let pr = t.settings.land == Land::PullRequest;
+    let audit = t.settings.audit_ref && !pr;
+    let target_ref = if pr {
+        format!("refs/heads/{}", landing::branch_of(&t.id))
     } else {
-        let args = push::push_args(&t.remote, &t.target, &t.base_sha, &s, audit);
-        match push::spawn(core.push_program.as_deref(), &git, &t.worktree, &args) {
+        format!("refs/heads/{}", t.target)
+    };
+    let audit_ref = format!("refs/sluice/landed/{s}");
+    let mut push_refs = vec![target_ref];
+    if audit {
+        push_refs.push(audit_ref.clone());
+    }
+    MarkerRow {
+        train_id: t.id.clone(),
+        sha: s.to_owned(),
+        base_sha: t.base_sha.clone(),
+        remote: t.remote.clone(),
+        endpoint_hash: t.endpoint_hash.clone(),
+        push_refs,
+        audit_ref: audit.then_some(audit_ref),
+        pin_ref: pin.to_owned(),
+        claim_token: String::new(),
+        push_pid: None,
+        push_start_ticks: None,
+        written_at: 0,
+        pr: PrColumns {
+            branch: pr.then(|| landing::branch_of(&t.id)),
+            ..PrColumns::default()
+        },
+    }
+}
+
+/// Step 3 of the push: the local ref update, the atomic push to the target,
+/// or (pull-request landing) the push of the train branch with a lease on
+/// its absence.
+async fn run_push(core: &Arc<Core>, t: &TrainRow, git: &Git, s: &str) -> Result<PushVerdict> {
+    let id = &t.id;
+    let pr = t.settings.land == Land::PullRequest;
+    let audit = t.settings.audit_ref;
+    if t.remote.is_empty() {
+        let (g2, t2, s2) = (git.clone(), t.clone(), s.to_owned());
+        return Ok(
+            match blocking(move || {
+                push::land_local(&g2, &t2.repo, &t2.id, &t2.target, &t2.base_sha, &s2, audit)
+            })
+            .await?
+            {
+                Ok(true) => PushVerdict::Landed,
+                Ok(false) => PushVerdict::Moved("update-ref compare-and-swap failed".into()),
+                Err(e) => PushVerdict::Ambiguous(format!("{e:#}")),
+            },
+        );
+    }
+    let (args, target_ref) = if pr {
+        let branch = landing::branch_of(id);
+        (
+            push::branch_push_args(&t.remote, &branch, s),
+            format!("refs/heads/{branch}"),
+        )
+    } else {
+        (
+            push::push_args(&t.remote, &t.target, &t.base_sha, s, audit),
+            format!("refs/heads/{}", t.target),
+        )
+    };
+    Ok(
+        match push::spawn(core.push_program.as_deref(), git, &t.worktree, &args) {
             // The marker is written: whatever happened, only reconcile may
             // decide (the train must never stay `pushing` in a live daemon).
             Err(e) => PushVerdict::Ambiguous(format!("push_spawn_failed: {e:#}")),
@@ -2353,10 +2418,8 @@ async fn push_train(core: &Arc<Core>, id: &str) -> Result<()> {
                     } => push::classify(code, &stdout, &stderr, &target_ref),
                 }
             }
-        }
-    };
-    tracing::info!(train = %id, ?verdict, "push ended");
-    apply_verdict(core, &t, &verdict).await
+        },
+    )
 }
 
 /// A push the remote or the repository's hook refused: the members fail
@@ -2390,11 +2453,70 @@ fn fail_pushed(
     w.dissolve(t, T::Pushing, reason, false)
 }
 
+/// What the push of a train's branch (pull-request landing) means: the
+/// branch has no target to have moved and no target to be protected, so a
+/// refusal of either kind is a plain `push_rejected`.
+fn branch_verdict(verdict: &PushVerdict) -> PushVerdict {
+    match verdict {
+        PushVerdict::Moved(why) | PushVerdict::TargetProtected(why) => {
+            PushVerdict::Rejected(why.clone())
+        }
+        other => other.clone(),
+    }
+}
+
+/// The train branch is on the remote: jobs and train wait for the merge.
+/// The marker stays (it names the branch and will name the pull request).
+fn awaiting_merge(
+    w: &store::Writer<'_, '_>,
+    t: &TrainRow,
+    pushing: &[&JobRow],
+) -> rusqlite::Result<()> {
+    for j in pushing {
+        w.job_to(
+            &j.id,
+            J::Pushing,
+            J::AwaitingMerge,
+            &JobEdit {
+                // A cancel asked for during the push is moot: the branch is
+                // out, and cancelling now is a request of its own.
+                cancel_requested: Some(false),
+                note: Some("branch pushed; awaiting merge".into()),
+                ..JobEdit::default()
+            },
+        )?;
+    }
+    if let Some(m) = store::marker(w.tx(), &t.id)? {
+        let mut pr = m.pr;
+        pr.since = Some(w.now());
+        w.set_pr(&t.id, &pr)?;
+    }
+    w.train_to(
+        &t.id,
+        T::Pushing,
+        T::AwaitingMerge,
+        &TrainEdit {
+            event_note: Some("outcome: branch pushed".into()),
+            ..TrainEdit::default()
+        },
+    )
+}
+
 async fn apply_verdict(core: &Arc<Core>, t: &TrainRow, verdict: &PushVerdict) -> Result<()> {
     let id = t.id.clone();
+    let pr = t.settings.land == Land::PullRequest;
+    let verdict = &if pr {
+        branch_verdict(verdict)
+    } else {
+        verdict.clone()
+    };
+    let awaiting = pr && *verdict == PushVerdict::Landed;
     let r = core.write(Actor::Runner, |w| {
         let jobs = store::train_jobs(w.tx(), t)?;
         let pushing: Vec<&JobRow> = jobs.iter().filter(|j| j.state == J::Pushing).collect();
+        if awaiting {
+            return awaiting_merge(w, t, &pushing);
+        }
         match verdict {
             PushVerdict::Landed => {
                 if !t.remote.is_empty() {
@@ -2458,8 +2580,12 @@ async fn apply_verdict(core: &Arc<Core>, t: &TrainRow, verdict: &PushVerdict) ->
     if !matches!(verdict, PushVerdict::Ambiguous(_)) {
         let (git, repo, wt) = (core.git.clone(), t.repo.clone(), t.worktree.clone());
         let pin = format!("refs/sluice/pending/{id}");
+        // The pin ref of a train awaiting its merge stays until the train
+        // ends: it keeps `S` in the repository.
         blocking(move || {
-            let _ = git.repo(&repo, &["update-ref", "-d", &pin]);
+            if !awaiting {
+                let _ = git.repo(&repo, &["update-ref", "-d", &pin]);
+            }
             git.remove_worktree(&repo, &wt);
         })
         .await?;

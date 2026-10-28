@@ -68,6 +68,14 @@ may be logged in through the desktop keyring, which the daemon's environment can
    unknown); `welcome.features` gains `queue-pr-landing`, and a client that does not see it
    refuses `land = "pull-request"` instead of ignoring it.
 
+## Amendment (2026-10-28, wave Q4b, user decision)
+
+While a train waits in `awaiting_merge`, it keeps its target: the next train for that target is
+not built until the pull request is merged or closed (or the job cancelled). Every merge is then
+exactly the combination Sluice verified; the cost is that a pull request left unreviewed blocks
+the queue of that target. Stacking the next train on the pending commit (merge-train style) was
+considered and left for later.
+
 ## User decisions (2026-10-28)
 
 | # | Question | Answer |
@@ -77,6 +85,7 @@ may be logged in through the desktop keyring, which the daemon's environment can
 | 3 | Who talks to the forge with the user's `gh` (keyring) | The client: approve opens the PR, status/reconcile read it |
 | 4 | Commit status on the PR | Later, opt-in |
 | 5 | Release | Together with the queue waves Q1-Q3 |
+| 6 | Next train while a PR waits | Waits for the PR to be merged or closed |
 
 ## Consequences
 

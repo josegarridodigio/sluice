@@ -13,10 +13,19 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::exec::{self, Budget, RunError};
+use super::pr::{self, PrObservation, PrSpec, PullRequest};
 use super::{Forge, Protection};
 use crate::git::EnvMap;
 
 const CALL_CAP: Duration = Duration::from_secs(4);
+
+/// Reading pull requests, and the calls that write one: a little more than
+/// an API probe takes.
+const PR_READ_CAP: Duration = Duration::from_secs(12);
+const PR_WRITE_CAP: Duration = Duration::from_secs(25);
+
+/// Fields of `gh pr list --json` the queue reads.
+const PR_FIELDS: &str = "number,url,state,headRefOid,mergedAt,mergeCommit,autoMergeRequest";
 
 /// Rule types of a ruleset that do not stop a fast-forward push of a
 /// merge commit.
@@ -229,6 +238,50 @@ impl<'a> GitHub<'a> {
         })
     }
 
+    /// `-R` argument naming this repository on its host.
+    fn repo_arg(&self) -> String {
+        if self.host == "github.com" {
+            self.repo.clone()
+        } else {
+            format!("{}/{}", self.host, self.repo)
+        }
+    }
+
+    /// Runs `gh <args>`; the captured output of a run that exited 0, else
+    /// the reason (gh's first line of complaint).
+    fn gh(&self, args: &[&str], budget: &Budget, cap: Duration) -> Result<String, String> {
+        let out = exec::run("gh", args, self.env, self.cwd, budget, cap).map_err(|e| match e {
+            RunError::Missing => "gh is not installed or not in PATH".to_owned(),
+            RunError::Timeout => "gh did not answer in time".to_owned(),
+            RunError::Failed(why) => format!("gh could not run: {why}"),
+        })?;
+        if out.code == Some(0) {
+            return Ok(out.stdout);
+        }
+        let line = out
+            .stderr
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("no message");
+        if line.contains("gh auth login") || line.contains("not logged in") {
+            return Err(format!(
+                "gh is not logged in to {}; run `gh auth login --hostname {}`",
+                self.host, self.host
+            ));
+        }
+        Err(format!("gh failed: {line}"))
+    }
+
+    fn list_prs(&self, branch: &str, budget: &Budget) -> Result<Vec<PullRequest>, String> {
+        let repo = self.repo_arg();
+        let args = [
+            "pr", "list", "-R", &repo, "--head", branch, "--state", "all", "--limit", "10",
+            "--json", PR_FIELDS,
+        ];
+        pr::parse_list(&self.gh(&args, budget, PR_READ_CAP)?)
+    }
+
     /// True when `gh` holds a login for this host (exit status of `gh auth
     /// status --hostname`).
     #[must_use]
@@ -245,6 +298,79 @@ impl Forge for GitHub<'_> {
 
     fn probe_protection(&self, target: &str, budget: &Budget) -> Protection {
         decide(&self.host, &self.repo, target, &mut |p| self.api(p, budget))
+    }
+
+    fn pr_state(&self, branch: &str, budget: &Budget) -> Result<Option<PullRequest>, String> {
+        Ok(pr::pick(self.list_prs(branch, budget)?))
+    }
+
+    fn ensure_pr(&self, spec: &PrSpec, budget: &Budget) -> Result<(PullRequest, bool), String> {
+        if let Some(found) = self.pr_state(&spec.head, budget)? {
+            return Ok((found, false));
+        }
+        let repo = self.repo_arg();
+        let args = [
+            "pr",
+            "create",
+            "-R",
+            &repo,
+            "--base",
+            &spec.base,
+            "--head",
+            &spec.head,
+            "--title",
+            &spec.title,
+            "--body",
+            &spec.body,
+        ];
+        let out = self.gh(&args, budget, PR_WRITE_CAP)?;
+        let (number, url) = pr::number_from_url(&out).ok_or_else(|| {
+            format!(
+                "gh pr create printed no pull request address: {}",
+                out.trim()
+            )
+        })?;
+        // The head of a new pull request is the branch's tip; the caller
+        // compares it with the commit it pushed.
+        let state = self.pr_state(&spec.head, budget).ok().flatten().map_or(
+            PrObservation::Open {
+                head: String::new(),
+            },
+            |p| p.state,
+        );
+        Ok((
+            PullRequest {
+                number,
+                url,
+                auto_merge: false,
+                state,
+            },
+            true,
+        ))
+    }
+
+    fn arm_auto_merge(&self, number: u64, head: &str, budget: &Budget) -> Result<(), String> {
+        let repo = self.repo_arg();
+        let n = number.to_string();
+        let args = [
+            "pr",
+            "merge",
+            &n,
+            "-R",
+            &repo,
+            "--auto",
+            "--merge",
+            "--match-head-commit",
+            head,
+        ];
+        self.gh(&args, budget, PR_WRITE_CAP).map(|_| ())
+    }
+
+    fn close_pr(&self, number: u64, comment: &str, budget: &Budget) -> Result<(), String> {
+        let repo = self.repo_arg();
+        let n = number.to_string();
+        let args = ["pr", "close", &n, "-R", &repo, "--comment", comment];
+        self.gh(&args, budget, PR_WRITE_CAP).map(|_| ())
     }
 }
 

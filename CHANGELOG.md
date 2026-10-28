@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The queue lands through a pull request where the target refuses direct pushes**
+  (ADR-0025, issue #5). `[queue] land = "pull-request"` (default `push`; in the target
+  commit's `.sluice.toml` or the user config, never from a queued branch; one-way key:
+  0.7.0 and older binaries reject it). After the human approval the daemon pushes the
+  verified commit to `sluice/train/<id>` (lease on absence, the approver's environment,
+  the same classifier, no audit ref) instead of the target, and the train and its jobs go
+  to the new state `awaiting_merge`. `sluice queue approve` then opens one pull request
+  per train with the user's own `gh` (found, not duplicated, when it exists; no token is
+  stored or sent to the daemon) and `--auto-merge` also arms the forge's auto-merge
+  (`--match-head-commit`, never admin rights). If the pull request cannot be opened the
+  train stays `awaiting_merge` with a note and `sluice queue reconcile` (or approving it
+  again) finishes it. Sluice never merges. `sluice queue status`, `sluice queue reconcile`
+  and the MCP `queue_status` read each waiting train's pull request with the caller's `gh`
+  (read-only, bounded, cached 20 s) and report it to the daemon, which decides with a new
+  pure table: merged and its commit on the target means `landed` (the merged tree is
+  compared with the verified one; another tree is still `landed` with the note
+  `tree_differs_from_verified`), closed or branch gone means the jobs fail with `pr_closed`
+  (`queue retry` is the way back), a changed head, a moved target (`target moved N commits
+  since the train was built`; the train waits, never requeues) and an unusable `gh`
+  (`forge_unreachable: <reason>`) are notes. A human's `queue cancel` of a waiting job
+  dissolves the train, closes the pull request Sluice opened and deletes the branch it
+  pushed (lease on that commit); `sluice doctor` lists leftover `sluice/train/*` branches
+  from the store (`queue-pr-branches`, offline). Agents wait or tell the human: approving
+  (even with `allow_agent_approval`), opening and cancelling are humans' acts, and MCP only
+  reads. Additive protocol: the feature `queue-pr-landing`, the message `queue-pr-facts`,
+  `pr_landing` on the train approval request, optional `land`/`pr` on the train view and
+  nullable `pr_*` marker columns; a client or daemon without the feature refuses a
+  pull-request train instead of ignoring it. The enqueue warnings about protected targets
+  now say how to land there and disappear for a repository that lands through a pull
+  request.
 - **Backfilling behind a reserved head** (ADR-0023). An overdue head that waits for
   budget or memory still reserves, but a job behind it now starts when it cannot delay
   it: the daemon predicts the head's start (its shadow time) from the running jobs'

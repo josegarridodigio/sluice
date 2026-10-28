@@ -123,6 +123,7 @@ tree; a missing or invalid file at the base yields the defaults. See
 | `prepare` | string | unset | Command run once per train in the merge worktree before the gates (install the dependencies a fresh worktree lacks, for example `pnpm install --frozen-lockfile --prefer-offline`). Must not be empty. See "Preparing the merge worktree" in [merge-queue.md](merge-queue.md). Needs 0.6.0 or later; older binaries reject the file. |
 | `prepare_timeout` | duration > 0 | `10m` | Limit of `prepare` (and of the probe that attributes its failure). Needs 0.6.0 or later. |
 | `prepare_weight` | int >= 1 or `"auto"` | `"auto"` | Budget units `prepare` consumes, like a gate's `weight`. Needs 0.6.0 or later. |
+| `land` | `"push"` or `"pull-request"` | `push` | How a verified train reaches the target: one push of the verified commit to it, or a push to `sluice/train/<id>` and a pull request that the forge and a human merge (see "Landing through a pull request" in [merge-queue.md](merge-queue.md)). Read from the target commit's file, else from the user config's `[queue] land`; a queued branch's own file never sets it. One-way: needs the release after 0.7.0, older binaries reject the file. |
 
 The per-user queue keys below are rejected here, and the keys above are
 rejected in the user file.
@@ -180,6 +181,7 @@ tick = "5s"
 retention = "30d"
 # tool_env = "login-shell"        # login-shell | daemon
 # tool_path = "/opt/node/bin:/usr/bin:/bin"
+# land = "pull-request"           # push | pull-request: default of the repositories' `[queue] land`
 
 [debug]
 level = "info"
@@ -254,6 +256,7 @@ budget_share_max = 4
 | `queue.retention` | `30d` | Finished queue rows older than this are pruned at daemon start and hourly. |
 | `queue.tool_env` | `"login-shell"` | Where merge trains get the environment of their tools (gates, `prepare`, `key_inputs`): `login-shell` resolves your login shell's environment once when the daemon starts (a restart picks up a new toolchain) and falls back to the daemon's own environment, with the reason in `sluice status` and the daemon log, when it cannot; `daemon` uses the daemon's own environment, whoever started it. Never the environment of whoever enqueued. Not understood by 0.6.0 and older. |
 | `queue.tool_path` | unset | An explicit `PATH` for merge trains' tools; wins over `tool_env` for `PATH`. Must not be empty. Not understood by 0.6.0 and older. |
+| `queue.land` | unset (`push`) | Default of `[queue] land` for repositories whose target commit does not set it: `push` or `pull-request` (see [merge-queue.md](merge-queue.md)). The repository's own value wins. Not understood by 0.7.0 and older. |
 | `debug.level` | `info` | Log filter (`RUST_LOG` syntax, for example `sluice_gate_daemon=debug,info`) of the daemon, `sluice mcp` and `sluice run`. `SLUICE_LOG` wins. |
 | `debug.daemon_log_max_mib` | `20` | Rotate `daemon.log` above this size (0 = never); keeps `daemon.log.1` to `.3`. |
 | `agent_detection.env_any_set` | `["CLAUDECODE"]` | Any of these variables set and non-empty means the caller is an agent (`SLUICE_AGENT` overrides). |

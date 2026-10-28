@@ -2653,7 +2653,8 @@ async fn handle_connection(shared: Arc<Shared>, stream: UnixStream) {
         | ClientMessage::QueueApprove { id, .. }
         | ClientMessage::QueueRetry { id, .. }
         | ClientMessage::QueueCancel { id, .. }
-        | ClientMessage::QueueReconcile { id, .. }) => {
+        | ClientMessage::QueueReconcile { id, .. }
+        | ClientMessage::QueuePrFacts { id, .. }) => {
             let ctx = ExtensionCtx {
                 conn_id,
                 client,

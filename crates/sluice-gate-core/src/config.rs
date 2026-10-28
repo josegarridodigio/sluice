@@ -135,6 +135,42 @@ pub struct QueueConfig {
     /// Budget units `prepare` consumes: an integer ceiling (at least 1) or
     /// `"auto"`, like a gate's `weight`.
     pub prepare_weight: Weight,
+    /// How a verified train reaches the target (ADR-0025): `push` (default)
+    /// or `pull-request`. Read from the target commit's `.sluice.toml`, never
+    /// from a queued branch; the user config's `[queue] land` is the default
+    /// for repositories that do not set it. Needs the release after 0.7.0.
+    pub land: Option<Land>,
+}
+
+/// `[queue] land`: how an approved train reaches its target (ADR-0025).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Land {
+    /// One atomic `git push` of the verified commit to the target.
+    #[default]
+    Push,
+    /// Push the verified commit to `sluice/train/<id>` and let a pull request
+    /// carry it to the target; the forge (and a human) merges.
+    PullRequest,
+}
+
+impl Land {
+    /// The configured spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Push => "push",
+            Self::PullRequest => "pull-request",
+        }
+    }
+
+    /// The landing mode of a train: the target commit's `[queue] land`, else
+    /// the user config's, else `push`. A queued branch's own `.sluice.toml`
+    /// is never an input.
+    #[must_use]
+    pub fn effective(base: Option<Self>, user: Option<Self>) -> Self {
+        base.or(user).unwrap_or_default()
+    }
 }
 
 impl Default for QueueConfig {
@@ -150,6 +186,7 @@ impl Default for QueueConfig {
             prepare: None,
             prepare_timeout: DEFAULT_PREPARE_TIMEOUT,
             prepare_weight: Weight::Auto,
+            land: None,
         }
     }
 }
@@ -865,6 +902,9 @@ pub struct UserQueueConfig {
     /// An explicit `PATH` for the trains' tools; wins over `tool_env` for
     /// `PATH` when set.
     pub tool_path: Option<String>,
+    /// Default of `[queue] land` for repositories whose target commit does
+    /// not set it (ADR-0025).
+    pub land: Option<Land>,
 }
 
 /// `[queue] tool_env`: the environment trains run their tools in.
@@ -888,6 +928,7 @@ impl Default for UserQueueConfig {
             retention: Duration::from_hours(30 * 24),
             tool_env: ToolEnv::default(),
             tool_path: None,
+            land: None,
         }
     }
 }

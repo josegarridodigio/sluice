@@ -26,6 +26,7 @@ pub fn job_state_str(s: QueueJobState) -> &'static str {
         J::Failed => "failed",
         J::Cancelled => "cancelled",
         J::NeedsReconcile => "needs_reconcile",
+        J::AwaitingMerge => "awaiting_merge",
         J::Unknown => "unknown",
     }
 }
@@ -52,6 +53,7 @@ pub fn train_state_str(s: QueueTrainState) -> &'static str {
         T::Landed => "landed",
         T::Dissolved => "dissolved",
         T::NeedsReconcile => "needs_reconcile",
+        T::AwaitingMerge => "awaiting_merge",
         T::Unknown => "unknown",
     }
 }
@@ -67,7 +69,7 @@ pub fn parse_train_state(s: &str) -> QueueTrainState {
 }
 
 /// Every known job state.
-pub const ALL_JOB_STATES: [QueueJobState; 11] = [
+pub const ALL_JOB_STATES: [QueueJobState; 12] = [
     J::Queued,
     J::Merging,
     J::Verifying,
@@ -79,10 +81,11 @@ pub const ALL_JOB_STATES: [QueueJobState; 11] = [
     J::Failed,
     J::Cancelled,
     J::NeedsReconcile,
+    J::AwaitingMerge,
 ];
 
 /// Every known train state.
-pub const ALL_TRAIN_STATES: [QueueTrainState; 8] = [
+pub const ALL_TRAIN_STATES: [QueueTrainState; 9] = [
     T::Building,
     T::Verifying,
     T::Ready,
@@ -91,6 +94,7 @@ pub const ALL_TRAIN_STATES: [QueueTrainState; 8] = [
     T::Landed,
     T::Dissolved,
     T::NeedsReconcile,
+    T::AwaitingMerge,
 ];
 
 /// The job transition table (design section 3): `(from, to, trigger)`.
@@ -158,6 +162,32 @@ pub const JOB_TRANSITIONS: &[(QueueJobState, QueueJobState, &str)] = &[
         J::Cancelled,
         "rejected push with a pending cancel",
     ),
+    (
+        J::Pushing,
+        J::AwaitingMerge,
+        "pull-request landing: the branch was pushed",
+    ),
+    (
+        J::AwaitingMerge,
+        J::Landed,
+        "the pull request was merged and its merge commit is on the target",
+    ),
+    (
+        J::AwaitingMerge,
+        J::Failed,
+        "the pull request was closed without merging, or its branch is gone (pr_closed)",
+    ),
+    (J::AwaitingMerge, J::Cancelled, "queue cancel"),
+    (
+        J::AwaitingMerge,
+        J::Queued,
+        "train dissolved because another member was cancelled",
+    ),
+    (
+        J::NeedsReconcile,
+        J::AwaitingMerge,
+        "reconcile: the branch of a pull-request landing is on the remote",
+    ),
     (J::NeedsReconcile, J::Landed, "reconcile rows 4-6"),
     (J::NeedsReconcile, J::Ready, "reconcile row 8"),
     (J::NeedsReconcile, J::Queued, "reconcile row 9"),
@@ -191,6 +221,10 @@ pub const TRAIN_TRANSITIONS: &[(QueueTrainState, QueueTrainState)] = &[
     (T::Pushing, T::Landed),
     (T::Pushing, T::Dissolved),
     (T::Pushing, T::NeedsReconcile),
+    (T::Pushing, T::AwaitingMerge),
+    (T::AwaitingMerge, T::Landed),
+    (T::AwaitingMerge, T::Dissolved),
+    (T::NeedsReconcile, T::AwaitingMerge),
     (T::NeedsReconcile, T::Landed),
     (T::NeedsReconcile, T::Ready),
     (T::NeedsReconcile, T::Dissolved),
@@ -236,12 +270,20 @@ pub fn job_cancellable_now(s: QueueJobState) -> bool {
 }
 
 /// Train states that occupy their (repo, remote, target): no other train of
-/// the same target is built meanwhile.
+/// the same target is built meanwhile. An `awaiting_merge` train occupies it
+/// too: what the next train would be built on does not hold the pull request
+/// still to merge.
 #[must_use]
 pub fn train_is_active(s: QueueTrainState) -> bool {
     matches!(
         s,
-        T::Building | T::Verifying | T::Ready | T::Approved | T::Pushing | T::NeedsReconcile
+        T::Building
+            | T::Verifying
+            | T::Ready
+            | T::Approved
+            | T::Pushing
+            | T::NeedsReconcile
+            | T::AwaitingMerge
     )
 }
 
@@ -363,6 +405,12 @@ mod tests {
             (J::Conflict, J::Queued),
             (J::Failed, J::Queued),
             (J::Merging, J::Queued),
+            (J::Pushing, J::AwaitingMerge),
+            (J::NeedsReconcile, J::AwaitingMerge),
+            (J::AwaitingMerge, J::Landed),
+            (J::AwaitingMerge, J::Failed),
+            (J::AwaitingMerge, J::Cancelled),
+            (J::AwaitingMerge, J::Queued),
         ] {
             assert!(job_transition_allowed(f, t), "{f:?} -> {t:?}");
         }
@@ -378,9 +426,18 @@ mod tests {
             (J::Approved, J::Landed),
             (J::NeedsReconcile, J::Pushing),
             (J::Conflict, J::Ready),
+            (J::Approved, J::AwaitingMerge),
+            (J::AwaitingMerge, J::Pushing),
+            (J::AwaitingMerge, J::Ready),
         ] {
             assert!(!job_transition_allowed(f, t), "{f:?} -> {t:?}");
         }
+        assert!(job_cancellable_now(J::AwaitingMerge));
+        assert!(train_is_active(T::AwaitingMerge));
+        assert!(train_transition_allowed(T::Pushing, T::AwaitingMerge));
+        assert!(train_transition_allowed(T::AwaitingMerge, T::Landed));
+        assert!(train_transition_allowed(T::AwaitingMerge, T::Dissolved));
+        assert!(!train_transition_allowed(T::AwaitingMerge, T::Ready));
         assert!(!job_cancellable_now(J::Pushing));
         assert!(!job_cancellable_now(J::NeedsReconcile));
         assert!(!job_cancellable_now(J::Landed));

@@ -15,7 +15,10 @@ How it works, in short:
 3. The gates of the queue run once on the combined tree, through Sluice: the cache,
    the budget and coalescing apply, so a tree that already passed needs no run.
 4. When everything passed the train is `ready`. `sluice queue status` shows the plan.
-5. A human runs `sluice queue approve <train>`. Only then is anything pushed.
+5. A human runs `sluice queue approve <train>`. Only then is anything pushed: by default
+   the verified commit goes to the target; with `[queue] land = "pull-request"` it goes
+   to a `sluice/train/<id>` branch and a pull request carries it to the target (see
+   [Landing through a pull request](#landing-through-a-pull-request)).
 
 Sluice never lands anything on its own: there is no auto-approval.
 
@@ -80,6 +83,10 @@ base commit's `.sluice.toml` is invalid, the queued line says why
 the queue tries again once per `[queue] tick` and, after 3 failed attempts in a
 row, marks the jobs `FAILED` with that reason. Fix the remote or the config, then
 `sluice queue retry <JOB_ID>`. A train in `needs_reconcile` tells you to run `sluice queue reconcile`.
+A train in `awaiting_merge` shows its pull request, how long it has waited, whether auto-merge is
+armed, how far the target moved and the last remark (see
+[Landing through a pull request](#landing-through-a-pull-request)); `status` first reads that
+pull request with your own `gh`.
 Inside a repository only its own trains and jobs are shown. `--json` prints the
 `queue-status` payload as is (it carries `"schema": 1`).
 
@@ -106,6 +113,8 @@ Reasons a job shows (`waiting:` for a job still `queued`, otherwise next to `FAI
 | `conflict`, `merge_failed`, `dirty_merge` | the merge did not apply cleanly (`conflict` lists the paths) |
 | `push_rejected`, `pre_push_hook` | the remote or the repository's `pre-push` hook refused the push |
 | `target_protected` | the forge refuses direct pushes to the target (a protected branch, a pull request required); the detail carries the server's words. Retrying cannot help: see [Targets protected against direct pushes](#targets-protected-against-direct-pushes) |
+| `pr_closed` | pull-request landing: the pull request was closed without merging, or its branch is gone. A human decided; `sluice queue retry` queues the job again |
+| `land_needs_remote` | `[queue] land = "pull-request"` with a local target branch: there is no forge to open a pull request on |
 | `target_checked_out`, `tree_mismatch`, `internal` | local target checked out at landing time; the merged tree differs from what git snapshots; an unexpected error |
 
 `sluice queue enqueue` without `--base` refuses a branch whose own `.sluice.toml` does not
@@ -116,7 +125,7 @@ the gates from the target either way.
 ### approve
 
 ```
-sluice queue approve <TRAIN_ID> [--yes]
+sluice queue approve <TRAIN_ID> [--yes] [--auto-merge]
 ```
 
 Prints the plan (members, base, landing commit, gates) and asks
@@ -128,7 +137,10 @@ look at `status` again and approve the new plan. On success it prints
 prints `sluice: approved; pushing…` and waits until the train lands or fails, at most the
 base's `push_timeout` plus its `network_timeout`, two ticks and 30 s; then it prints
 the train's current state and exits 1 (the daemon carries on; check
-`sluice queue status`).
+`sluice queue status`). For a train that lands through a pull request the command waits
+for the push of the train branch, then opens the pull request with your own `gh`; see
+[Landing through a pull request](#landing-through-a-pull-request). `--auto-merge` (only for
+such a train) also arms the forge's auto-merge on it.
 
 ### retry, cancel, reconcile
 
@@ -140,7 +152,11 @@ the train's current state and exits 1 (the daemon carries on; check
   (`--trust-member-config`, humans only).
 - `sluice queue cancel <JOB_ID>`: cancels a job that has not been pushed; a train
   that contains it is rebuilt without it. A job that is already pushing is only
-  cancelled if `reconcile` proves nothing landed.
+  cancelled if `reconcile` proves nothing landed. A job whose train waits for its pull
+  request (`awaiting_merge`) can be cancelled by a human: the train is dissolved (its other
+  members go back to the queue), the pull request Sluice opened is closed with your `gh`, and
+  the `sluice/train/<id>` branch Sluice pushed is deleted with a lease on that commit. A pull
+  request somebody else opened is left open (and so is its branch); over MCP the cancel is refused.
 - `sluice queue reconcile`: if a push was interrupted (daemon killed, network cut,
   timeout, or the push could not be started) the train is parked as
   `needs_reconcile`. `reconcile` reads the remote
@@ -149,6 +165,10 @@ the train's current state and exits 1 (the daemon carries on; check
   (the target moved, the train will be rebuilt), `cancelled` or `refused` (for example
   `push_in_progress`, `endpoint_changed`, `remote_unreachable`; nothing changed).
   With nothing to reconcile it prints `sluice: no train needs reconciling`.
+For trains that land through a pull request it also reads each `awaiting_merge` train's pull
+request with your own `gh` and reports it (a human running it opens a pull request that is
+still missing: find-or-create, never a second one). A push of the train branch that ended in
+doubt is decided from the branch on the remote (`ready`, or on to `awaiting_merge`).
 It only runs when you ask for it. If the decision cannot be recorded, the train
   stays `needs_reconcile` with its pin ref and worktree, so `reconcile` can run again.
 
@@ -314,11 +334,80 @@ run that hook, so Sluice finds out in two other ways, and neither refuses anythi
   that remote and target. The next enqueue to it warns from what was learned, even where `gh`
   cannot tell. A push that lands forgets it.
 
-The queue **cannot land on such a target yet**: the train is verified and approved, then its
-jobs fail with `target_protected` and nothing lands. Until pull-request landing exists (issue
-#5), verify with `verify` / `sluice run` and land through the forge's pull requests instead.
-The probe describes your `gh` identity, not the SSH or HTTPS identity that pushes, so an
-administrator who can bypass the protection may still see the warning.
+With the default `land = "push"` the queue **cannot land on such a target**: the train is
+verified and approved, then its jobs fail with `target_protected` and nothing lands. Set
+`[queue] land = "pull-request"` and it can: the train goes through a pull request, which the
+forge's rules and a human merge (see the next section). A repository that lands through a pull
+request gets none of these warnings, since the protection is what it expects. The probe
+describes your `gh` identity, not the SSH or HTTPS identity that pushes, so an administrator
+who can bypass the protection may still see the warning.
+
+## Landing through a pull request
+
+```toml
+[queue]
+land = "pull-request"      # default "push"
+```
+
+`land` is read from the target commit's `.sluice.toml` or the user config (the user's value is the
+default for repositories that do not set it), never from a queued branch: a branch cannot choose how
+it lands. Like the other newer keys it is one-way: a binary that does not know it rejects the file.
+It needs a remote target (a local branch has no forge) and, for the pull request, GitHub through
+`gh` (GitHub Enterprise Server hosts you are logged in to work too; other forges later).
+
+**The flow.** The train is built, verified and approved exactly as before (the plan hash, the
+refusal of agents and the trust rules are unchanged). Then:
+
+1. The daemon pushes the verified commit `S` to `refs/heads/sluice/train/<id>` (a lease on the branch
+   not existing, the approver's environment, the same classifier: a refusal is a real
+   `push_rejected`). It pushes no audit ref (the branch is the record) and does not touch the target.
+   The train and its jobs go to **`awaiting_merge`**.
+2. `sluice queue approve` waits for that push, then **opens one pull request per train with your own
+   `gh`** (`gh pr list --head sluice/train/<id> --state all`, and `gh pr create --base <target>
+   --head sluice/train/<id>` only when none exists, so it is safe to run again). The body lists the
+   members, the gates and the train id. No token is stored or sent to the daemon: the daemon
+   learns the pull request number from the client. If `gh` is missing, not logged in or the
+   forge says no, the train stays `awaiting_merge` with a note; `sluice queue reconcile`, or
+   approving that train again, finishes it.
+3. Only with `--auto-merge` does Sluice arm the forge's auto-merge (`gh pr merge --auto --merge
+   --match-head-commit <S>`): the forge merges when its own rules are met. **Sluice never merges and
+   never uses admin rights.** Merging is the forge's and a human's.
+
+**Seeing it land.** There is no webhook and the daemon never talks to the forge. `sluice queue status`,
+`sluice queue reconcile` and the MCP `queue_status` read each waiting train's pull request with the
+caller's own `gh` (read-only, a few seconds at most, cached for 20 s) and report what they saw to
+the daemon, which decides:
+
+| What the client saw | What the daemon does |
+|---|---|
+| merged, and its merge commit is on the target (fetched into a Sluice ref, `merge-base --is-ancestor`) | train and jobs `landed`; the note records whether the merged tree is the verified one |
+| merged with another tree than `S` (a human edited it, the forge merged onto a moved target) | still `landed`, with the note `tree_differs_from_verified`: never called verified |
+| merged but the commit is not on the target | waits, note `merge_commit_not_on_target` (or `ancestry_unknown`) |
+| closed without merging, or no pull request and the branch is gone | jobs `failed` with `pr_closed`, train dissolved; `queue retry` is the way back |
+| open, its head is not `S` (somebody pushed to it) | waits, note `pr_head_changed` |
+| open | waits; `status` says `target moved N commits since the train was built` when it did |
+| no pull request, the branch is there | waits, note `pr_not_opened` (run `reconcile` as a human) |
+| `gh` unusable (no CLI, no login, offline, rate limit) | nothing changes, note `forge_unreachable: <reason>` |
+
+**The target moves while the pull request waits**: Sluice waits. The pull request stays as it is and
+the forge's own rules decide (for example "require branches up to date"); Sluice does not requeue or
+rebuild. If the forge merges `S` onto a moved target, the result is landed with the tree note above.
+While a train waits it occupies its target, so the next train is built only when it lands, fails or
+is cancelled.
+
+**Cancelling and leftovers.** A human's `sluice queue cancel` of a waiting job dissolves the train,
+closes the pull request Sluice opened and deletes the `sluice/train/<id>` branch it pushed (a lease
+on that commit; only when the pull request was Sluice's). `sluice doctor` lists, offline and from the
+daemon's store, the trains waiting for a pull request and any `sluice/train/*` branch left behind by
+a dissolved train (for example after a closed pull request); delete those with
+`git push <remote> --delete <branch>`. A merged pull request's branch is the forge's to delete.
+
+**Who can do what.** The pull request exists because a human approved: an agent cannot approve it
+(`allow_agent_approval` does not change this for pull-request landing: the pull request is opened with
+the human's own forge login), cannot open it, and is told to wait or tell the human. Over MCP
+`queue_status` reads the pull request but never opens, closes or merges anything, and `queue_cancel` of
+a waiting job is refused. A client or daemon that does not know the `queue-pr-landing` feature refuses
+a pull-request train instead of ignoring it.
 
 ## Authenticated remotes (SSH, HTTPS)
 
@@ -376,6 +465,7 @@ network_timeout = "60s"    # every other network call (fetch, ls-remote); the pr
 prepare = "pnpm install --frozen-lockfile --prefer-offline"  # optional, needs 0.6.0: runs once per train before the gates
 prepare_timeout = "10m"    # default
 prepare_weight = "auto"    # integer >= 1 or "auto"
+land = "push"              # "push" (default) or "pull-request": see "Landing through a pull request"
 ```
 
 User, `~/.config/sluice/config.toml`:
@@ -386,6 +476,7 @@ enabled = true                 # user-level kill switch for the merge queue runn
 allow_agent_approval = false   # let agents approve trains (MCP queue_approve, CLI from an agent)
 tick = "5s"                    # runner housekeeping period
 retention = "30d"              # finished jobs, trains and their history are pruned after this
+land = "pull-request"          # optional: default of `[queue] land` for repositories that do not set it
 ```
 
 `allow_agent_approval` only exists in the user config. Putting it in `.sluice.toml`
@@ -407,6 +498,10 @@ the agent's permissions, for example in Claude Code's `.claude/settings.json`:
 ```json
 { "permissions": { "deny": ["Bash(sluice queue approve:*)"] } }
 ```
+
+A job or train `awaiting_merge` means a human approved it and a pull request is the way it lands:
+agents wait or tell the human, and never merge, close or push to the pull request or its
+`sluice/train/*` branch. `pr_closed` means a human closed the pull request: tell the human.
 
 An agent with shell access and push credentials can still `git push` directly; protected
 branches on the forge are the real enforcement. Design and failure handling:

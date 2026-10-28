@@ -58,6 +58,7 @@ fn state_spellings_are_frozen() {
         (QueueJobState::Failed, "failed"),
         (QueueJobState::Cancelled, "cancelled"),
         (QueueJobState::NeedsReconcile, "needs_reconcile"),
+        (QueueJobState::AwaitingMerge, "awaiting_merge"),
     ];
     for (state, text) in jobs {
         assert_eq!(serde_json::to_value(state).unwrap(), json!(text));
@@ -75,6 +76,7 @@ fn state_spellings_are_frozen() {
         (QueueTrainState::Landed, "landed"),
         (QueueTrainState::Dissolved, "dissolved"),
         (QueueTrainState::NeedsReconcile, "needs_reconcile"),
+        (QueueTrainState::AwaitingMerge, "awaiting_merge"),
     ];
     for (state, text) in trains {
         assert_eq!(serde_json::to_value(state).unwrap(), json!(text));
@@ -89,6 +91,8 @@ fn state_spellings_are_frozen() {
         (ReconcileDecision::Queued, "queued"),
         (ReconcileDecision::Cancelled, "cancelled"),
         (ReconcileDecision::Refused, "refused"),
+        (ReconcileDecision::AwaitingMerge, "awaiting_merge"),
+        (ReconcileDecision::Failed, "failed"),
     ];
     for (decision, text) in decisions {
         assert_eq!(serde_json::to_value(decision).unwrap(), json!(text));
@@ -108,5 +112,44 @@ fn unknown_states_from_a_newer_daemon_parse_as_unknown() {
     assert_eq!(
         serde_json::from_value::<ReconcileDecision>(json!("from-the-future")).unwrap(),
         ReconcileDecision::Unknown
+    );
+}
+
+/// ADR-0025: a daemon that lands trains through pull requests adds optional
+/// fields; the views a client of this version sends back and forth stay
+/// readable without them (older daemons) and with them (older clients ignore
+/// them).
+#[test]
+fn pull_request_fields_are_additive() {
+    use sluice_gate_proto::{PullRequestView, QueueTrainView};
+    let old: QueueTrainView = serde_json::from_value(json!({
+        "train_id": "t-1", "state": "landed", "members": []
+    }))
+    .unwrap();
+    assert_eq!((old.land, old.pr), (None, None));
+    let view = QueueTrainView {
+        train_id: "t-2".into(),
+        state: QueueTrainState::AwaitingMerge,
+        land: Some("pull-request".into()),
+        pr: Some(PullRequestView {
+            branch: "sluice/train/t-2".into(),
+            number: Some(7),
+            ..PullRequestView::default()
+        }),
+        ..QueueTrainView::default()
+    };
+    let wire = serde_json::to_value(&view).unwrap();
+    assert_eq!(wire["state"], "awaiting_merge");
+    assert_eq!(wire["pr"]["branch"], "sluice/train/t-2");
+    assert!(wire["pr"].get("url").is_none(), "{wire}");
+    assert_eq!(
+        serde_json::from_value::<QueueTrainView>(wire).unwrap(),
+        view
+    );
+    // A train without a pull request does not grow the JSON.
+    let plain = serde_json::to_value(QueueTrainView::default()).unwrap();
+    assert!(
+        plain.get("pr").is_none() && plain.get("land").is_none(),
+        "{plain}"
     );
 }

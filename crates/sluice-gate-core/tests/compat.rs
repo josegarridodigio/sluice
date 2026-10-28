@@ -681,3 +681,40 @@ fn gate_stall_timeout_fixture_parses() {
         );
     }
 }
+
+/// ADR-0025: `[queue] land` parses in the repository config and in the user
+/// config; without it the queue pushes. The target commit's value wins over
+/// the user's, and nothing else (a queued branch's file) is an input.
+#[test]
+fn queue_land_fixtures_parse_and_follow_the_precedence() {
+    use sluice_gate_core::config::Land;
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/unreleased");
+    let repo_path = dir.join("queue-land.toml");
+    let repo = RepoConfig::parse(&fs::read_to_string(&repo_path).unwrap(), &repo_path).unwrap();
+    assert_eq!(repo.queue.land, Some(Land::PullRequest));
+    let user_path = dir.join("queue-land-user.toml");
+    let user = UserConfig::parse(&fs::read_to_string(&user_path).unwrap(), &user_path).unwrap();
+    assert_eq!(user.queue.land, Some(Land::PullRequest));
+    let plain = RepoConfig::parse("version = 1\n", &repo_path).unwrap();
+    assert_eq!(plain.queue.land, None);
+    assert_eq!(Land::effective(plain.queue.land, None), Land::Push);
+    // The user's default applies when the repository does not say.
+    assert_eq!(
+        Land::effective(plain.queue.land, user.queue.land),
+        Land::PullRequest
+    );
+    // The repository's own value wins in both directions.
+    let push = RepoConfig::parse("version = 1\n[queue]\nland = \"push\"\n", &repo_path).unwrap();
+    assert_eq!(
+        Land::effective(push.queue.land, user.queue.land),
+        Land::Push
+    );
+    assert_eq!(
+        Land::effective(repo.queue.land, Some(Land::Push)),
+        Land::PullRequest
+    );
+    for bad in ["\"merge\"", "true", "1"] {
+        let toml = format!("version = 1\n[queue]\nland = {bad}\n");
+        assert!(RepoConfig::parse(&toml, &repo_path).is_err(), "{bad}");
+    }
+}

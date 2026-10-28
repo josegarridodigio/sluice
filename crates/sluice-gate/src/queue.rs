@@ -20,11 +20,14 @@ use sluice_gate_core::git::{self, EnvMap, RepoPaths};
 use sluice_gate_proto::client::{self, ClientError};
 use sluice_gate_proto::{
     ApproveVia, Caller, ClientMessage, EnqueueRequest, ErrorCode, FEATURE_QUEUE,
-    FEATURE_QUEUE_TRUST_CONFIG, QueueJobState, QueueJobView, QueueStatusReport, QueueTrainState,
-    QueueTrainView, ReconcileDecision, ServerMessage, TrainGate, TrainPrepare,
+    FEATURE_QUEUE_PR_LANDING, FEATURE_QUEUE_TRUST_CONFIG, QueueJobState, QueueJobView,
+    QueueStatusReport, QueueTrainState, QueueTrainView, ReconcileDecision, ServerMessage,
+    TrainGate, TrainPrepare,
 };
 
 use crate::run::EXIT_ERROR;
+
+mod pr;
 
 /// Exit status of a usage error (also what clap uses).
 const EXIT_USAGE: u8 = 2;
@@ -157,9 +160,14 @@ fn send_once(
         )));
     }
     if let Some(feature) = missing_feature(msg, |f| conn.supports(f)) {
+        let what = if feature == FEATURE_QUEUE_PR_LANDING {
+            "landing through a pull request"
+        } else {
+            "--trust-member-config"
+        };
         return Err(Retryable::Final(Failure::error(format!(
-            "the running daemon does not support --trust-member-config (it lacks the '{feature}' \
-             feature); run 'sluice daemon stop' so a daemon of this version starts, then retry"
+            "the running daemon does not support {what} (it lacks the '{feature}' feature); run \
+             'sluice daemon stop' so a daemon of this version starts, then retry"
         ))));
     }
     let timeout = if wait_forever {
@@ -184,8 +192,9 @@ fn send_once(
     }
 }
 
-/// The feature a daemon must announce for `msg`, when it does not: the
-/// trust flag is refused rather than silently ignored by an older daemon.
+/// The feature a daemon must announce for `msg`, when it does not: the trust
+/// flag and the pull-request facts are refused rather than silently ignored
+/// by an older daemon.
 fn missing_feature(msg: &ClientMessage, supports: impl Fn(&str) -> bool) -> Option<&'static str> {
     let trusting = match msg {
         ClientMessage::QueueEnqueue { request, .. } => request.trust_member_config,
@@ -195,7 +204,11 @@ fn missing_feature(msg: &ClientMessage, supports: impl Fn(&str) -> bool) -> Opti
         } => *trust_member_config,
         _ => false,
     };
-    (trusting && !supports(FEATURE_QUEUE_TRUST_CONFIG)).then_some(FEATURE_QUEUE_TRUST_CONFIG)
+    if trusting && !supports(FEATURE_QUEUE_TRUST_CONFIG) {
+        return Some(FEATURE_QUEUE_TRUST_CONFIG);
+    }
+    let facts = matches!(msg, ClientMessage::QueuePrFacts { .. });
+    (facts && !supports(FEATURE_QUEUE_PR_LANDING)).then_some(FEATURE_QUEUE_PR_LANDING)
 }
 
 fn unexpected(what: &str, reply: &ServerMessage) -> Failure {
@@ -337,6 +350,15 @@ fn do_enqueue(branch: Option<&str>, base: Option<&str>, trust_member_config: boo
     }
 }
 
+/// How the daemon says the job's target lands (ADR-0025).
+fn land_of(job: &QueueJobView) -> sluice_gate_core::config::Land {
+    if job.land.as_deref() == Some("pull-request") {
+        sluice_gate_core::config::Land::PullRequest
+    } else {
+        sluice_gate_core::config::Land::Push
+    }
+}
+
 /// Warnings about the target of a queued job (ADR-0025): the forge's
 /// protection as `gh` reports it with the caller's own login, and what the
 /// queue learned from a refused push. The enqueue has already happened.
@@ -345,7 +367,7 @@ fn enqueue_warnings(env: &EnvMap, cwd: &Path, job: &QueueJobView) -> Vec<String>
         .learned_protection
         .as_ref()
         .map(|l| (l.first_seen.as_str(), l.evidence.as_str()));
-    forge::enqueue_warnings(env, cwd, &job.remote, &job.target, learned)
+    forge::enqueue_warnings(env, cwd, &job.remote, &job.target, learned, land_of(job))
 }
 
 fn queued_line(job: &QueueJobView) -> String {
@@ -371,7 +393,12 @@ fn do_status(json: bool) -> Outcome {
     let env = process_env();
     // Inside a repository only its own trains and jobs are shown.
     let common = Repo::discover(&env).ok().map(|r| r.paths.common_dir);
-    let report = fetch_status(&env, common.as_deref())?;
+    let mut report = fetch_status(&env, common.as_deref())?;
+    // Trains waiting for a pull request: read it with this user's `gh` and
+    // tell the daemon what it says, then show what the daemon decided.
+    if pr::refresh(&env, &report) {
+        report = fetch_status(&env, common.as_deref())?;
+    }
     if json {
         let text =
             serde_json::to_string_pretty(&report).map_err(|e| Failure::error(e.to_string()))?;
@@ -435,6 +462,7 @@ fn train_state_label(s: QueueTrainState) -> &'static str {
         QueueTrainState::Landed => "LANDED",
         QueueTrainState::Dissolved => "DISSOLVED",
         QueueTrainState::NeedsReconcile => "NEEDS RECONCILE (push outcome unknown)",
+        QueueTrainState::AwaitingMerge => "AWAITING MERGE (pull request)",
         QueueTrainState::Unknown => "UNKNOWN",
     }
 }
@@ -450,6 +478,7 @@ fn job_state_label(s: QueueJobState) -> &'static str {
         QueueJobState::Failed => "FAILED",
         QueueJobState::Cancelled => "cancelled",
         QueueJobState::NeedsReconcile => "needs_reconcile",
+        QueueJobState::AwaitingMerge => "awaiting_merge",
         QueueJobState::Unknown => "unknown",
     }
 }
@@ -566,6 +595,11 @@ fn job_note(job: &QueueJobView, gates: &[TrainGate]) -> String {
             failure_text(job),
             PROTECTED_DOCS
         ),
+        QueueJobState::Failed if job.reason.as_deref() == Some("pr_closed") => format!(
+            " pr_closed  -> its pull request was closed without merging (or its branch deleted): \
+             a human decides; 'sluice queue retry {}' queues it again",
+            job.job_id
+        ),
         QueueJobState::Failed => format!(
             " {}  -> fix and commit, then 'sluice queue retry {}'",
             failure_text(job),
@@ -575,6 +609,7 @@ fn job_note(job: &QueueJobView, gates: &[TrainGate]) -> String {
         | QueueJobState::Ready
         | QueueJobState::Approved
         | QueueJobState::Pushing
+        | QueueJobState::AwaitingMerge
         | QueueJobState::Landed
             if !gates.is_empty() =>
         {
@@ -689,6 +724,7 @@ fn render_train(train: &QueueTrainView, jobs: &[QueueJobView]) -> String {
                 "  the push may or may not have happened: run 'sluice queue reconcile'"
             );
         }
+        QueueTrainState::AwaitingMerge => out.push_str(&pr::waiting_text(train)),
         _ => {}
     }
     out
@@ -774,12 +810,12 @@ fn render_status(report: &QueueStatusReport) -> String {
 
 // ------------------------------------------------------------------ approve
 
-/// `sluice queue approve <TRAIN_ID> [--yes]`.
-pub fn approve(train_id: &str, yes: bool) -> ExitCode {
-    finish(do_approve(train_id, yes))
+/// `sluice queue approve <TRAIN_ID> [--yes] [--auto-merge]`.
+pub fn approve(train_id: &str, yes: bool, auto_merge: bool) -> ExitCode {
+    finish(do_approve(train_id, yes, auto_merge))
 }
 
-fn do_approve(train_id: &str, yes: bool) -> Outcome {
+fn do_approve(train_id: &str, yes: bool, auto_merge: bool) -> Outcome {
     let tty = std::io::stdin().is_terminal();
     if !yes && !tty {
         return Err(Failure::usage(
@@ -795,6 +831,17 @@ fn do_approve(train_id: &str, yes: bool) -> Outcome {
         .ok_or_else(|| {
             Failure::error(format!("no train '{train_id}' (see 'sluice queue status')"))
         })?;
+    if auto_merge && train.land.is_none() {
+        return Err(Failure::usage(
+            "--auto-merge applies only to a train that lands through a pull request \
+             ([queue] land = \"pull-request\")",
+        ));
+    }
+    // A pull-request train already pushed whose pull request is missing:
+    // finish it instead of approving again.
+    if train.state == QueueTrainState::AwaitingMerge && train.land.is_some() {
+        return pr::resume(&env, train, &report.jobs, auto_merge);
+    }
     let Some(hash) = train
         .train_hash
         .clone()
@@ -819,6 +866,7 @@ fn do_approve(train_id: &str, yes: bool) -> Outcome {
         train_hash: hash,
         via: ApproveVia::Cli,
         env: approve_env(&env, &user),
+        pr_landing: true,
     };
     let ServerMessage::QueueApproved { train: after, .. } = send(&env, &msg, true)? else {
         return Err(Failure::error("unexpected reply to queue-approve"));
@@ -826,7 +874,8 @@ fn do_approve(train_id: &str, yes: bool) -> Outcome {
     match after.state {
         QueueTrainState::Approved | QueueTrainState::Pushing => {
             println!("sluice: approved; pushing\u{2026}");
-            wait_for_landing(&env, &after, landing_deadline(&after, user.queue.tick))
+            let deadline = landing_deadline(&after, user.queue.tick);
+            wait_for_landing(&env, &after, deadline, auto_merge)
         }
         _ => report_final(&after, &report.jobs),
     }
@@ -917,12 +966,21 @@ fn report_final(train: &QueueTrainView, jobs: &[QueueJobView]) -> Outcome {
 
 /// Polls `queue-status` until the train is no longer approved or pushing,
 /// or `deadline` expired (exit 1 with the current state).
-fn wait_for_landing(env: &EnvMap, train: &QueueTrainView, deadline: Duration) -> Outcome {
+fn wait_for_landing(
+    env: &EnvMap,
+    train: &QueueTrainView,
+    deadline: Duration,
+    auto_merge: bool,
+) -> Outcome {
     let started = std::time::Instant::now();
     loop {
         thread::sleep(POLL_PERIOD);
         let report = fetch_status(env, None)?;
         match report.trains.iter().find(|t| t.train_id == train.train_id) {
+            // Pull-request landing: the branch is out; open the pull request.
+            Some(t) if t.state == QueueTrainState::AwaitingMerge => {
+                return pr::finish(env, t, &report.jobs, auto_merge);
+            }
             Some(t)
                 if matches!(
                     t.state,
@@ -1020,6 +1078,9 @@ pub fn cancel(job_id: &str) -> ExitCode {
 
 fn do_cancel(job_id: &str) -> Outcome {
     let env = process_env();
+    // A job waiting for its pull request: remember the pull request, to
+    // close it once the daemon has dissolved the train.
+    let waiting = pr::before_cancel(&env, job_id);
     let msg = ClientMessage::QueueCancel {
         id: 1,
         job_id: job_id.to_owned(),
@@ -1041,6 +1102,9 @@ fn do_cancel(job_id: &str) -> Outcome {
                     job_state_label(job.state)
                 );
             }
+            if let Some(w) = &waiting {
+                pr::after_cancel(&env, w);
+            }
             Ok(())
         }
         other => Err(unexpected("queue-cancel", &other)),
@@ -1059,6 +1123,8 @@ fn decision_name(d: ReconcileDecision) -> &'static str {
         ReconcileDecision::Queued => "queued",
         ReconcileDecision::Cancelled => "cancelled",
         ReconcileDecision::Refused => "refused",
+        ReconcileDecision::AwaitingMerge => "awaiting_merge",
+        ReconcileDecision::Failed => "failed",
         ReconcileDecision::Unknown => "unknown",
     }
 }
@@ -1068,13 +1134,11 @@ fn do_reconcile() -> Outcome {
     let common = Repo::discover(&env).ok().map(|r| r.paths.common_dir);
     let msg = ClientMessage::QueueReconcile {
         id: 1,
-        repo: common,
+        repo: common.clone(),
     };
     match send(&env, &msg, true)? {
         ServerMessage::QueueReconcile { results, .. } => {
-            if results.is_empty() {
-                println!("sluice: no train needs reconciling");
-            }
+            let nothing = results.is_empty();
             for r in results {
                 println!(
                     "train {}: {} ({})",
@@ -1083,7 +1147,7 @@ fn do_reconcile() -> Outcome {
                     r.reason.as_deref().unwrap_or("no reason given")
                 );
             }
-            Ok(())
+            pr::reconcile_waiting(&env, common.as_deref(), nothing)
         }
         other => Err(unexpected("queue-reconcile", &other)),
     }
@@ -1496,6 +1560,43 @@ mod tests {
             missing_feature(&ClientMessage::QueueStatus { id: 1, repo: None }, old),
             None
         );
+    }
+
+    #[test]
+    fn a_daemon_without_the_feature_does_not_get_pull_request_facts() {
+        let facts = ClientMessage::QueuePrFacts {
+            id: 1,
+            facts: Vec::new(),
+            env: BTreeMap::new(),
+        };
+        let old = |f: &str| f == FEATURE_QUEUE;
+        let new = |f: &str| f == FEATURE_QUEUE || f == FEATURE_QUEUE_PR_LANDING;
+        assert_eq!(missing_feature(&facts, old), Some(FEATURE_QUEUE_PR_LANDING));
+        assert_eq!(missing_feature(&facts, new), None);
+    }
+
+    #[test]
+    fn an_awaiting_train_shows_its_pull_request_and_a_closed_one_its_way_back() {
+        let mut t = train("t-1", QueueTrainState::AwaitingMerge, &["j1"]);
+        t.pr = Some(sluice_gate_proto::PullRequestView {
+            branch: "sluice/train/t-1".into(),
+            number: Some(3),
+            url: Some("https://github.com/example/repo/pull/3".into()),
+            ..sluice_gate_proto::PullRequestView::default()
+        });
+        let j = job("j1", "feat/a", QueueJobState::AwaitingMerge);
+        let text = render_train(&t, &[j]);
+        assert!(text.contains("AWAITING MERGE (pull request)"), "{text}");
+        assert!(text.contains("job j1  awaiting_merge"), "{text}");
+        assert!(
+            text.contains("pull request: #3 https://github.com/example/repo/pull/3"),
+            "{text}"
+        );
+        let mut closed = job("j1", "feat/a", QueueJobState::Failed);
+        closed.reason = Some("pr_closed".into());
+        let note = job_note(&closed, &[]);
+        assert!(note.contains("pr_closed"), "{note}");
+        assert!(note.contains("a human decides"), "{note}");
     }
 
     #[test]

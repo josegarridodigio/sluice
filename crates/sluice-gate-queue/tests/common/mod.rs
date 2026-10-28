@@ -473,14 +473,46 @@ impl Daemon {
         hash: &str,
         via: ApproveVia,
     ) -> ServerMessage {
+        // The CLI of this version opens the pull request of a pull-request
+        // landing; MCP never does.
+        let env = fx.client_env();
+        self.approve_as(train, hash, via, via == ApproveVia::Cli, env)
+            .await
+    }
+
+    /// An approval with the client's capabilities and environment spelled out.
+    pub async fn approve_as(
+        &self,
+        train: &str,
+        hash: &str,
+        via: ApproveVia,
+        pr_landing: bool,
+        env: EnvMap,
+    ) -> ServerMessage {
         self.ask(&ClientMessage::QueueApprove {
             id: 3,
             train_id: train.into(),
             train_hash: hash.into(),
             via,
-            env: fx.client_env(),
+            env,
+            pr_landing,
         })
         .await
+    }
+
+    /// Reports what a client read about pull requests.
+    pub async fn pr_facts(
+        &self,
+        facts: Vec<sluice_gate_core::forge::PrFact>,
+        env: EnvMap,
+    ) -> Vec<ReconcileResult> {
+        match self
+            .ask(&ClientMessage::QueuePrFacts { id: 11, facts, env })
+            .await
+        {
+            ServerMessage::QueueReconcile { results, .. } => results,
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     pub async fn cancel(&self, job: &str) -> ServerMessage {

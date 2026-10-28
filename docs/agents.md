@@ -276,6 +276,12 @@ gist as its own instructions, but the file is read first:
   the human, do not retry. A warning in the `queue_enqueue` result about the
   target (it requires pull requests, is protected, could not be checked) is
   for the human too; the job is queued anyway.
+- A job or train `awaiting_merge` means a human approved it and a pull request
+  is the way it lands (`[queue] land = "pull-request"`): wait or tell the
+  human; never merge, close or push to the pull request or its
+  `sluice/train/*` branch, and do not cancel it (`queue_cancel` is refused for
+  it). `queue_status` reads the pull request, read-only. `pr_closed`: tell the
+  human, do not retry.
 - Errors start with a code: `conflict-state`, `stale-plan`,
   `duplicate-branch`, `not-allowed`, `not-supported`. Report them; do not work
   around them.

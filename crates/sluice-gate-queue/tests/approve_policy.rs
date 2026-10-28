@@ -28,6 +28,7 @@ async fn approve_as(
         train_hash: hash.to_owned(),
         via: ApproveVia::Cli,
         env,
+        pr_landing: true,
     })
     .await
 }
