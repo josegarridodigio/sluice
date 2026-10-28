@@ -398,6 +398,23 @@ fn git_has_http_transport() -> bool {
         })
 }
 
+/// True when `git http-backend` (the CGI program the test server runs) is
+/// installed. Some distributions ship it in a separate package (Alpine:
+/// `git-daemon`); without it the server answers an empty advertisement and a
+/// fetch fails with `couldn't find remote ref`.
+fn git_has_http_backend() -> bool {
+    Command::new("git")
+        .arg("--exec-path")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some_and(|o| {
+            Path::new(String::from_utf8_lossy(&o.stdout).trim())
+                .join("git-http-backend")
+                .is_file()
+        })
+}
+
 /// Serves the bare repositories under `root` (`<url>/<name>.git`); `None`
 /// (reason printed) without `python3` or without git's HTTP transport.
 pub fn http_remote(dir: &Path, root: &Path, repo: &str) -> Option<HttpRemote> {
@@ -409,6 +426,10 @@ pub fn http_remote(dir: &Path, root: &Path, repo: &str) -> Option<HttpRemote> {
         eprintln!(
             "skipped: this git has no HTTP transport (no git-remote-http, built without curl)"
         );
+        return None;
+    }
+    if !git_has_http_backend() {
+        eprintln!("skipped: git http-backend is not installed (Alpine: package git-daemon)");
         return None;
     }
     fs::create_dir_all(dir).expect("http dir");

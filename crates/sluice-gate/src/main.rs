@@ -43,7 +43,7 @@ use snippets::{HookManager, snippet};
     about = "Verification queue and cache for parallel coding agents",
     long_about = "Sluice runs named gates (tests, linters, type checks) under a global \
                   concurrency budget and caches results per git tree so each tree is verified \
-                  once. Git hooks call `sluice run`; coding agents call the MCP server started by \
+                  once. Git hooks run gates through `sluice run`, or through `sluice hooks on`, which runs the repository's own hook commands through the same queue and cache; coding agents call the MCP server started by \
                   `sluice mcp` (tools verify, status, gate_list, logs and the merge-queue tools \
                   queue_enqueue, queue_status, queue_approve, queue_retry, queue_cancel).\n\n\
                   On a cache miss `sluice run` hands the gate to the per-user daemon \
@@ -79,7 +79,8 @@ struct Cli {
 enum Command {
     /// Run a gate: cache hit in milliseconds, otherwise queue it in the daemon under the budget.
     Run {
-        /// Gate name as defined in `.sluice.toml`.
+        /// Gate name from `.sluice.toml`, or, without one, a check unit of a hook that Sluice runs
+        /// (see `sluice gate list`).
         gate: String,
         /// Name of the git hook invoking Sluice (pre-commit, pre-push, ...). Enables the
         /// hook policy on a cache miss and, for pre-commit, records the committed tree.
@@ -266,9 +267,11 @@ enum Command {
     /// `on` gives the clone a hooks directory of its own (under its git directory) and points
     /// `core.hooksPath` at it through a file included by the last `[include]` of the clone's
     /// git config, so husky's own `core.hooksPath` writes do not displace it. Every hook runs
-    /// `sluice hooks run`, which executes the hook the repository would have run (husky,
-    /// lefthook, pre-commit or plain), untouched: same arguments, stdin, directory,
-    /// environment and exit code. `off` removes the include and the managed files.
+    /// `sluice hooks run`: when Sluice understands the repository's hook (husky, lefthook,
+    /// pre-commit or plain) it runs the hook's commands one by one through the queue and the
+    /// cache; otherwise it executes the hook untouched, with the same arguments, stdin,
+    /// directory, environment and exit code. `status` shows which. `off` removes the include
+    /// and the managed files.
     Hooks {
         #[command(subcommand)]
         command: HooksCommand,
@@ -547,10 +550,11 @@ enum HooksCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Run a hook as git would have without Sluice (called by the managed scripts).
+    /// Run a hook of the repository through Sluice (called by the managed scripts).
     ///
-    /// Executes the repository's own hook with the same arguments and stdin, replacing this
-    /// process; a hook that is not installed exits 0.
+    /// Runs the hook's commands through the queue when Sluice understands the hook; otherwise
+    /// executes the repository's own hook with the same arguments and stdin, replacing this
+    /// process. A hook that is not installed exits 0.
     #[command(hide = true)]
     Run {
         /// The clone's git common directory (written into the scripts).

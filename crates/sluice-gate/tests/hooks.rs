@@ -9,12 +9,12 @@ mod common;
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Output, Stdio};
 
-use common::{NO_AUTO_MAINTENANCE, Sandbox};
+use common::{NO_AUTO_MAINTENANCE, Sandbox, find_on_path, tools_dir};
 use serde_json::Value;
 
 /// Records argv, cwd, stdin, an environment variable and `$0` to `$RECORD`
@@ -41,28 +41,8 @@ fn fake_hook(path: &Path, marker: &str) {
     exe(path, &format!("#!/bin/sh\n# {marker}\n{RECORDER}"));
 }
 
-fn find_on_path(name: &str) -> Option<PathBuf> {
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|d| d.join(name))
-        .find(|p| p.is_file())
-}
-
-/// A `PATH` with only the tools hooks need, and no `sluice`: the scripts must
-/// not depend on one being installed (an older one would not know `hooks`).
 fn tools(sb: &Sandbox) -> PathBuf {
-    let dir = sb.root.path().join("tools");
-    if dir.exists() {
-        return dir;
-    }
-    fs::create_dir_all(&dir).unwrap();
-    for name in [
-        "git", "sh", "cat", "tail", "env", "dirname", "basename", "kill", "sed", "sleep",
-    ] {
-        if let Some(real) = find_on_path(name) {
-            symlink(real, dir.join(name)).unwrap();
-        }
-    }
-    dir
+    tools_dir(sb)
 }
 
 fn record_file(sb: &Sandbox) -> PathBuf {
@@ -573,6 +553,19 @@ fn a_missing_sluice_binary_still_runs_the_original_hook() {
     let out = run_script(&sb, "pre-push", &["q"], "", &[]);
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     assert!(record(&sb).contains("self:.githooks/pre-push"));
+
+    // Sluice's own directory among the values (a later `--add`, or includes
+    // read by a newer git) is not the repository's hook: the last other value wins.
+    fs::remove_file(record_file(&sb)).unwrap();
+    let ours = hooks_dir(&sb).display().to_string();
+    git_ok(&sb, &["config", "--add", "core.hooksPath", &ours], &[]);
+    let out = run_script(&sb, "pre-push", &["q"], "", &[]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(
+        record(&sb).contains("self:.githooks/pre-push"),
+        "{}",
+        record(&sb)
+    );
 }
 
 #[test]

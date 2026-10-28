@@ -68,7 +68,8 @@ already passed is answered from the cache in milliseconds. `status` shows queued
 jobs, `logs` shows a job's output, `gate_list` lists the gates of a repository: those of its `.sluice.toml` or, in a repository \
 without one whose git hooks go through Sluice, the check units of its hooks (it also says which \
 hooks and units are left out and why); `verify` runs them with the same cache entries as the \
-commit's hook, so a pass here makes the commit's hook a cache hit. \
+commit's hook, so a pass here makes the commit's hook a cache hit. A unit that `gate_list` leaves \
+out is run by the commit's hook: do not run its command by hand through the shell. \
 Merge queue: to land a finished branch, commit it, call `verify` and wait for it to pass, then \
 call `queue_enqueue` with your absolute working directory, and stop. Tell the human the job id \
 (and the train id from `queue_status`): a human approves the train with `sluice queue approve`. \

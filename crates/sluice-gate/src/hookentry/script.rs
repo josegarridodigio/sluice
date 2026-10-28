@@ -74,7 +74,8 @@ pub fn render(hook: &str, input: &ScriptInput<'_>) -> String {
          if [ -n \"$bin\" ]; then\n\
          \x20 exec \"$bin\" hooks run --common-dir \"$common\" \"$hook\" -- \"$@\"\n\
          fi\n\
-         prev=$(git config --file \"$common/config\" --get-all core.hooksPath 2>/dev/null | tail -n 1)\n\
+         prev=$(git config --no-includes --file \"$common/config\" --get-all core.hooksPath 2>/dev/null \
+         | grep -vxF -e {ours} | tail -n 1)\n\
          [ -n \"$prev\" ] || prev={previous}\n\
          case $prev in \"~/\"*) prev=$HOME/${{prev#\"~/\"}} ;; esac\n\
          if [ -z \"$prev\" ] || [ \"$prev\" = {ours} ]; then prev=$common/hooks; fi\n\

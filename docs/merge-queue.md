@@ -287,6 +287,18 @@ the commit); a modified tracked file dissolves the train. The push is
 protected by `--force-with-lease` on the target, and by default a `refs/sluice/landed/<sha>`
 audit ref is pushed with it.
 
+### Targets protected against direct pushes
+
+The queue lands by pushing the merge commit to the target. A target branch that the forge
+only lets change through a pull request (GitHub "Require a pull request before merging",
+GitLab protected branches with "Allowed to push: No one", and similar) refuses that push
+with a server-side hook (`protected branch hook declined`): the train is verified and
+approved, then its jobs fail with `push_rejected` and nothing lands. Sluice cannot see this
+protection before pushing today (a `git push --dry-run` does not run the forge's hook), so
+**do not use the merge queue on such a target**: verify with `verify` / `sluice run` and land
+through the forge's pull requests instead. Early detection and a pull-request landing mode
+are tracked in issue #5.
+
 ## Authenticated remotes (SSH, HTTPS)
 
 The daemon has no credentials of its own and never prompts: git runs with

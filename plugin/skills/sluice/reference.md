@@ -131,12 +131,15 @@ memory` is not retried unchanged. Heavy commands include `cargo check` and
 `cargo doc`, which go through the queue like `cargo build`.
 
 Context variants: repository with `.sluice.toml` (rules and gate names);
-git repository without it whose hooks go through Sluice (the rules; the gates
-are the hooks' check units, see `gate_list`); git
+git repository without it whose hooks go through Sluice (`sluice hooks on`
+was run: the rules; the gates are the hooks' check units, see `gate_list`); git
 repository without it (propose Sluice once: `sluice init --dry-run`, show
 the output, `sluice init` only after the user agrees); anything else (one
 line). A missing or older binary yields a note asking you to tell the user
-and, only with their consent, run the installer or `sluice update`.
+and, only with their consent, run the installer or `sluice update`. In a clone
+whose hooks entry point was displaced the session start puts it back and says so
+(`hooks=restored` in the log); when it cannot, the context asks you to tell the
+user to run `sluice hooks on`. It never turns the entry point on by itself.
 
 ## Troubleshooting
 
@@ -165,3 +168,9 @@ and, only with their consent, run the installer or `sluice update`.
 - The human is asked to approve a rewritten command (`ask`): this happens when
   the original command would have needed a permission prompt anyway.
 - Hook exit code 3 on a git command: see the section in `SKILL.md`.
+- `gate_list` shows a unit under `excluded`: it edits files or the index, depends
+  on what a commit stages, or its hook is one Sluice does not understand
+  completely. Do not run its command yourself: the commit's hook runs it. A unit
+  that depends on the staged set becomes a gate once the change is staged
+  (`git add`, then `verify`). `sluice hooks status` (human) says what each hook
+  does.

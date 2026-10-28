@@ -16,7 +16,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Output};
 
-use common::{NO_AUTO_MAINTENANCE, Sandbox};
+use common::{NO_AUTO_MAINTENANCE, Sandbox, find_on_path, tools_dir};
 use serde_json::Value;
 
 /// A fake `lefthook`: `version` and `dump` answer from files next to the
@@ -72,8 +72,11 @@ fn set_codes(sb: &Sandbox, codes: &str) {
 
 /// `PATH` with the fakes first, as extra environment.
 fn with_fakes(sb: &Sandbox) -> (String, String) {
-    let path = std::env::var("PATH").unwrap_or_default();
-    ("PATH".into(), format!("{}:{path}", bin_dir(sb).display()))
+    let tools = tools_dir(sb);
+    (
+        "PATH".into(),
+        format!("{}:{}", bin_dir(sb).display(), tools.display()),
+    )
 }
 
 fn hooks_dir(sb: &Sandbox) -> PathBuf {
@@ -302,94 +305,104 @@ fn another_exit_code_ends_the_hook_at_once_and_a_3_is_the_units_own() {
     assert_eq!(counter(&sb).len(), 1, "b never ran");
 }
 
+/// lefthook dumps whose hook must be delegated, and a word of the reason.
+const LEFTHOOK_DELEGATIONS: &[(&str, &str)] = &[
+    (r#"{"pre-commit":{"jobs":[{"run":"jest"}]}}"#, "no name"),
+    (
+        r#"{"pre-commit":{"scripts":{"a.sh":{"runner":"bash"}}}}"#,
+        "`scripts`",
+    ),
+    (
+        r#"{"pre-commit":{"setup":[{"run":"x"}],"commands":{"a":{"run":"jest"}}}}"#,
+        "`setup`",
+    ),
+    (
+        r#"{"pre-commit":{"piped":true,"commands":{"a":{"run":"jest"}}}}"#,
+        "`piped`",
+    ),
+    (
+        r#"{"pre-commit":{"follow":true,"commands":{"a":{"run":"jest"}}}}"#,
+        "`follow`",
+    ),
+    (
+        r#"{"pre-commit":{"exclude_tags":["x"],"commands":{"a":{"run":"jest"}}}}"#,
+        "`exclude_tags`",
+    ),
+    (
+        r#"{"pre-commit":{"skip":["merge"],"commands":{"a":{"run":"jest"}}}}"#,
+        "`skip`",
+    ),
+    (
+        r#"{"pre-commit":{"commands":{"a":{"run":"jest","only":[{"ref":"main"}]}}}}"#,
+        "`only`",
+    ),
+    (
+        r#"{"pre-commit":{"commands":{"a":{"run":"jest {staged_files}"}}}}"#,
+        "template",
+    ),
+    (
+        r#"{"pre-commit":{"commands":{"a":{"run":"jest","glob":"*.ts"}}}}"#,
+        "`glob`",
+    ),
+    (
+        r#"{"pre-commit":{"commands":{"a":{"run":"jest","stage_fixed":true}}}}"#,
+        "`stage_fixed`",
+    ),
+    (
+        r#"{"pre-commit":{"commands":{"a":{"run":"jest","use_stdin":true}}}}"#,
+        "`use_stdin`",
+    ),
+    (
+        r#"{"pre-commit":{"commands":{"a":{"run":"jest","interactive":true}}}}"#,
+        "`interactive`",
+    ),
+    (
+        r#"{"pre-commit":{"jobs":[{"name":"g","group":{"jobs":[{"run":"x"}]}}]}}"#,
+        "`group`",
+    ),
+    (
+        r#"{"pre-commit":{"commands":{"a":{"run":"jest"}}},"remotes":[{"git_url":"u"}]}"#,
+        "`remotes`",
+    ),
+    (
+        r#"{"pre-commit":{"commands":{"a":{"run":"jest"}}},"rc":"~/.rc"}"#,
+        "`rc`",
+    ),
+    (
+        r#"{"pre-commit":{"commands":{"1-a":{"run":"jest"},"1-b":{"run":"tsc"}}}}"#,
+        "order",
+    ),
+    (
+        r#"{"pre-commit":{"commands":{"a":{"run":"jest"}},"nonsense":1}}"#,
+        "unknown option",
+    ),
+    (
+        r#"{"pre-push":{"commands":{"a":{"run":"jest"}}}}"#,
+        "files to push",
+    ),
+    (
+        r#"{"commit-msg":{"commands":{"a":{"run":"x {1}"}}}}"#,
+        "template",
+    ),
+    (r#"{"pre-commit":{}}"#, "no job"),
+    (
+        r#"{"pre-commit":{"commands":{"a":{"run":"sluice run --hook pre-commit test"}}}}"#,
+        "already runs sluice",
+    ),
+    (
+        r#"{"pre-commit":{"jobs":[{"name":"a","run":"if command -v sluice >/dev/null 2>&1; then sluice run --hook pre-commit test; else jest; fi"}]}}"#,
+        "already runs sluice",
+    ),
+    (
+        r#"{"post-rewrite":{"commands":{"a":{"run":"./scripts/x.sh"}}}}"#,
+        "stdin",
+    ),
+];
+
 #[test]
 fn what_lefthook_would_skip_or_a_per_command_run_would_change_is_delegated() {
-    let cases = [
-        (r#"{"pre-commit":{"jobs":[{"run":"jest"}]}}"#, "no name"),
-        (
-            r#"{"pre-commit":{"scripts":{"a.sh":{"runner":"bash"}}}}"#,
-            "`scripts`",
-        ),
-        (
-            r#"{"pre-commit":{"setup":[{"run":"x"}],"commands":{"a":{"run":"jest"}}}}"#,
-            "`setup`",
-        ),
-        (
-            r#"{"pre-commit":{"piped":true,"commands":{"a":{"run":"jest"}}}}"#,
-            "`piped`",
-        ),
-        (
-            r#"{"pre-commit":{"follow":true,"commands":{"a":{"run":"jest"}}}}"#,
-            "`follow`",
-        ),
-        (
-            r#"{"pre-commit":{"exclude_tags":["x"],"commands":{"a":{"run":"jest"}}}}"#,
-            "`exclude_tags`",
-        ),
-        (
-            r#"{"pre-commit":{"skip":["merge"],"commands":{"a":{"run":"jest"}}}}"#,
-            "`skip`",
-        ),
-        (
-            r#"{"pre-commit":{"commands":{"a":{"run":"jest","only":[{"ref":"main"}]}}}}"#,
-            "`only`",
-        ),
-        (
-            r#"{"pre-commit":{"commands":{"a":{"run":"jest {staged_files}"}}}}"#,
-            "template",
-        ),
-        (
-            r#"{"pre-commit":{"commands":{"a":{"run":"jest","glob":"*.ts"}}}}"#,
-            "`glob`",
-        ),
-        (
-            r#"{"pre-commit":{"commands":{"a":{"run":"jest","stage_fixed":true}}}}"#,
-            "`stage_fixed`",
-        ),
-        (
-            r#"{"pre-commit":{"commands":{"a":{"run":"jest","use_stdin":true}}}}"#,
-            "`use_stdin`",
-        ),
-        (
-            r#"{"pre-commit":{"commands":{"a":{"run":"jest","interactive":true}}}}"#,
-            "`interactive`",
-        ),
-        (
-            r#"{"pre-commit":{"jobs":[{"name":"g","group":{"jobs":[{"run":"x"}]}}]}}"#,
-            "`group`",
-        ),
-        (
-            r#"{"pre-commit":{"commands":{"a":{"run":"jest"}}},"remotes":[{"git_url":"u"}]}"#,
-            "`remotes`",
-        ),
-        (
-            r#"{"pre-commit":{"commands":{"a":{"run":"jest"}}},"rc":"~/.rc"}"#,
-            "`rc`",
-        ),
-        (
-            r#"{"pre-commit":{"commands":{"1-a":{"run":"jest"},"1-b":{"run":"tsc"}}}}"#,
-            "order",
-        ),
-        (
-            r#"{"pre-commit":{"commands":{"a":{"run":"jest"}},"nonsense":1}}"#,
-            "unknown option",
-        ),
-        (
-            r#"{"pre-push":{"commands":{"a":{"run":"jest"}}}}"#,
-            "files to push",
-        ),
-        (
-            r#"{"commit-msg":{"commands":{"a":{"run":"x {1}"}}}}"#,
-            "template",
-        ),
-        (r#"{"pre-commit":{}}"#, "no job"),
-        (
-            r#"{"post-rewrite":{"commands":{"a":{"run":"./scripts/x.sh"}}}}"#,
-            "stdin",
-        ),
-    ];
     let sb = lefthook_repo(&serde_json::json!({}));
-    for (dump, expected) in cases {
+    for &(dump, expected) in LEFTHOOK_DELEGATIONS {
         fs::write(side(&sb, "dump"), dump).unwrap();
         let hook = if dump.contains("\"pre-push\"") {
             "pre-push"
@@ -423,7 +436,7 @@ fn lefthook_is_delegated_when_it_cannot_be_found_asked_or_is_not_a_known_version
     assert_eq!(hook_entry(&status(&sb, &[]), "pre-commit")["mode"], "units");
 
     // The hook script's other ways to find the binary are not modelled.
-    let path = std::env::var("PATH").unwrap_or_default();
+    let path = tools_dir(&sb).display().to_string();
     let entry = hook_entry(&status(&sb, &[("PATH", path.as_str())]), "pre-commit");
     assert!(
         entry["reason"].as_str().unwrap().contains("not on PATH"),
@@ -508,11 +521,13 @@ fn a_commit_runs_the_lefthook_units_and_a_failure_refuses_it() {
 
 const STUB_MARK: &str = "delegated-to-the-pre-commit-stub";
 
+/// pre-commit's stub is bash; the fake is `sh` (Alpine has no bash), so its `ARGS=(...)` line
+/// sits in a here-document that `sh` skips and Sluice's reader still sees.
 fn stub(python: &str) -> String {
     format!(
-        "#!/usr/bin/env bash\n# File generated by pre-commit: https://pre-commit.com\n\
+        "#!/bin/sh\n# File generated by pre-commit: https://pre-commit.com\n\
          # ID: 138fd403232d2ddd5efb44317e38bf03\n# start templated\nINSTALL_PYTHON={python}\n\
-         ARGS=(hook-impl --config=.pre-commit-config.yaml --hook-type=pre-commit)\n\
+         : <<'ARGS_AS_BASH'\nARGS=(hook-impl --config=.pre-commit-config.yaml --hook-type=pre-commit)\nARGS_AS_BASH\n\
          # end templated\necho {STUB_MARK} >> \"$SLUICE_TEST_COUNTER\"\n"
     )
 }
@@ -659,12 +674,46 @@ fn what_pre_commit_would_run_differently_per_hook_is_delegated() {
         ),
         (one(""), "pre-push", "stdin"),
         (one(""), "commit-msg", "arguments"),
+        (
+            config(&[local_hook("a", "sluice run --hook pre-commit test", "")]),
+            "pre-commit",
+            "already runs sluice",
+        ),
+        (
+            config(&[local_hook(
+                "a",
+                "/usr/local/bin/sluice",
+                "    args: [run, --hook, pre-commit, test]\n",
+            )]),
+            "pre-commit",
+            "already runs sluice",
+        ),
+        (
+            config(&[local_hook("a", "sh", "    args: [-c, sluice, run, test]\n")]),
+            "pre-commit",
+            "already runs sluice",
+        ),
     ];
     for (cfg, hook, expected) in cases {
         let sb = pre_commit_repo(&cfg);
         let why = reason(&sb, hook);
         assert!(why.contains(expected), "{cfg}: {why}");
     }
+}
+
+#[test]
+fn a_legacy_hook_that_the_stub_chains_delegates_the_whole_hook() {
+    let sb = pre_commit_repo(&config(&[local_hook("a", "jest", CHECK_EXTRA)]));
+    let legacy = sb.repo.join(".git/hooks/pre-commit.legacy");
+    // pre-commit runs `<hook>.legacy` only when it is executable.
+    fs::write(&legacy, "#!/bin/sh\nexit 0\n").unwrap();
+    let entry = hook_entry(&status(&sb, &[]), "pre-commit");
+    assert_eq!(entry["mode"], "units", "{entry}");
+    exe(&legacy, "#!/bin/sh\nexit 0\n");
+    assert_eq!(reason(&sb, "pre-commit"), "runs a legacy hook first");
+    // Another hook type has no legacy file.
+    let entry = hook_entry(&status(&sb, &[]), "pre-push");
+    assert!(!entry["reason"].as_str().unwrap().contains("legacy"));
 }
 
 #[test]
@@ -764,12 +813,6 @@ fn pre_commit_exit_codes_are_the_units_own_and_one_failure_does_not_stop_the_res
 
 // ----------------------------------------------------------------- real tools
 
-fn find_on_path(name: &str) -> Option<PathBuf> {
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|d| d.join(name))
-        .find(|p| p.is_file())
-}
-
 /// A real tool, run in the repository with the sandbox environment.
 fn real(sb: &Sandbox, tool: &Path, args: &[&str]) -> Output {
     StdCommand::new(tool)
@@ -827,6 +870,11 @@ fn real_pre_commit_local_hooks_run_as_units() {
         eprintln!("skipped: `pre-commit` is not on PATH");
         return;
     };
+    if find_on_path("bash").is_none() {
+        // pre-commit's generated hook script has a `#!/usr/bin/env bash` shebang.
+        eprintln!("skipped: `bash` is not on PATH");
+        return;
+    }
     let sb = Sandbox::standard();
     fs::write(
         sb.repo.join(".pre-commit-config.yaml"),

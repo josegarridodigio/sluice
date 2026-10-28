@@ -43,7 +43,7 @@ use sluice_gate_core::config::EnvMap;
 use super::classify;
 use super::delegate::{Manager, is_executable};
 use super::grammar;
-use super::plan::Input;
+use super::plan::{ALREADY_ROUTED, Input, is_sluice, text_runs_sluice};
 use super::tooling::{find_on_path, parse_version, sh_line};
 use super::units::{Kind, Precondition, Program, Unit};
 
@@ -137,6 +137,7 @@ pub fn plan(input: &Input<'_>) -> Result<Program, String> {
         return Err("SKIP is set (pre-commit skips hooks successfully)".to_owned());
     }
     let stub = read_stub(input)?;
+    check_legacy(input)?;
     let launcher = launcher(&stub, input.env)?;
     let text = read_config(&input.root.join(&stub.config))?;
     let config = parse_config(&text)?;
@@ -148,7 +149,26 @@ pub fn plan(input: &Input<'_>) -> Result<Program, String> {
         ));
     }
     check_ids(&hooks)?;
+    if let Some(hook) = hooks.iter().find(|h| runs_sluice(h)) {
+        return Err(format!("the hook `{}` {ALREADY_ROUTED}", hook.id));
+    }
     Ok(program(input, &stub, &launcher, &hooks))
+}
+
+/// `pre-commit hook-impl --hook-dir` runs `<hook>.legacy` (an earlier hook
+/// that `pre-commit install` moved aside) first, when `os.access` says it is
+/// executable, and ORs its status into the result. Units would not chain it.
+fn check_legacy(input: &Input<'_>) -> Result<(), String> {
+    let dir = super::activate::resolve(input.dir, input.root);
+    if is_executable(&dir.join(format!("{}.legacy", input.hook))) {
+        return Err("runs a legacy hook first".to_owned());
+    }
+    Ok(())
+}
+
+/// A hook whose `entry` or `args` call `sluice`.
+fn runs_sluice(hook: &HookDef) -> bool {
+    text_runs_sluice(&hook.entry) || hook.args.iter().any(|a| is_sluice(a))
 }
 
 /// `INSTALL_PYTHON` and `--config` as the stub in the hooks directory bakes

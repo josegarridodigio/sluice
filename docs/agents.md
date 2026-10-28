@@ -140,7 +140,10 @@ The shims depend on the `PATH` of the shell that runs the command
 - Git hooks run by husky put `node_modules/.bin` first in `PATH`, so a hook
   that calls `ng test` or `jest` reaches the real tool, not the shim. That is
   why `sluice init` rewrites the hook lines to `sluice run --hook <hook>
-  <gate>`: the hook then goes through the queue whatever its `PATH`.
+  <gate>`: the hook then goes through the queue whatever its `PATH`. When the
+  hook files cannot be rewired, `sluice hooks on` makes Sluice the clone's hooks
+  entry point instead and runs husky's commands itself with that `PATH`
+  ([hooks](hooks.md)).
 - The behaviour relies on Claude Code's handling of `CLAUDE_ENV_FILE`;
   `sluice doctor` reports whether the shims are installed, current and first
   in `PATH` (check `shims`), and whether the plugin and the binary versions
@@ -173,7 +176,7 @@ section 3):
 |---|---|
 | `verify` | Run gates (default: those whose `hooks` contain `pre-commit`; if none is tagged, every gate). Blocks until they finish, returns one line per gate and the log tail of the first failure. |
 | `status` | Queued and running jobs; with `working_directory`, also the cache state of that tree per gate. |
-| `gate_list` | Gates defined in `.sluice.toml`. |
+| `gate_list` | Gates defined in `.sluice.toml`; without one, the check units of the repository's git hooks (`source: hook`, `manager`, named `<manager>:<hook>#<n>`) and `excluded`, the hooks and units that are not gates, with the reason ([hooks](hooks.md#verify-and-gates-without-sluicetoml)). |
 | `logs` | Tail of a job log (default: newest). |
 | `queue_enqueue` | Put the committed branch (default: the current one) in the local merge queue. Refuses a detached HEAD and tracked uncommitted changes. |
 | `queue_status` | Trains, members and their state, conflicts with paths, and which trains are ready for a human to approve. |
@@ -300,6 +303,15 @@ invoked the hook and on `defaults.agent_hook_policy` in `.sluice.toml`:
 | `run-unqueued` | Run the gate immediately, outside the queue and the budget. |
 
 Humans use `human_hook_policy` (`wait` by default, or `run-unqueued`).
+
+With the hooks entry point on (`sluice hooks on`, [hooks](hooks.md)), the hooks
+Sluice understands completely run their commands as units, and the policy is
+**not** applied to them: an agent's commit on a miss runs (or waits for) the
+units inside `git commit`, and a `3` from such a hook is the unit's own code.
+That is why agents call `verify` first: in a repository without `.sluice.toml`
+the check units of the hooks are the gates, and a `verify` pass is the cache hit
+the commit's hook then finds. Hooks the entry point delegates, and hooks that
+call `sluice run --hook`, behave as described here.
 
 The `fail-fast` message is three lines on stderr (`<rule>` is the detection
 rule that fired, `<why>` the cache state; the exit code is 3):

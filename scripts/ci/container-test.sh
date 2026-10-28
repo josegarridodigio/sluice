@@ -23,8 +23,9 @@ fedora)
     dnf install -y -q git gcc make curl ca-certificates tar procps-ng coreutils findutils python3
     ;;
 alpine)
-    apk add --no-cache git gcc musl-dev make curl ca-certificates tar procps coreutils \
-        python3 py3-pip >/dev/null
+    # git-daemon ships `git http-backend`, which the HTTP transport tests serve with.
+    apk add --no-cache git git-daemon gcc musl-dev make curl ca-certificates tar procps \
+        coreutils python3 py3-pip >/dev/null
     ;;
 *)
     echo "unsupported distribution: $ID" >&2

@@ -111,6 +111,10 @@ blocks safely, with progress notifications and cancellation. Full output goes
 to a log file; callers get one line on success and the tail of the log on
 failure (40 lines by default, `defaults.tail_lines` or `cache.tail_lines`).
 
+The one exception is a hook run as units by the optional hooks entry point
+(`sluice hooks on`): units do not get the fail-fast refusal, so an agent should
+`verify` before committing ([hooks](hooks.md)).
+
 ## Things to know before trusting a cache hit
 
 - A hit is a **local optimisation**. CI stays authoritative. Caching is off

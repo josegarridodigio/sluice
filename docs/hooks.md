@@ -1,172 +1,195 @@
 # Git hooks
 
-Sluice can be the git hooks entry point of a clone without editing the
-repository. `sluice hooks on` makes git call Sluice for every hook, and Sluice
-runs the hook the repository would have run anyway (husky, lefthook,
-pre-commit or plain hooks). When it understands a husky or plain hook
-completely it runs the hook's commands itself, through the queue and the cache
-("Units"); otherwise it runs the hook untouched
+`sluice hooks on` makes Sluice the git hooks entry point of **one clone**,
+without editing the repository. Git calls Sluice for every hook the repository
+has (husky, lefthook, pre-commit or plain hook files), and for each one Sluice
+either runs the hook's commands itself, through the daemon's queue, budget and
+cache, or runs the hook exactly as git would have without it. Anything Sluice
+does not understand completely is run as before; the repository, its hook files
+and its teammates are not touched
 ([ADR-0021](../kb/sluice/design/adr/0021-sluice-runs-the-repository-hooks.md)).
 
-Use it when the hook files cannot be rewired (`sluice init`, which edits them)
-because a hook manager or a teammate owns them.
-
-## Turning it on and off
+Use it when the hook files cannot be rewired with `sluice init` (which edits
+them) because a hook manager or a teammate owns them: a commit then no longer
+re-runs lint and the whole suite outside the queue and the cache. It is
+optional and local: no `.sluice.toml` is needed, nothing is committed, and
+`sluice hooks off` undoes it.
 
 ```sh
 sluice hooks on        # activate this clone (idempotent)
-sluice hooks status    # on/off, directory, repository hooks, manager, effective?
+sluice hooks status    # on or off, directory, repository hooks, manager, effective?, what each hook does
 sluice hooks off       # undo
 ```
 
-`sluice init --hooks entry` does the same after writing `.sluice.toml`, leaving
-the hook files as they are.
+`sluice init --hooks entry` writes `.sluice.toml` and runs `sluice hooks on`,
+leaving the hook files as they are (`--hooks rewire`, the default, edits them to
+call `sluice run`). With no existing hook file there is nothing to delegate to
+and `init` does its usual setup.
 
-## How the entry point works
+## What happens when git runs a hook
 
-- `on` creates `<git common dir>/sluice/hooks/` with one executable `sh`
-  script for each hook that exists as an executable file in the directory git
-  would use without Sluice (the repository's own `core.hooksPath`, else
-  `<git dir>/hooks`), and for no other. Once `core.hooksPath` points to Sluice
-  git looks nowhere else, so a hook without a script would silently stop
-  running; and a script for a hook the repository does not have would cost a
-  process start on every `reference-transaction`, `post-index-change` or
-  `post-checkout` for nothing. The two sets are kept equal (see "Keeping the
-  mirror in sync")
-- It writes `<git common dir>/sluice/hooks.gitconfig` (`[core] hooksPath =
-  <that directory>`) and runs `git config --local --add include.path <that
-  file>`. The config file is only ever changed through `git config`.
-- `<git common dir>/sluice/hooks.json` records `core.hooksPath` as it was.
-- Git applies the last value of `core.hooksPath` it reads and expands an
-  `[include]` in place, so the include being the last entry of the clone's
-  config makes Sluice's value the effective one. husky writes `core.hooksPath`
-  into `[core]` (near the top) on every install; that write does not displace
-  Sluice. If an `[include]` section sits before `[core]`, `on` removes the
-  clone's includes and adds them again with its own last, in the same order.
-- `git config --show-origin --get-all core.hooksPath` shows both values; the
-  last is Sluice's.
+git runs Sluice's script for the hook. Sluice then decides, each time and from
+the files as they are at that moment:
 
-Each script runs `sluice hooks run <hook> -- "$@"` (with the `sluice` that
-activated the clone, else the one in `PATH`). If no `sluice` binary can be
-found, the script runs the repository's own hook directly (the value the
-repository's local config sets for `core.hooksPath`, else the one recorded, else
-`<git dir>/hooks`), so a missing binary never disables the hooks. In a worktree
-created with `git worktree add` the activation is shared: it lives in the
-common git directory.
+1. **No hook file**: if the underlying hooks directory (below) has no executable
+   file for the hook, nothing ran before and nothing runs now (exit 0).
+2. **Units**: if Sluice understands the hook completely (the grammar and the
+   rules of the manager below), it runs the hook's commands itself, one after
+   another, as jobs of the daemon.
+3. **Delegation**: otherwise it replaces itself with the hook the repository
+   would have run: the same arguments, the same stdin (`pre-push` reads its
+   refs from it), the same working directory (the worktree root), the same
+   environment, and the exit code or signal of the hook itself.
 
-## What runs
+All the doubt goes to delegation: an unknown manager, a construct that is not
+understood, a daemon that cannot be reached or started, a repository that cannot
+be resolved, a non-UTF-8 environment. The decision is taken **before the first
+unit starts**, so a hook is never half run by Sluice and then delegated. A
+Sluice problem never stops a hook from running or makes it run differently.
+`sluice hooks status` shows which of the two applies to each hook and why.
 
-Two things can happen to a hook, decided each time git runs it, from the files as
-they are at that moment: Sluice runs its **units** ("Units", "Units: lefthook",
-"Units: pre-commit"), or it **delegates** the hook untouched. `sluice hooks status` shows
-which, and why, for every hook of the repository. This section describes
-delegation, which is also the fallback of units.
+The delegated file is each manager's own entry point, found in the directory git
+would have used without Sluice:
 
-`sluice hooks run` asks git what `core.hooksPath` would be without Sluice's
-value (so a husky rewrite made after activation is followed) and executes
-`<that directory>/<hook>` in place, replacing itself: the same arguments, the
-same stdin (`pre-push` reads its refs from it), the same working directory (the
-worktree root), the same environment, and the exit code or the signal of the
-hook itself. A hook with no executable file there did not run before and does
-not run now. This is each manager's own entry point:
-
-| Manager | Where the hook is | What runs |
+| Manager | Delegated file | What it does |
 |---|---|---|
-| husky 9 | `.husky/_/<hook>` (`core.hooksPath = .husky/_`) | the stub, which sources husky's `h`: `init.sh`, `HUSKY=0`, the `PATH` entry, `sh -e .husky/<hook>`. A hook without a stub exits 0, as husky does. |
-| lefthook | `<git dir>/hooks/<hook>` (script generated by `lefthook install`) | the script: `LEFTHOOK=0`, `rc`, binary discovery, `lefthook run <hook>`. |
-| pre-commit | `<git dir>/hooks/<hook>` (stub generated by `pre-commit install`) | the stub: `pre-commit hook-impl --config=... --hook-type=<hook> -- <args>`, with its `.legacy` chaining. |
-| plain | the directory `core.hooksPath` names, else `<git dir>/hooks` | the hook file, if executable. |
+| husky 9 | `.husky/_/<hook>` (`core.hooksPath = .husky/_`) | the stub sources husky's `h`: `init.sh`, `HUSKY=0`, the `PATH` entry, `sh -e .husky/<hook>`. A hook without a stub exits 0, as husky does. |
+| lefthook | `<git dir>/hooks/<hook>` (generated by `lefthook install`) | `LEFTHOOK=0`, `rc`, binary discovery, `lefthook run <hook>`. |
+| pre-commit | `<git dir>/hooks/<hook>` (generated by `pre-commit install`) | `pre-commit hook-impl --config=... --hook-type=<hook> -- <args>`, with its `.legacy` chaining. |
+| plain | the directory `core.hooksPath` names, else `<git dir>/hooks` | the hook file. |
 
-Whether a repository uses husky, lefthook, pre-commit or plain hooks is
-detected at run time (`sluice hooks status` shows it), so a teammate changing
-the hooks or migrating managers needs no Sluice change. A manager that was
-configured but never installed in this clone (for example, `lefthook.yml`
-without `lefthook install`) ran nothing before and runs nothing now.
+The manager is detected at run time (`hooks status` shows it), so a teammate
+changing a hook or migrating managers needs no Sluice change. A manager that is
+configured but not installed in this clone (`lefthook.yml` without `lefthook
+install`) ran nothing before and runs nothing now: Sluice only runs units of a
+hook whose manager's own file is installed.
 
-## Units (husky and plain hooks)
+### Opt-outs
+
+| What | Effect |
+|---|---|
+| `SLUICE_HOOKS_DELEGATE=1` (any value other than empty or `0`) | every hook is delegated untouched |
+| `SLUICE_DISABLE=1` | every hook is delegated untouched |
+| `sluice hooks off` | Sluice is out of the picture for this clone |
+
+## Units
+
+A unit is one command of a hook. Each unit becomes a synthetic gate and runs
+through the same pipeline as `sluice run`: cache lookup, the daemon's queue,
+budget and containment, a log, a line in `client.log`, and `sluice run`'s
+in-process fallback (under the budget semaphore, with `daemon unavailable ...
+running in-process` on stderr) if the daemon dies in the middle of a hook.
+
+- **Order and place.** Units run in the user's working tree, from the worktree
+  root, one after another, in the order the manager would run them. Sluice never
+  reorders them: a check placed before a formatter must see the files before it.
+- **Two kinds.** A **mutating** unit may change files or the index (formatters
+  with a write flag, `lint-staged`, `git`, package installs, and every program
+  Sluice does not recognise as read-only). It always runs, is never cached, and
+  keeps the variables git sets for the hook (`GIT_INDEX_FILE`, ...) so that `git
+  add` and `lint-staged` act on the index the commit uses. A **check** only reads
+  the tree (test runners, linters, type checkers, formatters in check mode, build
+  tools); its pass is cached, and it runs without git's hook variables, as a gate
+  does (lefthook and pre-commit units keep them because those managers ask git
+  what is staged; the key does not depend on them).
+- **Output.** The output of a unit goes to its job log, not to the terminal: a
+  unit prints a one-line summary (`sluice: husky:pre-commit#2 PASS 12.3s (job
+  ...)`), and on failure the last lines of the log (`defaults.tail_lines`;
+  `sluice logs` has the rest). A cache hit prints `PASS (cached, passed ...)`
+  and skips the run. Sluice also prints one stderr line when it starts: `sluice:
+  <hook>: running N unit(s) of the <manager> hook through the queue`.
+- **Exit codes.** The hook exits with what the manager's own run would: the exit
+  code of the unit that ended it (details per manager below). Sluice never
+  refuses a unit: the `agent_hook_policy = "fail-fast"` refusal (exit code 3,
+  `has not passed on this tree`) belongs to `sluice run --hook`, and the hook
+  policy is **not applied** to units, so a `3` from a hook run as units is
+  always the unit's own code (the line `FAIL exit=3` names it), and a `3` from a
+  delegated pre-commit is pre-commit's own. Timeouts (124) and kills (143) are
+  Sluice's, as for gates; a unit has no timeout of its own.
+- **No fail-fast for agents.** Because units do not get the refusal, a commit an
+  agent makes on a cache miss runs (or waits for) its units inside `git commit`,
+  within the agent's shell timeout. The agent plugin tells agents to call
+  `verify` first: a `verify` pass leaves the cache entries the commit's hook then
+  hits ([below](#verify-and-gates-without-sluicetoml)).
+
+### Cache key of a check
+
+The key is the one of a gate ([how it works](how-it-works.md)):
+
+- the working tree content at the moment the unit starts, so after the earlier
+  units ran (a hook whose first unit is a formatter keys the later checks on the
+  formatted tree), taken with a private index: nothing is written to the
+  repository;
+- the unit's name (`<manager>:<hook>#<position>`) and its exact command;
+- the environment addition (husky: the `PATH` it would give the unit, without
+  git's own directory, which git puts first in every hook's `PATH`), the tool
+  version and a hash of the effective configuration for lefthook, and the
+  configuration file's bytes and version for pre-commit.
+
+A pass is stored only if the unit did not change the tree; a failure is never
+stored as a pass. If the tree cannot be described (unmerged or skip-worktree
+entries, submodules) or the key cannot be derived, the unit runs uncached.
+Untracked toolchain inputs (`node_modules`, installed binaries) are not part of
+the key, as for gates without `key_inputs`; for husky the `PATH` string is a
+proxy for the toolchain location.
+
+### husky and plain hooks
 
 A husky hook (`.husky/<hook>`, behind husky 9's `_/h`) or a plain hook file is
 run as units when every line is one of: blank, a comment, a `#!/bin/sh` or
-`bash` shebang, husky's v4-v8 bootstrap line (`. "$(dirname -- "$0")/_/husky.sh"`),
-`set -e`, a trailing `exit 0`, or simple commands joined by `&&`. A simple
-command has literal words and `'single'`/`"double"` quoted strings without
-expansions. Anything else delegates the whole hook: variables, `$(...)`,
-backticks, globs, redirections, pipes, `||`, `;`, `if`/`while`/functions,
-`cd`, `export`, here-documents, line continuations, trailing comments, `echo`
-and other builtins, `$1`/`"$@"` (the hook's arguments), another interpreter's
-shebang. Also delegated: a plain hook with several lines and no `set -e`; a hook
-whose command is `sluice` itself (it is already routed); husky when `HUSKY` is
-set, `~/.config/husky/init.sh` or `~/.huskyrc` exists, or `_/h` is not the
-version whose behaviour Sluice knows; a hook that receives stdin (`pre-push`,
-`post-rewrite`, ...) with any unit that is not a recognised read-only check; `SLUICE_HOOKS_DELEGATE=1` or `SLUICE_DISABLE=1`; and any
-case where the daemon cannot be reached or started, or the repository cannot be
-resolved, before the first unit runs (the whole hook is delegated, never part
-of it).
+`bash` shebang (`-e` allowed), husky's v4-v8 bootstrap line (`. "$(dirname --
+"$0")/_/husky.sh"`), `set -e` before the first command, a trailing `exit 0`, or
+simple commands joined by `&&`. A simple command has literal words and
+`'single'`/`"double"` quoted strings without expansions. Anything else delegates
+the whole hook, with the offending line in the reason: variables, `$(...)`,
+backticks, globs, redirections, pipes, `||`, `;`, `if`/`while`/functions, `cd`,
+`export`, here-documents, line continuations, trailing comments, `echo` and
+other builtins, `FOO=1 cmd`, `$1`/`"$@"` (the hook's arguments), another
+interpreter's shebang.
 
-Each unit runs in the working tree, from the worktree root, in file order and
-with `sh -e` semantics, as a job of the daemon (queue, budget, containment,
-logs), exactly like `sluice run` runs a gate. husky's `h` does one thing that
-matters here and Sluice reproduces it: `node_modules/.bin` (relative) is put
-before `PATH`. A hook's stdin is not given to a unit, so a hook that receives
-stdin (`pre-push`, `post-rewrite`, ...) runs as units only when every unit is a
-check (the recognised tools do not read stdin): `pre-push` with `npm test` is
-accelerated, `pre-push` with an unknown program is delegated. The file does not need a `.sluice.toml`;
-when there is one it is only read for its settings.
+Also delegated:
 
-- A unit that may change files or the index is **mutating**: `lint-staged`,
-  `pretty-quick`, `nano-staged`, anything with `--staged`/`--cached`, `git`,
-  formatters with a write flag (`--fix`, `--write`, `-w`, `-i`, `cargo fmt`
-  without `--check`, `black` without `--check`, `ruff format`, `gofmt -w`,
-  `go fmt`), package-manager installs, `npm|pnpm|yarn audit` (its answer comes from the
-  advisory database, not from the tree, so it is never cached), package scripts whose body contains one of
-  those or whose name says `fix`/`format`/`write`, and every program Sluice does
-  not recognise as read-only. Mutating units always run and are never cached,
-  and they keep the variables git sets for the hook (`GIT_INDEX_FILE`, ...) so
-  `git add` and `lint-staged` act on the index the commit uses.
-- A unit recognised as read-only is a **check**: test runners, linters and type
-  checkers, formatters in check mode, build tools, and `npm|pnpm|yarn run <script>`
-  whose script body (and `pre`/`post` scripts) is made only of those. Its pass is
-  cached. A check runs without git's hook variables, like a gate does.
-- **The cache key** is that of a gate ([how it works](how-it-works.md)): the working tree
-  content at the moment the unit starts (so, after the earlier units ran), the
-  unit's name (`<manager>:<hook>#<position>`), its exact command, and the
-  environment addition (husky: the full `PATH` husky would give it, so a
-  different `PATH` is a different key). A pass is stored only if the unit did not
-  change the tree; a failure is never stored as a pass. If the tree cannot be
-  described (unmerged or skip-worktree entries, submodules) or the key cannot be derived, the
-  unit runs uncached. A cached pass prints one line, `sluice: husky:pre-commit#2
-  PASS (cached, passed ...)`, and skips the run. Dependencies that are not
-  tracked (`node_modules`) are not part of the key, as for gates.
-- **Exit codes.** The hook exits with the exit code of the unit that ended it,
-  as `sh -e` would (a non-final member of an `&&` list that fails skips the rest
-  of its list and the hook goes on with the next line, as `sh -e` does). husky's
-  `husky - <hook> script failed (code N)` line is printed too. Sluice never
-  refuses a unit: the `agent_hook_policy = "fail-fast"` refusal (exit code 3,
-  `has not passed on this tree`) belongs to `sluice run`, so a `3` from a hook
-  run as units is always the unit's own exit code (the line `FAIL exit=3` names
-  it). Timeouts (124) and kills (143) are Sluice's, as for gates; a unit has no
-  timeout of its own.
-- **If the daemon fails in the middle of a hook**, the unit being run follows
-  the usual `sluice run` fallback: it runs in-process under the budget
-  semaphore, with `daemon unavailable ... running in-process` on stderr, and the
-  remaining units go on the same way.
-- **Opt out**: `SLUICE_HOOKS_DELEGATE=1` delegates every hook untouched.
+- a plain hook with several lines and no `set -e`;
+- a hook whose command is `sluice` itself (it is already routed: hooks rewired
+  by `sluice init`);
+- husky when `HUSKY` is set, `~/.config/husky/init.sh` (or under
+  `XDG_CONFIG_HOME`) or `~/.huskyrc` exists, `_/h` is not the version whose
+  behaviour Sluice knows, or the hook has no user file;
+- a hook that receives stdin (`pre-push`, `post-rewrite`, `pre-receive`,
+  `post-receive`, `reference-transaction`, `proc-receive`) with any unit that is
+  not a recognised check. Units do not get the hook's stdin, so such a hook runs
+  as units only when every unit is a check, which does not read it: `pre-push`
+  with `npm test` is accelerated, `pre-push` with an unknown program is
+  delegated.
 
-`sluice hooks status` lists each hook with its mode:
+Semantics are those of `sh -e` over the file, as husky runs it: an `&&` list
+stops at its first failure; the hook ends with that unit's code only when the
+failing unit is the last of its list, otherwise the next line runs (errexit does
+not apply to non-final members of an AND list); `exit 0` at the end forces
+status 0. For husky the `husky - <hook> script failed (code N)` line is printed
+(with the `PATH` after a 127). husky's `h` puts `node_modules/.bin` (relative)
+before `PATH`; Sluice reproduces that for each unit.
 
-```
-hook pre-commit: 2 unit(s) run through the queue: mutating lint-staged; check npm run lint
-hook commit-msg: delegated (.husky/commit-msg line 1: uses the hook's arguments ($1, "$@"))
-```
+What is a check: test runners, linters and type checkers, formatters in check
+mode, build tools, `cargo`/`go`/`ruff`/`black`/`isort`/`dotnet`/`terraform`
+subcommands that do not write, and `npm|pnpm|yarn run <script>` whose body (and
+`pre`/`post` scripts) is made only of those, looking through `npx`, `pnpm exec`,
+`yarn dlx` and `bunx`. What is mutating: `lint-staged`, `pretty-quick`,
+`nano-staged`, anything with `--staged`, `--cached`, `--fix`, `--write`, `-w`,
+`-i`, `-u`, `git`, package-manager installs, formatters without their check
+flag (`cargo fmt`, `black`, `ruff format`, `gofmt -w`, `go fmt`), scripts whose
+body contains one of those or has a redirection, `npm|pnpm|yarn audit` (its
+answer comes from the advisory database, not from the tree), and every program
+not recognised. When in doubt a unit is mutating, which only costs the cache.
 
-## Units: lefthook
+### lefthook
 
-lefthook's own CLI runs each unit, so templates, `env`, `timeout` and the rest
-of a job's semantics are lefthook's. Sluice asks lefthook for its effective
+lefthook's own CLI runs each unit, so templates, `env`, `timeout` and the rest of
+a job's semantics are lefthook's. Sluice asks lefthook for its effective
 configuration (`lefthook dump --format json`: `extends`, `lefthook-local` and
-already-cloned `remotes` merged) and runs, for every **named** command or job,
-in lefthook's sequential order (`jobs` as written, then `commands` by
-`priority`, leading number, name):
+already-cloned `remotes` merged) and runs, for every **named** command or job, in
+lefthook's sequential order (`jobs` as written, then `commands` by `priority`,
+leading number, name):
 
 ```sh
 lefthook run <hook> --command <name> --no-auto-install --skip-lfs
@@ -180,44 +203,43 @@ flags were read from that source) or a `dump` that fails.
 
 **The skip problem.** lefthook exits 1 with `no job matching` when the selected
 job is skipped, and a skipped job cannot be told from a failed one. So a hook is
-run as units only when no job can be skipped, and is delegated when it has any of:
-`skip`/`only` (hook or job), `exclude_tags`, `LEFTHOOK_EXCLUDE`; a file template
-(`{staged_files}`, `{all_files}`, `{push_files}`, `{files}`, `{0}`/`{1}`..., any
-`{word}`) or a filter (`glob`, `exclude`, `root`, `files`, `file_types`; each can
-empty the file list); `pre-push` (it skips a command with no files to push). In
-`pre-commit`, lefthook also skips every command when nothing is staged, so the units are used only
-if something is staged when the hook starts. The dominant real-world shape
-(`glob` plus `{staged_files}`) is therefore delegated; a command such as `run:
-npm test` or `run: cargo test` is run as a unit.
+run as units only when no job can be skipped, and is delegated when it has any
+of: `skip`/`only` (hook or job), `exclude_tags`, `LEFTHOOK_EXCLUDE`; a file
+template (`{staged_files}`, `{all_files}`, `{push_files}`, `{files}`, `{0}`,
+`{1}`..., any `{word}`) or a filter (`glob`, `exclude`, `root`, `files`,
+`file_types`; each can empty the file list); `pre-push` (it skips a command with
+no files to push). In `pre-commit` lefthook also skips every command when
+nothing is staged, so the units are used only if something is staged when the
+hook starts. The dominant real-world shape (`glob` plus `{staged_files}`) is
+therefore delegated; a command such as `run: npm test` or `run: cargo test` is
+run as a unit.
 
-Also delegated: unnamed jobs, `scripts`, `setup`, `piped`, `follow` (not
-modelled), `group`/nested jobs, `interactive`, `use_stdin`, `stage_fixed`
-(lefthook stages after all jobs and hides the unstaged half of partially staged
-files; per-command runs would not keep that), `fail_on_changes`, `remotes`, `rc`,
-a configuration with a name used twice or an order lefthook leaves undefined,
+Also delegated: unnamed jobs, `scripts`, `setup`, `piped`, `follow`,
+`group`/nested jobs, `interactive`, `use_stdin`, `stage_fixed` (lefthook stages
+after all jobs and hides the unstaged half of partially staged files; per-command
+runs would not keep that), `fail_on_changes`, `remotes`, `rc`, `lefthook:`, a
+configuration with a name used twice or an order lefthook leaves undefined,
 unknown options, the hooks lefthook runs git-lfs for (`post-checkout`,
-`post-commit`, `post-merge`: `--skip-lfs` would drop it), `LEFTHOOK=0`, and a
+`post-commit`, `post-merge`: `--skip-lfs` would drop it), `LEFTHOOK=0`, a job whose `run` already calls `sluice` (it is already routed), and a
 `pre-commit` with a partially staged file (while it runs lefthook hides the
 unstaged half; the guard is lefthook's to run once).
 
 `parallel: true` only changes concurrency: the units run one after another. The
-hook's git arguments are not passed: with no template a job cannot read them.
+hook's git arguments are not passed to `lefthook run`: with no template a job
+cannot read them. A unit's kind comes from classifying the job's `run` text like
+a husky command (unrecognised, or with a redirection, a pipe or an `env`
+expansion: mutating; a recognised read-only tool or `&&` list of them: check). A
+check's key adds the lefthook version and a hash of `lefthook dump`, so any
+change of configuration (including an untracked `lefthook-local.yml`) is a
+different key. Exit codes: lefthook returns 0 or 1. Every unit runs even after a
+failure (lefthook's sequential mode does) and the hook then exits 1; any other
+code ends the hook at once with it.
 
-Each unit sees git's own variables (lefthook asks git for the staged files).
-Its kind comes from classifying the job's `run` text like a husky command
-(unrecognised or with a redirection or pipe: mutating, uncached; a recognised
-read-only tool, or `&&` list of them, with no `env` expansion: check). A check is cached by the working tree and a
-key that adds the lefthook version and a hash of `lefthook dump`, so any change
-of configuration (including an untracked `lefthook-local.yml`) is a different
-key. Exit codes: lefthook returns 0 or 1. Every unit runs even after a failure
-(lefthook's sequential mode does) and the hook then exits 1; any other code
-(Sluice never emits 3 here) ends the hook at once with it.
+### pre-commit
 
-## Units: pre-commit
-
-pre-commit's own CLI runs each unit. Sluice reads `.pre-commit-config.yaml`
-(the path the installed stub bakes in with `--config=`) and runs, for each hook
-at the git hook's stage, in file order:
+pre-commit's own CLI runs each unit. Sluice reads `.pre-commit-config.yaml` (the
+path the installed stub bakes in with `--config=`) and runs, for each hook at the
+git hook's stage, in file order:
 
 ```sh
 <launcher> run <id> --hook-stage <stage> --config=<config>
@@ -235,19 +257,21 @@ A hook belongs to the stage through `stages` (legacy `commit`, `push`,
 stage. A `repo: local` hook is placed from the config. A remote hook (`repo:
 <url>`) is placed only when its config entry lists `stages` (its manifest, which
 Sluice does not read, otherwise decides); without it the whole hook is
-delegated, since `pre-commit run <id>` for a hook that is not at the stage fails.
+delegated.
 
 **The stash.** `pre-commit run` stashes the unstaged changes of tracked files on
 every invocation (`git checkout -- .`, then a patch re-applied). One unit per hook
-would stash once per hook, and Sluice never edits the index or tree itself. So the
-units are used only while no tracked file differs from the index (the stash is
-then a no-op, and the working tree equals the tree the cache key describes);
+would stash once per hook, and Sluice never edits the index or tree itself. So
+the units are used only while no tracked file differs from the index (the stash
+is then a no-op, and the working tree equals the tree the cache key describes);
 otherwise the whole hook is delegated and pre-commit stashes once, as before.
 
-Also delegated: `fail_fast` (top-level or hook), an id selecting more than one
-hook (ids are not unique; an alias counts), `repo: meta`, `minimum_pre_commit_version`
-above 4.7.0 (the version read), `SKIP` set, YAML merge keys (`<<`) or values
-that YAML 1.1 would read differently (`always_run: yes`), unknown config keys.
+Also delegated: a hook whose `entry` or `args` call `sluice` (it is already routed), an executable
+`<hooks dir>/<hook>.legacy` file (`hook-impl` runs it first: `runs a legacy hook first`), `fail_fast` (top-level or hook), an id selecting more than one
+hook (ids are not unique; an alias counts), `repo: meta`,
+`minimum_pre_commit_version` above 4.7.0, `SKIP` set, YAML merge keys (`<<`) or
+values that YAML 1.1 would read differently (`always_run: yes`), unknown config
+keys.
 
 **Caching.** A hook is a cacheable check only if it is `repo: local`, `language:
 system` (or `unsupported`), `always_run: true` (otherwise pre-commit skips it,
@@ -256,55 +280,10 @@ that never happened), `pass_filenames: false`, no `log_file`, and its `entry`
 (one simple command, `args` appended) is a recognised read-only tool. Its key adds
 the configuration file's bytes and the pre-commit version. Everything else, every
 fixer and every remote hook, is mutating: it always runs and is never cached.
-Every unit sees git's own variables.
 
 Exit codes: pre-commit returns 1 for a failure and 3 for an internal error. Every
-unit runs after a failure and the hook then exits 1; any other code (3, 130) ends the hook at
-once with the unit's own code. Sluice never emits 3 on this path, so a 3 is always
-pre-commit's.
-
-## Verify and gates without `.sluice.toml`
-
-In a repository with no `.sluice.toml`, the **check units** of the hooks are the
-gates of `sluice run <gate>`, `sluice gate list` and the MCP tools `verify` and
-`gate_list`. They are the same units, with the same names and the same cache
-entries as the hook runs, so an agent that calls `verify` before `git commit`
-leaves the cache entries that the commit's hook then hits, and a commit leaves the
-ones a later `verify` hits. Nothing needs configuring: the hooks are read at the
-moment `verify` runs, like a hook run does.
-
-- **Names**: `<manager>:<hook>#<n>`, `n` the unit's position in its hook (`husky:pre-commit#2`,
-  `lefthook:pre-commit#1`, `pre-commit:pre-commit#1`, `plain:pre-push#1`). Adding a line
-  renumbers the units after it, and a renumbered unit is a cache miss once (the name
-  is part of the key), never a wrong hit.
-- **Which hooks**: `pre-commit`, `pre-merge-commit` and `pre-push`. `commit-msg` and
-  `prepare-commit-msg` receive the message file, which only a commit provides.
-  `verify` with no `gates` runs the `pre-commit` units, or all of them when the
-  repository has none.
-- **Not gates, with the reason** (listed by `gate_list` and `sluice gate list`):
-  a hook Sluice delegates (it does not understand it completely); a mutating unit
-  (`lint-staged`, a formatter with a write flag, a program not known to be read-only:
-  `verify` never edits files or the index outside a commit); and the units of a
-  hook whose condition does not hold now. lefthook's `pre-commit` units need
-  something staged and nothing partially staged, and pre-commit's would stash
-  unstaged changes: those depend on the staged set, so they are gates only while
-  the condition holds (stage the change, then `verify`).
-- **Same key**: the gate is the unit's own gate (command, `PATH` addition, tool version,
-  configuration hash), the key is derived from the working tree as the hook run does,
-  and git's own directory, which git puts first in the `PATH` of every hook, is left
-  out of the hashed `PATH`. A `verify` from an environment whose `PATH` differs from
-  the commit's (husky hashes the `PATH` it runs with) is a miss, not a wrong hit.
-  lefthook and pre-commit units run from `verify` without git's hook variables; the
-  key does not depend on them.
-
-With a `.sluice.toml` its gates are unchanged and no gate is derived from the hooks.
-A unit shares the cache entry of a configured gate only when running the unit as that
-gate is the same run: the unit has no `PATH` addition (so not husky's) and sees no git
-variables (so not lefthook's or pre-commit's), exactly one gate has the same command
-text, and that gate is cached, not queue-only, not path-scoped and declares no `env`.
-The unit then runs under the gate's name and definition (its `timeout` is dropped: a
-hook has none), so `verify` of the gate and the hook hit each other. Otherwise the
-unit keeps its own entry; `sluice hooks status` says which case applies and why.
+unit runs after a failure and the hook then exits 1; any other code (3, 130) ends
+the hook at once with the unit's own code.
 
 ## Compatibility
 
@@ -312,63 +291,177 @@ unit keeps its own entry; `sluice hooks status` says which case applies and why.
 |---|---|---|---|
 | husky 9 | simple commands and `&&` lists in `.husky/<hook>` | any shell construct, `$1`, `HUSKY`, `init.sh`, `~/.huskyrc`, stdin hooks with a non-check unit | recognised read-only commands |
 | plain hooks | the same grammar, with `set -e` for several lines | the same | the same |
-| lefthook 2.x | named commands and jobs with no skip rule, template, filter or `stage_fixed`; `pre-commit` with files staged and none partially | `pre-push`, LFS hooks, unnamed jobs, scripts, `setup`, `piped`, groups, `use_stdin`, remotes, `rc`, `lefthook:` | `run` text made of read-only tools, keyed by tree, version and `dump` |
+| lefthook 2.x (from 2.2.2) | named commands and jobs with no skip rule, template, filter or `stage_fixed`; `pre-commit` with files staged and none partially | `pre-push`, LFS hooks, unnamed jobs, scripts, `setup`, `piped`, groups, `use_stdin`, remotes, `rc`, `lefthook:`, other binary routes | `run` text made of read-only tools, keyed by tree, version and `dump` |
 | pre-commit 4.x | hooks of `pre-commit` and `pre-merge-commit`, `repo: local` or remote with explicit `stages`, while the worktree equals the index | other stages, `fail_fast`, ambiguous ids, `meta`, remote hooks without `stages`, `SKIP` | `language: system` + `always_run` + `pass_filenames: false` + read-only `entry` |
+| anything else (`.git/hooks` scripts of another tool, `core.hooksPath` elsewhere) | plain hooks, if the file fits the grammar | the rest | the same as plain hooks |
 
-## Worktrees and husky
+Delegation is the safety net, not a failure: a delegated hook runs exactly as it
+did, only outside the queue and the cache.
 
-husky's `.husky/_` directory is untracked, so a fresh linked worktree has none
-and husky runs no hook there today. In this release Sluice preserves that:
-the delegated hook does not exist, so nothing runs. Running the repository's
-tracked hook files in such worktrees comes with the later waves of ADR-0021,
-where Sluice runs the hooks' commands itself.
+## Verify and gates without `.sluice.toml`
 
-## pre-commit's `install` refuses while `core.hooksPath` is set
+In a repository with no `.sluice.toml`, the **check units** of the hooks are the
+gates of `sluice run <gate>`, `sluice gate list` and the MCP tools `verify` and
+`gate_list`. They are the same units, with the same names and the same cache
+entries as the hook runs, so an agent that calls `verify` before `git commit`
+leaves the cache entries the commit's hook then hits, and a commit leaves the
+ones a later `verify` hits. Nothing needs configuring: the hooks are read at the
+moment `verify` runs, like a hook run does. This works whether or not the entry
+point is on, but only with it on does a hook go through Sluice and benefit
+from the warm cache.
 
-`pre-commit install` exits with an error if `core.hooksPath` is set in any
-scope, and Sluice sets it. Install pre-commit's hooks first (`sluice hooks off`,
-`pre-commit install`, `sluice hooks on`), or call it once with the entry point
-off. An existing `.git/hooks/pre-commit` stub keeps working through the entry
-point.
+- **Names**: `<manager>:<hook>#<n>`, `n` the unit's position in its hook
+  (`husky:pre-commit#2`, `lefthook:pre-commit#1`, `pre-commit:pre-commit#1`,
+  `plain:pre-push#1`). Adding a line renumbers the units after it, and a
+  renumbered unit is a cache miss once (the name is part of the key), never a
+  wrong hit.
+- **Which hooks**: `pre-commit`, `pre-merge-commit` and `pre-push`. `commit-msg`
+  and `prepare-commit-msg` receive the message file, which only a commit
+  provides. `verify` with no `gates` runs the `pre-commit` units, or all of them
+  when the repository has no `pre-commit` unit.
+- **Not gates, with the reason** (listed by `gate_list` and `sluice gate list`):
+  a hook Sluice delegates (it does not understand it completely); a mutating
+  unit (`verify` never edits files or the index outside a commit); and the units
+  of a hook whose condition does not hold now. lefthook's `pre-commit` units need
+  something staged and nothing partially staged, and pre-commit's would stash
+  unstaged changes: those depend on the staged set, so they are gates only while
+  the condition holds (stage the change, then `verify`). The list is a snapshot of
+  what can be verified now.
+- **Same key**: the gate is the unit's own gate (command, `PATH` addition, tool
+  version, configuration hash) and the key is derived from the working tree as
+  the hook run does. A `verify` from an environment whose `PATH` differs from
+  the commit's (husky hashes the `PATH` it runs with) is a miss, not a wrong hit;
+  so is a `git commit -a` or `git commit <paths>` for lefthook and pre-commit
+  units (git gives the hook a temporary index, so the hook sees another tree).
+- **Derivation cost**: one `git config` read plus the adapters' probes
+  (lefthook: `version` and `dump`); `gate_list` plans up to three hooks.
+- Not extended: `sluice cache status` and the MCP `status` cache section still
+  read `.sluice.toml` only, and the merge queue reads the base commit's
+  `.sluice.toml`: hook gates are not queue gates.
 
-## Keeping the mirror in sync
+With a `.sluice.toml` its gates are unchanged and no gate is derived from the
+hooks. A unit shares the cache entry of a configured gate only when running the
+unit as that gate is the same run: the unit has no `PATH` addition (so not
+husky's) and sees no git variables (so not lefthook's or pre-commit's), exactly
+one gate has the same command text, and that gate is cached, `mode = "gate"`, not
+path-scoped and declares no `env`. In practice that is plain-hook units. The unit
+then runs under the gate's name and definition (its `timeout` is dropped: a hook
+has none), so `verify` of the gate and the hook hit each other. Otherwise the
+unit keeps its own entry; `sluice hooks status` says which case applies and why.
 
-- `sluice hooks on` (run it again at any time) rebuilds the set and removes
-  the scripts of hooks that no worktree of the clone has any more. A relative
-  hooks directory such as husky's `.husky/_` is looked up in every worktree:
-  the worktrees share Sluice's directory, and a fresh linked worktree has no
-  `.husky/_` of its own.
-- Every `sluice hooks run` compares the repository's hooks with Sluice's
-  scripts (a few `stat` calls) and adds a script for a hook that appeared. It
-  never removes one, since it sees a single worktree; a leftover script only
-  costs a process start and runs nothing. The run that notices still delegates
-  exactly as before; the new script takes effect from the next time git runs
-  that hook.
-- New hooks appear mainly through husky's `.husky/_` (a fixed list of 14
-  stubs, regenerated by every install) or manual files: lefthook and
-  pre-commit install into the hooks directory, which Sluice's value displaces,
-  so they write elsewhere or refuse. After installing a manager's hooks, run
-  `sluice hooks on` again.
-- `sluice doctor` fails when the repository has a hook with no Sluice script
-  (git would not run it) and says to run `sluice hooks on`; the session start
-  restores it too.
+## Files and activation
 
-## When something displaces it
+`on` creates, under `<git common dir>/sluice/`:
 
-- `sluice doctor` reports the `hooks` check as a failure with the reason when
-  the clone was activated and Sluice's value is no longer the effective one
-  (the include was removed, a later include or a per-worktree config sets
-  `core.hooksPath`) or a hook of the repository has no script. `sluice hooks on` repairs it.
-- The agent plugin's session start restores an activated clone whose entry point
-  was displaced (within its 300 ms budget) and says so in the context. It never
-  activates a clone that was not activated before.
-- Without `sluice hooks on`, `sluice doctor` fails when a hook manager owns hooks
+| File | Purpose |
+|---|---|
+| `hooks/<hook>` | one executable `sh` script for each hook that exists as an executable file in the directory git would use without Sluice (the repository's own `core.hooksPath`, else `<git dir>/hooks`), and for no other |
+| `hooks.gitconfig` | `[core] hooksPath = <that directory>`, included by the clone's config |
+| `hooks.json` | `core.hooksPath` as it was, Sluice's directory and the `sluice` binary that activated the clone |
+
+Once `core.hooksPath` points to Sluice git looks nowhere else, so a hook without
+a script would silently stop running; and a script for a hook the repository
+does not have would cost a process start on every `reference-transaction`,
+`post-index-change` or `post-checkout` for nothing. So the scripts mirror exactly
+the hooks the repository has.
+
+`on` writes the files and runs `git config --local --add include.path <that
+file>` (only `git config` ever changes the clone's config). Git applies the last
+value of `core.hooksPath` it reads and expands an `[include]` in place, so the
+include being the last entry of the config makes Sluice's value the effective
+one. husky writes `core.hooksPath` into `[core]` (near the top) on every install;
+that write does not displace Sluice. If an `[include]` section sits before
+`[core]`, `on` removes the clone's includes and adds them again with its own
+last, in the same order. `git config --show-origin --get-all core.hooksPath`
+shows both values; the last is Sluice's. The repository's tracked files and the
+other config entries are never touched; `off` removes the include and the
+managed files, and when Sluice's include was the only one `.git/config` is
+byte-identical to its state before `on`.
+
+Each script runs `sluice hooks run --common-dir <dir> <hook> -- "$@"`, with the
+`sluice` that activated the clone if it is still executable, else the one in
+`PATH`. If no `sluice` binary can be found, the script runs the repository's
+own hook directly (the value the clone's local config sets for `core.hooksPath`,
+else the one recorded, else `<git dir>/hooks`), so a missing binary never
+disables the hooks.
+
+### Worktrees
+
+The activation lives in the common git directory, so every linked worktree
+(`git worktree add`) shares it. husky's `.husky/_` is untracked and relative, so
+a fresh linked worktree has none, and husky runs no hook there; with Sluice as
+the entry point it is the same: the delegated stub does not exist and Sluice does
+not run `.husky/<hook>` without it (nothing ran before, nothing runs now). Run
+husky's install in that worktree to get its hooks. A commit in one worktree never
+removes the scripts another worktree needs.
+
+### pre-commit's `install` refuses while `core.hooksPath` is set
+
+`pre-commit install` exits with an error if `core.hooksPath` is set in any scope,
+and Sluice sets it. Install pre-commit's hooks first (`sluice hooks off`,
+`pre-commit install`, `sluice hooks on`). An existing `.git/hooks/pre-commit`
+stub keeps working through the entry point, delegated: its `.legacy` chaining
+works because the stub runs in place. A hook with an executable `<hook>.legacy`
+file next to the stub is always delegated (`runs a legacy hook first`), because
+`hook-impl` runs that file first and units would not.
+
+## Keeping it in sync and in place
+
+- `sluice hooks on` (run it again at any time) rebuilds the set of scripts and
+  removes those of hooks that no worktree of the clone has any more. A relative
+  hooks directory such as `.husky/_` is looked up in every worktree.
+- Every `sluice hooks run` compares the repository's hooks with Sluice's scripts
+  (a few `stat` calls) and adds a script for a hook that appeared. It never
+  removes one, since it sees a single worktree; a leftover script only costs a
+  process start and runs nothing. The new script takes effect the next time git
+  runs that hook.
+- New hooks appear mainly through husky's `.husky/_` (a fixed list of 14 stubs,
+  regenerated by every install) or manual files: lefthook and pre-commit install
+  into the hooks directory, which Sluice's value displaces, so they write
+  elsewhere or refuse. After installing a manager's hooks, run `sluice hooks on`
+  again.
+- `sluice doctor` reports the `hooks` check as a **failure** with the reason when
+  the clone was activated and Sluice's value is no longer the effective one (the
+  include was removed, a later include or a per-worktree config sets
+  `core.hooksPath`) or a hook of the repository has no script; `sluice hooks on`
+  repairs it. Without the entry point it fails when a hook manager owns hooks
   that do not call sluice, or `.sluice.toml` has gates with hooks and the hook
   files do not call sluice, and suggests `sluice hooks on`.
+- The agent plugin's session start restores an activated clone whose entry
+  point was displaced or lacks a script for a new hook (within its 230 ms budget; the session hook gives up silently at 300 ms) and says so in the context
+  (`hooks=restored`, or `hooks=displaced` with the instruction to run `sluice
+  hooks on` when it could not). It never activates a clone that was not
+  activated before.
 
-## Cost and limits
+## Known limitations
 
-Only the hooks the repository has start a short `sh` script and `sluice hooks
-run` (one `git config` read and a few `stat` calls); the others cost nothing. An older `sluice` binary
-that does not know `hooks` would make every hook fail: the scripts prefer the
-binary that activated the clone, but after downgrading run `sluice hooks off`.
+- **Units are not fail-fast for agents** (above): a commit on a miss runs the
+  units inside `git commit`. `verify` first.
+- **Output is in the log**, not on the terminal; failures print the tail.
+- **The skip problem** and the conservative grammar mean that many real
+  configurations delegate: lefthook with `glob` and `{staged_files}`, pre-commit
+  with remote hooks that do not list `stages`, husky hooks with any shell
+  construct. Delegation costs nothing but the acceleration; `sluice hooks status`
+  names the reason.
+- **Untracked toolchain inputs are not in the key** (above): upgrading a tool
+  without touching tracked files does not invalidate a cached check.
+- **Hook arguments are not passed to units** (a hook that uses `$1` or `"$@"`
+  delegates).
+- **Linux only**, as Sluice; `sluice hooks run` is `exec`-based.
+- **An older `sluice` binary** that does not know `hooks` would make every hook
+  fail: the scripts prefer the binary that activated the clone, but after
+  downgrading run `sluice hooks off`.
+
+## Turning it off
+
+- One command: `SLUICE_HOOKS_DELEGATE=1 git commit ...` (every hook delegated).
+- This clone: `sluice hooks off` (removes the include and the managed files; the
+  repository's own `core.hooksPath` applies again).
+- A hook that `sluice init` rewired to `sluice run` (husky, plain, lefthook or
+  pre-commit) is delegated by the entry point (it is already routed).
+
+## Cost
+
+Only the hooks the repository has start a short `sh` script and `sluice hooks run`
+(one `git config` read and a few `stat` calls, plus the planning of the hook);
+the others cost nothing.

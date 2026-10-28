@@ -13,8 +13,9 @@ each wave (fmt, clippy, test), then Matrix on the branch before any release.
 
 ## H1 — Entry point and faithful delegation (no behaviour change)
 
-- Per-clone hooks directory under the clone's git directory, one small script per hook
-  git supports, each calling `sluice hooks run <hook> -- "$@"` (stdin forwarded).
+- Per-clone hooks directory under the clone's git directory, one small script for each hook
+  the repository has (as built; the plan said one per hook git supports, which would cost a
+  process start on every `reference-transaction`), each calling `sluice hooks run <hook> -- "$@"` (stdin forwarded).
 - Activation: a Sluice-managed config file included by the last `[include]` of the clone's
   `.git/config` sets `core.hooksPath`; the previous effective value is recorded so
   `sluice hooks off` restores it. Idempotent; never writes inside the repository's
@@ -24,9 +25,10 @@ each wave (fmt, clippy, test), then Matrix on the branch before any release.
   variants, its hook scripts), pre-commit (`.pre-commit-config.yaml`, its hook stub),
   plain hooks (the previous `core.hooksPath` or `.git/hooks`), none.
 - Full delegation for every manager, byte-for-byte arguments and stdin, exit code
-  propagated: `.husky/_/<hook>`; lefthook's installed script or `lefthook run <hook>` with
-  its binary discovery; `pre-commit hook-impl --config=... --hook-type=<hook> -- <args>`;
-  plain: the previous hook file. If anything fails before delegating, delegate anyway.
+  propagated, as built: `exec` the executable file the underlying hooks directory holds for the
+  hook (`.husky/_/<hook>`, lefthook's script, pre-commit's stub, the plain hook); no file: exit 0.
+  `lefthook run` and `pre-commit hook-impl` are never called when the manager's own file is not
+  installed. If anything fails before delegating, delegate anyway.
 - `sluice hooks on|off|status`; `sluice init` offers it; doctor reports a clone whose hooks
   bypass Sluice as a failure and the activation's state; the plugin session start
   restores a displaced activation (husky's rewrite does not displace it, but `hooks off`
@@ -47,8 +49,8 @@ each wave (fmt, clippy, test), then Matrix on the branch before any release.
   --format json`.
 - pre-commit: hook ids through `pre-commit run <id> --hook-stage <stage>`; ambiguous ids,
   remote-ref dependent runs → delegate; config + resolved revs in the key.
-- Execution in the user's worktree, sequentially, mutating steps first and uncached,
-  checks through the daemon with keys from the index tree + unit + effective config +
+- Execution in the user's worktree, sequentially, in the manager's order (ADR amendment: file order, not mutating
+  first), mutating steps uncached, checks through the daemon with keys from the index tree + unit + effective config +
   toolchain inputs.
 - Exit code mapping (pre-commit's 3 vs Sluice's refusal).
 
@@ -69,4 +71,4 @@ each wave (fmt, clippy, test), then Matrix on the branch before any release.
 | H1 | done (verified through Sluice: fmt, clippy, test) |
 | H2 | H2a (husky and plain units, caching, status) done, verified through Sluice; H2b (lefthook and pre-commit adapters) done, verified through Sluice; real-tool tests pending in CI/Matrix |
 | H3 | implemented (hook units as gates, shared keys with the hook runs, `sluice gate list`, doctor, plugin text); done, verified through Sluice, see [[sluice/changes/hook-runner-h3.md]] |
-| H4 | pending |
+| H4 | documentation and agent text reconciled with the code (hooks page, CLI reference, README, plugin, CHANGELOG, KB); see [[sluice/changes/hook-runner-h4.md]]. Release pending: Matrix, real-tool tests in CI, the code findings listed in that note |

@@ -15,6 +15,38 @@ use tempfile::TempDir;
 /// Options for the test's own git calls: no auto-maintenance, no `gc --auto`.
 pub const NO_AUTO_MAINTENANCE: [&str; 4] = ["-c", "maintenance.auto=false", "-c", "gc.auto=0"];
 
+/// The first executable `name` on the host `PATH`.
+pub fn find_on_path(name: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
+}
+
+/// Tools that hooks, fakes and test gates use, linked into the sandbox's own
+/// `tools` directory.
+const BASIC_TOOLS: [&str; 33] = [
+    "git", "sh", "cat", "tail", "head", "env", "dirname", "basename", "kill", "sed", "sleep", "tr",
+    "grep", "awk", "sort", "uniq", "wc", "mkdir", "rm", "cp", "mv", "ls", "printf", "date",
+    "touch", "chmod", "expr", "uname", "id", "readlink", "mktemp", "tee", "cut",
+];
+
+/// A `PATH` directory with only the basic tools (symlinks to the host's), so
+/// that a test never sees a tool the machine happens to have installed (a
+/// real `lefthook`, `pre-commit`, `bash`, `sluice`). Created once per sandbox.
+pub fn tools_dir(sb: &Sandbox) -> PathBuf {
+    let dir = sb.root.path().join("tools");
+    if dir.exists() {
+        return dir;
+    }
+    fs::create_dir_all(&dir).expect("tools dir");
+    for name in BASIC_TOOLS {
+        if let Some(real) = find_on_path(name) {
+            std::os::unix::fs::symlink(real, dir.join(name)).expect("link tool");
+        }
+    }
+    dir
+}
+
 /// A temporary HOME / XDG layout plus one repository with a `.sluice.toml`.
 pub struct Sandbox {
     pub root: TempDir,

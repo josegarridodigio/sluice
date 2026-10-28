@@ -31,7 +31,7 @@ authoritative.
 <summary>Full help</summary>
 
 ```text
-Sluice runs named gates (tests, linters, type checks) under a global concurrency budget and caches results per git tree so each tree is verified once. Git hooks call `sluice run` (or, with `sluice hooks on`, Sluice runs the hooks' commands itself); coding agents call the MCP server started by `sluice mcp` (tools verify, status, gate_list, logs and the merge-queue tools queue_enqueue, queue_status, queue_approve, queue_retry, queue_cancel).
+Sluice runs named gates (tests, linters, type checks) under a global concurrency budget and caches results per git tree so each tree is verified once. Git hooks run gates through `sluice run`, or through `sluice hooks on`, which runs the repository's own hook commands through the same queue and cache; coding agents call the MCP server started by `sluice mcp` (tools verify, status, gate_list, logs and the merge-queue tools queue_enqueue, queue_status, queue_approve, queue_retry, queue_cancel).
 
 On a cache miss `sluice run` hands the gate to the per-user daemon (`sluice daemon`), starting it on demand; when the daemon cannot be reached or started the gate runs in-process. `sluice status` shows the queue. `sluice exec -- <cmd>` runs any other heavy command under the same budget, without cache.
 
@@ -65,6 +65,7 @@ Commands:
   cache   Inspect or clear cache markers for the current repository
   init    Write a `.sluice.toml` that fits the repository and wire its git hooks
   hook    Print hook integration snippets
+  hooks   Make Sluice the git hooks entry point of this clone, without touching the repository
   logs    Show the log of a job
   queue   Local merge queue: enqueue committed branches, approve trains, land them
   update  Update sluice to the latest (or a given) release
@@ -95,7 +96,7 @@ Run a gate: cache hit in milliseconds, otherwise queue it in the daemon under th
 Usage: sluice run [OPTIONS] <GATE> [-- <EXTRA>...]
 
 Arguments:
-  <GATE>      Gate name as defined in `.sluice.toml`
+  <GATE>      Gate name from `.sluice.toml`, or, without one, a check unit of a hook that Sluice runs (see `sluice gate list`)
   [EXTRA]...  Extra arguments appended to the gate command
 
 Options:
@@ -106,6 +107,10 @@ Options:
 ```
 
 </details>
+
+In a repository without `.sluice.toml` whose hooks Sluice can plan, `<GATE>` also
+accepts the name of a check unit of a hook (`husky:pre-commit#2`, see
+[`sluice gate`](#sluice-gate)).
 
 ### `sluice exec`
 
@@ -459,21 +464,51 @@ Options:
 
 ### `sluice gate`
 
+List the gates of the current repository.
+
 ```sh
 sluice gate list          # name, command, weight, timeout, hooks, cache, origin
 sluice gate list --json   # {schema, repository, gates[], excluded[]}
 ```
 
-Lists the gates of the repository. With a `.sluice.toml` they are its gates,
-unchanged. Without one, they are the **check units of its git hooks**
+<details>
+<summary>Full help</summary>
+
+```text
+List the gates: those of `.sluice.toml` or, without one, the check units of the repository's git hooks (named `<manager>:<hook>#<n>`), and the hooks and units that are not gates, with the reason
+
+Usage: sluice gate list [OPTIONS]
+
+Options:
+      --json  Print machine-readable JSON instead of text
+  -h, --help  Print help
+```
+
+</details>
+
+With a `.sluice.toml` they are its gates, unchanged. Without one, they are the
+**check units of its git hooks**
 ([ADR-0021](../kb/sluice/design/adr/0021-sluice-runs-the-repository-hooks.md),
-[Git hooks](hooks.md#verify-and-gates-without-sluicetoml)), named
-`<manager>:<hook>#<n>` (`husky:pre-commit#2`), followed by `not gates:`: the hooks
-and units that cannot be verified, each with the reason (a hook Sluice delegates, a
-unit that may edit files, a unit that needs what a commit stages). `sluice run
-<gate>` takes those names, and the MCP tools `verify` and `gate_list` use the same
+[Git hooks](hooks.md#verify-and-gates-without-sluicetoml)): those of `pre-commit`,
+`pre-merge-commit` and `pre-push`, named `<manager>:<hook>#<n>`
+(`husky:pre-commit#2`), whether or not `sluice hooks on` was run. A line per gate:
+
+```text
+husky:pre-commit#2  npm run lint  (weight 4, timeout 0s, hooks: pre-commit, cache on, from the husky hook)
+not gates:
+  husky:pre-commit#1 `lint-staged`: it may change files or the index (...): it only runs inside the hook
+  hook commit-msg: delegated, not a gate: ...
+```
+
+The `not gates:` block lists the hooks and units that cannot be verified, each
+with the reason (a hook Sluice delegates, a mutating unit, a unit that needs what a
+commit stages). `--json` has, per gate, `name`, `cmd`, `weight`, `timeout_seconds`,
+`hooks`, `cache` and `source` (`config` or `hook`; `manager` too for `hook`), and
+`excluded[]` with `hook`, `unit`, `command` (both null for a whole hook) and
+`reason`. `sluice run <gate>`, the MCP tools `verify` and `gate_list` use the same
 gates. A repository with neither a `.sluice.toml` nor such a unit still gets the
-"no .sluice.toml found" error.
+"no .sluice.toml found" error (its message points to `sluice hooks status`); exit
+code 1 on any error, 0 otherwise.
 
 ### `sluice cache`
 
@@ -660,7 +695,7 @@ Options:
 
           Possible values:
           - rewire: Rewrite the hook lines that became gates to `sluice run --hook <hook> <gate>` (edits the repository's hook files)
-          - entry:  Leave the repository's hook files alone: make Sluice the hooks entry point of this clone (`sluice hooks on`), which runs them untouched
+          - entry:  Leave the repository's hook files alone: make Sluice the hooks entry point of this clone (`sluice hooks on`), which runs their commands through the queue or, when it cannot, the hooks untouched
           
           [default: rewire]
 
@@ -673,7 +708,10 @@ Options:
 `--hooks entry` is for repositories whose hook files you cannot or do not want
 to edit (husky hooks that a teammate owns, generated hooks): `init` writes only
 `.sluice.toml` and runs `sluice hooks on`; `--dry-run` shows it as `would run
-sluice hooks on`. See [Git hooks](hooks.md).
+sluice hooks on`. It needs existing hook files to delegate to: with none, `init`
+says so and does its usual setup. With the default `--hooks rewire` and a hook
+manager that owns the hooks, `init` adds a note offering `--hooks entry`. See
+[Git hooks](hooks.md).
 
 ### `sluice hook`
 
@@ -733,46 +771,102 @@ repository ([ADR-0021](../kb/sluice/design/adr/0021-sluice-runs-the-repository-h
 [Git hooks](hooks.md)).
 
 ```sh
-sluice hooks on        # activate (idempotent)
-sluice hooks status    # on or off, directory, repository hooks, manager, effective?
+sluice hooks on             # activate (idempotent)
+sluice hooks status         # on or off, directory, repository hooks, manager, effective?, each hook
 sluice hooks status --json
-sluice hooks off       # remove the include and the managed files
+sluice hooks off            # remove the include and the managed files
 ```
 
-In a repository without `.sluice.toml` the check units of the hooks are also the
-gates of `sluice run`, `sluice gate list` and the MCP tools, with the same cache
-entries as the hook runs ([Git hooks](hooks.md#verify-and-gates-without-sluicetoml)).
-`hooks status --json` names each unit (`name`) and, when `.sluice.toml` has a gate with the
-same command, says whether the unit shares that gate's cache entry (`shares`).
+<details>
+<summary>Full help</summary>
+
+```text
+Make Sluice the git hooks entry point of this clone, without touching the repository.
+
+`on` gives the clone a hooks directory of its own (under its git directory) and points `core.hooksPath` at it through a file included by the last `[include]` of the clone's git config, so husky's own `core.hooksPath` writes do not displace it. Every hook runs `sluice hooks run`: when Sluice understands the repository's hook (husky, lefthook, pre-commit or plain) it runs the hook's commands one by one through the queue and the cache; otherwise it executes the hook untouched, with the same arguments, stdin, directory, environment and exit code. `status` shows which. `off` removes the include and the managed files.
+
+Usage: sluice hooks <COMMAND>
+
+Commands:
+  on      Activate the entry point in this clone (idempotent)
+  off     Remove the include and the managed files; the previous `core.hooksPath` applies again
+  status  Show whether the entry point is on, what it delegates to and whether it is effective
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+</details>
+
+The help above summarises the entry point; what runs for each hook is described
+next.
 
 `on` creates `<git common dir>/sluice/hooks/` with one script for each hook the
-repository has (and none for the others) and sets `core.hooksPath` to it through a file included by the last
-`[include]` of the clone's git config (only `git config` writes it). Every
-hook then goes through `sluice hooks run`, which executes the hook the
-repository would have run without Sluice (husky, lefthook, pre-commit or plain
-hooks): same arguments, stdin, working directory, environment and exit code.
-Nothing in the repository changes. A husky, plain, lefthook or pre-commit hook
-that Sluice understands completely runs its commands as units through the daemon
-(queue, budget, cache for checks; lefthook's and pre-commit's through their own
-CLIs); every other hook is delegated untouched
-(`SLUICE_HOOKS_DELEGATE=1` forces delegation; see [hooks](hooks.md)).
-`off` removes the include and the managed files; the repository's own
-`core.hooksPath` applies again. Exit codes: 0, 1 on an error (not in a git
-repository, git failure).
+repository has (and none for the others) and sets `core.hooksPath` to it through a
+file included by the last `[include]` of the clone's git config (only `git config`
+writes it). Nothing in the repository changes. Every hook then goes through
+`sluice hooks run`, which does one of two things, decided at each run:
 
-`status` also lists every hook the repository has, as `units` (with each unit's
-kind, `mutating` or `check`, and command) or `delegate` (with the reason); in
-`--json` that is the `hooks` array (`{hook, mode, reason}` or `{hook, mode,
-units: [{index, kind, command}], requires?}`; `requires` is the run-time
-condition of a lefthook or pre-commit hook, which is delegated when it does not
-hold). It reports whether the entry point is `effective`: Sluice's directory is
-the value `git config core.hooksPath` returns. When it is not (the include was
-removed, a later include or a worktree config wins), `problem` says why and
-`sluice hooks on` repairs it. Re-run `on` after a manager installs a new hook:
-`status`/`doctor` report a hook that has no script.
+- **units**: a husky, plain, lefthook or pre-commit hook that Sluice understands
+  completely runs its commands as jobs of the daemon (queue, budget, containment,
+  logs; cache for checks; lefthook's and pre-commit's through their own CLIs). The
+  `agent_hook_policy` refusal (exit code 3) is not applied to them;
+- **delegation**: every other hook is replaced by the repository's own hook, with
+  the same arguments, stdin, working directory, environment, exit code and signal.
+  A hook that is not installed exits 0.
 
-`sluice hooks run <hook> -- <args>` is internal (hidden): the managed scripts
-call it.
+`SLUICE_HOOKS_DELEGATE=1` (or `SLUICE_DISABLE=1`) forces delegation; see
+[hooks](hooks.md). `on` prints the number of scripts written, the hooks directory
+and what it delegates to. `off` removes the include and the managed files (the
+repository's own `core.hooksPath` applies again) and prints `was already off` when
+there was nothing to remove. Exit codes of `on`, `off` and `status`: 0, or 1 on an
+error (not inside a git repository, a git or file failure, `core.hooksPath` still
+not Sluice's after the include).
+
+`status` prints `hooks entry point: on|off`, the directory, the repository's
+hooks directory (`repository hooks`), the manager (`husky`, `lefthook`,
+`pre-commit`, `plain hooks` or `none`), whether the entry point is `effective`
+(Sluice's directory is the value `git config core.hooksPath` returns) and, when it
+is not, a `problem` and `fix: sluice hooks on`; then a line for every hook the
+repository has: `N unit(s) run through the queue: <kind> <command>; ...` (with a
+`(delegated at run time unless ...)` line for the condition of a lefthook or
+pre-commit hook, and a `cache shared with gate ...` or `same command as gate ...,
+cache not shared: ...` note when `.sluice.toml` has a gate with the unit's
+command) or `delegated (<reason>)`. With `--json`:
+
+```json
+{
+  "schema": 1,
+  "active": true,
+  "effective": true,
+  "directory": "<git dir>/sluice/hooks",
+  "previous": ".husky/_",
+  "underlying": ".husky/_",
+  "manager": "husky",
+  "problem": null,
+  "hooks": [
+    {"hook": "pre-commit", "mode": "units",
+     "units": [{"index": 1, "name": "husky:pre-commit#1", "kind": "mutating", "command": "lint-staged"},
+               {"index": 2, "name": "husky:pre-commit#2", "kind": "check", "command": "npm run lint",
+                "shares": "cache shared with gate `lint`"}],
+     "requires": "something is staged and no file is partially staged"},
+    {"hook": "commit-msg", "mode": "delegate", "reason": "..."}
+  ]
+}
+```
+
+`shares` appears only when a `.sluice.toml` gate has the unit's command; `requires`
+only for lefthook and pre-commit units (the hook is delegated at run time when it
+does not hold; it is not evaluated by `status`). When the include was removed, a
+later include or a worktree config wins, or a hook of the repository has no script
+(re-run `on` after a manager installs a new hook), `problem` says why and
+`sluice hooks on` repairs it.
+
+`sluice hooks run [--common-dir <dir>] <hook> -- <args>` is internal (hidden from
+`--help`): the managed scripts call it with the hook's arguments, and it never
+fails a hook for a Sluice problem.
 
 ### `sluice logs`
 
@@ -996,7 +1090,8 @@ Besides the basics, the zero-config checks are:
 | `shims` | The shims are installed in the stable directory and current (`warn` when missing or stale). First in `PATH` for this shell: in an agent shell `warn` when it is not; in a human shell `ok`, with a note that the agent plugin puts them in `PATH` for agent sessions. |
 | `plugin` | Version of the installed agent plugin (read from `installed_plugins.json` under `$CLAUDE_CONFIG_DIR` or `~/.claude`) against the binary: `warn` when they differ, `ok` when equal, missing or unreadable. Never fails. |
 | `weights` | For each gate that declares a number, `warn` when the weight the runs actually need (learned, without the ceiling) exceeds the declared ceiling by more than 50 %: raise it or use `weight = "auto"`. |
-| `hooks` | Where the clone's hooks stand. With the entry point on (`sluice hooks on`): `ok` when it is effective and complete, `fail` with the reason when something displaced it or a hook of the repository has no Sluice script. Otherwise: `ok` when a hook in the hooks directory (`core.hooksPath` or `.git/hooks`) calls sluice (for a husky v9 runner, `.husky/_` with an `h` file, the scripts it executes, `.husky/<hook>`, are inspected); `fail` when a hook manager (husky, lefthook, pre-commit) owns hooks that do not call sluice, or `.sluice.toml` has gates with hooks and the hook files do not call sluice (suggests `sluice hooks on`); `warn` when no hook calls sluice and there is nothing else to judge. |
+| `hooks` | Where the clone's hooks stand. With the entry point on (`sluice hooks on`): `ok` when it is effective and complete, `fail` with the reason when something displaced it or a hook of the repository has no Sluice script (fix: `sluice hooks on`). Otherwise: `ok` when a hook in the hooks directory (`core.hooksPath` or `.git/hooks`) calls sluice (for a husky v9 runner, `.husky/_` with an `h` file, the scripts it executes, `.husky/<hook>`, are inspected) or when the lefthook or pre-commit configuration calls sluice; `fail` when a hook manager (husky, lefthook, pre-commit) owns hooks that do not call sluice, or `.sluice.toml` has gates with hooks and the hook files do not call sluice (suggests `sluice hooks on`); `warn` when no hook calls sluice and there are hook files or gates with hooks to judge; `ok` when there is nothing to route. |
+| `repo-config` | Where `.sluice.toml` stands. Besides `ok` (parses) and `fail` (does not parse, or missing): in a clone with no `.sluice.toml` whose hooks go through Sluice it is `ok`, "gates are derived from the hooks (n unit(s) can be verified, m left out; see 'sluice gate list')". With the entry point off a missing `.sluice.toml` still fails. |
 | `cache` | In a repository: `warn` when the index has skip-worktree or assume-unchanged entries (it names up to 5 paths): the tree cannot be hashed, so the cache is disabled for this worktree. The detail gives `git update-index --no-skip-worktree <path>` / `--no-assume-unchanged <path>`. `ok` otherwise. |
 | `init` | In a git repository without `.sluice.toml`: `ok`, with the hint `run 'sluice init --dry-run'`. |
 
@@ -1094,6 +1189,8 @@ Options:
 | `sluice exec` | The command's own code; 128+N when killed by signal N; 124 on `--timeout`; 143 when the daemon stopped and killed it; 127 not found; 126 not executable; 125 Sluice error after the request was accepted; 141 when its own stdout is a closed pipe. |
 | `sluice daemon` | 75 when another daemon already holds the lock. |
 | `sluice queue` | 0 ok; 1 error; 2 usage; 4 refused by the state of the queue (`conflict-state`, `not-allowed`, `stale-plan`, `duplicate-branch`). |
+| `sluice hooks on`, `off`, `status`; `sluice gate list` | 0; 1 on an error (not in a git repository, a git or file failure; `gate list`: no `.sluice.toml` and no unit). |
+| `sluice hooks run` (internal) | The hook's own code (delegated or the failing unit's); never 3 from Sluice. 126 when the hook file cannot be executed. 0 when the hook is not installed or the repository cannot be found. |
 | `sluice doctor` | 1 when a check fails, 0 otherwise. |
 | `sluice update` | 0 updated, up to date or `--check`; 1 error; 2 usage. |
 
@@ -1116,6 +1213,7 @@ turns caching off, it prints `lookup: OFF (<reason>)` instead of a HIT or MISS.
 | `SLUICE_CONFIG` | Path of the user config (default `~/.config/sluice/config.toml`). |
 | `SLUICE_SOCKET` | Override the daemon socket path. |
 | `SLUICE_LOG` | Log filter of `sluice daemon` (written to `~/.local/state/sluice/daemon.log`), `sluice mcp` (stderr and a log file) and `sluice run`; then `[debug] level` of the user config; then `info`. |
+| `SLUICE_HOOKS_DELEGATE=1` | With the hooks entry point on, every git hook is delegated untouched (no units). Empty or `0` is off. `SLUICE_DISABLE` has the same effect on hooks. |
 | `SLUICE_UPDATE_BASE_URL` | `sluice update`: a directory or `file://` URL holding the release archives, `SHA256SUMS` and a `LATEST` file. |
 | `SLUICE_VERSION`, `SLUICE_INSTALL_DIR` | `scripts/install.sh` only: release tag to install (default latest) and target directory (default `$HOME/.local/bin`). |
 

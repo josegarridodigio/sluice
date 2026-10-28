@@ -87,6 +87,24 @@ start, so they reflect earlier mutating units. A hook that receives stdin runs a
 only when every unit is a recognised check (none of them reads stdin); otherwise it is
 delegated whole. Details: [[sluice/changes/hook-runner-h2a.md]].
 
+## Amendment (2026-10-28, wave H4: documentation reconciliation)
+
+Two statements of this ADR are corrected to match the code:
+
+- **Delegation executes a file, it does not call the manager.** Decision 3 says Sluice
+  calls `.husky/_/<hook>`, lefthook's hook script or `pre-commit hook-impl`. What is
+  implemented (and measured) is one rule for every manager: `exec` the executable file
+  that the directory git would have used without Sluice holds for the hook (the husky
+  stub, lefthook's generated script, pre-commit's stub, a plain hook). A hook with no such
+  file exits 0, and units are only attempted for a hook whose file exists: nothing that did
+  not run before starts running ([[sluice/changes/hook-runner-h4.md]]).
+- **Fresh linked worktrees do not gain hooks.** The Consequences said that in a fresh
+  linked worktree, where husky's untracked `.husky/_` is missing, the repository's hooks
+  now run. They do not: the delegation target `.husky/_/<hook>` does not exist there, so
+  the run exits 0 before any planning, exactly as husky does without Sluice. Running
+  `.husky/<hook>` without its stub would be a behaviour change that was never
+  implemented. The consequence is removed.
+
 ## User decisions (2026-10-28)
 
 | # | Question | Answer |
@@ -106,8 +124,11 @@ delegated whole. Details: [[sluice/changes/hook-runner-h2a.md]].
 - Sluice becomes responsible for faithfully invoking three managers; each adapter is
   tested against configurations taken from public repositories, and delegation is the
   safety net.
-- In a fresh linked worktree husky runs no hook today; with Sluice as the entry point the
-  repository's hooks do run there (documented behaviour change).
+- In a fresh linked worktree husky runs no hook (its `.husky/_` is untracked), and it
+  still runs none with Sluice as the entry point (see the H4 amendment).
+- Hooks run as units do not get the `agent_hook_policy = "fail-fast"` refusal (decision 8
+  keeps exit code 3 unambiguous by never emitting it for units): an agent's commit on a
+  miss runs the units inside `git commit`; agents are told to `verify` first.
 
 ## Alternatives considered
 

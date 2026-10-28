@@ -115,7 +115,7 @@ pub enum HooksMode {
     /// (edits the repository's hook files).
     Rewire,
     /// Leave the repository's hook files alone: make Sluice the hooks entry point of
-    /// this clone (`sluice hooks on`), which runs them untouched.
+    /// this clone (`sluice hooks on`), which runs their commands through the queue or, when it cannot, the hooks untouched.
     Entry,
 }
 

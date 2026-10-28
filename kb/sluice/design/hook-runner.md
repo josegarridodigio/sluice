@@ -1,18 +1,32 @@
 ---
-title: "Design: the hooks entry point and the unit runner (waves H1, H2a, H2b, H3)"
+title: "Design: the hooks entry point and the unit runner (waves H1, H2a, H2b, H3, H4)"
 tags: [sluice, design, hooks, husky, lefthook, pre-commit]
 ---
 
-# Design: the hooks entry point (wave H1)
+# Design: the hooks entry point and the unit runner
 
 Decision: [[sluice/design/adr/0021-sluice-runs-the-repository-hooks.md]]. Plan:
 [[sluice/plan/hook-runner-plan.md]]. Research:
 [[sluice/research/hook-managers-synthesis.md]]. Code: `crates/sluice-gate/src/hookentry/`.
+User documentation: `docs/hooks.md`.
 
-H1 makes Sluice the hooks entry point of a clone and delegates every hook untouched. No
-unit parsing, no caching, no behaviour change.
+The feature was built in four waves and this note follows them: **H1** the entry point
+(per-clone hooks directory, activation, delegation, drift), **H2a/H2b** the unit runner
+(what Sluice runs itself and how it caches), **H3** hook units as gates. Read as one
+system: git runs Sluice's script for a hook; `hooks run` decides **units** or
+**delegation** at each run (an executable hook file must exist in the underlying
+directory first); units go through the daemon with the cache; the same units are the
+gates of `verify` in a repository without `.sluice.toml`. Wave H4 reconciled the
+documentation with the code ([[sluice/changes/hook-runner-h4.md]]); where a section below
+was written for an earlier wave it says so.
 
-## Files (per clone, under `<git common dir>/sluice/`)
+## H1: the entry point and delegation
+
+H1 made Sluice the hooks entry point of a clone and delegated every hook untouched. The
+delegation is still the default and the fallback of every later wave; since H2a it is
+not what runs when Sluice understands the whole hook.
+
+### Files (per clone, under `<git common dir>/sluice/`)
 
 | File | Purpose |
 |---|---|
@@ -36,7 +50,7 @@ session-start restore (activates again when `Inspection::healthy` is false); doc
 husky's fixed 14 stubs or manual files; lefthook and pre-commit write elsewhere or refuse once
 Sluice's value is set. Relative underlying paths resolve against the worktree root.
 
-## Activation (`activate.rs`, `gitcfg.rs`)
+### Activation (`activate.rs`, `gitcfg.rs`)
 
 1. Read `git config --show-origin --get-all core.hooksPath`; the previous value is the last
    one that is not Sluice's directory (a global value counts).
@@ -59,7 +73,7 @@ entries and `<git common dir>/sluice/markers` are never touched. When Sluice's i
 the only one, `.git/config` is byte-identical to its state before `on` (git drops the empty
 section).
 
-## Scripts (`script.rs`)
+### Scripts (`script.rs`)
 
 Run `exec <bin> hooks run --common-dir <common> <hook> -- "$@"`, with `<bin>` the binary that
 activated the clone if still executable, else `command -v sluice` (an older `sluice` earlier
@@ -69,9 +83,11 @@ husky rewrite is followed), else the value recorded at activation (baked into th
 else `<common>/hooks`; executable file -> `exec`, otherwise `exit 0`. Paths are shell-quoted
 at generation.
 
-## Delegation (`delegate.rs`)
+### Delegation (`delegate.rs`)
 
-`hooks run` never fails a hook. It reads the `core.hooksPath` entries (if git cannot be
+`hooks run` never fails a hook. (Describing H1's path; since H2a `runner::try_units` may run
+the hook as units instead of the `exec` below, after the target was found to exist.) It reads
+the `core.hooksPath` entries (if git cannot be
 asked, the recorded previous value, with a stderr line), drops Sluice's own value, expands
 `~/`, defaults to `<common>/hooks`, and `exec`s `<dir>/<hook>` when it is an executable
 regular file (through `Command::exec`: same argv, stdin, cwd, environment; signals and exit
@@ -81,19 +97,25 @@ against the cwd git runs hooks in (the worktree root).
 Per manager, all through this one rule because each manager's own entry file is what lives in
 the directory git would have used: husky `.husky/_/<hook>` (missing stub: exit 0 as husky),
 lefthook's generated script, pre-commit's stub (its `--hook-dir "$HERE"` legacy chaining still
-works because the stub runs in place), plain hooks. `detect()` classifies (husky: `.husky/_`
+works when the hook is delegated, because the stub runs in place; a hook run as units does not
+chain `<hook>.legacy`, see the H4 change note), plain hooks. `detect()` classifies (husky: `.husky/_`
 with `h`; lefthook: `LEFTHOOK` in a script, else a config file; pre-commit: its generation
 marker, else `.pre-commit-config.yaml`; plain) for `status` and `doctor` only.
 
-Deliberate non-goal in H1: calling `lefthook run <hook>` or `pre-commit hook-impl ...` when the
-manager's script is not installed. That hook did not run before; running it would be a
-behaviour change. It belongs to H2, where Sluice runs units itself.
+Deliberate non-goal, kept through every wave: calling `lefthook run <hook>` or `pre-commit
+hook-impl ...` when the manager's script is not installed (and running `.husky/<hook>`
+when `.husky/_/<hook>` is missing, which is what a fresh linked worktree has). That hook
+did not run before; running it would be a behaviour change. `delegate::run` returns before
+`runner::try_units` when no executable file exists, and the lefthook and pre-commit
+adapters read the installed script, so units are only attempted for hooks that already
+ran. Consequently ADR-0021's original statement that hooks now run in fresh linked
+worktrees is wrong (amended in H4).
 
-## Drift
+### Drift
 
 - `doctor` (`check_hooks`): activated -> `ok` or `fail` with the reason (include missing,
-  other value wins and where from, a repository hook without a script); not activated -> `ok` when a hook calls
-  sluice, `fail` when a manager owns non-calling hooks or gates with hooks meet non-calling
+  other value wins and where from, a repository hook without a script); not activated -> `ok` when a hook (or the lefthook or pre-commit
+  configuration) calls sluice, `fail` when a manager owns non-calling hooks or gates with hooks meet non-calling
   hook files, `warn` for hooks files with no gates to run or gates with hooks and no hook files,
   `ok` when there is nothing to route.
 - Session start: only a clone with `hooks.json` is looked at (found without spawning git: walk
@@ -102,11 +124,12 @@ behaviour change. It belongs to H2, where Sluice runs units itself.
   context gains one sentence; the log decision gets `hooks=on|restored|displaced`. Never
   activates a clone that was not activated.
 
-## `sluice init`
+### `sluice init`
 
 `--hooks rewire` (default, unchanged) or `--hooks entry`: only `.sluice.toml` is written,
 `hooks on` is run, the repository's hook files are not edited (`--dry-run` shows "would run
-sluice hooks on"). With managed hooks and the default mode, a note offers `--hooks entry`.
+sluice hooks on"). With managed hooks and the default mode, a note offers `--hooks entry`;
+`--hooks entry` with no existing hook file says so and does the usual setup.
 init reads `core.hooksPath` without Sluice's value, so it works on an activated clone.
 
 ## H2a: units for husky and plain hooks
@@ -117,7 +140,8 @@ Decisions 3 to 6 and 8 of ADR-0021 for the two managers whose hooks are shell fi
 
 ### Flow
 
-`delegate::run` resolves the hook file exactly as in H1, then calls `runner::try_units`. `None`
+`delegate::run` resolves the hook file exactly as in H1 (no executable file: exit 0, units are never
+attempted), then calls `runner::try_units`. `None`
 means "delegate as H1" and is returned, in this order, for: `SLUICE_HOOKS_DELEGATE` set,
 `SLUICE_DISABLE` set, a non-UTF-8 environment, no git worktree, a `Plan::Delegate`, a repository
 or daemon that cannot be prepared (`prepare`: `lookup::resolve_repo_or_implicit`,
@@ -181,15 +205,27 @@ skip-worktree, submodules, git error) or a failed key derivation runs the unit u
 the key: untracked toolchain inputs (`node_modules`, installed binaries), exactly as for gates
 without `key_inputs`; the husky `PATH` string is a proxy for the toolchain location. The unit
 name is in the key, so a unit does not share the entry of a `.sluice.toml` gate with the same
-command (the gate name is part of `KeyMaterial`); sharing needs a key without the name and is
-left for H3.
+command (the gate name is part of `KeyMaterial`). H3 solved it without a key change: an `Exact`
+match runs the unit under the gate's own name and definition (see "Sharing with `.sluice.toml`").
 
 ### Environment
 
-A check gets `git::child_env` (no `GIT_DIR`, `GIT_INDEX_FILE`, ..., no `CLAUDE*`), like a gate:
-required for a key that says "working tree". A mutating unit keeps git's variables (only
-`CLAUDE*` removed) so that `git add` and `lint-staged` edit the index the commit is using, also
-with `git commit -a` or paths (a temporary `GIT_INDEX_FILE`).
+A husky or plain check gets `git::child_env` (no `GIT_DIR`, `GIT_INDEX_FILE`, ..., no `CLAUDE*`),
+like a gate: required for a key that says "working tree". A mutating unit keeps git's variables
+(only `CLAUDE*` removed) so that `git add` and `lint-staged` edit the index the commit is using,
+also with `git commit -a` or paths (a temporary `GIT_INDEX_FILE`). Since H2b every lefthook and
+pre-commit unit keeps them too (the managers ask git what is staged).
+
+### Output and policy
+
+A unit runs with `verbose = false`: its output goes to the job log, the terminal gets the summary
+line and, on failure, the last `tail_lines` lines (`report`). `run_unit` runs with `enforce_policy
+= false`, so neither `agent_hook_policy` nor `human_hook_policy` applies: an agent's commit on a
+miss runs or waits for the units inside `git commit` (the "agents never hang" property of
+`sluice run --hook` does not hold for units; the plugin tells agents to `verify` first, which warms
+the keys). A nested `sluice run` inside a unit (a lefthook or pre-commit configuration wired by
+`sluice init`) runs directly because `SLUICE_JOB` is set; see the H4 change note for why that
+configuration is not delegated.
 
 ### Classification (`classify.rs`)
 
@@ -215,7 +251,7 @@ directly with `sh -c`; a daemon that dies or refuses uses `run_queued`'s in-proc
 
 `hooks status [--json]` gains one entry per hook the repository has (`plan::plan` with the same
 inputs a run would use; `SLUICE_HOOKS_DELEGATE`/`SLUICE_DISABLE` shown as the reason). No doctor
-change.
+change in H2a (H3 and the drift section below cover doctor).
 
 ## H2b: units for lefthook and pre-commit
 

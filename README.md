@@ -45,6 +45,11 @@ removes the redundancy and never leaves an agent hanging.
   to use (learned from its earlier runs) fits what is free.
 - **Git hooks** for Husky, lefthook, pre-commit/prek and plain `.githooks/`,
   failing fast inside agents instead of hanging.
+- **Hooks entry point (optional).** `sluice hooks on` makes Sluice the hooks
+  entry point of one clone, without editing the repository, for hook files you
+  cannot rewire. Hooks Sluice understands completely run their commands through
+  the queue and the cache; every other hook runs as before. See
+  [Git hooks](docs/hooks.md).
 - **MCP tools and an agent plugin.** `sluice mcp` gives agents a blocking
   `verify` tool; the agent plugin adds a skill, a guard hook and a session
   hook that puts shell shims in the agent's `PATH` and hands it the rules.
@@ -97,6 +102,10 @@ is `sluice`.
    sluice init                  # writes .sluice.toml, rewires your hooks
    ```
 
+   If the hook files cannot be edited (a hook manager or a teammate owns
+   them), `sluice init --hooks entry` leaves them alone and makes Sluice the
+   hooks entry point of your clone instead ([Git hooks](docs/hooks.md)).
+
 That is all: no `PATH` edit, no `CLAUDE.md`, no user config. From then on a
 commit runs `sluice run` on a cache miss, and `sluice status` shows the
 daemon, budget, queue and totals. Agents other than Claude Code use the MCP
@@ -123,6 +132,7 @@ the cache. Recipes for Node, Python, Rust, Go, Docker and monorepos are in the
 | Document | What it covers |
 |---|---|
 | [How it works](docs/how-it-works.md) | Architecture, cache key, scheduling, what to know before trusting a hit, prior art |
+| [Git hooks](docs/hooks.md) | The hooks entry point (`sluice hooks on`): what runs through the queue and the cache, what is left to the hook manager, limits |
 | [CLI reference](docs/cli.md) | Every command with its full `--help`, exit codes, environment variables |
 | [Configuration](docs/configuration.md) | Every field of `.sluice.toml` and the user config, with defaults |
 | [Gates cookbook](docs/gates-cookbook.md) | Ready-to-adapt gate files per stack |

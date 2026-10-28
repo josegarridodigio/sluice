@@ -143,7 +143,9 @@ fn rules_text(gates: &[String], derived: bool) -> String {
          to the target branch. \
          6) A gate result `KILLED for lack of memory` is not a flaky failure: do not rerun it \
          unchanged or outside Sluice; lower its footprint (e.g. test concurrency) or tell the \
-         human."
+         human. \
+         7) A hook command that `gate_list` leaves out is run by the commit's hook: do not run it \
+         by hand through the shell."
     )
 }
 
@@ -276,7 +278,7 @@ fn hooks_entry(cwd: &Path, env: &EnvMap, start: Instant) -> (&'static str, &'sta
         Restore::Restored => (
             " hooks=restored",
             " Sluice re-enabled its git hooks entry point in this clone (something had displaced \
-             it); the repository's own hooks still run unchanged.",
+             it); the repository's own hooks run through Sluice again.",
         ),
         Restore::Failed(_) => (
             " hooks=displaced",

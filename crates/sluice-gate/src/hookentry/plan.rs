@@ -73,6 +73,30 @@ fn check_stdin(hook: &str, program: Program) -> Result<Program, String> {
     Ok(program)
 }
 
+/// The reason of a delegation whose configuration already calls `sluice`: a
+/// nested `sluice run` inside a unit would lose the agent fail-fast refusal.
+pub const ALREADY_ROUTED: &str = "already runs sluice";
+
+/// True when `word` is the `sluice` program, bare or by path.
+pub fn is_sluice(word: &str) -> bool {
+    word.rsplit('/').next() == Some("sluice")
+}
+
+/// True when the shell text `text` runs `sluice`. Text outside the grammar is
+/// searched word by word, so that nothing wired to Sluice slips through.
+pub fn text_runs_sluice(text: &str) -> bool {
+    match grammar::parse(text) {
+        Ok(script) => script
+            .lists
+            .iter()
+            .flatten()
+            .any(|c| c.argv.first().is_some_and(|p| is_sluice(p))),
+        Err(_) => text
+            .split_whitespace()
+            .any(|w| is_sluice(w.trim_matches(['\'', '"']))),
+    }
+}
+
 fn home_file(env: &EnvMap, rest: &str) -> Option<PathBuf> {
     env.get("HOME")
         .filter(|h| !h.is_empty())
@@ -153,12 +177,8 @@ fn build(
         let mut units = Vec::new();
         for cmd in list {
             index += 1;
-            if cmd
-                .argv
-                .first()
-                .is_some_and(|p| p.rsplit('/').next() == Some("sluice"))
-            {
-                return Err("already runs sluice".to_owned());
+            if cmd.argv.first().is_some_and(|p| is_sluice(p)) {
+                return Err(ALREADY_ROUTED.to_owned());
             }
             let kind = classify::classify(&cmd.argv, input.root);
             units.push(Unit {

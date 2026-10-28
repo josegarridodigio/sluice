@@ -1168,7 +1168,7 @@ fn check_managed_hooks(ins: &hookentry::activate::Inspection) -> Check {
             "hooks",
             Status::Ok,
             format!(
-                "git hooks go through sluice ({}); the repository's own hooks run untouched from {}",
+                "git hooks go through sluice ({}); the repository's own hooks are in {}",
                 ins.dir,
                 ins.underlying
                     .as_deref()
@@ -1224,7 +1224,7 @@ fn check_hooks(env: &EnvMap, paths: &RepoPaths, config: Option<&RepoConfig>) -> 
             Status::Fail,
             format!(
                 "the hooks of this clone ({}, in {}) do not call sluice, so their commands run outside the queue and the cache; \
-                 run 'sluice hooks on' (Sluice becomes the hooks entry point and runs them untouched) or wire them with 'sluice init'",
+                 run 'sluice hooks on' (Sluice becomes the hooks entry point and runs their commands through the queue and the cache) or wire them with 'sluice init'",
                 manager.label(),
                 dir.display()
             ),

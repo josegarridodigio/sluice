@@ -14,7 +14,10 @@ session context says so) works the same way: its gates are the check units of
 its hooks (husky, lefthook, pre-commit or plain hooks), and a `verify` pass is
 the cache hit that the commit's hook then finds. `gate_list` shows those gates
 and the hooks or units that are not gates (formatters that edit files, hooks
-Sluice does not understand), each with the reason.
+Sluice does not understand), each with the reason. The units of a hook run by
+Sluice are not refused with exit code 3 when they miss: a commit made without
+a `verify` first runs them inside `git commit`, which can outlast your shell
+call. Call `verify` before every commit.
 
 ## Automatic setup in agent sessions
 
@@ -63,7 +66,9 @@ session. Never install or update on your own.
   exit code are your command's own; treat the result as if you had run it. Do
   not retry it without the prefix and do not prefix commands yourself.
 - Call `verify` before every commit. Do not re-run a gate that just passed:
-  a pass is cached for this exact git tree.
+  a pass is cached for this exact git tree. A lefthook or pre-commit
+  unit depends on what is staged: if `gate_list` leaves it out for that
+  reason, `git add` your change and call `verify` again.
 
 ## Read the result
 
@@ -90,7 +95,9 @@ If `git commit` or `git push` fails with a message starting
 `sluice: '<gate>' has not passed on this tree` (exit code 3), the hook refused
 to run the gate inside your shell call. Call `verify` with that gate, then
 retry the same git command. Do not bypass the hook (`--no-verify`) and do not
-change the hook policy.
+change the hook policy. A hook that Sluice runs as units never answers with
+that message; an exit code 3 without it is the hook manager's own (for example
+pre-commit's internal error): read the output, do not retry blindly.
 
 ## Landing a branch (merge queue)
 

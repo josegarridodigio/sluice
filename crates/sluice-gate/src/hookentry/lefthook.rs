@@ -30,7 +30,7 @@ use sluice_gate_core::config::EnvMap;
 use super::classify;
 use super::delegate::{Manager, is_executable};
 use super::grammar;
-use super::plan::Input;
+use super::plan::{ALREADY_ROUTED, Input, text_runs_sluice};
 use super::tooling::{capture, find_on_path, parse_version, sh_line, sha256_hex};
 use super::units::{Kind, Precondition, Program, Unit};
 
@@ -239,6 +239,9 @@ fn read_job(name: &str, object: &Map<String, Value>) -> Result<Job, String> {
     }
     if job.run.is_empty() {
         return Err(format!("`{name}` has no `run`"));
+    }
+    if text_runs_sluice(&job.run) {
+        return Err(format!("`{name}` {ALREADY_ROUTED}"));
     }
     if uses_template(&job.run) {
         return Err(format!(
