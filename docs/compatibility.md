@@ -143,6 +143,12 @@ has them (fixture `crates/sluice-gate-core/tests/fixtures/unreleased/queue-tool-
 The status JSON gains the optional `queue.tool_env` (`source`, `reason`, `path`), which
 older clients ignore.
 
+The release after 0.7.0 adds the user config key `[scheduler] backfill` (ADR-0023). It
+is one-way like the 0.6.0 keys: 0.7.0 and older binaries reject a user config that has
+it (fixture `crates/sluice-gate-core/tests/fixtures/unreleased/scheduler-backfill.toml`).
+The status JSON gains `queued[].reserved_eta_ms` and `totals.backfilled` and
+`totals.backfill_head_delay_ms`, which older clients ignore (schema stays 1).
+
 ### The database
 
 `$XDG_STATE_HOME/sluice/sluice.db` holds the daemon's job history and the merge

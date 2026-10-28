@@ -211,6 +211,16 @@ change, `plan` stays pure.
   not change the CPU weight or its learning; CPU-driven over-admission stays
   CPU-driven, now also needing a learned peak that fits.
 - A memory-blocked job that is not overdue still lets smaller jobs backfill.
+- Behind a reserved head, a job starts only when it cannot delay it (ADR-0023,
+  `scheduler/shadow.rs`): `shadow()` releases the running jobs and those started
+  earlier in the pass in order of predicted end until the head fits budget, repository
+  cap and memory (the admission accounting: a released job returns what it holds plus
+  what it is still expected to grow by); `room()` is what is left beside the head for
+  the jobs still running then and every job started behind it. A job that fits now
+  starts when it fits the room (extra resources) or, with a learned duration, ends
+  before the shadow time (ends in time). A probe is never a backfill. `plan` stays pure;
+  `Plan::shadow` and `Plan::backfills` carry the result, the scheduler keeps the
+  counters. `[scheduler] backfill = false` is the strict reservation.
 - `plan` stays a pure function of the snapshot; `jobs` and `gate_stats` are
   unchanged and `sched_schema` stays 1.
 - A prior never raises an estimate (`min` with the proxy) and never makes a job

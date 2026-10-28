@@ -3,6 +3,8 @@
 
 use super::*;
 
+mod backfill;
+
 const RESERVE: u64 = 30_000;
 
 fn key(c: char) -> CacheKey {
@@ -273,6 +275,9 @@ fn r(id: &str, lane: &str, weight: u32) -> RunningSnap {
         lower_bound: None,
         learn_key: None,
         probe: false,
+        started_at: 0,
+        expected_ms: None,
+        backfilled: false,
     }
 }
 
@@ -1963,6 +1968,7 @@ fn switch_policy(bits: u8) -> Policy {
             Order::Fifo
         },
         cap: if bits & 8 != 0 { 9 } else { 6 },
+        reservation: HeadReservation::backfill(bits & 16 != 0),
         ..policy(6)
     }
 }
@@ -1974,7 +1980,7 @@ fn switch_policy(bits: u8) -> Policy {
 #[test]
 fn started_jobs_never_exceed_free_memory_unless_alone() {
     let mut rng = Lcg(7);
-    for bits in 0u8..16 {
+    for bits in 0u8..32 {
         let p = switch_policy(bits);
         for _ in 0..300 {
             let (run, queued, memory) = random_case(&mut rng);
@@ -2040,7 +2046,7 @@ fn running_memory_of(s: &Snapshot<'_>, memory: &MemoryFacts) -> u64 {
 #[test]
 fn memory_off_or_plentiful_plans_like_cpu_only_admission() {
     let mut rng = Lcg(42);
-    for bits in 0u8..16 {
+    for bits in 0u8..32 {
         let p = switch_policy(bits);
         for n in 0..300 {
             let (run, queued, memory) = random_case(&mut rng);
@@ -2109,6 +2115,7 @@ fn an_overdue_head_blocked_only_by_memory_starts_within_the_bound() {
     for (bits, peak_gib) in (0u8..16).flat_map(|b| [(b, 28), (b, 40)]) {
         let p = Policy {
             cap: if bits & 8 != 0 { 12 } else { 8 },
+            reservation: HeadReservation::backfill(bits.count_ones() % 2 == 1),
             fairness: bits & 1 != 0,
             human_first: bits & 2 != 0,
             order: if bits & 4 != 0 {

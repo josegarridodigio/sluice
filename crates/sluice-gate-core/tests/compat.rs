@@ -637,3 +637,15 @@ fn admission_memory_guard_fixture_parses() {
     let plain = UserConfig::parse("version = 1\n", &path).unwrap();
     assert!(!plain.admission.memory_guard);
 }
+
+/// ADR-0023: `[scheduler] backfill` parses, and is on without the key.
+#[test]
+fn scheduler_backfill_fixture_parses() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/unreleased/scheduler-backfill.toml");
+    let text = fs::read_to_string(&path).unwrap();
+    let cfg = UserConfig::parse(&text, &path).unwrap();
+    assert!(!cfg.scheduler.backfill);
+    let plain = UserConfig::parse("version = 1\n", &path).unwrap();
+    assert!(plain.scheduler.backfill);
+}

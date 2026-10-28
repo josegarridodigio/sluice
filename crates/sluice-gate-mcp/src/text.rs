@@ -160,7 +160,7 @@ pub(crate) fn render_status(r: &StatusReport, this_repo: Option<&Path>) -> Strin
     for (i, j) in r.queued.iter().enumerate() {
         let _ = writeln!(
             out,
-            " {}#{:<3} {:<16} {:<20} weight {:<2} waiting {:>8}  ({}{}){}  job {}",
+            " {}#{:<3} {:<16} {:<20} weight {:<2} waiting {:>8}  ({}{}){}{}  job {}",
             mark(&j.repo),
             i + 1,
             j.gate,
@@ -170,6 +170,7 @@ pub(crate) fn render_status(r: &StatusReport, this_repo: Option<&Path>) -> Strin
             reason(j.reason),
             j.wait_detail_text(),
             j.memory_text(),
+            j.reserved_text(dur),
             j.job_id
         );
     }
@@ -280,6 +281,19 @@ mod tests {
         );
         assert!(text.contains("mem 3.0 GiB/18.0 GiB"), "{text}");
         assert!(text.contains("(budget: memory)  mem 18.0 GiB"), "{text}");
+    }
+
+    #[test]
+    fn status_text_shows_the_eta_of_the_reserved_head() {
+        use sluice_gate_proto::QueuedJob;
+        let mut r = StatusReport::default();
+        r.queued.push(QueuedJob {
+            gate: "test".into(),
+            reserved_eta_ms: Some(245_000),
+            ..QueuedJob::default()
+        });
+        let text = render_status(&r, None);
+        assert!(text.contains("reserved, eta 4m05s"), "{text}");
     }
 
     #[test]

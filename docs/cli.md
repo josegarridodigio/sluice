@@ -449,6 +449,26 @@ only where the gates' scope has its own `systemd-oomd` policy. In `--json`:
 `containment.gates_oom_policy` (`limit_percent`, `duration_secs`). All optional
 and additive.
 
+With backfilling (`[scheduler] backfill`) the reserved head of the queue shows
+its predicted start, and the totals count what backfilling did:
+
+```text
+queued:   2
+  #1   test            app                  weight 6  waiting  4m10s  (budget: memory)  expected 9m  mem 18.0 GiB  reserved, eta 4m05s
+  #2   lint            app                  weight 1  waiting  1m02s  (budget)  expected 120ms
+backfill: 7 started before a reserved head, heads started 3.2s after their eta in total
+```
+
+`reserved, eta 4m05s` is the head's shadow time: when enough of the running jobs
+are predicted to have ended for it to fit, from their learned durations (a job
+past its expectation counts for 10 % of it plus 2 s more). It is a prediction;
+it moves as jobs finish early or late. The `backfill:` line appears once a job
+has started before a reserved head since the daemon started. In `--json`:
+`queued[].reserved_eta_ms` (only on the reserved head, milliseconds from the
+report) and `totals.backfilled` and `totals.backfill_head_delay_ms` (the sum,
+over the reserved heads that started, of how long after its first computed eta
+each did; zero when earlier). All optional and additive.
+
 <details>
 <summary>Full help</summary>
 

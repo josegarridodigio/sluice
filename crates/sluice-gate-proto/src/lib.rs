@@ -560,7 +560,7 @@ pub enum ServerMessage {
         id: u64,
         /// The report.
         #[serde(flatten)]
-        status: StatusReport,
+        status: Box<StatusReport>,
     },
     /// Reply to a logs request.
     Log {
@@ -965,6 +965,14 @@ impl QueuedJob {
         })
     }
 
+    /// `  reserved, eta 4m05s` on the reserved head (`dur` spells the
+    /// milliseconds), or nothing.
+    #[must_use]
+    pub fn reserved_text(&self, dur: impl Fn(u64) -> String) -> String {
+        self.reserved_eta_ms
+            .map_or_else(String::new, |ms| format!("  reserved, eta {}", dur(ms)))
+    }
+
     /// The `: <detail>` appended to the wait reason, or nothing.
     #[must_use]
     pub fn wait_detail_text(&self) -> String {
@@ -1236,6 +1244,10 @@ pub struct QueuedJob {
     /// the weight and the gates of the machine). Absent from older daemons.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_expected_basis: Option<String>,
+    /// Present on the reserved head only: milliseconds until it is predicted
+    /// to start (its shadow time, ADR-0023). Absent from older daemons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reserved_eta_ms: Option<u64>,
 }
 
 /// Why a queued job is not running yet.
@@ -1295,6 +1307,15 @@ pub struct Totals {
     /// Jobs started by over-admission (current daemon instance only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub over_admissions: Option<u64>,
+    /// Jobs that started before a reserved head (ADR-0023; current daemon
+    /// instance only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backfilled: Option<u64>,
+    /// Summed over the reserved heads that started: how long after its first
+    /// computed shadow time each did, in milliseconds (zero when earlier;
+    /// current daemon instance only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backfill_head_delay_ms: Option<u64>,
 }
 
 /// Payload of the `queue-status` reply (also `sluice queue status --json`).
@@ -2065,7 +2086,7 @@ mod tests {
             },
             ServerMessage::Status {
                 id: 2,
-                status: status_report(),
+                status: Box::new(status_report()),
             },
             ServerMessage::Log {
                 id: 3,
@@ -2522,7 +2543,7 @@ mod tests {
         report.queue = None;
         let line = encode(&ServerMessage::Status {
             id: 2,
-            status: report,
+            status: Box::new(report),
         })
         .unwrap();
         assert!(!line.contains("\"queue\""));
@@ -2532,7 +2553,7 @@ mod tests {
         assert_eq!(status.queue, None);
         let line = encode(&ServerMessage::Status {
             id: 2,
-            status: status_report(),
+            status: Box::new(status_report()),
         })
         .unwrap();
         assert!(line.contains(r#""queue":{"active":3,"ready":1,"needs_reconcile":0}"#));
@@ -2650,6 +2671,36 @@ mod tests {
             serde_json::from_str::<QueuedJob>(&json)
                 .unwrap()
                 .memory_expected_basis,
+            None
+        );
+    }
+    #[test]
+    fn the_backfill_fields_are_additive() {
+        let head = QueuedJob {
+            reserved_eta_ms: Some(245_000),
+            ..QueuedJob::default()
+        };
+        assert_eq!(
+            head.reserved_text(|ms| format!("{}s", ms / 1000)),
+            "  reserved, eta 245s"
+        );
+        assert_eq!(QueuedJob::default().reserved_text(|_| String::new()), "");
+        let plain = serde_json::to_string(&QueuedJob::default()).unwrap();
+        assert!(!plain.contains("reserved_eta_ms"), "{plain}");
+        let with = serde_json::to_string(&head).unwrap();
+        assert!(with.contains(r#""reserved_eta_ms":245000"#), "{with}");
+        let totals = Totals {
+            backfilled: Some(3),
+            backfill_head_delay_ms: Some(1500),
+            ..Totals::default()
+        };
+        let json = serde_json::to_string(&totals).unwrap();
+        assert!(json.contains(r#""backfilled":3"#), "{json}");
+        assert!(json.contains(r#""backfill_head_delay_ms":1500"#), "{json}");
+        let old = serde_json::to_string(&Totals::default()).unwrap();
+        assert!(!old.contains("backfill"), "{old}");
+        assert_eq!(
+            serde_json::from_str::<Totals>(&old).unwrap().backfilled,
             None
         );
     }

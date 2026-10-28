@@ -1,0 +1,8 @@
+# Written for the release after 0.7.0 (ADR-0023): `[scheduler] backfill`
+# (`true` by default; `false` restores the strict head reservation of ADR-0007).
+# Not a recording of a released binary; 0.7.0 and older reject this file
+# because `[scheduler]` refuses unknown keys.
+version = 1
+
+[scheduler]
+backfill = false

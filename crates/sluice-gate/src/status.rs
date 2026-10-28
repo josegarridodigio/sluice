@@ -123,9 +123,10 @@ fn render_jobs(out: &mut String, r: &StatusReport) {
             .expected_ms
             .map_or_else(String::new, |ms| format!("  expected {}", dur(ms)));
         let memory = j.memory_text();
+        let eta = j.reserved_text(dur);
         let _ = writeln!(
             out,
-            "  #{:<3} {:<16} {:<20} weight {:<2} waiting {:>8}  ({}{detail}){expected}{memory}",
+            "  #{:<3} {:<16} {:<20} weight {:<2} waiting {:>8}  ({}{detail}){expected}{memory}{eta}",
             j.rank.unwrap_or(i + 1),
             j.gate,
             basename(&j.repo),
@@ -218,6 +219,13 @@ fn render(r: &StatusReport, log_path: &Path, socket_fallback: Option<&str>) -> S
             t.over_admissions
                 .filter(|n| *n > 0)
                 .map_or_else(String::new, |n| format!(", {n} over-admitted"))
+        );
+    }
+    if let Some(n) = t.backfilled.filter(|n| *n > 0) {
+        let _ = writeln!(
+            out,
+            "backfill: {n} started before a reserved head, heads started {} after their eta in total",
+            dur(t.backfill_head_delay_ms.unwrap_or(0))
         );
     }
     out.push_str(&r.containment_text());
@@ -433,6 +441,33 @@ mod tests {
         assert!(
             text.contains(
                 "interventions:\n  2026-10-24T10:00:00Z  s-7f3a  s-7f3a/tools  oomd_memory_pressure\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn render_shows_the_reserved_head_eta_and_the_backfill_totals() {
+        let mut r = StatusReport::default();
+        r.queued.push(QueuedJob {
+            gate: "test".into(),
+            reserved_eta_ms: Some(245_000),
+            ..QueuedJob::default()
+        });
+        r.queued.push(QueuedJob {
+            gate: "lint".into(),
+            ..QueuedJob::default()
+        });
+        let plain = render(&r, Path::new("/l"), None);
+        assert!(plain.contains("reserved, eta 4m05s"), "{plain}");
+        assert_eq!(plain.matches("reserved, eta").count(), 1, "{plain}");
+        assert!(!plain.contains("backfill:"), "{plain}");
+        r.totals.backfilled = Some(4);
+        r.totals.backfill_head_delay_ms = Some(12_300);
+        let text = render(&r, Path::new("/l"), None);
+        assert!(
+            text.contains(
+                "backfill: 4 started before a reserved head, heads started 12.3s after their eta in total"
             ),
             "{text}"
         );

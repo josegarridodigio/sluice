@@ -363,6 +363,22 @@ this line) and `grep "after waiting"` gives the time of those that started.
 `free` is `MemAvailable`; `running headroom` is what the running jobs are still
 expected to grow by. Both lines are `info`.
 
+A job that starts before the reserved head (`[scheduler] backfill`) is logged
+with the rule that let it:
+
+```text
+job j12 (shop:lint) starts before the reserved head job j9 (shop:test) (extra resources): expected 0.1s, the head is predicted to start in 245.0s
+job j13 (shop:typecheck) starts before the reserved head job j9 (shop:test) (ends in time): expected 3.4s, the head is predicted to start in 244.0s
+```
+
+`grep "starts before the reserved head"` finds them. If a heavy job starts much
+later than the `eta` `sluice status` showed, compare `totals.backfill_head_delay_ms`
+with the number of `backfilled` jobs; a running job that overran its learned
+duration (or hangs) keeps the prediction late until it ends. Setting
+`[scheduler] backfill = false` restores the strict reservation, under which a
+job behind the head is `head-reserved` in `sluice logs --timeline` until the head
+starts.
+
 ### The stopgap holder
 
 The session hook creates `sluice-agents.scope` itself when no daemon runs. It

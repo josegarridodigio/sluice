@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Backfilling behind a reserved head** (ADR-0023). An overdue head that waits for
+  budget or memory still reserves, but a job behind it now starts when it cannot delay
+  it: the daemon predicts the head's start (its shadow time) from the running jobs'
+  learned durations, and lets a job start if it fits now and either the head still fits
+  beside it at that time (*extra resources*, no duration needed, works for first runs)
+  or its learned duration, times 1.5 or plus 10 s, ends before then (*ends in time*).
+  Nothing is killed for overrunning and a memory probe is never a backfill. The daemon
+  log says `starts before the reserved head`; `sluice status` shows the head's eta
+  (`reserved, eta 4m05s`) and, in the totals, the jobs backfilled and how late heads
+  started against their first eta (`backfilled`, `backfill_head_delay_ms` in
+  `--json`, additive). `[scheduler] backfill = false` restores the strict reservation;
+  the key is one-way (0.7.0 and older binaries reject it).
 - **First-run memory probe** (ADR-0022). A gate with no passing run may start
   as a *memory probe* when a quarter of its estimated peak is free, one probe per
   gate and one per machine at a time; it never over-admits. The daemon log says
@@ -23,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A job waiting behind the reserved head is no longer `head-reserved` for as long as the
+  head waits when it cannot delay the head (on one recorded day, 91 % of the
+  head-reserved minutes were jobs expected to run under a minute).
 - The guess for a gate that never ran is the 75th percentile of the learned
   peaks of the gates of the same or lighter weight, clamped between 1 GiB and the
   gate's weight share of the usable memory, instead of the share lowered to the

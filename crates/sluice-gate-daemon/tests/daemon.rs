@@ -277,7 +277,7 @@ async fn read_pid(path: &Path) -> i32 {
 async fn status(d: &Daemon) -> sluice_gate_proto::StatusReport {
     let (_w, mut r) = d.request(&ClientMessage::Status { id: 2 }).await;
     match next(&mut r).await {
-        Some(ServerMessage::Status { id: 2, status }) => status,
+        Some(ServerMessage::Status { id: 2, status }) => *status,
         other => panic!("unexpected {other:?}"),
     }
 }

@@ -69,7 +69,9 @@ use crate::psi::{self, Admission};
 use crate::reaper::Reaper;
 pub use crate::reaper::ReaperCommand;
 use crate::sampler::{self, JobUsage, Utilisation};
-use crate::scheduler::{self as sched, Class, Enqueued, JobSpec, Policy, Pressure, Scheduler};
+use crate::scheduler::{
+    self as sched, Class, Enqueued, HeadReservation, JobSpec, Policy, Pressure, Scheduler,
+};
 use crate::store::{
     FinishMeta, GateMemory, GateStat, JobRow, JobState, QueuedMeta, RequestRow, Store,
 };
@@ -413,6 +415,7 @@ fn policy(config: &DaemonConfig) -> Policy {
         human_first: s.human_first,
         learned_weights: s.learned_weights,
         repo_caps: config.repo_caps.clone(),
+        reservation: HeadReservation::backfill(s.backfill),
     }
 }
 
@@ -1452,7 +1455,7 @@ fn admit(shared: &Shared, now: u64) -> Vec<(String, sched::Admission)> {
         (u.idle_cpus(), u.sampled_at())
     };
     let facts = memory::facts(a, gates_memory(shared));
-    let (started, notes) = {
+    let (started, notes, backfills) = {
         let mut st = shared.state();
         // The working set each running job had at its last sample.
         let currents = st
@@ -1471,12 +1474,16 @@ fn admit(shared: &Shared, now: u64) -> Vec<(String, sched::Admission)> {
                 sampled_at,
             },
         );
-        (started, st.sched.take_memory_notes())
+        let notes = st.sched.take_memory_notes();
+        (started, notes, st.sched.take_backfill_notes())
     };
     // Memory waits are folded into the budget column and reason: the log is
     // where they show.
     for note in &notes {
         tracing::info!("{}", sched::memory_note_line(note));
+    }
+    for note in &backfills {
+        tracing::info!("{}", sched::backfill_line(note));
     }
     for (id, admission) in &started {
         match admission {
@@ -2574,6 +2581,19 @@ async fn dispatch_extension(
     }
 }
 
+/// The status report with the queue summary of the first active extension
+/// that has one.
+async fn status_with_queue(shared: &Shared) -> StatusReport {
+    let mut status = status_report(shared);
+    for e in &shared.extensions().active {
+        if let Some(summary) = e.status_summary().await {
+            status.queue = Some(summary);
+            break;
+        }
+    }
+    status
+}
+
 async fn handle_connection(shared: Arc<Shared>, stream: UnixStream) {
     let conn_id = shared.next_conn.fetch_add(1, Ordering::Relaxed);
     let peer_pid = stream.peer_cred().ok().and_then(|c| c.pid());
@@ -2605,13 +2625,7 @@ async fn handle_connection(shared: Arc<Shared>, stream: UnixStream) {
         }
         ClientMessage::Exec { id, request } => handle_exec(&shared, rd, wr, id, request).await,
         ClientMessage::Status { id } => {
-            let mut status = status_report(&shared);
-            for e in &shared.extensions().active {
-                if let Some(summary) = e.status_summary().await {
-                    status.queue = Some(summary);
-                    break;
-                }
-            }
+            let status = Box::new(status_with_queue(&shared).await);
             let _ = send(&mut wr, &ServerMessage::Status { id, status }).await;
         }
         msg @ (ClientMessage::QueueEnqueue { id, .. }
@@ -2684,7 +2698,7 @@ fn status_report(shared: &Shared) -> StatusReport {
         let adm = lock(&shared.psi);
         (adm.info(), adm.blocked_ms_total(), adm.blocking())
     };
-    let (running, queued, total, used, cap, over_admissions, memory) = {
+    let (running, queued, total, used, cap, over_admissions, backfill, memory) = {
         let st = shared.state();
         let (running, queued) = st.sched.snapshot(now, psi_blocking);
         let caller = |id: &str| {
@@ -2760,6 +2774,7 @@ fn status_report(shared: &Shared) -> StatusReport {
                         .memory_expected
                         .map(super::scheduler::Expected::learned),
                     memory_expected_basis: v.memory_expected.map(|e| e.basis.as_str().to_owned()),
+                    reserved_eta_ms: v.shadow_at.map(|at| at.saturating_sub(now)),
                 }
             })
             .collect();
@@ -2770,6 +2785,7 @@ fn status_report(shared: &Shared) -> StatusReport {
             st.sched.used(),
             st.sched.cap(),
             st.sched.over_admissions(),
+            st.sched.backfill_stats(),
             st.sched
                 .memory_facts()
                 .zip(st.sched.memory_headroom())
@@ -2811,6 +2827,8 @@ fn status_report(shared: &Shared) -> StatusReport {
     totals.idle_while_waiting_ms = Some(idle_while_waiting_ms);
     totals.waiting_wall_ms = Some(waiting_wall_ms);
     totals.over_admissions = Some(over_admissions);
+    totals.backfilled = Some(backfill.backfilled);
+    totals.backfill_head_delay_ms = Some(backfill.head_delay_ms);
     StatusReport {
         schema: STATUS_SCHEMA_VERSION,
         daemon: DaemonInfo {

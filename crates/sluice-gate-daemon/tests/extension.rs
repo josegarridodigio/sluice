@@ -206,7 +206,7 @@ impl Daemon {
 
     async fn status(&self) -> StatusReport {
         match self.ask(&ClientMessage::Status { id: 2 }).await {
-            ServerMessage::Status { status, .. } => status,
+            ServerMessage::Status { status, .. } => *status,
             other => panic!("unexpected {other:?}"),
         }
     }

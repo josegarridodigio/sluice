@@ -450,7 +450,7 @@ impl Daemon {
     /// The daemon's general status report (`sluice status`).
     pub async fn daemon_status(&self) -> sluice_gate_proto::StatusReport {
         match self.ask(&ClientMessage::Status { id: 3 }).await {
-            ServerMessage::Status { status, .. } => status,
+            ServerMessage::Status { status, .. } => *status,
             other => panic!("unexpected {other:?}"),
         }
     }

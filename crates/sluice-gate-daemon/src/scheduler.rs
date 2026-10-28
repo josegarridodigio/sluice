@@ -15,6 +15,11 @@ use std::path::{Path, PathBuf};
 use sluice_gate_core::key::CacheKey;
 use sluice_gate_proto::{WaitReason, gib_text};
 
+mod shadow;
+
+pub use shadow::BackfillRule;
+use shadow::{Head, Holder, Machine, Room, ends_in_time, predicted_end, room, shadow};
+
 /// Expected run time of a job without history (HRRN), milliseconds.
 pub const DEFAULT_EXPECTED_MS: u64 = 60_000;
 /// Samples needed before a learned weight is used.
@@ -286,6 +291,9 @@ pub struct QueuedView {
     /// Peak the job is expected to reach; `None` with memory-aware
     /// admission off.
     pub memory_expected: Option<Expected>,
+    /// The job is the reserved head and is predicted to start then (its
+    /// shadow time, unix milliseconds, ADR-0023).
+    pub shadow_at: Option<u64>,
 }
 
 /// Scheduling facts of one job for the timeline (`jobs` columns).
@@ -343,11 +351,29 @@ pub struct Policy {
     pub learned_weights: bool,
     /// Per-repository caps.
     pub repo_caps: BTreeMap<PathBuf, u32>,
+    /// What an overdue head's reservation lets through.
+    pub reservation: HeadReservation,
+}
+
+/// What an overdue head's reservation lets through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadReservation {
+    /// Nothing behind the head starts (ADR-0007).
+    Strict,
+    /// Jobs shown not to delay the head start before it (ADR-0023).
+    Backfill,
+}
+
+impl HeadReservation {
+    /// `Backfill` when `on`, else `Strict` (the `[scheduler] backfill` key).
+    pub fn backfill(on: bool) -> Self {
+        if on { Self::Backfill } else { Self::Strict }
+    }
 }
 
 impl Policy {
-    /// ADR-0007 behaviour: FIFO with backfill and reservation, every
-    /// ADR-0011 switch off.
+    /// ADR-0007 behaviour: FIFO with backfill and a strict reservation, every
+    /// ADR-0011 switch and the ADR-0023 backfill off.
     pub fn fifo(
         budget: u32,
         head_reserve_after_ms: u64,
@@ -365,6 +391,7 @@ impl Policy {
             human_first: false,
             learned_weights: false,
             repo_caps,
+            reservation: HeadReservation::Strict,
         }
     }
 
@@ -554,6 +581,13 @@ pub struct RunningSnap {
     pub learn_key: Option<LearnKey>,
     /// The job started as a first-run memory probe (ADR-0022).
     pub probe: bool,
+    /// Start time, unix milliseconds (the shadow time of ADR-0023).
+    pub started_at: u64,
+    /// Expected run time from history; `None` without any.
+    pub expected_ms: Option<u64>,
+    /// The job started behind a reserved head (ADR-0023): it counts for the
+    /// whole interval when later candidates are checked.
+    pub backfilled: bool,
 }
 
 /// Everything one admission decision depends on.
@@ -614,6 +648,12 @@ pub struct Plan {
     /// The jobs of `start` that start as first-run memory probes: they did
     /// not fit their estimate, only a quarter of it (ADR-0022).
     pub probes: Vec<String>,
+    /// When the reserved head is predicted to start (the shadow time,
+    /// unix milliseconds); `Some` exactly when `reserved` is.
+    pub shadow: Option<u64>,
+    /// The jobs of `start` that start before the reserved head, with the
+    /// rule that let them (ADR-0023).
+    pub backfills: Vec<(String, BackfillRule)>,
 }
 
 fn overdue(s: &Snapshot<'_>, j: &QueuedSnap) -> bool {
@@ -753,13 +793,16 @@ impl MemPass {
             && probe_share(e.bytes) <= self.free()
     }
 
-    /// The job starts: its whole expected peak counts from now on, or a
-    /// quarter of it for a probe (what the probe is expected to need).
-    fn start(&mut self, i: usize, key: Option<&LearnKey>, probe: bool) {
+    /// What a started job holds back: its whole expected peak, or a quarter
+    /// of it for a probe (what the probe is expected to need).
+    fn cost(&self, i: usize, probe: bool) -> u64 {
         let e = self.peaks[i].bytes;
-        self.held = self
-            .held
-            .saturating_add(if probe { probe_share(e) } else { e });
+        if probe { probe_share(e) } else { e }
+    }
+
+    /// The job starts: [`MemPass::cost`] counts from now on.
+    fn start(&mut self, i: usize, key: Option<&LearnKey>, probe: bool) {
+        self.held = self.held.saturating_add(self.cost(i, probe));
         self.busy = true;
         self.probing |= probe;
         if let Some(k) = key {
@@ -768,15 +811,27 @@ impl MemPass {
     }
 }
 
+/// What one running job is still expected to grow by:
+/// `max(0, expected - current)`.
+fn headroom_of(s: &Snapshot<'_>, facts: &MemoryFacts, r: &RunningSnap) -> u64 {
+    let e = estimate_job(s, facts, r.expected_peak, r.lower_bound, r.weight).bytes;
+    // A probe is expected to need a quarter of its estimate.
+    let e = if r.probe { probe_share(e) } else { e };
+    e.saturating_sub(r.current)
+}
+
 /// Headroom of the running jobs: what they are still expected to grow by
 /// (`max(0, expected - current)`, summed).
 fn running_headroom_of(s: &Snapshot<'_>, facts: &MemoryFacts) -> u64 {
-    s.running.iter().fold(0, |held, r| {
-        let e = estimate_job(s, facts, r.expected_peak, r.lower_bound, r.weight).bytes;
-        // A probe is expected to need a quarter of its estimate.
-        let e = if r.probe { probe_share(e) } else { e };
-        held.saturating_add(e.saturating_sub(r.current))
-    })
+    s.running
+        .iter()
+        .fold(0, |held, r| held.saturating_add(headroom_of(s, facts, r)))
+}
+
+/// The memory a running job hands back when it ends, in the terms of
+/// admission: what it holds now plus what it is still expected to grow by.
+fn running_release(s: &Snapshot<'_>, facts: &MemoryFacts, r: &RunningSnap) -> u64 {
+    r.current.saturating_add(headroom_of(s, facts, r))
 }
 
 /// The expected peak of a job of effective weight `weight` with the given
@@ -815,6 +870,20 @@ struct Pass<'s> {
     /// `(repo, weight)` of the running jobs and of those started so far.
     held: Vec<(&'s Path, u32)>,
     mem: Option<MemPass>,
+    /// The running jobs and those started so far, for the shadow time.
+    holders: Vec<Holder<'s>>,
+    /// The reserved head, once the pass has found one (ADR-0023).
+    reservation: Option<Reservation<'s>>,
+}
+
+/// The head holding the reservation of a pass, when it could start and what
+/// a job started behind it may still take.
+struct Reservation<'s> {
+    /// Queue index of the head.
+    head: usize,
+    /// Its shadow time, unix milliseconds.
+    shadow_at: u64,
+    room: Room<'s>,
 }
 
 impl<'s> Pass<'s> {
@@ -830,6 +899,17 @@ impl<'s> Pass<'s> {
             .map(|r| (r.repo.as_path(), r.weight))
             .collect();
         let mem = s.memory.map(|facts| MemPass::new(&s, facts, &w));
+        let holders = s
+            .running
+            .iter()
+            .map(|r| Holder {
+                repo: r.repo.as_path(),
+                weight: r.weight,
+                end: predicted_end(s.now, r.started_at, r.expected_ms),
+                memory: s.memory.map_or(0, |f| running_release(&s, &f, r)),
+                backfilled: r.backfilled,
+            })
+            .collect();
         Self {
             s,
             lanes,
@@ -837,6 +917,8 @@ impl<'s> Pass<'s> {
             w,
             held,
             mem,
+            holders,
+            reservation: None,
         }
     }
 
@@ -890,10 +972,67 @@ impl<'s> Pass<'s> {
     }
 
     /// Admits job `i` into the pass: its weight and memory count from now on.
+    /// A job admitted under a reservation is a backfill: it counts for the
+    /// whole interval and takes its share of the room beside the head.
     fn start(&mut self, i: usize, probe: bool) {
-        self.held.push((self.s.queued[i].repo.as_path(), self.w[i]));
+        let s = self.s;
+        let j = &s.queued[i];
+        self.held.push((j.repo.as_path(), self.w[i]));
+        let peak = self.mem.as_ref().map(|m| m.peaks[i].bytes);
+        let memory = self.mem.as_ref().map_or(0, |m| m.cost(i, probe));
         if let Some(m) = &mut self.mem {
-            m.start(i, self.s.queued[i].learn_key.as_ref(), probe);
+            m.start(i, j.learn_key.as_ref(), probe);
+        }
+        self.holders.push(Holder {
+            repo: j.repo.as_path(),
+            weight: self.w[i],
+            end: predicted_end(s.now, s.now, j.expected_ms),
+            memory,
+            backfilled: self.reservation.is_some(),
+        });
+        if let Some(res) = &mut self.reservation {
+            res.room.take(self.w[i], peak);
+        }
+    }
+
+    /// Job `i` becomes the reserved head: its shadow time and the room beside
+    /// it are fixed for the rest of the pass.
+    fn reserve(&mut self, i: usize) {
+        let s = self.s;
+        let j = &s.queued[i];
+        let head = Head {
+            repo: j.repo.as_path(),
+            weight: self.w[i],
+            repo_cap: s.policy.repo_caps.get(&j.repo).copied(),
+            peak: self.mem.as_ref().map(|m| m.peaks[i].bytes),
+        };
+        let machine = Machine {
+            budget: s.policy.budget,
+            free: self.mem.as_ref().map_or(0, MemPass::free),
+        };
+        let at = shadow(s.now, &self.holders, &head, &machine);
+        self.reservation = Some(Reservation {
+            head: i,
+            shadow_at: at.at,
+            room: room(&self.holders, &at, &head, &machine),
+        });
+    }
+
+    /// The rule that lets job `i`, which fits now, start before the reserved
+    /// head; `None` when it may not (or backfilling is off).
+    fn backfill_rule(&self, i: usize) -> Option<BackfillRule> {
+        let res = self
+            .reservation
+            .as_ref()
+            .filter(|_| self.s.policy.reservation == HeadReservation::Backfill)?;
+        let j = &self.s.queued[i];
+        let peak = self.mem.as_ref().map(|m| m.peaks[i].bytes);
+        if res.room.admits(&j.repo, self.w[i], peak) {
+            Some(BackfillRule::ExtraResources)
+        } else if ends_in_time(self.s.now, j.expected_ms, res.shadow_at) {
+            Some(BackfillRule::EndsInTime)
+        } else {
+            None
         }
     }
 
@@ -920,29 +1059,39 @@ impl<'s> Pass<'s> {
         }
     }
 
-    /// The nominal pass in rank order with backfill and head reservation.
-    /// Returns the reserved head and the jobs left waiting.
+    /// The nominal pass in rank order with the head reservation, and the
+    /// jobs that start before the reserved head (ADR-0023). Returns the
+    /// reserved head and the jobs left waiting.
     fn nominal(&mut self, plan: &mut Plan) -> (Option<usize>, Vec<usize>) {
         let s = self.s;
         let used0 = self.used();
-        let mut reserved: Option<usize> = None;
         let mut first_waiting = true;
         let mut started: Vec<usize> = Vec::new();
         let mut waiting: Vec<usize> = Vec::new();
         for i in self.order.clone() {
             let j = &s.queued[i];
+            let reserved = self.reservation.is_some();
             let fits_budget = self.used() + self.w[i] <= s.policy.budget;
             let fits_cap = self.fits_repo(i);
             let mut fits_mem = self.fits_mem(i);
             // A job that does not fit its estimate may still probe it
-            // (ADR-0022); a reserved head holds everything back.
-            let probe =
-                !fits_mem && reserved.is_none() && fits_budget && fits_cap && self.probe_mem(i);
+            // (ADR-0022); behind a reserved head only a job that fits its
+            // whole estimate may start, so a probe never backfills.
+            let probe = !fits_mem && !reserved && fits_budget && fits_cap && self.probe_mem(i);
             fits_mem |= probe;
-            if reserved.is_none() && fits_budget && fits_cap && fits_mem {
+            let fits = fits_budget && fits_cap && fits_mem;
+            let rule = if fits && reserved {
+                self.backfill_rule(i)
+            } else {
+                None
+            };
+            if fits && (!reserved || rule.is_some()) {
                 plan.start.push((j.id.clone(), Admission::Nominal));
                 if probe {
                     plan.probes.push(j.id.clone());
+                }
+                if let Some(rule) = rule {
+                    plan.backfills.push((j.id.clone(), rule));
                 }
                 self.start(i, probe);
                 started.push(i);
@@ -952,29 +1101,15 @@ impl<'s> Pass<'s> {
             // head blocked by its repository cap alone must not stop other
             // repositories.
             if first_waiting
-                && reserved.is_none()
+                && !reserved
                 && overdue(&s, j)
                 && (!fits_budget || (fits_cap && !fits_mem))
             {
-                reserved = Some(i);
+                self.reserve(i);
             }
             first_waiting = false;
-            let (cause, detail) = if !fits_budget {
-                if !started.is_empty() && used0 + self.w[i] <= s.policy.budget {
-                    (
-                        WaitCause::Order,
-                        Some(order_detail(&s, &self.lanes, &started, i)),
-                    )
-                } else {
-                    (WaitCause::Budget, None)
-                }
-            } else if !fits_cap {
-                (WaitCause::RepoCap, None)
-            } else if !fits_mem {
-                (WaitCause::Memory, Some("memory"))
-            } else {
-                (WaitCause::Reserved, None)
-            };
+            let (cause, detail) =
+                self.wait_cause(&started, used0, i, [fits_budget, fits_cap, fits_mem]);
             waiting.push(i);
             plan.waits.push(Wait {
                 id: j.id.clone(),
@@ -982,7 +1117,34 @@ impl<'s> Pass<'s> {
                 detail,
             });
         }
-        (reserved, waiting)
+        plan.shadow = self.reservation.as_ref().map(|r| r.shadow_at);
+        (self.reservation.as_ref().map(|r| r.head), waiting)
+    }
+
+    /// Why job `i`, which did not start, waits; `fits` is the budget, the
+    /// repository cap and the memory.
+    fn wait_cause(
+        &self,
+        started: &[usize],
+        used0: u32,
+        i: usize,
+        fits: [bool; 3],
+    ) -> (WaitCause, Option<&'static str>) {
+        let [fits_budget, fits_cap, fits_mem] = fits;
+        if !fits_budget {
+            if !started.is_empty() && used0 + self.w[i] <= self.s.policy.budget {
+                let detail = order_detail(&self.s, &self.lanes, started, i);
+                (WaitCause::Order, Some(detail))
+            } else {
+                (WaitCause::Budget, None)
+            }
+        } else if !fits_cap {
+            (WaitCause::RepoCap, None)
+        } else if !fits_mem {
+            (WaitCause::Memory, Some("memory"))
+        } else {
+            (WaitCause::Reserved, None)
+        }
     }
 
     /// At most one over-admission (the reserved head, else the first ranked
@@ -1154,11 +1316,7 @@ pub struct MemoryNote {
 impl MemoryNote {
     /// `<id> (<repo basename>:<gate>)`.
     fn who(&self) -> String {
-        let repo = self
-            .repo
-            .file_name()
-            .map_or_else(|| "?".into(), |n| n.to_string_lossy());
-        format!("job {} ({repo}:{})", self.job, self.gate)
+        who(&self.job, &self.repo, &self.gate)
     }
 
     /// `18.0 GiB learned` / `0.4 GiB lower-bound` / `18.0 GiB guessed`,
@@ -1252,6 +1410,64 @@ fn memory_note(
     }
 }
 
+/// A job that started before the reserved head, for the log (ADR-0023).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackfillNote {
+    /// Job id.
+    pub job: String,
+    /// Repository of the job.
+    pub repo: PathBuf,
+    /// Gate name.
+    pub gate: String,
+    /// The rule that let it start.
+    pub rule: BackfillRule,
+    /// Its learned duration, if any.
+    pub expected_ms: Option<u64>,
+    /// The reserved head: job id, repository and gate.
+    pub head: (String, PathBuf, String),
+    /// Milliseconds until the head's shadow time, as of the pass.
+    pub shadow_in_ms: u64,
+}
+
+/// `<id> (<repo basename>:<gate>)`.
+fn who(job: &str, repo: &Path, gate: &str) -> String {
+    let repo = repo
+        .file_name()
+        .map_or_else(|| "?".into(), |n| n.to_string_lossy());
+    format!("job {job} ({repo}:{gate})")
+}
+
+/// Milliseconds as `12.3s`.
+fn seconds_text(ms: u64) -> String {
+    format!("{}.{}s", ms / 1000, ms % 1000 / 100)
+}
+
+/// The line logged when a job starts before the reserved head.
+pub fn backfill_line(n: &BackfillNote) -> String {
+    let (head, head_repo, head_gate) = &n.head;
+    format!(
+        "{} starts before the reserved head {} ({}): expected {}, the head is predicted to \
+         start in {}",
+        who(&n.job, &n.repo, &n.gate),
+        who(head, head_repo, head_gate),
+        n.rule.as_str(),
+        n.expected_ms
+            .map_or_else(|| "unknown".to_owned(), seconds_text),
+        seconds_text(n.shadow_in_ms),
+    )
+}
+
+/// What backfilling did since the daemon started.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackfillStats {
+    /// Jobs that started before a reserved head.
+    pub backfilled: u64,
+    /// Summed over the reserved heads that started: how long after its first
+    /// computed shadow time each did (zero when it started earlier),
+    /// milliseconds.
+    pub head_delay_ms: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Stateful scheduler
 // ---------------------------------------------------------------------------
@@ -1273,6 +1489,8 @@ struct Job {
     memory_blocked_at: Option<u64>,
     /// The job started as a first-run memory probe (ADR-0022).
     probe: bool,
+    /// The job started before the reserved head (ADR-0023).
+    backfilled: bool,
     cause: WaitCause,
     detail: Option<&'static str>,
     accounted_at: u64,
@@ -1291,6 +1509,7 @@ impl Job {
             memory_wait_ms: 0,
             memory_blocked_at: None,
             probe: false,
+            backfilled: false,
             cause: WaitCause::Budget,
             detail: None,
             accounted_at,
@@ -1334,6 +1553,9 @@ impl Job {
             lower_bound: None,
             learn_key: self.spec.learn_key.clone(),
             probe: self.probe,
+            started_at: self.started_at,
+            expected_ms: self.spec.expected_ms,
+            backfilled: self.backfilled,
         }
     }
 }
@@ -1367,6 +1589,14 @@ pub struct Scheduler {
     last_now: u64,
     /// Memory waits to log, drained by [`Scheduler::take_memory_notes`].
     notes: Vec<MemoryNote>,
+    /// Starts before a reserved head to log, drained by
+    /// [`Scheduler::take_backfill_notes`].
+    backfill_notes: Vec<BackfillNote>,
+    /// The first shadow time computed for each reserved head still queued.
+    first_shadows: BTreeMap<String, u64>,
+    /// Jobs started before a reserved head, and the time the reserved heads
+    /// that have started did so after their first shadow time.
+    backfill_stats: BackfillStats,
 }
 
 impl Scheduler {
@@ -1396,6 +1626,9 @@ impl Scheduler {
             over_admissions: 0,
             last_now: 0,
             notes: Vec::new(),
+            backfill_notes: Vec::new(),
+            first_shadows: BTreeMap::new(),
+            backfill_stats: BackfillStats::default(),
         }
     }
 
@@ -1504,6 +1737,17 @@ impl Scheduler {
     /// started).
     pub fn take_memory_notes(&mut self) -> Vec<MemoryNote> {
         std::mem::take(&mut self.notes)
+    }
+
+    /// The jobs the passes since the last call started before a reserved
+    /// head, oldest first.
+    pub fn take_backfill_notes(&mut self) -> Vec<BackfillNote> {
+        std::mem::take(&mut self.backfill_notes)
+    }
+
+    /// Backfilled jobs and head delay since the daemon started.
+    pub fn backfill_stats(&self) -> BackfillStats {
+        self.backfill_stats
     }
 
     /// Adds a request. The configured weight is clamped to
@@ -1639,6 +1883,7 @@ impl Scheduler {
             job.account(now);
         }
         let plan = self.plan_at(now, pressure);
+        let head = self.note_shadow(&plan);
         // What the running jobs still hold back, before this pass starts any.
         let memory = self.memory.zip(self.memory_headroom());
         // Every queued job takes the weight of this pass; a started one keeps
@@ -1669,6 +1914,7 @@ impl Scheduler {
             }
             job.started_at = now;
             job.admission = Some(*admission);
+            self.record_start(&mut job, &plan, head.as_ref());
             self.last_start_at = Some(now);
             if *admission == Admission::Over {
                 self.last_overcommit_at = Some(now);
@@ -1677,6 +1923,8 @@ impl Scheduler {
             self.running.push(job);
         }
         // The waiting jobs see the jobs this pass started as running.
+        self.first_shadows
+            .retain(|id, _| self.queue.iter().any(|j| &j.spec.id == id));
         let memory = self.memory.zip(self.memory_headroom());
         for wait in &plan.waits {
             if let Some(job) = self.queue.iter_mut().find(|j| j.spec.id == wait.id) {
@@ -1693,6 +1941,53 @@ impl Scheduler {
             }
         }
         plan.start
+    }
+
+    /// Remembers the first shadow time of the reserved head of `plan`; returns
+    /// the head's id, repository and gate for the log.
+    fn note_shadow(&mut self, plan: &Plan) -> Option<(String, PathBuf, String)> {
+        let id = plan.reserved.as_ref()?;
+        if let Some(at) = plan.shadow {
+            self.first_shadows.entry(id.clone()).or_insert(at);
+        }
+        let head = self.queue.iter().find(|j| &j.spec.id == id)?;
+        Some((id.clone(), head.spec.repo.clone(), head.spec.gate.clone()))
+    }
+
+    /// Books a job `plan` starts: a start before the reserved head is flagged
+    /// (so later passes count it for the whole interval), counted and logged;
+    /// a reserved head's start is measured against its first shadow time.
+    fn record_start(
+        &mut self,
+        job: &mut Job,
+        plan: &Plan,
+        head: Option<&(String, PathBuf, String)>,
+    ) {
+        let id = &job.spec.id;
+        if let Some(first) = self.first_shadows.remove(id) {
+            let late = job.started_at.saturating_sub(first);
+            self.backfill_stats.head_delay_ms =
+                self.backfill_stats.head_delay_ms.saturating_add(late);
+        }
+        let rule = plan
+            .backfills
+            .iter()
+            .find(|(b, _)| b == id)
+            .map(|(_, r)| *r);
+        let (Some(rule), Some(head)) = (rule, head) else {
+            return;
+        };
+        job.backfilled = true;
+        self.backfill_stats.backfilled += 1;
+        self.backfill_notes.push(BackfillNote {
+            job: id.clone(),
+            repo: job.spec.repo.clone(),
+            gate: job.spec.gate.clone(),
+            rule,
+            expected_ms: job.spec.expected_ms,
+            head: head.clone(),
+            shadow_in_ms: plan.shadow.unwrap_or(0).saturating_sub(job.started_at),
+        });
     }
 
     /// The first ranked queued job at `now`: `(id, queued_at)`.
@@ -1879,6 +2174,7 @@ impl Scheduler {
                     rank: pos + 1,
                     expected_ms: j.spec.expected_ms,
                     memory_expected: plan.expected.get(pos).copied(),
+                    shadow_at: plan.shadow.filter(|_| plan.reserved.as_ref() == Some(id)),
                 })
             })
             .collect();

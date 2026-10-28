@@ -305,7 +305,7 @@ impl Client {
     pub fn status(mut self) -> std::result::Result<StatusReport, ClientError> {
         self.send(&ClientMessage::Status { id: 1 })?;
         match self.recv()? {
-            ServerMessage::Status { status, .. } => Ok(status),
+            ServerMessage::Status { status, .. } => Ok(*status),
             other => Err(anyhow!("unexpected reply to status: {other:?}").into()),
         }
     }

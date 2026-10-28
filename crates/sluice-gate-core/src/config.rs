@@ -977,6 +977,10 @@ pub struct SchedulerConfig {
     pub human_first: bool,
     /// Order among jobs of equal priority (ADR-0011 M7).
     pub order: QueueOrder,
+    /// A job that cannot delay the reserved head (it fits beside it, or ends
+    /// before it could start) starts before it (ADR-0023); `false` keeps the
+    /// strict reservation: nothing behind the head starts.
+    pub backfill: bool,
 }
 
 impl Default for SchedulerConfig {
@@ -987,6 +991,7 @@ impl Default for SchedulerConfig {
             fairness: Fairness::Lane,
             human_first: true,
             order: QueueOrder::Fifo,
+            backfill: true,
         }
     }
 }

@@ -71,7 +71,19 @@ run at once, and it makes identical simultaneous requests share one run.
   take turns (`fairness = "lane"`) and arrival order decides (`order =
   "fifo"`, or `sjf`). A job that does not fit is backfilled around, up to a
   head-of-line reservation (`head_reserve_after`, 30 s) that also bounds how
-  long anything can be overtaken, so heavy jobs never starve. While the
+  long anything can be overtaken, so heavy jobs never starve. Once the head is
+  reserved (waiting for budget or for memory), a job behind it still starts when
+  it cannot delay it: the daemon predicts when the head could start (its
+  *shadow time*: the running jobs end at their start plus their learned
+  duration, the head starts once enough of them are gone to fit its budget and
+  memory) and lets a later job start if it fits now and either the head still
+  fits at that time beside it and everything else started behind the head
+  (*extra resources*, no duration needed, works for first runs), or it is
+  expected to end before then (*ends in time*: its learned duration times 1.5,
+  or plus 10 s if that is more). `sluice status` shows the head's eta; `[scheduler]
+  backfill = false` restores the strict reservation, where nothing behind the
+  head starts. Nothing is killed for overrunning: a late job only moves the
+  prediction, which every pass recomputes, and no memory probe is a backfill. While the
   machine is calm and CPUs are idle, one job at a time may start beyond the
   budget, up to `overcommit` (default 1.5) times it, at most once per
   `overcommit_interval` (5 s). `sluice logs --timeline` shows why each job
