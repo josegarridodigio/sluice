@@ -10,8 +10,8 @@ Approved by the user on 2026-10-28; started after release 0.7.0. Research:
 [[sluice/research/protected-targets-analysis.md]] (S3). Decisions:
 [[sluice/design/adr/0022-first-run-memory-estimate.md]] (S4),
 [[sluice/design/adr/0023-backfilling-behind-a-reserved-head.md]] (S1),
-[[sluice/design/adr/0024-stalled-jobs-are-reported-never-killed.md]] (S2); S3 gets its ADR
-when its wave starts. Sub-agents run on Sonnet; each wave ends with the full verification
+[[sluice/design/adr/0024-stalled-jobs-are-reported-never-killed.md]] (S2); S3:
+[[sluice/design/adr/0025-protected-targets-and-pull-request-landing.md]]. Sub-agents run on Sonnet; each wave ends with the full verification
 through Sluice, Matrix on the branch before a release (watched job by job).
 
 ## User decisions (2026-10-28)
@@ -22,6 +22,9 @@ through Sluice, Matrix on the branch before a release (watched job by job).
 | 2 | Stalled jobs | Report only, never kill (no kill setting) |
 | 3 | Enqueue on a target that requires pull requests | Warn only (never refuse) |
 | 4 | Pull-request mode, target moves before the forge merges | Wait for the forge; never call a different merged tree verified |
+| 5 | Who talks to the forge with the user's `gh` (keyring login) | The client: `approve` opens the PR, `status`/`reconcile` read it |
+| 6 | Commit status on the PR | Later, opt-in |
+| 7 | Release | Q1-Q4 together, one release |
 
 ## Waves
 
@@ -30,7 +33,8 @@ through Sluice, Matrix on the branch before a release (watched job by job).
 | Q1 | S4: lower bounds from failed runs, capped prior, first-run probe (ADR-0022) | done, verified through Sluice ([[sluice/changes/queue-q1-first-run-memory.md]]) |
 | Q2 | S1: shadow time, extra-resources and duration rules, head-delay counter, switch (ADR-0023) | done, verified through Sluice ([[sluice/changes/queue-q2-backfilling.md]]) |
 | Q3 | S2: stall detection and reporting, longest quiet window per job (ADR-0024) | done, verified through Sluice ([[sluice/changes/queue-q3-stalled-jobs.md]]) |
-| Q4 | S3: protected targets: detection (warn), then pull-request landing (ADR to write) | pending |
+| Q4a | S3: target probe at enqueue and in doctor (warn only), `target_protected` reason and learned signal (ADR-0025 1-2) | pending |
+| Q4b | S3: `land = "pull-request"`: branch push, `awaiting_merge`, client opens and reads the PR, reconcile table (ADR-0025 3-7) | pending |
 
 ## Evidence (a second machine, 12 threads, 30 GiB, 2026-10-28, daemon 0.6.3)
 
