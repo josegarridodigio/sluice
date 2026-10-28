@@ -80,6 +80,31 @@ pub struct Resolved {
 pub fn resolve_repo(cwd: &Path, env: &EnvMap, mode: &CacheMode) -> Result<RepoContext> {
     let paths = git::discover(cwd, env)?;
     let config = RepoConfig::load(&paths.toplevel)?;
+    build_context(paths, config, env, mode)
+}
+
+/// [`resolve_repo`] for a repository that may have no `.sluice.toml` (the hook
+/// runner): a missing file means [`RepoConfig::implicit`]; an invalid one is
+/// still an error.
+///
+/// # Errors
+///
+/// See [`resolve_repo`], except [`crate::Error::ConfigNotFound`].
+pub fn resolve_repo_or_implicit(cwd: &Path, env: &EnvMap, mode: &CacheMode) -> Result<RepoContext> {
+    let paths = git::discover(cwd, env)?;
+    let config = match RepoConfig::load(&paths.toplevel) {
+        Err(crate::Error::ConfigNotFound(_)) => RepoConfig::implicit(),
+        other => other?,
+    };
+    build_context(paths, config, env, mode)
+}
+
+fn build_context(
+    paths: git::RepoPaths,
+    config: RepoConfig,
+    env: &EnvMap,
+    mode: &CacheMode,
+) -> Result<RepoContext> {
     let user = if *mode == CacheMode::Bypass {
         UserConfig::default()
     } else {
@@ -121,6 +146,43 @@ impl RepoContext {
             store: self.store.clone(),
             ttl: self.ttl,
             child_env: OnceCell::new(),
+        })
+    }
+}
+
+impl RepoContext {
+    /// A synthetic gate that is not in `.sluice.toml` (a unit of a repository
+    /// hook). Its process environment is `env` without `CLAUDE*` variables
+    /// plus `gate.env`; unless `keep_git_env`, the variables git sets for
+    /// hooks (`GIT_DIR`, `GIT_INDEX_FILE`, ...) are removed too, like for a
+    /// configured gate. A unit that edits or reads the index needs them.
+    ///
+    /// # Errors
+    ///
+    /// When git cannot list its local environment variables.
+    pub fn select_unit(&self, name: &str, gate: Gate, keep_git_env: bool) -> Result<Resolved> {
+        let mut child: EnvMap = if keep_git_env {
+            self.env
+                .iter()
+                .filter(|(k, _)| !k.starts_with("CLAUDE"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        } else {
+            git::child_env(&self.env)?
+        };
+        child.extend(gate.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        Ok(Resolved {
+            env: self.env.clone(),
+            paths: self.paths.clone(),
+            config: self.config.clone(),
+            user: self.user.clone(),
+            gate_name: name.to_owned(),
+            gate,
+            probe_env: self.probe_env.clone(),
+            scratch: self.scratch.clone(),
+            store: self.store.clone(),
+            ttl: self.ttl,
+            child_env: OnceCell::from(child),
         })
     }
 }

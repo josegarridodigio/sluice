@@ -3,9 +3,10 @@
 Sluice can be the git hooks entry point of a clone without editing the
 repository. `sluice hooks on` makes git call Sluice for every hook, and Sluice
 runs the hook the repository would have run anyway (husky, lefthook,
-pre-commit or plain hooks), untouched. In this release nothing about what runs
-changes; it is the base for running the hooks' commands through the queue and
-the cache ([ADR-0021](../kb/sluice/design/adr/0021-sluice-runs-the-repository-hooks.md)).
+pre-commit or plain hooks). When it understands a husky or plain hook
+completely it runs the hook's commands itself, through the queue and the cache
+("Units"); otherwise it runs the hook untouched
+([ADR-0021](../kb/sluice/design/adr/0021-sluice-runs-the-repository-hooks.md)).
 
 Use it when the hook files cannot be rewired (`sluice init`, which edits them)
 because a hook manager or a teammate owns them.
@@ -55,6 +56,12 @@ common git directory.
 
 ## What runs
 
+Two things can happen to a hook, decided each time git runs it, from the files as
+they are at that moment: Sluice runs its **units** ("Units", husky and plain
+hooks only), or it **delegates** the hook untouched. `sluice hooks status` shows
+which, and why, for every hook of the repository. This section describes
+delegation, which is also the fallback of units.
+
 `sluice hooks run` asks git what `core.hooksPath` would be without Sluice's
 value (so a husky rewrite made after activation is followed) and executes
 `<that directory>/<hook>` in place, replacing itself: the same arguments, the
@@ -75,6 +82,83 @@ detected at run time (`sluice hooks status` shows it), so a teammate changing
 the hooks or migrating managers needs no Sluice change. A manager that was
 configured but never installed in this clone (for example, `lefthook.yml`
 without `lefthook install`) ran nothing before and runs nothing now.
+
+## Units (husky and plain hooks)
+
+A husky hook (`.husky/<hook>`, behind husky 9's `_/h`) or a plain hook file is
+run as units when every line is one of: blank, a comment, a `#!/bin/sh` or
+`bash` shebang, husky's v4-v8 bootstrap line (`. "$(dirname -- "$0")/_/husky.sh"`),
+`set -e`, a trailing `exit 0`, or simple commands joined by `&&`. A simple
+command has literal words and `'single'`/`"double"` quoted strings without
+expansions. Anything else delegates the whole hook: variables, `$(...)`,
+backticks, globs, redirections, pipes, `||`, `;`, `if`/`while`/functions,
+`cd`, `export`, here-documents, line continuations, trailing comments, `echo`
+and other builtins, `$1`/`"$@"` (the hook's arguments), another interpreter's
+shebang. Also delegated: a plain hook with several lines and no `set -e`; a hook
+whose command is `sluice` itself (it is already routed); husky when `HUSKY` is
+set, `~/.config/husky/init.sh` or `~/.huskyrc` exists, or `_/h` is not the
+version whose behaviour Sluice knows; a hook that receives stdin (`pre-push`,
+`post-rewrite`, ...) with any unit that is not a recognised read-only check; lefthook and pre-commit (their
+units come later); `SLUICE_HOOKS_DELEGATE=1` or `SLUICE_DISABLE=1`; and any
+case where the daemon cannot be reached or started, or the repository cannot be
+resolved, before the first unit runs (the whole hook is delegated, never part
+of it).
+
+Each unit runs in the working tree, from the worktree root, in file order and
+with `sh -e` semantics, as a job of the daemon (queue, budget, containment,
+logs), exactly like `sluice run` runs a gate. husky's `h` does one thing that
+matters here and Sluice reproduces it: `node_modules/.bin` (relative) is put
+before `PATH`. A hook's stdin is not given to a unit, so a hook that receives
+stdin (`pre-push`, `post-rewrite`, ...) runs as units only when every unit is a
+check (the recognised tools do not read stdin): `pre-push` with `npm test` is
+accelerated, `pre-push` with an unknown program is delegated. The file does not need a `.sluice.toml`;
+when there is one it is only read for its settings.
+
+- A unit that may change files or the index is **mutating**: `lint-staged`,
+  `pretty-quick`, `nano-staged`, anything with `--staged`/`--cached`, `git`,
+  formatters with a write flag (`--fix`, `--write`, `-w`, `-i`, `cargo fmt`
+  without `--check`, `black` without `--check`, `ruff format`, `gofmt -w`,
+  `go fmt`), package-manager installs, `npm|pnpm|yarn audit` (its answer comes from the
+  advisory database, not from the tree, so it is never cached), package scripts whose body contains one of
+  those or whose name says `fix`/`format`/`write`, and every program Sluice does
+  not recognise as read-only. Mutating units always run and are never cached,
+  and they keep the variables git sets for the hook (`GIT_INDEX_FILE`, ...) so
+  `git add` and `lint-staged` act on the index the commit uses.
+- A unit recognised as read-only is a **check**: test runners, linters and type
+  checkers, formatters in check mode, build tools, and `npm|pnpm|yarn run <script>`
+  whose script body (and `pre`/`post` scripts) is made only of those. Its pass is
+  cached. A check runs without git's hook variables, like a gate does.
+- **The cache key** is that of a gate ([how it works](how-it-works.md)): the working tree
+  content at the moment the unit starts (so, after the earlier units ran), the
+  unit's name (`<manager>:<hook>#<position>`), its exact command, and the
+  environment addition (husky: the full `PATH` husky would give it, so a
+  different `PATH` is a different key). A pass is stored only if the unit did not
+  change the tree; a failure is never stored as a pass. If the tree cannot be
+  described (unmerged or skip-worktree entries, submodules) or the key cannot be derived, the
+  unit runs uncached. A cached pass prints one line, `sluice: husky:pre-commit#2
+  PASS (cached, passed ...)`, and skips the run. Dependencies that are not
+  tracked (`node_modules`) are not part of the key, as for gates.
+- **Exit codes.** The hook exits with the exit code of the unit that ended it,
+  as `sh -e` would (a non-final member of an `&&` list that fails skips the rest
+  of its list and the hook goes on with the next line, as `sh -e` does). husky's
+  `husky - <hook> script failed (code N)` line is printed too. Sluice never
+  refuses a unit: the `agent_hook_policy = "fail-fast"` refusal (exit code 3,
+  `has not passed on this tree`) belongs to `sluice run`, so a `3` from a hook
+  run as units is always the unit's own exit code (the line `FAIL exit=3` names
+  it). Timeouts (124) and kills (143) are Sluice's, as for gates; a unit has no
+  timeout of its own.
+- **If the daemon fails in the middle of a hook**, the unit being run follows
+  the usual `sluice run` fallback: it runs in-process under the budget
+  semaphore, with `daemon unavailable ... running in-process` on stderr, and the
+  remaining units go on the same way.
+- **Opt out**: `SLUICE_HOOKS_DELEGATE=1` delegates every hook untouched.
+
+`sluice hooks status` lists each hook with its mode:
+
+```
+hook pre-commit: 2 unit(s) run through the queue: mutating lint-staged; check npm run lint
+hook commit-msg: delegated (.husky/commit-msg line 1: uses the hook's arguments ($1, "$@"))
+```
 
 ## Worktrees and husky
 

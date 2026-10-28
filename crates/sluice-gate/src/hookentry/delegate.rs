@@ -1,7 +1,8 @@
 //! `sluice hooks run <hook> -- <args>`: runs the hook the repository would
 //! have run without Sluice.
 //!
-//! Wave H1 changes nothing about what runs: the hooks directory git would
+//! Wave H1 changes nothing about what runs, and wave H2a only replaces the
+//! delegation when Sluice understands the whole hook ([`super::runner`]): the hooks directory git would
 //! use without Sluice (`core.hooksPath` as the repository's own config sets
 //! it, else `<git dir>/hooks`) is found at run time and its script for the
 //! hook is executed in place with the same arguments, stdin, working
@@ -50,6 +51,19 @@ impl Manager {
             Self::Lefthook => "lefthook",
             Self::PreCommit => "pre-commit",
             Self::Plain => "plain hooks",
+            Self::None => "none",
+        }
+    }
+}
+
+impl Manager {
+    /// A word without spaces, for unit names (`husky:pre-commit#1`).
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Husky => "husky",
+            Self::Lefthook => "lefthook",
+            Self::PreCommit => "pre-commit",
+            Self::Plain => "plain",
             Self::None => "none",
         }
     }
@@ -219,6 +233,9 @@ pub fn run(hook: &str, args: &[OsString], common_dir: Option<&Path>) -> ExitCode
     let Some(target) = decision.target else {
         return ExitCode::SUCCESS;
     };
+    if let Some(code) = super::runner::try_units(hook, &decision.dir, &cwd, &env) {
+        return code;
+    }
     tracing::debug!(%hook, target = %target.display(), "delegating");
     let error = Command::new(&target).args(args).exec();
     eprintln!(

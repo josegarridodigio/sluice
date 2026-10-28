@@ -131,32 +131,80 @@ pub fn run(args: &RunArgs) -> ExitCode {
     let mut trace = Trace::default();
     let code = run_traced(args, &mut trace);
     if !args.explain {
-        let env: EnvMap = sluice_gate_core::config::process_env();
-        let cwd = std::env::current_dir().unwrap_or_default();
-        let exit = exit_byte(code);
-        let decision = trace.decision.unwrap_or(if exit == EXIT_ERROR {
-            "error"
-        } else {
-            "miss-run"
-        });
-        let entry = clientlog::Entry {
-            pid: std::process::id(),
-            caller: trace.caller.unwrap_or("human"),
-            hook: args.hook.as_deref(),
-            gate: &args.gate,
-            tree: trace.tree.as_deref(),
-            key: trace.key.as_deref(),
-            reason: trace.reason,
-            decision,
-            exit,
-            duration_ms: started.elapsed().as_millis(),
-            cwd: &cwd,
-        };
-        if let Err(e) = clientlog::record(&env, &entry) {
-            tracing::debug!("cannot write client.log: {e}");
-        }
+        record_invocation(args, &trace, exit_byte(code), started);
     }
     code
+}
+
+/// Appends the `client.log` line of one invocation; a failure to write it is
+/// only logged.
+fn record_invocation(args: &RunArgs, trace: &Trace, exit: u8, started: Instant) {
+    let env: EnvMap = sluice_gate_core::config::process_env();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let decision = trace.decision.unwrap_or(if exit == EXIT_ERROR {
+        "error"
+    } else {
+        "miss-run"
+    });
+    let entry = clientlog::Entry {
+        pid: std::process::id(),
+        caller: trace.caller.unwrap_or("human"),
+        hook: args.hook.as_deref(),
+        gate: &args.gate,
+        tree: trace.tree.as_deref(),
+        key: trace.key.as_deref(),
+        reason: trace.reason,
+        decision,
+        exit,
+        duration_ms: started.elapsed().as_millis(),
+        cwd: &cwd,
+    };
+    if let Err(e) = clientlog::record(&env, &entry) {
+        tracing::debug!("cannot write client.log: {e}");
+    }
+}
+
+/// Runs one unit of a repository hook (a synthetic gate, see
+/// `hookentry::runner`) exactly like `sluice run` runs a gate (cache lookup,
+/// daemon queue, in-process fallback, logs, `client.log`), except that a
+/// miss never applies `agent_hook_policy`: the hook runs the unit, it does
+/// not ask for a `verify` first. Returns the exit byte `sluice run` would.
+pub(crate) fn run_unit(res: Resolved, hook: &str) -> u8 {
+    let started = Instant::now();
+    let env = res.env.clone();
+    let args = RunArgs {
+        gate: res.gate_name.clone(),
+        extra: Vec::new(),
+        hook: Some(hook.to_owned()),
+        verbose: false,
+        explain: false,
+    };
+    let ctx = Context {
+        tail_lines: res.tail_lines(),
+        hook: args.hook.clone(),
+        res,
+    };
+    let mut trace = Trace {
+        caller: Some(caller_label(&ctx, &env)),
+        ..Trace::default()
+    };
+    let mode = cache_mode(&env);
+    let code = run_resolved(&ctx, &args, &mode, &mut trace, false);
+    let exit = exit_byte(code);
+    record_invocation(&args, &trace, exit, started);
+    exit
+}
+
+/// `agent` or `human`, for `client.log`.
+fn caller_label(ctx: &Context, env: &EnvMap) -> &'static str {
+    match agent::detect(
+        env,
+        &ctx.user.agent_detection.env_any_set,
+        &ctx.user.agent_detection.env_any_equals,
+    ) {
+        Caller::Agent { .. } => "agent",
+        Caller::Human => "human",
+    }
 }
 
 /// `ExitCode` has no accessor: recover the byte through its debug form.
@@ -181,34 +229,39 @@ fn run_traced(args: &RunArgs, trace: &mut Trace) -> ExitCode {
         Err(e) => return fail(&e),
     };
     crate::logging::init_cli(&env, &ctx.user.debug.level);
-    trace.caller = Some(
-        match agent::detect(
-            &env,
-            &ctx.user.agent_detection.env_any_set,
-            &ctx.user.agent_detection.env_any_equals,
-        ) {
-            Caller::Agent { .. } => "agent",
-            Caller::Human => "human",
-        },
-    );
+    trace.caller = Some(caller_label(&ctx, &env));
 
     if args.explain {
         return explain(&ctx, &env, &mode, &args.extra);
     }
-    if mode == CacheMode::Bypass {
+    run_resolved(&ctx, args, &mode, trace, true)
+}
+
+/// Everything after the gate is resolved: bypass, cache lookup, hit, policy
+/// and run. `enforce_policy` applies `agent_hook_policy` on a miss inside a
+/// hook (`sluice run`); a hook unit always waits for the daemon instead.
+fn run_resolved(
+    ctx: &Context,
+    args: &RunArgs,
+    mode: &CacheMode,
+    trace: &mut Trace,
+    enforce_policy: bool,
+) -> ExitCode {
+    let env = &ctx.env;
+    if *mode == CacheMode::Bypass {
         trace.decision = Some("disabled");
         eprintln!(
             "sluice: SLUICE_DISABLE is set; running '{}' directly",
             ctx.gate_name
         );
-        return run_inline(&ctx, &args.extra);
+        return run_inline(ctx, &args.extra);
     }
 
     // Queue-only: no marker lookup; the coalescing key in its own namespace.
     let queue_only = ctx
         .gate
         .is_queue_only()
-        .then(|| queue_only_key(&ctx, &args.extra));
+        .then(|| queue_only_key(ctx, &args.extra));
     let lookup_state = if queue_only.is_some() {
         CacheState::Off {
             reason: "queue-only gate".to_owned(),
@@ -216,31 +269,10 @@ fn run_traced(args: &RunArgs, trace: &mut Trace) -> ExitCode {
             code: "queue-only",
         }
     } else {
-        lookup::lookup(&ctx, &mode, &args.extra)
+        lookup::lookup(ctx, mode, &args.extra)
     };
     let state = match lookup_state {
-        CacheState::Hit { marker: hit, tree } => {
-            trace.decision = Some("hit");
-            // The current tree: on a scoped hit `hit.tree` is an earlier one.
-            trace.tree = Some(tree.as_str().to_owned());
-            trace.key = Some(hit.key.as_str().to_owned());
-            println!(
-                "sluice: {} PASS (cached, passed {} ago)",
-                ctx.gate_name,
-                age(&hit.passed_at)
-            );
-            if let Ok(socket) = sluice_gate_core::dirs::socket_path(&env)
-                && socket.exists()
-            {
-                client::send_hit_event(
-                    &socket,
-                    &ctx.paths.toplevel,
-                    &ctx.gate_name,
-                    hit.duration_ms,
-                );
-            }
-            return ExitCode::SUCCESS;
-        }
+        CacheState::Hit { marker: hit, tree } => return report_hit(ctx, &hit, &tree, trace),
         state @ CacheState::Off {
             notice: Some(_), ..
         } => announce_cache_off(state, trace),
@@ -261,20 +293,53 @@ fn run_traced(args: &RunArgs, trace: &mut Trace) -> ExitCode {
             "sluice: inside Sluice job {parent}; running '{}' directly",
             ctx.gate_name
         );
-        return execute(&ctx, args, state);
+        return execute(ctx, args, state);
     }
-    let (caller, in_hook, policy) = decide_policy(&ctx, &env, &state);
+    let (caller, policy) = if enforce_policy {
+        let (caller, _in_hook, policy) = decide_policy(ctx, env, &state);
+        (caller, policy)
+    } else {
+        let caller = agent::detect(
+            env,
+            &ctx.user.agent_detection.env_any_set,
+            &ctx.user.agent_detection.env_any_equals,
+        );
+        (caller, HookPolicy::Wait)
+    };
     if policy == HookPolicy::FailFast {
         trace.decision = Some("miss-fail-fast");
-        print_fail_fast(&ctx, &state, &caller);
-        let _ = in_hook;
+        print_fail_fast(ctx, &state, &caller);
         return ExitCode::from(EXIT_FAIL_FAST);
     }
     if policy == HookPolicy::RunUnqueued {
         trace.decision = Some("in-process");
-        return execute(&ctx, args, state);
+        return execute(ctx, args, state);
     }
-    run_queued(&ctx, args, &caller, state, queue_only.flatten(), trace)
+    run_queued(ctx, args, &caller, state, queue_only.flatten(), trace)
+}
+
+/// A fresh marker matched: one line, a best-effort `hit` event, exit 0.
+fn report_hit(ctx: &Context, hit: &Marker, tree: &TreeHash, trace: &mut Trace) -> ExitCode {
+    trace.decision = Some("hit");
+    // The current tree: on a scoped hit `hit.tree` is an earlier one.
+    trace.tree = Some(tree.as_str().to_owned());
+    trace.key = Some(hit.key.as_str().to_owned());
+    println!(
+        "sluice: {} PASS (cached, passed {} ago)",
+        ctx.gate_name,
+        age(&hit.passed_at)
+    );
+    if let Ok(socket) = sluice_gate_core::dirs::socket_path(&ctx.env)
+        && socket.exists()
+    {
+        client::send_hit_event(
+            &socket,
+            &ctx.paths.toplevel,
+            &ctx.gate_name,
+            hit.duration_ms,
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 /// Prints the one-line reason the cache is off on stderr (with or without

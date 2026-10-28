@@ -24,6 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default, is the previous behaviour).
 - The agent plugin's session start restores an activated clone whose entry point
   was displaced and says so in the context; it never activates a clone by itself.
+- The hook runner runs the units of husky and plain hooks through the daemon
+  (ADR-0021, wave H2a): when every line of the hook is understood (simple
+  commands, `&&` lists, comments, `exit 0`), each command is a job of the queue
+  in file order with `sh -e` semantics, mutating ones (`lint-staged`, formatters
+  with a write flag, `git`, unknown programs) always run and checks (tests,
+  linters, `npm run` scripts made of them) are cached by the working tree they
+  saw. Anything else, a daemon that is down or `SLUICE_HOOKS_DELEGATE=1`
+  delegates the whole hook untouched as before. `sluice hooks status` shows
+  for each hook whether it runs as units or is delegated, and why. See
+  `docs/hooks.md`.
 
 ### Changed
 

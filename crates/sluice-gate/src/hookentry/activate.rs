@@ -46,7 +46,7 @@ struct Inputs<'a> {
 }
 
 /// `dir` made absolute against the worktree root `root` (git runs hooks there).
-fn resolve(dir: &Path, root: &Path) -> PathBuf {
+pub(super) fn resolve(dir: &Path, root: &Path) -> PathBuf {
     if dir.is_absolute() {
         dir.to_path_buf()
     } else {
@@ -58,7 +58,7 @@ fn resolve(dir: &Path, root: &Path) -> PathBuf {
 /// A hook without a script in Sluice's directory is not run by git at all
 /// once `core.hooksPath` points there, and a script for a hook the repository
 /// does not have only costs a process start, so the two sets must be equal.
-fn mirrored(dir: &Path) -> Vec<&'static str> {
+pub(super) fn mirrored(dir: &Path) -> Vec<&'static str> {
     ALL_HOOKS
         .iter()
         .copied()

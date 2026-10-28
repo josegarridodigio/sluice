@@ -435,6 +435,18 @@ fn valid_gate_name(name: &str) -> bool {
 }
 
 impl RepoConfig {
+    /// The configuration of a repository without a `.sluice.toml`: version 1,
+    /// the default settings and no gates (the hook runner synthesises its own).
+    #[must_use]
+    pub fn implicit() -> Self {
+        Self {
+            version: 1,
+            defaults: Defaults::default(),
+            gates: BTreeMap::new(),
+            queue: QueueConfig::default(),
+        }
+    }
+
     /// Parse and validate `.sluice.toml` contents; `path` is used in errors.
     ///
     /// # Errors

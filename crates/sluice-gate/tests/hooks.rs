@@ -533,13 +533,24 @@ fn a_missing_sluice_binary_still_runs_the_original_hook() {
     fs::create_dir(&copy).unwrap();
     fs::copy(Sandbox::binary(), copy.join("sluice")).unwrap();
     fake_hook(&sb.repo.join(".git/hooks/pre-push"), "plain");
-    let out = StdCommand::new(copy.join("sluice"))
-        .args(["hooks", "on"])
-        .current_dir(&sb.repo)
-        .env_clear()
-        .envs(sb.env())
-        .output()
-        .unwrap();
+    // `fs::copy` leaves a write descriptor that another test thread's `fork`
+    // can inherit for a moment: exec then fails with ETXTBSY. Retry briefly.
+    let mut attempts = 0;
+    let out = loop {
+        let spawned = StdCommand::new(copy.join("sluice"))
+            .args(["hooks", "on"])
+            .current_dir(&sb.repo)
+            .env_clear()
+            .envs(sb.env())
+            .output();
+        match spawned {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => break other.unwrap(),
+        }
+    };
     assert!(out.status.success(), "{out:?}");
     fs::remove_dir_all(&copy).unwrap();
 

@@ -76,6 +76,17 @@ their own CLIs (synthesis note).
 8. **Exit codes.** A hook's exit code is the manager's (or the unit's); Sluice's own
    refusal code is never confused with a delegated manager's code 3 (pre-commit).
 
+## Amendment (2026-10-28, wave H2a)
+
+Decision 5 is refined: units keep the **hook file's order** instead of running mutating
+steps first. Reordering changes semantics (a check placed before a formatter would see
+different files), and order preservation is what "run the hook faithfully" means.
+Mutating units (and every program not recognised as read-only) always run and are never
+cached; recognised checks are cached by the working-tree snapshot taken right before they
+start, so they reflect earlier mutating units. A hook that receives stdin runs as units
+only when every unit is a recognised check (none of them reads stdin); otherwise it is
+delegated whole. Details: [[sluice/changes/hook-runner-h2a.md]].
+
 ## User decisions (2026-10-28)
 
 | # | Question | Answer |

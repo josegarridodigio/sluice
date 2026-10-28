@@ -20,9 +20,14 @@ use sluice_gate_core::git::{self, RepoPaths};
 use crate::run::EXIT_ERROR;
 
 pub mod activate;
+pub mod classify;
 pub mod delegate;
 pub mod gitcfg;
+pub mod grammar;
+pub mod plan;
+pub mod runner;
 pub mod script;
+pub mod units;
 
 pub use delegate::run;
 
@@ -141,12 +146,42 @@ pub fn off() -> ExitCode {
     }
 }
 
-/// The text and JSON of `status`.
+/// What would happen for each hook the repository has: run as units or
+/// delegated, and why.
+fn hook_plans(
+    paths: &RepoPaths,
+    hooks_dir: &Path,
+    env: &EnvMap,
+) -> Vec<(&'static str, units::Plan)> {
+    let full = activate::resolve(hooks_dir, &paths.toplevel);
+    let forced = runner::opt_out(env);
+    activate::mirrored(&full)
+        .into_iter()
+        .map(|hook| {
+            let planned = forced.clone().map_or_else(
+                || {
+                    plan::plan(&plan::Input {
+                        hook,
+                        root: &paths.toplevel,
+                        dir: hooks_dir,
+                        env,
+                    })
+                },
+                units::Plan::Delegate,
+            );
+            (hook, planned)
+        })
+        .collect()
+}
+
+/// The JSON of `status`.
 fn describe(
     paths: &RepoPaths,
     ins: &activate::Inspection,
-    home: Option<&str>,
+    env: &EnvMap,
+    plans: &[(&'static str, units::Plan)],
 ) -> serde_json::Value {
+    let home = env.get("HOME").map(String::as_str);
     let hooks_dir = delegate::underlying_dir(ins.underlying.as_deref(), &paths.common_dir, home);
     let manager = delegate::detect(&paths.toplevel, &hooks_dir);
     serde_json::json!({
@@ -158,7 +193,30 @@ fn describe(
         "underlying": ins.underlying,
         "manager": manager.label(),
         "problem": ins.problem(),
+        "hooks": plans.iter().map(|(h, p)| plan::describe(h, p)).collect::<Vec<_>>(),
     })
+}
+
+/// One line per hook for the text `status`.
+fn print_plans(plans: &[(&'static str, units::Plan)]) {
+    for (hook, planned) in plans {
+        match planned {
+            units::Plan::Delegate(reason) => {
+                println!("  hook {hook}: delegated ({reason})");
+            }
+            units::Plan::Units(program) => {
+                let kinds: Vec<String> = program
+                    .units()
+                    .map(|u| format!("{} {}", u.kind.label(), u.command))
+                    .collect();
+                println!(
+                    "  hook {hook}: {} unit(s) run through the queue: {}",
+                    program.unit_count(),
+                    kinds.join("; ")
+                );
+            }
+        }
+    }
 }
 
 /// `sluice hooks status [--json]`.
@@ -172,7 +230,13 @@ pub fn status(json: bool) -> ExitCode {
         Ok(i) => i,
         Err(e) => return fail(&e),
     };
-    let value = describe(&paths, &ins, env.get("HOME").map(String::as_str));
+    let hooks_dir = delegate::underlying_dir(
+        ins.underlying.as_deref(),
+        &paths.common_dir,
+        env.get("HOME").map(String::as_str),
+    );
+    let plans = hook_plans(&paths, &hooks_dir, &env);
+    let value = describe(&paths, &ins, &env, &plans);
     if json {
         println!("{value:#}");
         return ExitCode::SUCCESS;
@@ -202,6 +266,7 @@ pub fn status(json: bool) -> ExitCode {
     } else {
         println!("  enable with:     sluice hooks on");
     }
+    print_plans(&plans);
     ExitCode::SUCCESS
 }
 
