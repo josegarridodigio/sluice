@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.3"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT"
@@ -22,11 +22,11 @@ categories = ["development-tools", "command-line-utilities"]
 
 [workspace.dependencies]
 # Internal crates
-sluice-gate-core = { path = "crates/sluice-gate-core", version = "0.6.3" }
-sluice-gate-proto = { path = "crates/sluice-gate-proto", version = "0.6.3" }
-sluice-gate-daemon = { path = "crates/sluice-gate-daemon", version = "0.6.3" }
-sluice-gate-mcp = { path = "crates/sluice-gate-mcp", version = "0.6.3" }
-sluice-gate-queue = { path = "crates/sluice-gate-queue", version = "0.6.3" }
+sluice-gate-core = { path = "crates/sluice-gate-core", version = "0.7.0" }
+sluice-gate-proto = { path = "crates/sluice-gate-proto", version = "0.7.0" }
+sluice-gate-daemon = { path = "crates/sluice-gate-daemon", version = "0.7.0" }
+sluice-gate-mcp = { path = "crates/sluice-gate-mcp", version = "0.7.0" }
+sluice-gate-queue = { path = "crates/sluice-gate-queue", version = "0.7.0" }
 
 # External crates (versions are re-checked when a crate first uses them)
 anyhow = "1"

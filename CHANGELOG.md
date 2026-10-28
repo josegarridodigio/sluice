@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Fixed
+
+## [0.7.0] - 2026-10-28
+
+### Added
+
 - **Hooks entry point** (`sluice hooks on|off|status`, optional and local to a
   clone, ADR-0021). Sluice becomes the git hooks entry point of a clone without
   editing the repository: `on` gives the clone a hooks directory under its git
@@ -64,8 +72,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   activated entry point is displaced or a hook of the repository has no script.
   `repo-config` is `ok` for a missing `.sluice.toml` in a clone whose hooks go
   through Sluice.
-
-### Fixed
 
 ## [0.6.3] - 2026-10-26
 
@@ -589,7 +595,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PSI thresholds must be percentages (rejected at config load otherwise).
 - Findings of the Phase 1, 2, 3 and 4 reconciliation passes.
 
-[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.6.3...HEAD
+[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/josegarridodigio/sluice/compare/v0.6.3...v0.7.0
 [0.6.3]: https://github.com/josegarridodigio/sluice/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/josegarridodigio/sluice/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/josegarridodigio/sluice/compare/v0.6.0...v0.6.1
