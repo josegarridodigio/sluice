@@ -162,6 +162,7 @@ fn config(dir: &Path) -> DaemonConfig {
         extensions: Vec::new(),
         reaper: None,
         containment: None,
+        stall: sluice_gate_daemon::stall::Tuning::default(),
     }
 }
 

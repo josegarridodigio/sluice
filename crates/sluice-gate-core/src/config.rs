@@ -292,6 +292,57 @@ fn default_timeout() -> Duration {
     Duration::from_mins(30)
 }
 
+/// A gate's `stall_timeout` (ADR-0024): how long the running job may show no
+/// progress before Sluice reports it as stalled. Sluice only reports; it
+/// never ends a stalled job.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StallTimeout {
+    /// `max(5 min, 3 x the gate's expected duration)` (the default).
+    #[default]
+    Auto,
+    /// `"off"`: the gate is never reported as stalled (watch and serve gates).
+    Off,
+    /// A fixed quiet window. The daemon raises anything below one minute to
+    /// one minute.
+    After(Duration),
+}
+
+impl StallTimeout {
+    /// The wire form (`GateSpec::stall_timeout_ms`): `None` is
+    /// [`Self::Auto`], `Some(0)` is [`Self::Off`].
+    pub fn to_wire(self) -> Option<u64> {
+        match self {
+            Self::Auto => None,
+            Self::Off => Some(0),
+            Self::After(d) => Some(u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1)),
+        }
+    }
+
+    /// The inverse of [`Self::to_wire`].
+    pub fn from_wire(wire: Option<u64>) -> Self {
+        match wire {
+            None => Self::Auto,
+            Some(0) => Self::Off,
+            Some(ms) => Self::After(Duration::from_millis(ms)),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StallTimeout {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        if text.trim() == "off" {
+            return Ok(Self::Off);
+        }
+        match humantime::parse_duration(text.trim()) {
+            Ok(d) if !d.is_zero() => Ok(Self::After(d)),
+            _ => Err(serde::de::Error::custom(format!(
+                "invalid stall_timeout \"{text}\": use a duration such as \"10m\" (> 0) or \"off\""
+            ))),
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -309,6 +360,12 @@ pub struct Gate {
     /// Maximum execution time; queue wait does not count.
     #[serde(with = "humantime_serde", default = "default_timeout")]
     pub timeout: Duration,
+    /// How long the running job may show no progress before it is reported
+    /// as stalled: a duration or `"off"`; by default `max(5 min, 3 x the
+    /// expected duration)`. Report only, never a kill (ADR-0024). Needs a
+    /// sluice newer than 0.7.0.
+    #[serde(default)]
+    pub stall_timeout: StallTimeout,
     /// Hook names this gate belongs to.
     #[serde(default)]
     pub hooks: Vec<String>,

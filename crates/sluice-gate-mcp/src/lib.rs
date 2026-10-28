@@ -91,7 +91,12 @@ the target's configuration judges: tell the human to land it first or retry with
 `--trust-member-config`; never use that flag or ask for such a train to be approved. \
 A gate result `KILLED for lack of memory` is not a failure to retry unchanged: reduce the gate's \
 footprint (for example test concurrency) or tell the human; a gate that `status` shows waiting \
-for memory is only queued. Never run a gate through the shell to get around either.";
+for memory is only queued. Never run a gate through the shell to get around either. \
+A `verify` progress message or a `status` that reports its job STALLED (no CPU, I/O or output \
+for its quiet window) means the gate is probably hung, for example a test waiting forever: \
+look at the test and `logs`, and cancel your own `verify` call (the daemon then ends the job \
+if nobody else waits for it); never re-run the gate through the shell. Sluice only reports a \
+stall, it never ends the job itself.";
 
 /// Runs the MCP server on stdin/stdout until the client disconnects.
 ///
@@ -530,6 +535,7 @@ fn to_request(m: RunMaterial) -> RunRequest {
             timeout_ms: m.timeout_ms,
             env: m.gate.env,
             cache: m.gate.cache,
+            stall_timeout_ms: m.gate.stall_timeout.to_wire(),
         },
         key: m.key,
         tree: m.tree,
@@ -630,6 +636,9 @@ struct JobState {
     running: bool,
     /// Elapsed run time reported by the daemon and when it was reported.
     elapsed: Option<(u64, Instant)>,
+    /// How long the running job has shown no progress, while it is stalled
+    /// (ADR-0024), and when it was reported.
+    stalled: Option<(u64, Instant)>,
 }
 
 impl JobState {
@@ -650,10 +659,12 @@ impl JobState {
             ServerMessage::Progress {
                 elapsed_ms,
                 position,
+                stalled_ms,
                 ..
             } => {
                 if self.running {
                     self.elapsed = Some((*elapsed_ms, Instant::now()));
+                    self.stalled = stalled_ms.map(|ms| (ms, Instant::now()));
                 } else {
                     self.position = *position;
                 }
@@ -671,7 +682,14 @@ impl JobState {
             let ms = self.elapsed.map_or(0, |(ms, at)| {
                 ms + u64::try_from(at.elapsed().as_millis()).unwrap_or(0)
             });
-            format!("{gate}: running for {}{job}", dur(ms))
+            let stalled = self.stalled.map_or_else(String::new, |(ms, at)| {
+                let ms = ms + u64::try_from(at.elapsed().as_millis()).unwrap_or(0);
+                format!(
+                    "; looks STALLED: no CPU, I/O or output for {}, probably hung",
+                    dur(ms)
+                )
+            });
+            format!("{gate}: running for {}{job}{stalled}", dur(ms))
         } else if let Some(p) = self.position {
             format!("{gate}: queued, position {p}{job}")
         } else {
@@ -1892,6 +1910,39 @@ mod tests {
         assert!(e.result.message.is_some() && e.line.starts_with("ERROR"));
     }
 
+    /// ADR-0024: the progress message of a running job says when it looks
+    /// stalled, and stops saying it when the job is active again.
+    #[test]
+    fn progress_says_when_the_running_job_looks_stalled() {
+        let progress = |stalled_ms| ServerMessage::Progress {
+            id: 1,
+            job_id: "j1".into(),
+            elapsed_ms: 400_000,
+            log_bytes: 9,
+            position: None,
+            stalled_ms,
+        };
+        let mut state = JobState::default();
+        state.update(&ServerMessage::Started {
+            id: 1,
+            job_id: "j1".into(),
+            started_at: "t".into(),
+            spool: None,
+        });
+        state.update(&progress(None));
+        assert!(!state.describe("test").contains("STALLED"));
+        state.update(&progress(Some(300_000)));
+        let line = state.describe("test");
+        assert!(
+            line.contains(
+                "running for 6m40s (job j1); looks STALLED: no CPU, I/O or output for 5m0"
+            ),
+            "{line}"
+        );
+        state.update(&progress(None));
+        assert!(!state.describe("test").contains("STALLED"));
+    }
+
     #[test]
     fn job_ids_are_checked() {
         assert!(valid_job_id("1761234-42-abc123"));
@@ -2064,6 +2115,8 @@ mod schema_tests {
             "--trust-member-config",
             "KILLED for lack of memory",
             "waiting for memory",
+            "STALLED",
+            "probably hung",
         ] {
             assert!(INSTRUCTIONS.contains(needle), "missing '{needle}'");
         }

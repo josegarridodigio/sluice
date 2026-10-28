@@ -440,6 +440,11 @@ pub struct GateSpec {
     /// Whether results of this gate are cached.
     #[serde(default)]
     pub cache: bool,
+    /// Quiet window after which the running job is reported as stalled, in
+    /// milliseconds (ADR-0024): `Some(0)` is `"off"`; omitted for the
+    /// default, `max(5 min, 3 x expected duration)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_timeout_ms: Option<u64>,
 }
 
 /// Origin of a run request.
@@ -544,6 +549,10 @@ pub enum ServerMessage {
         /// Queue position while queued.
         #[serde(default)]
         position: Option<usize>,
+        /// Milliseconds the running job has shown no progress, present only
+        /// while it is stalled (ADR-0024); omitted from the wire otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stalled_ms: Option<u64>,
     },
     /// The job finished; the server closes afterwards.
     Done {
@@ -950,6 +959,15 @@ impl RunningJob {
             _ => String::new(),
         }
     }
+
+    /// `  STALLED 6m12s (flat: cpu io output)` for a job that shows no
+    /// progress (`dur` spells the milliseconds), or nothing.
+    #[must_use]
+    pub fn stalled_text(&self, dur: impl Fn(u64) -> String) -> String {
+        self.stalled.as_ref().map_or_else(String::new, |s| {
+            format!("  STALLED {} (flat: {})", dur(s.for_ms), s.flat.join(" "))
+        })
+    }
 }
 
 impl QueuedJob {
@@ -1179,6 +1197,22 @@ pub struct RunningJob {
     /// the weight and the gates of the machine). Absent from older daemons.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_expected_basis: Option<String>,
+    /// Present while the job is stalled (ADR-0024): no progress for the
+    /// whole quiet window. Sluice only reports it; the job is never ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stalled: Option<StalledJob>,
+}
+
+/// A running job that shows no progress (see [`RunningJob::stalled`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct StalledJob {
+    /// Milliseconds the job has shown no progress. The memory and the
+    /// weight it holds are the job's `memory_bytes` and `weight`.
+    pub for_ms: u64,
+    /// The signals that stayed flat, from `cpu`, `cpu-wait`, `io`,
+    /// `faults`, `output` and `processes` (the ones the machine gives).
+    pub flat: Vec<String>,
 }
 
 /// A queued job in a status report.
@@ -1680,6 +1714,7 @@ mod tests {
                 timeout_ms: 1_200_000,
                 env: BTreeMap::from([("NODE_ENV".into(), "test".into())]),
                 cache: true,
+                stall_timeout_ms: None,
             },
             key: Some(key),
             tree: Some(tree.clone()),
@@ -2078,6 +2113,7 @@ mod tests {
                 elapsed_ms: 5000,
                 log_bytes: 10,
                 position: Some(2),
+                stalled_ms: Some(300_000),
             },
             ServerMessage::Done {
                 id: 1,
@@ -2703,5 +2739,46 @@ mod tests {
             serde_json::from_str::<Totals>(&old).unwrap().backfilled,
             None
         );
+    }
+    /// ADR-0024: `stalled` on a running job and `stalled_ms` on `progress`
+    /// are additive: absent from the wire unless the job is stalled, and
+    /// older peers' messages decode without them.
+    #[test]
+    fn the_stalled_fields_are_additive() {
+        let plain = serde_json::to_string(&RunningJob::default()).unwrap();
+        assert!(!plain.contains("stalled"), "{plain}");
+        let job = RunningJob {
+            stalled: Some(StalledJob {
+                for_ms: 372_000,
+                flat: vec!["cpu".into(), "io".into(), "output".into()],
+            }),
+            ..RunningJob::default()
+        };
+        let json = serde_json::to_string(&job).unwrap();
+        assert!(
+            json.contains(r#""stalled":{"for_ms":372000,"flat":["cpu","io","output"]}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<RunningJob>(&json).unwrap(), job);
+        assert_eq!(
+            job.stalled_text(|ms| format!("{}s", ms / 1000)),
+            "  STALLED 372s (flat: cpu io output)"
+        );
+        assert_eq!(RunningJob::default().stalled_text(|_| String::new()), "");
+        let old = r#"{"type":"progress","id":1,"job_id":"j","elapsed_ms":5,"log_bytes":2}"#;
+        let ServerMessage::Progress { stalled_ms, .. } = decode_server(old).unwrap() else {
+            panic!("progress expected");
+        };
+        assert_eq!(stalled_ms, None);
+        let quiet = encode(&ServerMessage::Progress {
+            id: 1,
+            job_id: "j".into(),
+            elapsed_ms: 5,
+            log_bytes: 2,
+            position: None,
+            stalled_ms: None,
+        })
+        .unwrap();
+        assert!(!quiet.contains("stalled_ms"), "{quiet}");
     }
 }

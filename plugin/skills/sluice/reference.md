@@ -56,6 +56,17 @@ e2e   FAIL exit=1 12.3s (job 1761...) log=/home/u/.local/state/sluice/logs/1761.
   expected to use (the text of `status`, like `sluice status`, prints
   `(budget: memory)`, and the structured result has `wait_detail: "memory"`). It starts when a running gate ends: normal, wait for it
   and do not run it outside Sluice.
+- A running job in `status` that shows `STALLED 6m12s (flat: cpu io output)`
+  (`stalled: {for_ms, flat}` in the structured result, a `looks STALLED`
+  line in the progress of `verify`) has shown no CPU time, block I/O, page
+  faults, process changes or log output for its whole quiet window
+  (`max(5 min, 3 x its usual duration)`, or the gate's `stall_timeout`). It
+  holds the weight and memory shown on its line. It is probably hung (a test
+  waiting forever): read `logs`, fix or skip the test, cancel your own
+  `verify` call if you are waiting for it (the daemon ends the job when
+  nobody else waits for it) and call `verify` again after the fix. Never
+  re-run the gate through the shell. Sluice reports a stall and never ends
+  the job itself; when the job shows activity again the line goes away.
 - Use `logs` with the job id for the full log, not another run.
 
 ## Merge queue states

@@ -328,3 +328,7 @@ obey every rule here; the scheduler has no queue specific code.
 - Marker appearing while queued → `cached`, no process run.
 - Last subscriber gone → process killed under `cancel`; an early-verdict
   cancel kills only a job nobody else waits for.
+- A running job that shows no progress (`stalled`, ADR-0024, `stall.rs`) is a holder that
+  ends at an unknown time (`UNKNOWN_END`): `shadow()` never releases it, the shadow time
+  is unknown when the head needs its room (no ETA, no duration backfill), and the room
+  counts it as a survivor. Nothing is released for admission and nothing is killed.

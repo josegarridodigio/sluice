@@ -494,6 +494,7 @@ fn to_request(m: RunMaterial, budget: u32, caller: proto::Caller) -> RunRequest 
             timeout_ms: m.timeout_ms,
             env: m.gate.env,
             cache: m.gate.cache,
+            stall_timeout_ms: m.gate.stall_timeout.to_wire(),
         },
         key: m.key,
         tree: m.tree,
@@ -579,7 +580,11 @@ fn via_daemon(
     let mut queued = false;
     let mut started = false;
     let mut follower: Option<LogFollower> = None;
+    let mut stalled = false;
     let result = conn.run(request, |msg| match msg {
+        ServerMessage::Progress {
+            job_id, stalled_ms, ..
+        } => stall_notice(gate, job_id, *stalled_ms, &mut stalled),
         ServerMessage::Queued {
             job_id,
             position,
@@ -635,6 +640,22 @@ fn via_daemon(
         ))),
         Err(e) => Ok(fail(&format!("lost the connection to the daemon: {e}"))),
     }
+}
+
+/// The one-line notice when the running job becomes stalled (no CPU, I/O or
+/// output for its whole quiet window), and when it is active again
+/// (ADR-0024). Sluice only reports: it never ends the job.
+fn stall_notice(gate: &str, job_id: &str, stalled_ms: Option<u64>, noted: &mut bool) {
+    match (stalled_ms, *noted) {
+        (Some(ms), false) => eprintln!(
+            "sluice: {gate} looks stalled: no CPU, I/O or output for {} (job {job_id}); it is \
+             probably hung, look at what it is waiting for",
+            crate::status::dur(ms)
+        ),
+        (None, true) => eprintln!("sluice: {gate} is active again (job {job_id})"),
+        _ => return,
+    }
+    *noted = stalled_ms.is_some();
 }
 
 /// Prints a daemon outcome exactly as the in-process path would.

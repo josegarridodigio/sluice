@@ -85,6 +85,13 @@ session. Never install or update on your own.
 - A gate that `status` shows as waiting for memory (`(budget: memory)` in
   its text, `wait_detail` `memory` in the structured result) is only queued
   behind other gates: normal, wait. Do not run it outside Sluice.
+- A `verify` progress message, or a `status` line, that reports your job
+  `STALLED` (no CPU, I/O or output for its quiet window, 5 minutes or more)
+  means the gate is probably hung, for example a test waiting forever. Look
+  at the test and its `logs`; you may cancel your own `verify` call (the
+  daemon then ends the job if nobody else waits for it). Never re-run the
+  gate through the shell. Sluice only reports a stall: it never ends the job
+  by itself, so the gate's timeout still applies.
 - For more output use `logs` (newest job by default, or a job id). For queued
   and running jobs, and the cache state of your tree, use `status` with
   `working_directory`. Do not re-run anything to diagnose.

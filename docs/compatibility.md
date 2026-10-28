@@ -149,6 +149,15 @@ it (fixture `crates/sluice-gate-core/tests/fixtures/unreleased/scheduler-backfil
 The status JSON gains `queued[].reserved_eta_ms` and `totals.backfilled` and
 `totals.backfill_head_delay_ms`, which older clients ignore (schema stays 1).
 
+The release after 0.7.0 also adds the gate key `stall_timeout` (ADR-0024). It is one-way
+like the other keys: 0.7.0 and older binaries reject a `.sluice.toml` that has it (fixture
+`crates/sluice-gate-core/tests/fixtures/unreleased/gate-stall-timeout.toml`). On the
+wire it is the optional `gate.stall_timeout_ms` of a `run` request (`0` is `"off"`), which
+an older daemon ignores. The status JSON gains `running[].stalled` (`for_ms`, `flat`) and
+the `progress` message the optional `stalled_ms`; older clients ignore both (schema stays
+1). A `.sluice.toml` with `stall_timeout` read by an older client simply fails to load, so
+add the key only where every machine runs a newer binary.
+
 ### The database
 
 `$XDG_STATE_HOME/sluice/sluice.db` holds the daemon's job history and the merge

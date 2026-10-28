@@ -278,6 +278,7 @@ fn r(id: &str, lane: &str, weight: u32) -> RunningSnap {
         started_at: 0,
         expected_ms: None,
         backfilled: false,
+        stalled: false,
     }
 }
 

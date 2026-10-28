@@ -1170,6 +1170,7 @@ async fn build_inner(core: &Arc<Core>, train: &TrainRow, config: Option<RepoConf
                     timeout_ms: u64::try_from(gate.timeout.as_millis()).unwrap_or(u64::MAX),
                     env: gate.env.clone(),
                     cache: gate.cache,
+                    stall_timeout_ms: gate.stall_timeout.to_wire(),
                 },
                 key,
                 tree: Some(tree_hash.clone()),

@@ -379,6 +379,29 @@ duration (or hangs) keeps the prediction late until it ends. Setting
 job behind the head is `head-reserved` in `sluice logs --timeline` until the head
 starts.
 
+### A job reported as stalled
+
+`sluice status` shows `STALLED 6m12s (flat: ...)` on a running job that has shown no
+progress for its whole quiet window (`max(5 min, 3 x expected duration)`, or the gate's
+`stall_timeout`), and `sluice run` and the MCP `verify` say so while they wait. The
+daemon log records both ends of a stall and the longest quiet window of every
+finished job:
+
+```text
+job j9 stalled: no progress for 5m0s while holding 6 unit(s) of budget; reported only, Sluice never ends it
+job j9 active again after a stall of 7m12s
+job j9 finished: longest quiet window 7m12s
+```
+
+`grep "stalled:"` finds the stalls, `grep "longest quiet window"` lists every job's
+longest quiet stretch: a passing job whose figure is near the window is a gate to give
+a longer `stall_timeout` (or `"off"`). A stalled job is usually a test waiting forever
+(a lock, a socket, a promise that never settles): read `sluice logs <job>` and fix the
+test. Network waits and `sleep`-based tests are quiet by design, so they can be reported
+too. The gate is never ended by Sluice on this account; cancel the `verify` or `sluice
+run` that waits for it, or let the gate `timeout` do it. `flat` lists the counters that
+were read and did not move; a missing `io` means the machine did not give it.
+
 ### The stopgap holder
 
 The session hook creates `sluice-agents.scope` itself when no daemon runs. It

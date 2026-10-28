@@ -500,6 +500,7 @@ fn a_job_backfilled_by_an_earlier_pass_still_takes_room() {
     let mut run = budget_run();
     run.push(RunningSnap {
         backfilled: true,
+        stalled: false,
         ..run_for("old", 2, 30_000, 1_000)
     });
     let queued = budget_queue(&[4]);
@@ -794,4 +795,113 @@ fn backfilling_never_delays_a_heavy_job_in_the_replays() {
         backfilled > 20,
         "the replays exercise backfilling: {backfilled}"
     );
+}
+
+// ------------------------------------------------- stalled jobs (ADR-0024)
+
+#[test]
+fn a_stalled_holder_is_never_released_and_leaves_the_shadow_unknown() {
+    // Budget 6: a stalled job of 4 units and a normal one of 2; the head needs 3.
+    let holders = [holder(4, UNKNOWN_END, 0), holder(2, 20_000, 0)];
+    let at = shadow(5_000, &holders, &head(3, None), &machine(6, 0));
+    assert_eq!(
+        at.at, UNKNOWN_END,
+        "only the stalled job's release would let it start"
+    );
+    assert_eq!(
+        at.released,
+        [false, true],
+        "what ends at a known time is released"
+    );
+    // A head that fits once the known job is gone does not depend on the stalled one.
+    let at = shadow(5_000, &holders, &head(2, None), &machine(6, 0));
+    assert_eq!(at.at, 20_000);
+    assert_eq!(at.released, [false, true]);
+    // Memory: the stalled job's share is not handed back either.
+    let holders = [holder(1, UNKNOWN_END, 12), holder(1, 20_000, 2)];
+    let at = shadow(0, &holders, &head(1, Some(8)), &machine(6, 3));
+    assert_eq!(at.at, UNKNOWN_END, "3 + 2 GiB free are short of 8");
+}
+
+#[test]
+fn nothing_passes_an_unknown_shadow_by_duration() {
+    assert!(!ends_in_time(0, Some(1), UNKNOWN_END));
+    assert!(ends_in_time(0, Some(1), 60_000));
+}
+
+/// The suite of the evidence case, stalled or not, blocks a head that needs
+/// 18 GiB of the 9 free; a linter waits behind them.
+fn stalled_suite_pass(stalled: bool, lint: QueuedSnap) -> Plan {
+    let run = [RunningSnap {
+        started_at: 0,
+        expected_ms: Some(600_000),
+        stalled,
+        ..running("suite", 6, 14, 18)
+    }];
+    let queued = [want("head", 6, 18, 0, Some(600_000)), lint];
+    let p = on(12);
+    let s = snapshot(100_000, &p, Pressure::default(), &run, &queued);
+    plan(&with_memory(s, facts(16, 30, 3)))
+}
+
+#[test]
+fn a_head_blocked_by_a_stalled_job_has_no_eta_and_no_promise_is_built_on_it() {
+    let live = stalled_suite_pass(false, linter());
+    assert_eq!(live.shadow, Some(600_000));
+    assert_eq!(started(&live), [("lint", Admission::Nominal)]);
+
+    let stalled = stalled_suite_pass(true, linter());
+    assert_eq!(stalled.reserved.as_deref(), Some("head"));
+    assert_eq!(
+        stalled.shadow, None,
+        "the head waits for a job that may never end"
+    );
+    assert_eq!(
+        started(&stalled),
+        Vec::new(),
+        "the room is closed, not a wrong promise"
+    );
+    let duration = QueuedSnap {
+        expected_ms: Some(SECOND),
+        ..peaked("quick", 1, 1, 50_000)
+    };
+    let stalled = stalled_suite_pass(true, duration);
+    assert_eq!(
+        started(&stalled),
+        Vec::new(),
+        "no job ends before an unknown time"
+    );
+}
+
+#[test]
+fn a_stalled_job_does_not_stop_a_head_that_fits_beside_it() {
+    // 12 units: a stalled job of 2 and a normal one of 6; the head needs 6,
+    // so it waits for the normal one only, and its shadow is known.
+    let run = [
+        RunningSnap {
+            started_at: 0,
+            expected_ms: Some(10_000),
+            stalled: true,
+            ..r("hung", "/hung", 2)
+        },
+        run_for("busy", 6, 0, 600_000),
+    ];
+    let queued = [want("head", 6, 0, 0, Some(60_000))];
+    let p = on(12);
+    let s = snapshot(100_000, &p, Pressure::default(), &run, &queued);
+    let decided = plan(&s);
+    assert_eq!(decided.reserved.as_deref(), Some("head"));
+    assert_eq!(decided.shadow, Some(600_000));
+}
+
+#[test]
+fn the_scheduler_flags_the_stalled_running_jobs_in_its_snapshots() {
+    let mut s = Scheduler::with_policy(on(4));
+    s.enqueue(spec("a", None, "/a", 1, 0));
+    s.admit(0, false);
+    s.set_stalled(BTreeSet::from(["a".to_owned()]));
+    let (running, _) = s.snaps();
+    assert!(running[0].stalled);
+    s.set_stalled(BTreeSet::new());
+    assert!(!s.snaps().0[0].stalled);
 }

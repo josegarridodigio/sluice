@@ -145,7 +145,7 @@ pub(crate) fn render_status(r: &StatusReport, this_repo: Option<&Path>) -> Strin
     for j in &r.running {
         let _ = writeln!(
             out,
-            " {}{:<16} {:<20} weight {:<2} {:>8}  {} subscriber(s){}  job {}",
+            " {}{:<16} {:<20} weight {:<2} {:>8}  {} subscriber(s){}{}  job {}",
             mark(&j.repo),
             j.gate,
             basename(&j.repo),
@@ -153,6 +153,7 @@ pub(crate) fn render_status(r: &StatusReport, this_repo: Option<&Path>) -> Strin
             dur(j.elapsed_ms),
             j.subscribers,
             j.memory_text(),
+            j.stalled_text(dur),
             j.job_id
         );
     }
@@ -294,6 +295,26 @@ mod tests {
         });
         let text = render_status(&r, None);
         assert!(text.contains("reserved, eta 4m05s"), "{text}");
+    }
+
+    #[test]
+    fn status_text_shows_a_stalled_job() {
+        use sluice_gate_proto::{RunningJob, StalledJob};
+        let mut r = StatusReport::default();
+        r.running.push(RunningJob {
+            gate: "test".into(),
+            memory_bytes: Some(7 << 30),
+            stalled: Some(StalledJob {
+                for_ms: 372_000,
+                flat: vec!["cpu".into(), "io".into(), "output".into()],
+            }),
+            ..RunningJob::default()
+        });
+        let text = render_status(&r, None);
+        assert!(
+            text.contains("mem 7.0 GiB  STALLED 6m12s (flat: cpu io output)"),
+            "{text}"
+        );
     }
 
     #[test]

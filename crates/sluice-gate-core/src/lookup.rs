@@ -547,6 +547,9 @@ pub struct RunMaterial {
     pub gate: Gate,
     /// Execution timeout in milliseconds (`0` = none).
     pub timeout_ms: u64,
+    /// Wire form of the gate's `stall_timeout` (`None` default, `Some(0)`
+    /// off).
+    pub stall_timeout_ms: Option<u64>,
     /// Cache key, `None` when caching is off.
     pub key: Option<CacheKey>,
     /// Working tree, `None` when caching is off or the tree is unknown.
@@ -597,6 +600,7 @@ pub fn run_material(
         gate_name: r.gate_name.clone(),
         gate: r.gate.clone(),
         timeout_ms: u64::try_from(r.gate.timeout.as_millis()).unwrap_or(u64::MAX),
+        stall_timeout_ms: r.gate.stall_timeout.to_wire(),
         key,
         tree,
         committed_tree,

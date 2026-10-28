@@ -109,7 +109,9 @@ session-start`. Within a 300 ms watchdog it:
   before every commit with the `verify` tool, never retry a queued command
   without Sluice, do not wrap builds or tests in subshells or scripts, do not
   start several dev servers while gates run, never approve merge trains, and a
-  gate result `KILLED for lack of memory` is not retried unchanged.
+  gate result `KILLED for lack of memory` is not retried unchanged, and a job
+  reported `STALLED` is probably hung: look at the test, never re-run it through the
+  shell.
 
 `CLAUDECODE` already marks the session as an agent, so the shims queue heavy
 commands without `SLUICE_SHIMS=1`. The hook fails open: on any error it prints
@@ -224,6 +226,10 @@ the same instructions. For agents without the plugin, paste this into `AGENTS.md
 - A gate that `status` shows as waiting for memory (`(budget: memory)` in the text
   of MCP `status` and of `sluice status`, `wait_detail: "memory"` in the structured result) is only queued behind
   other gates: wait, do not run it outside Sluice.
+- A `verify` progress message or a `status` that reports your job `STALLED` (no
+  CPU, I/O or output for its quiet window) means the gate is probably hung, for
+  example a test waiting forever: look at the test and `logs`, cancel your own
+  `verify` call, never re-run the gate through the shell.
 ```
 
 Adapt the examples in the second bullet to your stack.

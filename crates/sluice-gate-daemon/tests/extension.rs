@@ -157,6 +157,7 @@ fn config(dir: &Path, extensions: Vec<Arc<dyn Extension>>) -> DaemonConfig {
         extensions,
         reaper: None,
         containment: None,
+        stall: sluice_gate_daemon::stall::Tuning::default(),
     }
 }
 
@@ -250,6 +251,7 @@ fn run_request(dir: &Path, cmd: &str) -> RunRequest {
             timeout_ms: 60_000,
             env: BTreeMap::new(),
             cache: false,
+            stall_timeout_ms: None,
         },
         key: None,
         tree: None,

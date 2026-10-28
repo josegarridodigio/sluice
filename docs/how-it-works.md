@@ -88,6 +88,21 @@ run at once, and it makes identical simultaneous requests share one run.
   budget, up to `overcommit` (default 1.5) times it, at most once per
   `overcommit_interval` (5 s). `sluice logs --timeline` shows why each job
   waited.
+- **Stalled jobs.** Sluice samples a job's CPU, working set and log every second but
+  that says little about a test suite that finished its work and then waits forever on
+  one test (the hangs on record held a weight and gigabytes of memory for 25 minutes or
+  more). Every 5 s the daemon also reads each running job's own counters (its leaf
+  cgroup: `cpu.stat`, `io.stat`, `memory.stat`, `pids.current`; the process group
+  without containment) and the log bytes, and keeps the time of its last progress. A job
+  whose counters stayed flat for `max(5 min, 3 x its expected duration)` (or the gate's
+  `stall_timeout`, `"off"` to never) is reported as `stalled`: in `sluice status`, as a
+  one-line notice to `sluice run` and the MCP `verify` progress, and in `daemon.log`,
+  which also records each finished job's longest quiet window. A job waiting for a CPU
+  is not quiet, a job whose counters cannot be read is not stalled, and after a daemon
+  restart the window starts again. **Sluice only reports.** It never ends a stalled
+  job, and there is no setting that does; the gate timeout stays the only automatic
+  limit. A stalled job counts as ending at an unknown time when the head's start is
+  predicted (backfill), so no promise is built on it.
 - **PSI admission.** Admission pauses while the machine is under real pressure
   (Linux PSI `some avg10` above 60 % CPU or 20 % memory by default, the
   `[admission]` table of the user config). While pressure blocks, the head of

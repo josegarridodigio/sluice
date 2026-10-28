@@ -9,6 +9,11 @@ use std::path::Path;
 
 use super::DEFAULT_EXPECTED_MS;
 
+/// The predicted end of a stalled job (ADR-0024): it ends at an unknown
+/// time, so it is never released in a shadow computation and, when the head
+/// needs its room, the shadow time is unknown too.
+pub(super) const UNKNOWN_END: u64 = u64::MAX;
+
 /// Added to `0.1 x expected` for a job past its expectation, milliseconds.
 const OVERRUN_PAD_MS: u64 = 2_000;
 /// Added to the expected time of a candidate for the duration rule.
@@ -73,7 +78,8 @@ pub(super) struct Machine {
 /// When the head could start and which holders have ended by then.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Shadow {
-    /// Unix milliseconds; `now` when the head already fits.
+    /// Unix milliseconds; `now` when the head already fits;
+    /// [`UNKNOWN_END`] when it fits only once a stalled job has ended.
     pub at: u64,
     /// Parallel to the holders: released by `at`.
     pub released: Vec<bool>,
@@ -127,7 +133,9 @@ fn fits(holders: &[Holder<'_>], released: &[bool], head: &Head<'_>, m: &Machine)
 }
 
 /// The earliest time the head fits: the holders are released in order of
-/// predicted end until it fits budget, cap and memory.
+/// predicted end until it fits budget, cap and memory. A holder that ends at
+/// an unknown time ([`UNKNOWN_END`], a stalled job) is never released: when
+/// the head does not fit without it, the shadow time is [`UNKNOWN_END`].
 pub(super) fn shadow(now: u64, holders: &[Holder<'_>], head: &Head<'_>, m: &Machine) -> Shadow {
     let mut order: Vec<usize> = (0..holders.len()).collect();
     order.sort_by_key(|&i| (holders[i].end, i));
@@ -136,6 +144,14 @@ pub(super) fn shadow(now: u64, holders: &[Holder<'_>], head: &Head<'_>, m: &Mach
     for i in order {
         if fits(holders, &released, head, m) {
             break;
+        }
+        if holders[i].end == UNKNOWN_END {
+            // Everything that ends at a known time is gone and the head
+            // still does not fit: it waits for a job that may never end.
+            return Shadow {
+                at: UNKNOWN_END,
+                released,
+            };
         }
         released[i] = true;
         at = at.max(holders[i].end);
@@ -214,10 +230,13 @@ impl Room<'_> {
 
 /// The duration rule: the job's learned duration, as
 /// `max(1.5 x expected, expected + 10 s)`, ends before the shadow time. A job
-/// with no learned duration never passes (`DEFAULT_EXPECTED_MS` is no bound).
+/// with no learned duration never passes (`DEFAULT_EXPECTED_MS` is no bound),
+/// and none passes an unknown shadow time (no promise is built on a stalled
+/// job).
 pub(super) fn ends_in_time(now: u64, expected_ms: Option<u64>, shadow_at: u64) -> bool {
-    expected_ms.is_some_and(|e| {
-        let bound = e.saturating_add(e / 2).max(e.saturating_add(BOUND_PAD_MS));
-        now.saturating_add(bound) <= shadow_at
-    })
+    shadow_at != UNKNOWN_END
+        && expected_ms.is_some_and(|e| {
+            let bound = e.saturating_add(e / 2).max(e.saturating_add(BOUND_PAD_MS));
+            now.saturating_add(bound) <= shadow_at
+        })
 }

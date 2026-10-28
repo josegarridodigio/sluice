@@ -18,7 +18,7 @@ use sluice_gate_proto::{WaitReason, gib_text};
 mod shadow;
 
 pub use shadow::BackfillRule;
-use shadow::{Head, Holder, Machine, Room, ends_in_time, predicted_end, room, shadow};
+use shadow::{Head, Holder, Machine, Room, UNKNOWN_END, ends_in_time, predicted_end, room, shadow};
 
 /// Expected run time of a job without history (HRRN), milliseconds.
 pub const DEFAULT_EXPECTED_MS: u64 = 60_000;
@@ -588,6 +588,9 @@ pub struct RunningSnap {
     /// The job started behind a reserved head (ADR-0023): it counts for the
     /// whole interval when later candidates are checked.
     pub backfilled: bool,
+    /// The job shows no progress (ADR-0024): it ends at an unknown time, so
+    /// no shadow time or room is built on its release.
+    pub stalled: bool,
 }
 
 /// Everything one admission decision depends on.
@@ -649,7 +652,8 @@ pub struct Plan {
     /// not fit their estimate, only a quarter of it (ADR-0022).
     pub probes: Vec<String>,
     /// When the reserved head is predicted to start (the shadow time,
-    /// unix milliseconds); `Some` exactly when `reserved` is.
+    /// unix milliseconds); `None` without a reserved head or when it waits
+    /// for a stalled job (ADR-0024).
     pub shadow: Option<u64>,
     /// The jobs of `start` that start before the reserved head, with the
     /// rule that let them (ADR-0023).
@@ -905,7 +909,11 @@ impl<'s> Pass<'s> {
             .map(|r| Holder {
                 repo: r.repo.as_path(),
                 weight: r.weight,
-                end: predicted_end(s.now, r.started_at, r.expected_ms),
+                end: if r.stalled {
+                    UNKNOWN_END
+                } else {
+                    predicted_end(s.now, r.started_at, r.expected_ms)
+                },
                 memory: s.memory.map_or(0, |f| running_release(&s, &f, r)),
                 backfilled: r.backfilled,
             })
@@ -1117,7 +1125,12 @@ impl<'s> Pass<'s> {
                 detail,
             });
         }
-        plan.shadow = self.reservation.as_ref().map(|r| r.shadow_at);
+        // An unknown shadow time (the head waits for a stalled job) is no ETA.
+        plan.shadow = self
+            .reservation
+            .as_ref()
+            .map(|r| r.shadow_at)
+            .filter(|&at| at != UNKNOWN_END);
         (self.reservation.as_ref().map(|r| r.head), waiting)
     }
 
@@ -1556,6 +1569,7 @@ impl Job {
             started_at: self.started_at,
             expected_ms: self.spec.expected_ms,
             backfilled: self.backfilled,
+            stalled: false,
         }
     }
 }
@@ -1581,6 +1595,8 @@ pub struct Scheduler {
     memory: Option<MemoryFacts>,
     /// Working set of each running job at its last sample, bytes.
     currents: BTreeMap<String, u64>,
+    /// Running jobs that show no progress (ADR-0024).
+    stalled: BTreeSet<String>,
     last_overcommit_at: Option<u64>,
     /// Time of the latest admission of any kind.
     last_start_at: Option<u64>,
@@ -1621,6 +1637,7 @@ impl Scheduler {
             priors: PeakPriors::new(),
             memory: None,
             currents: BTreeMap::new(),
+            stalled: BTreeSet::new(),
             last_overcommit_at: None,
             last_start_at: None,
             over_admissions: 0,
@@ -1719,6 +1736,12 @@ impl Scheduler {
         self.currents = currents;
     }
 
+    /// Sets which running jobs are stalled (ADR-0024): the shadow time of a
+    /// reserved head never counts on their release.
+    pub fn set_stalled(&mut self, stalled: BTreeSet<String>) {
+        self.stalled = stalled;
+    }
+
     /// The machine's memory at the last [`Scheduler::set_memory`]; `None`
     /// with the rule off.
     pub fn memory_facts(&self) -> Option<MemoryFacts> {
@@ -1813,6 +1836,7 @@ impl Scheduler {
             .iter()
             .map(|j| RunningSnap {
                 current: self.currents.get(&j.spec.id).copied().unwrap_or(0),
+                stalled: self.stalled.contains(&j.spec.id),
                 expected_peak: self.peak_of(j.spec.learn_key.as_ref()),
                 lower_bound: self.bound_of(j.spec.learn_key.as_ref()),
                 ..j.running_snap()

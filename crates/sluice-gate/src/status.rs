@@ -56,7 +56,7 @@ pub fn show(json: bool) -> ExitCode {
 }
 
 /// Short human duration: `850ms`, `12.3s`, `4m05s`, `2h10m`.
-fn dur(ms: u64) -> String {
+pub(crate) fn dur(ms: u64) -> String {
     match ms {
         m if m < 1000 => format!("{m}ms"),
         m if m < 60_000 => format!("{:.1}s", Duration::from_millis(m).as_secs_f64()),
@@ -106,13 +106,14 @@ fn render_jobs(out: &mut String, r: &StatusReport) {
     for j in &r.running {
         let _ = writeln!(
             out,
-            "  {:<16} {:<20} weight {:<2} {:>8}  {} subscriber(s){}  job {}",
+            "  {:<16} {:<20} weight {:<2} {:>8}  {} subscriber(s){}{}  job {}",
             j.gate,
             basename(&j.repo),
             weight_text(j.weight, j.weight_cfg, j.weight_auto),
             dur(j.elapsed_ms),
             j.subscribers,
             j.memory_text(),
+            j.stalled_text(dur),
             j.job_id
         );
     }
@@ -404,6 +405,32 @@ mod tests {
         assert!(text.contains("mem 3.0 GiB/18.0 GiB"), "{text}");
         assert!(text.contains("mem 1.0 GiB/~9.0 GiB"), "{text}");
         assert!(text.contains("(budget: memory)  mem 18.0 GiB"), "{text}");
+    }
+
+    #[test]
+    fn render_shows_a_stalled_job_with_its_memory_and_flat_signals() {
+        use sluice_gate_proto::StalledJob;
+        let mut r = StatusReport::default();
+        r.running.push(RunningJob {
+            gate: "test".into(),
+            weight: 6,
+            memory_bytes: Some(7 << 30),
+            stalled: Some(StalledJob {
+                for_ms: 372_000,
+                flat: vec!["cpu".into(), "io".into(), "output".into()],
+            }),
+            ..RunningJob::default()
+        });
+        r.running.push(RunningJob {
+            gate: "lint".into(),
+            ..RunningJob::default()
+        });
+        let text = render(&r, Path::new("/l"), None);
+        assert!(
+            text.contains("mem 7.0 GiB  STALLED 6m12s (flat: cpu io output)"),
+            "{text}"
+        );
+        assert_eq!(text.matches("STALLED").count(), 1, "{text}");
     }
 
     #[test]

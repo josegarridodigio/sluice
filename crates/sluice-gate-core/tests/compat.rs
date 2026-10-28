@@ -649,3 +649,35 @@ fn scheduler_backfill_fixture_parses() {
     let plain = UserConfig::parse("version = 1\n", &path).unwrap();
     assert!(plain.scheduler.backfill);
 }
+
+/// ADR-0024: a gate's `stall_timeout` parses (a duration, `"off"`, or the
+/// default), has a wire form that round-trips, and rejects nonsense.
+#[test]
+fn gate_stall_timeout_fixture_parses() {
+    use sluice_gate_core::config::StallTimeout;
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/unreleased/gate-stall-timeout.toml");
+    let text = fs::read_to_string(&path).unwrap();
+    let cfg = RepoConfig::parse(&text, &path).unwrap();
+    assert_eq!(cfg.gates["lint"].stall_timeout, StallTimeout::Auto);
+    assert_eq!(
+        cfg.gates["test"].stall_timeout,
+        StallTimeout::After(std::time::Duration::from_mins(10))
+    );
+    assert_eq!(cfg.gates["serve"].stall_timeout, StallTimeout::Off);
+    for t in [
+        StallTimeout::Auto,
+        StallTimeout::Off,
+        cfg.gates["test"].stall_timeout,
+    ] {
+        assert_eq!(StallTimeout::from_wire(t.to_wire()), t);
+    }
+    for bad in ["\"soon\"", "\"0s\"", "5"] {
+        let toml = format!("version = 1\n[gates.g]\ncmd = \"x\"\nstall_timeout = {bad}\n");
+        let err = RepoConfig::parse(&toml, &path).unwrap_err().to_string();
+        assert!(
+            err.contains("stall_timeout") || err.contains("invalid type"),
+            "{err}"
+        );
+    }
+}

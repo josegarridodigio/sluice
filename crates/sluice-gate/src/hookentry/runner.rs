@@ -242,6 +242,7 @@ pub(super) fn gate_of(unit: &Unit, env: &EnvMap) -> Gate {
         cmd: unit.command.clone(),
         weight: Weight::Auto,
         timeout: Duration::ZERO,
+        stall_timeout: sluice_gate_core::config::StallTimeout::Auto,
         hooks: Vec::new(),
         key_inputs: unit.key_inputs.clone(),
         key_files: unit.key_files.clone(),

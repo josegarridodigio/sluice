@@ -145,7 +145,9 @@ fn rules_text(gates: &[String], derived: bool) -> String {
          unchanged or outside Sluice; lower its footprint (e.g. test concurrency) or tell the \
          human. \
          7) A hook command that `gate_list` leaves out is run by the commit's hook: do not run it \
-         by hand through the shell."
+         by hand through the shell. \
+         8) A job reported STALLED (`verify`, `status`) is probably hung: cancel your `verify`, \
+         look at the test, never rerun it through the shell."
     )
 }
 

@@ -19,6 +19,7 @@
 //! each and a [`DaemonHandle`]; `queue-*` requests are routed to them.
 
 mod extension;
+mod stalls;
 
 pub use extension::{
     BoxFuture, DaemonHandle, Extension, ExtensionCtx, LeaseFence, RunSubscription, StoreError,
@@ -72,6 +73,7 @@ use crate::sampler::{self, JobUsage, Utilisation};
 use crate::scheduler::{
     self as sched, Class, Enqueued, HeadReservation, JobSpec, Policy, Pressure, Scheduler,
 };
+use crate::stall::StallWatch;
 use crate::store::{
     FinishMeta, GateMemory, GateStat, JobRow, JobState, QueuedMeta, RequestRow, Store,
 };
@@ -156,6 +158,9 @@ pub struct DaemonConfig {
     /// when `[containment] enabled` is true; the daemon still falls back to
     /// no containment when the machine does not allow it.
     pub containment: Option<ContainmentSetup>,
+    /// Timing of the stalled-job detection (ADR-0024); the default is the
+    /// production setting, tests lower the floors and the cadence.
+    pub stall: crate::stall::Tuning,
 }
 
 /// How many rotated generations of `daemon.log` are kept (`.1` to `.3`).
@@ -188,6 +193,8 @@ enum JobEvent {
     Progress {
         elapsed_ms: u64,
         log_bytes: u64,
+        /// How long the job has shown no progress, while it is stalled.
+        stalled_ms: Option<u64>,
     },
     /// The outcome and the job's start time (each subscriber derives its
     /// own `queue_wait_ms` from it).
@@ -304,6 +311,8 @@ struct JobEntry {
     /// The message of a job the memory guard cancelled (replaces the generic
     /// "was killed" text when the job ends).
     guard_message: Option<String>,
+    /// Progress record of the stalled-job detection, from the first read.
+    stall: Option<StallWatch>,
 }
 
 /// What [`register`] hands to the connection handler.
@@ -383,6 +392,8 @@ struct Shared {
     /// Why containment is off, when it was configured but is not running
     /// (shown by `status`; `None` when it runs or was never set up).
     containment_off: Option<String>,
+    /// Monotonic time of the last stall read ([`stalls::due`]).
+    stall_last: AtomicU64,
 }
 
 /// Extensions after start-up.
@@ -903,6 +914,7 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
         reaper,
         containment,
         containment_off,
+        stall_last: AtomicU64::new(u64::MAX),
         config,
     });
     seed_peaks(&shared);
@@ -1159,7 +1171,9 @@ fn sample_tick(shared: &Shared) -> bool {
         }
     }
     guard_tick(shared, now);
-    changed
+    let mono = crate::stall::mono_ms();
+    let stalls = stalls::due(shared, mono) && stalls::tick(shared, mono);
+    changed || stalls
 }
 
 /// The memory the gates may use: the machine's `meminfo`, capped by the
@@ -1464,6 +1478,8 @@ fn admit(shared: &Shared, now: u64) -> Vec<(String, sched::Admission)> {
             .filter_map(|(id, e)| Some((id.clone(), e.usage.memory_now()?)))
             .collect();
         st.sched.set_memory(facts, currents);
+        let stalled = stalls::stalled_ids(&st);
+        st.sched.set_stalled(stalled);
         let started = st.sched.admit_with(
             now,
             Pressure {
@@ -1621,6 +1637,9 @@ fn close_job(
         }
         let coalesced = entry.as_ref().map_or(0, |e| e.coalesced);
         let started_at = entry.as_ref().and_then(|e| e.started_at);
+        if let Some(entry) = &entry {
+            stalls::log_finished(id, label, entry);
+        }
         if let Some(r) = &record {
             outcome.wait_reason = r.dominant().map(|c| c.as_str().to_owned());
             outcome.admission = r.admission.map(|a| a.as_str().to_owned());
@@ -2083,6 +2102,7 @@ async fn launch_placed(shared: &Shared, id: &str, spec: ExecSpec) -> Option<Fini
                 let _ = events.send(JobEvent::Progress {
                     elapsed_ms: now_ms().saturating_sub(info.started_at),
                     log_bytes: handle.log_bytes(),
+                    stalled_ms: stalls::stalled_for(shared, id),
                 });
             }
         }
@@ -2721,6 +2741,7 @@ fn status_report(shared: &Shared) -> StatusReport {
                     .get(&v.id)
                     .and_then(|e| e.usage.demand_so_far(elapsed_ms))
                     .map(|d| (d * 10.0).round() / 10.0);
+                let stall_view = stalls::view(st.jobs.get(&v.id));
                 RunningJob {
                     caller: caller(&v.id),
                     kind,
@@ -2744,6 +2765,7 @@ fn status_report(shared: &Shared) -> StatusReport {
                         .memory_expected
                         .map(super::scheduler::Expected::learned),
                     memory_expected_basis: v.memory_expected.map(|e| e.basis.as_str().to_owned()),
+                    stalled: stall_view,
                 }
             })
             .collect();
@@ -3258,6 +3280,7 @@ fn register_job(shared: &Shared, job: NewJob) -> std::result::Result<Registered,
                     usage: JobUsage::default(),
                     killed_by: None,
                     guard_message: None,
+                    stall: None,
                 },
             );
             Ok(Registered {
@@ -3417,6 +3440,7 @@ impl Subscriber<'_> {
             Ok(JobEvent::Progress {
                 elapsed_ms,
                 log_bytes,
+                stalled_ms,
             }) => Some((
                 ServerMessage::Progress {
                     id,
@@ -3424,6 +3448,7 @@ impl Subscriber<'_> {
                     elapsed_ms,
                     log_bytes,
                     position: None,
+                    stalled_ms,
                 },
                 false,
             )),
@@ -3472,6 +3497,7 @@ impl Subscriber<'_> {
             elapsed_ms: now_ms().saturating_sub(queued_at),
             log_bytes: 0,
             position: Some(position),
+            stalled_ms: None,
         })
     }
 }

@@ -1,0 +1,16 @@
+# Written for the release after 0.7.0 (ADR-0024): `stall_timeout` of a gate, a
+# duration or "off"; omitted means `max(5 min, 3 x expected duration)`. Not a
+# recording of a released binary; 0.7.0 and older reject this file because a
+# gate refuses unknown keys.
+version = 1
+
+[gates.lint]
+cmd = "npm run lint"
+
+[gates.test]
+cmd = "npm test"
+stall_timeout = "10m"
+
+[gates.serve]
+cmd = "npm run serve"
+stall_timeout = "off"

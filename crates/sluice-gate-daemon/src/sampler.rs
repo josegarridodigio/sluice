@@ -200,7 +200,7 @@ pub type TaskReading = (u32, u64, Option<(u64, u64)>);
 
 /// Fields after the `(comm)` of a `/proc/<pid>/stat` line (field 3 is
 /// index 0).
-fn stat_fields(stat: &str) -> Option<Vec<&str>> {
+pub(crate) fn stat_fields(stat: &str) -> Option<Vec<&str>> {
     let rest = &stat[stat.rfind(')')? + 1..];
     Some(rest.split_whitespace().collect())
 }

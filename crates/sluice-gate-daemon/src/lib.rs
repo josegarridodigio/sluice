@@ -28,6 +28,7 @@ pub mod reaper;
 pub mod sampler;
 pub mod scheduler;
 pub mod server;
+pub mod stall;
 pub mod store;
 
 /// Errors of the daemon crate.

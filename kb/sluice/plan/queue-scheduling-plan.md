@@ -29,7 +29,7 @@ through Sluice, Matrix on the branch before a release (watched job by job).
 |---|---|---|
 | Q1 | S4: lower bounds from failed runs, capped prior, first-run probe (ADR-0022) | done, verified through Sluice ([[sluice/changes/queue-q1-first-run-memory.md]]) |
 | Q2 | S1: shadow time, extra-resources and duration rules, head-delay counter, switch (ADR-0023) | done, verified through Sluice ([[sluice/changes/queue-q2-backfilling.md]]) |
-| Q3 | S2: stall detection and reporting, longest quiet window per job (ADR-0024) | pending |
+| Q3 | S2: stall detection and reporting, longest quiet window per job (ADR-0024) | done, verified through Sluice ([[sluice/changes/queue-q3-stalled-jobs.md]]) |
 | Q4 | S3: protected targets: detection (warn), then pull-request landing (ADR to write) | pending |
 
 ## Evidence (a second machine, 12 threads, 30 GiB, 2026-10-28, daemon 0.6.3)

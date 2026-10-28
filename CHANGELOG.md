@@ -21,6 +21,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   started against their first eta (`backfilled`, `backfill_head_delay_ms` in
   `--json`, additive). `[scheduler] backfill = false` restores the strict reservation;
   the key is one-way (0.7.0 and older binaries reject it).
+- **Stalled jobs are reported, never killed** (ADR-0024). Every 5 s the daemon reads
+  what each running job does: CPU time, block I/O, page faults and process count from
+  its leaf cgroup (the process group without containment), plus the log bytes. A job
+  with no progress for `max(5 min, 3 x its expected duration)` is `stalled`; a job
+  waiting for a CPU is not. `status` shows `STALLED 6m12s (flat: cpu io output)` on the
+  job (with the memory and weight it holds; `running[].stalled` in `--json`), `sluice
+  run` prints a notice when the job becomes stalled and when it is active again, the MCP
+  `verify` progress says `looks STALLED`, and `daemon.log` records each stall and, for
+  every finished job, its longest quiet window. A stalled job counts as ending at an
+  unknown time in the backfill shadow time. Sluice never ends a stalled job and has no
+  setting to: the gate `timeout` stays the only limit. A gate can set `stall_timeout`
+  (a duration, at least 1 minute, or `"off"`); the key is one-way (0.7.0 and older
+  binaries reject it in `.sluice.toml`). Agents are told that a job reported `STALLED`
+  is probably hung and that they should look at the test, never re-run the gate
+  through the shell.
 - **First-run memory probe** (ADR-0022). A gate with no passing run may start
   as a *memory probe* when a quarter of its estimated peak is free, one probe per
   gate and one per machine at a time; it never over-admits. The daemon log says

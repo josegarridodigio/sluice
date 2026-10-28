@@ -469,6 +469,23 @@ report) and `totals.backfilled` and `totals.backfill_head_delay_ms` (the sum,
 over the reserved heads that started, of how long after its first computed eta
 each did; zero when earlier). All optional and additive.
 
+A running job that shows no progress is reported `STALLED` with how long, and the
+signals that were flat (`cpu`, `cpu-wait`, `io`, `faults`, `output`, `processes`; the
+ones the machine gives); the memory and weight it holds are on the same line:
+
+```text
+running:  1
+  test             app                  weight 6    41m12s  1 subscriber(s)  mem 7.1 GiB/14.0 GiB  STALLED 36m05s (flat: cpu cpu-wait io faults output processes)  job j9
+```
+
+Quiet means no progress beyond small thresholds: CPU above 1 % of one CPU, waiting
+for a CPU above 10 % of the interval, block I/O of 16 KiB or 16 operations, 128 minor
+or one major page fault, any log byte, any change in the number of processes, all per
+5 s read. The window is `max(5 min, 3 x expected duration)` or the gate's
+`stall_timeout`. The line goes away when the job shows activity. In `--json`:
+`running[].stalled` (`for_ms`, `flat`), present only while stalled; additive. Sluice
+never ends a stalled job.
+
 <details>
 <summary>Full help</summary>
 

@@ -319,6 +319,7 @@ pub fn daemon_config_full(
         }))],
         reaper: None,
         containment: None,
+        stall: sluice_gate_daemon::stall::Tuning::default(),
     }
 }
 

@@ -88,7 +88,21 @@ fn daemon_config(env: &EnvMap, user: &UserConfig, detached: bool) -> Result<Daem
         extensions: vec![Arc::new(QueueExtension::new(QueueOptions::default()))],
         reaper: Some(reaper_command()),
         containment: containment_setup(env, user),
+        stall: stall_tuning(env),
     })
+}
+
+/// Test-only: lowers the floors of the stalled-job window (milliseconds).
+pub const TEST_STALL_FLOOR_ENV: &str = "SLUICE_TEST_STALL_FLOOR_MS";
+/// Test-only: the cadence of the stalled-job counter reads (milliseconds).
+pub const TEST_STALL_EVERY_ENV: &str = "SLUICE_TEST_STALL_EVERY_MS";
+
+/// The stalled-job timing: production values unless a test overrides them.
+fn stall_tuning(env: &EnvMap) -> sluice_gate_daemon::stall::Tuning {
+    sluice_gate_daemon::stall::Tuning::with_test_overrides(
+        env.get(TEST_STALL_FLOOR_ENV).map(String::as_str),
+        env.get(TEST_STALL_EVERY_ENV).map(String::as_str),
+    )
 }
 
 /// Test-only: the runtime directory where the systemd user manager's socket

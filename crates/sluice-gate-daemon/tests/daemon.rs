@@ -116,6 +116,7 @@ fn config(dir: &Path, budget: u32, policy: LastSubscriberGone) -> DaemonConfig {
         extensions: Vec::new(),
         reaper: None,
         containment: None,
+        stall: sluice_gate_daemon::stall::Tuning::default(),
     }
 }
 
@@ -197,6 +198,7 @@ fn run_msg(
                 timeout_ms,
                 env: BTreeMap::new(),
                 cache: key.is_some(),
+                stall_timeout_ms: None,
             },
             key,
             tree,
@@ -2008,5 +2010,92 @@ async fn the_memory_guard_does_nothing_when_off_or_when_nothing_is_to_blame() {
     write_memory_pressure(&psi_root, 90.0);
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert_eq!(status(&d).await.running.len(), 1, "nothing to blame");
+    d.shutdown().await;
+}
+
+/// Progress of the job as `(stalled_ms)` values, in order.
+fn stall_marks(msgs: &[ServerMessage]) -> Vec<Option<u64>> {
+    msgs.iter()
+        .filter_map(|m| match m {
+            ServerMessage::Progress { stalled_ms, .. } => Some(*stalled_ms),
+            _ => None,
+        })
+        .collect()
+}
+
+/// ADR-0024: a job that sleeps without output is reported stalled (to its
+/// subscriber and in `status`), reported active again when it wakes up, and
+/// is never ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_job_is_reported_stalled_then_active_and_never_killed() {
+    let repo = make_repo();
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path(), 2, LastSubscriberGone::Cancel);
+    cfg.admission.psi_poll_interval = Duration::from_millis(200);
+    cfg.stall = sluice_gate_daemon::stall::Tuning::with_test_overrides(Some("1000"), Some("200"));
+    let d = start_in(dir, cfg).await;
+    let mut msg = run_msg(
+        &repo,
+        "hang",
+        "sleep 4; echo awake; sleep 1",
+        None,
+        None,
+        60_000,
+    );
+    if let ClientMessage::Run { request, .. } = &mut msg {
+        request.gate.stall_timeout_ms = Some(1_500);
+    }
+    let (_w, mut r) = d.request(&msg).await;
+    let mut seen = Vec::new();
+    loop {
+        let m = next(&mut r).await.expect("a message");
+        let stalled = matches!(
+            m,
+            ServerMessage::Progress {
+                stalled_ms: Some(_),
+                ..
+            }
+        );
+        seen.push(m);
+        if stalled {
+            break;
+        }
+    }
+    let report = status(&d).await;
+    let job = &report.running[0];
+    let stalled = job.stalled.as_ref().expect("status shows the stall");
+    assert!(stalled.for_ms >= 1_500, "{stalled:?}");
+    assert!(
+        stalled.flat.contains(&"cpu".to_owned()) && stalled.flat.contains(&"output".to_owned())
+    );
+    assert_eq!(job.weight, 1, "the job still holds its weight");
+    seen.extend(until_done(&mut r).await);
+    assert_eq!(done_status(&seen), OutcomeStatus::Pass, "never killed");
+    let marks = stall_marks(&seen);
+    let first = marks.iter().position(Option::is_some).unwrap();
+    assert!(
+        marks[first..].iter().any(Option::is_none),
+        "active again after the stall: {marks:?}"
+    );
+    d.shutdown().await;
+}
+
+/// `stall_timeout = "off"` (`Some(0)`) never reports a stall.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gate_with_the_stall_timeout_off_is_never_reported_stalled() {
+    let repo = make_repo();
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path(), 2, LastSubscriberGone::Cancel);
+    cfg.admission.psi_poll_interval = Duration::from_millis(200);
+    cfg.stall = sluice_gate_daemon::stall::Tuning::with_test_overrides(Some("500"), Some("200"));
+    let d = start_in(dir, cfg).await;
+    let mut msg = run_msg(&repo, "serve", "sleep 2", None, None, 60_000);
+    if let ClientMessage::Run { request, .. } = &mut msg {
+        request.gate.stall_timeout_ms = Some(0);
+    }
+    let (_w, mut r) = d.request(&msg).await;
+    let seen = until_done(&mut r).await;
+    assert_eq!(done_status(&seen), OutcomeStatus::Pass);
+    assert!(stall_marks(&seen).iter().all(Option::is_none));
     d.shutdown().await;
 }

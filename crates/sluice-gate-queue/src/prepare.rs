@@ -170,6 +170,7 @@ pub(crate) fn submit(
                 .max(1),
             env: BTreeMap::new(),
             cache: false,
+            stall_timeout_ms: None,
         },
         key: None,
         tree: None,
