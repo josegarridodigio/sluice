@@ -53,6 +53,15 @@ fn record(sb: &Sandbox) -> String {
     fs::read_to_string(record_file(sb)).unwrap_or_default()
 }
 
+/// Whether the recorded `$0` of a hook run is `path` (relative to the
+/// repository): shells report it as given or made absolute, depending on the
+/// shell and how the hook was executed.
+fn ran(rec: &str, path: &str) -> bool {
+    rec.lines()
+        .filter_map(|l| l.strip_prefix("self:"))
+        .any(|s| s == path || s.ends_with(&format!("/{path}")))
+}
+
 /// Runs git in the repository with the tools-only `PATH` and `extra` added.
 fn git_out(sb: &Sandbox, args: &[&str], extra: &[(&str, &str)]) -> Output {
     StdCommand::new(find_on_path("git").unwrap())
@@ -369,7 +378,7 @@ fn husky_hooks_run_with_the_same_argv_stdin_cwd_environment_and_exit_code() {
     assert!(rec.contains("env:kept"), "{rec}");
     assert!(rec.contains(&format!("cwd:{}", sb.repo.display())), "{rec}");
     // The stub was run where git's relative path points, so its `$0` is relative.
-    assert!(rec.contains("self:.husky/_/pre-push"), "{rec}");
+    assert!(ran(&rec, ".husky/_/pre-push"), "{rec}");
 }
 
 #[test]
@@ -432,7 +441,7 @@ fn plain_hooks_run_from_core_hooks_path_and_from_the_default_directory() {
     assert_eq!(status(&sb)["manager"], "plain hooks");
     let out = run_script(&sb, "pre-commit", &[], "", &[("FAKE_EXIT", "5")]);
     assert_eq!(out.status.code(), Some(5), "{out:?}");
-    assert!(record(&sb).contains("self:.githooks/pre-commit"));
+    assert!(ran(&record(&sb), ".githooks/pre-commit"), "{}", record(&sb));
 
     // The default directory is not consulted while core.hooksPath names another one
     // (git would not have run it either).
@@ -552,7 +561,7 @@ fn a_missing_sluice_binary_still_runs_the_original_hook() {
     git_ok(&sb, &["config", "core.hooksPath", ".githooks"], &[]);
     let out = run_script(&sb, "pre-push", &["q"], "", &[]);
     assert_eq!(out.status.code(), Some(0), "{out:?}");
-    assert!(record(&sb).contains("self:.githooks/pre-push"));
+    assert!(ran(&record(&sb), ".githooks/pre-push"), "{}", record(&sb));
 
     // Sluice's own directory among the values (a later `--add`, or includes
     // read by a newer git) is not the repository's hook: the last other value wins.
@@ -561,11 +570,7 @@ fn a_missing_sluice_binary_still_runs_the_original_hook() {
     git_ok(&sb, &["config", "--add", "core.hooksPath", &ours], &[]);
     let out = run_script(&sb, "pre-push", &["q"], "", &[]);
     assert_eq!(out.status.code(), Some(0), "{out:?}");
-    assert!(
-        record(&sb).contains("self:.githooks/pre-push"),
-        "{}",
-        record(&sb)
-    );
+    assert!(ran(&record(&sb), ".githooks/pre-push"), "{}", record(&sb));
 }
 
 #[test]

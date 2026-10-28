@@ -42,9 +42,15 @@ fi
 chmod 0755 "$tmp"
 mv "$tmp" "$prefix/bin/lefthook"
 
-python3 -m venv "$prefix/pre-commit-venv"
-"$prefix/pre-commit-venv/bin/pip" install --quiet "pre-commit==$PRE_COMMIT_VERSION"
-ln -sf "$prefix/pre-commit-venv/bin/pre-commit" "$prefix/bin/pre-commit"
+# pre-commit 4.7.0 requires Python >= 3.11. On an older Python (ubuntu:22.04 has 3.10) it
+# is not installed and the real pre-commit tests skip themselves; other jobs run them.
+if python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
+    python3 -m venv "$prefix/pre-commit-venv"
+    "$prefix/pre-commit-venv/bin/pip" install --quiet "pre-commit==$PRE_COMMIT_VERSION"
+    ln -sf "$prefix/pre-commit-venv/bin/pre-commit" "$prefix/bin/pre-commit"
+else
+    echo "pre-commit $PRE_COMMIT_VERSION needs Python >= 3.11 ($(python3 --version)); not installed"
+fi
 
 "$prefix/bin/lefthook" version
-"$prefix/bin/pre-commit" --version
+if [ -x "$prefix/bin/pre-commit" ]; then "$prefix/bin/pre-commit" --version; fi
