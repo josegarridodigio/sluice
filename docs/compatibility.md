@@ -158,6 +158,14 @@ the `progress` message the optional `stalled_ms`; older clients ignore both (sch
 1). A `.sluice.toml` with `stall_timeout` read by an older client simply fails to load, so
 add the key only where every machine runs a newer binary.
 
+The release after 0.7.0 adds the queue reason `target_protected` (ADR-0025): a push the forge
+refused as a protected branch fails its jobs with it instead of `push_rejected`. It is a new
+string in an existing optional field, shown as is by older clients (which print an unknown
+reason without special wording and suggest a retry that cannot help). `queue-enqueue` replies
+gain the optional job field `learned_protection` (`first_seen`, `evidence`) and the MCP
+`queue_enqueue` result the optional `warnings`; older clients ignore both. The
+`target-protection` check of `sluice doctor` is not covered (doctor output never is).
+
 ### The database
 
 `$XDG_STATE_HOME/sluice/sluice.db` holds the daemon's job history and the merge
@@ -171,6 +179,10 @@ queue's state in two independent schemas. Markers are not in it.
   (`queue_trains.prepare`, `config_source`, `config_hash`,
   `queue_jobs.trust_config`), added by an idempotent migration when the daemon
   opens the file; `queue_schema` stays 1 and an older binary ignores them.
+- The release after 0.7.0 adds the queue table `queue_protected_targets` (the targets that
+  refused a direct push, per endpoint hash and target), created by the same idempotent
+  migration when the daemon opens the file; `queue_schema` stays 1 and an older binary
+  never reads it.
 - The scheduler timeline and the learned-weight statistics of 0.3.0 (extra
   `jobs` columns and the `job_requests` and `gate_stats` tables) are additive
   and tracked by their own `sched_schema` version; older binaries ignore them.

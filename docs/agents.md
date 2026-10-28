@@ -271,7 +271,11 @@ gist as its own instructions, but the file is read first:
   approve such a train, the daemon refuses it.
 - The push of an approved train runs the repository's `pre-push` hook; a Sluice
   hook is answered from the train, so there is nothing to do. A hook that
-  declines fails the job with `pre_push_hook`: read its output.
+  declines fails the job with `pre_push_hook`: read its output. A forge that
+  refuses direct pushes to the target fails it with `target_protected`: tell
+  the human, do not retry. A warning in the `queue_enqueue` result about the
+  target (it requires pull requests, is protected, could not be checked) is
+  for the human too; the job is queued anyway.
 - Errors start with a code: `conflict-state`, `stale-plan`,
   `duplicate-branch`, `not-allowed`, `not-supported`. Report them; do not work
   around them.

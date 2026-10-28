@@ -11,9 +11,9 @@ use sluice_gate_daemon::server::{
 };
 use sluice_gate_proto::{
     ApproveVia, ClientMessage, EnqueueRequest, ErrorCode, FEATURE_QUEUE,
-    FEATURE_QUEUE_TRUST_CONFIG, QUEUE_STATUS_SCHEMA_VERSION, QueueJobState as J, QueueJobView,
-    QueueStatusReport, QueueSummary, QueueTrainState as T, QueueTrainView, ReconcileDecision,
-    ReconcileResult, RunRequest, ServerMessage,
+    FEATURE_QUEUE_TRUST_CONFIG, LearnedProtection, QUEUE_STATUS_SCHEMA_VERSION, QueueJobState as J,
+    QueueJobView, QueueStatusReport, QueueSummary, QueueTrainState as T, QueueTrainView,
+    ReconcileDecision, ReconcileResult, RunRequest, ServerMessage,
 };
 
 use crate::git::{EnvMap, allowlisted};
@@ -102,6 +102,7 @@ fn job_view(tx: &rusqlite::Transaction<'_>, j: &JobRow) -> rusqlite::Result<Queu
         enqueued_at: rfc3339(j.enqueued_at),
         updated_at: rfc3339(j.updated_at),
         finished_at: j.finished_at.map(rfc3339),
+        learned_protection: None,
     })
 }
 
@@ -424,7 +425,13 @@ async fn enqueue(core: &Arc<Core>, id: u64, req: EnqueueRequest) -> ServerMessag
         // head's `[queue] network_timeout`: a stall only delays this request.
         let g2 = g2.with_network_timeout(defaults.network_timeout);
         match target::resolve(&g2, &r2, &branch, base.as_deref(), &defaults) {
-            Ok(t) => Ok((full, t)),
+            Ok(t) => {
+                // The endpoint the learned `target_protected` facts hang on.
+                let endpoint = (!t.is_local())
+                    .then(|| target::endpoint_hash(&g2, &r2, &t.remote).ok())
+                    .flatten();
+                Ok((full, t, endpoint))
+            }
             Err(e) => Err((
                 if e.is_policy() {
                     ErrorCode::NotAllowed
@@ -436,7 +443,7 @@ async fn enqueue(core: &Arc<Core>, id: u64, req: EnqueueRequest) -> ServerMessag
         }
     })
     .await;
-    let (head_sha, tgt) = match resolved {
+    let (head_sha, tgt, endpoint) = match resolved {
         Ok(Ok(v)) => v,
         Ok(Err((ecode, why))) => return err(id, ecode, why),
         Err(e) => return err(id, ErrorCode::Internal, e.to_string()),
@@ -457,7 +464,15 @@ async fn enqueue(core: &Arc<Core>, id: u64, req: EnqueueRequest) -> ServerMessag
     let actor = actor_of(req.via);
     match core.write(actor, |w| {
         let j = w.insert_job(&new)?;
-        job_view(w.tx(), &j)
+        let mut view = job_view(w.tx(), &j)?;
+        if let Some(hash) = &endpoint {
+            view.learned_protection =
+                store::protected_target(w.tx(), hash, &j.target)?.map(|p| LearnedProtection {
+                    first_seen: rfc3339(p.first_seen),
+                    evidence: p.evidence,
+                });
+        }
+        Ok(view)
     }) {
         Ok(job) => ServerMessage::QueueJob { id, job },
         Err(e) => store_err(id, &e),

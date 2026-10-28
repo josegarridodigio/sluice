@@ -1471,6 +1471,21 @@ pub struct QueueJobView {
     /// Time the job reached a terminal state.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<String>,
+    /// Only in the reply to `queue-enqueue`: this target refused a direct
+    /// push before (ADR-0025). Additive: older clients ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub learned_protection: Option<LearnedProtection>,
+}
+
+/// A push to a target that the forge refused as protected, remembered per
+/// endpoint and target (reason `target_protected`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct LearnedProtection {
+    /// When it was first seen (RFC 3339).
+    pub first_seen: String,
+    /// The server's refusal text (short).
+    pub evidence: String,
 }
 
 /// One gate of a train (`queue_trains.gates`).
@@ -1873,6 +1888,7 @@ mod tests {
             enqueued_at: "t".into(),
             updated_at: "t".into(),
             finished_at: None,
+            learned_protection: None,
         }
     }
 

@@ -15,6 +15,7 @@ use std::time::Duration;
 use serde_json::Value;
 use sluice_gate_core::agent;
 use sluice_gate_core::config::UserConfig;
+use sluice_gate_core::forge;
 use sluice_gate_core::git::{self, EnvMap, RepoPaths};
 use sluice_gate_proto::client::{self, ClientError};
 use sluice_gate_proto::{
@@ -327,10 +328,24 @@ fn do_enqueue(branch: Option<&str>, base: Option<&str>, trust_member_config: boo
     match send(&env, &ClientMessage::QueueEnqueue { id: 1, request }, true)? {
         ServerMessage::QueueJob { job, .. } => {
             println!("{}", queued_line(&job));
+            for w in enqueue_warnings(&env, &repo.paths.toplevel, &job) {
+                eprintln!("sluice: warning: {w}");
+            }
             Ok(())
         }
         other => Err(unexpected("queue-enqueue", &other)),
     }
+}
+
+/// Warnings about the target of a queued job (ADR-0025): the forge's
+/// protection as `gh` reports it with the caller's own login, and what the
+/// queue learned from a refused push. The enqueue has already happened.
+fn enqueue_warnings(env: &EnvMap, cwd: &Path, job: &QueueJobView) -> Vec<String> {
+    let learned = job
+        .learned_protection
+        .as_ref()
+        .map(|l| (l.first_seen.as_str(), l.evidence.as_str()));
+    forge::enqueue_warnings(env, cwd, &job.remote, &job.target, learned)
 }
 
 fn queued_line(job: &QueueJobView) -> String {
@@ -467,6 +482,9 @@ fn config_changed(job: &QueueJobView) -> bool {
 /// the branch's own gates.
 const CONFIG_CHANGED_TEXT: &str = "changes .sluice.toml (this train runs the base's gates)";
 
+/// Where the limits of a protected target are explained.
+const PROTECTED_DOCS: &str = "see docs/merge-queue.md";
+
 /// One-line explanation of a failed job from its `reason` and `detail`.
 fn failure_text(job: &QueueJobView) -> String {
     let mut parts = Vec::new();
@@ -487,6 +505,12 @@ fn failure_text(job: &QueueJobView) -> String {
                 .and_then(Value::as_str);
             if let Some(e) = error {
                 parts.push(e.lines().next().unwrap_or_default().to_owned());
+            }
+            // `target_protected`: what the server said.
+            if job.reason.as_deref() == Some("target_protected")
+                && let Some(out) = o.get("output").and_then(Value::as_str)
+            {
+                parts.push(format!("({})", out.lines().next().unwrap_or_default()));
             }
             if prepare && o.get("base").and_then(Value::as_bool) == Some(true) {
                 parts.push("(the base fails too)".to_owned());
@@ -537,6 +561,11 @@ fn job_note(job: &QueueJobView, gates: &[TrainGate]) -> String {
         QueueJobState::Queued if job.reason.is_some() => {
             format!("  waiting: {}", failure_text(job))
         }
+        QueueJobState::Failed if job.reason.as_deref() == Some("target_protected") => format!(
+            " {}  -> the target refuses direct pushes: the queue cannot land there ({})",
+            failure_text(job),
+            PROTECTED_DOCS
+        ),
         QueueJobState::Failed => format!(
             " {}  -> fix and commit, then 'sluice queue retry {}'",
             failure_text(job),
@@ -1083,6 +1112,40 @@ mod tests {
             target: "main".into(),
             ..QueueJobView::default()
         }
+    }
+
+    #[test]
+    fn a_protected_target_failure_does_not_suggest_a_retry() {
+        let mut j = job("j1", "feat/a", QueueJobState::Failed);
+        j.reason = Some("target_protected".into());
+        j.detail = Some(serde_json::json!({"output": "GH006: Protected branch update failed"}));
+        let note = job_note(&j, &[]);
+        assert!(note.contains("target_protected"), "{note}");
+        assert!(note.contains("GH006"), "{note}");
+        assert!(note.contains("the queue cannot land there"), "{note}");
+        assert!(!note.contains("retry"), "{note}");
+    }
+
+    #[test]
+    fn enqueue_warnings_use_the_learned_fact_when_the_probe_cannot_speak() {
+        let mut j = job("j1", "feat/a", QueueJobState::Queued);
+        j.learned_protection = Some(sluice_gate_proto::LearnedProtection {
+            first_seen: "2026-10-28T09:00:00Z".into(),
+            evidence: "GH006: Protected branch update failed".into(),
+        });
+        // A directory that is no repository: the probe is unknown.
+        let dir = tempfile::tempdir().unwrap();
+        let w = enqueue_warnings(&EnvMap::new(), dir.path(), &j);
+        assert!(
+            w[0].contains("origin/main refused a direct push on 2026-10-28"),
+            "{w:?}"
+        );
+        assert!(w[1].starts_with("could not check origin/main"), "{w:?}");
+        j.remote.clear();
+        assert_eq!(
+            enqueue_warnings(&EnvMap::new(), dir.path(), &j),
+            Vec::<String>::new()
+        );
     }
 
     fn train(id: &str, state: QueueTrainState, members: &[&str]) -> QueueTrainView {

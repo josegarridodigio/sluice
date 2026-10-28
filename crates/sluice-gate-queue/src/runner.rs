@@ -2359,6 +2359,37 @@ async fn push_train(core: &Arc<Core>, id: &str) -> Result<()> {
     apply_verdict(core, &t, &verdict).await
 }
 
+/// A push the remote or the repository's hook refused: the members fail
+/// with `reason` (a pending cancel wins), the train is dissolved.
+fn fail_pushed(
+    w: &store::Writer<'_, '_>,
+    t: &TrainRow,
+    pushing: &[&JobRow],
+    reason: &str,
+    why: &str,
+) -> rusqlite::Result<()> {
+    w.delete_marker(&t.id)?;
+    for j in pushing {
+        let to = if j.cancel_requested {
+            J::Cancelled
+        } else {
+            J::Failed
+        };
+        w.job_to(
+            &j.id,
+            J::Pushing,
+            to,
+            &JobEdit {
+                reason: Some(Some(reason.to_owned())),
+                detail: Some(Some(json!({ "output": why }))),
+                note: Some(reason.to_owned()),
+                ..JobEdit::default()
+            },
+        )?;
+    }
+    w.dissolve(t, T::Pushing, reason, false)
+}
+
 async fn apply_verdict(core: &Arc<Core>, t: &TrainRow, verdict: &PushVerdict) -> Result<()> {
     let id = t.id.clone();
     let r = core.write(Actor::Runner, |w| {
@@ -2366,6 +2397,9 @@ async fn apply_verdict(core: &Arc<Core>, t: &TrainRow, verdict: &PushVerdict) ->
         let pushing: Vec<&JobRow> = jobs.iter().filter(|j| j.state == J::Pushing).collect();
         match verdict {
             PushVerdict::Landed => {
+                if !t.remote.is_empty() {
+                    w.clear_protected_target(&t.endpoint_hash, &t.target)?;
+                }
                 for j in &pushing {
                     w.job_to(&j.id, J::Pushing, J::Landed, &JobEdit::default())?;
                 }
@@ -2383,32 +2417,13 @@ async fn apply_verdict(core: &Arc<Core>, t: &TrainRow, verdict: &PushVerdict) ->
                 w.delete_marker(&id)?;
                 w.dissolve(t, T::Pushing, &format!("push rejected: {why}"), false)
             }
-            PushVerdict::Rejected(why) | PushVerdict::HookDeclined(why) => {
-                let reason = if matches!(verdict, PushVerdict::HookDeclined(_)) {
-                    "pre_push_hook"
-                } else {
-                    "push_rejected"
-                };
-                w.delete_marker(&id)?;
-                for j in &pushing {
-                    let to = if j.cancel_requested {
-                        J::Cancelled
-                    } else {
-                        J::Failed
-                    };
-                    w.job_to(
-                        &j.id,
-                        J::Pushing,
-                        to,
-                        &JobEdit {
-                            reason: Some(Some(reason.to_owned())),
-                            detail: Some(Some(json!({ "output": why }))),
-                            note: Some(reason.to_owned()),
-                            ..JobEdit::default()
-                        },
-                    )?;
+            PushVerdict::Rejected(why) => fail_pushed(w, t, &pushing, "push_rejected", why),
+            PushVerdict::HookDeclined(why) => fail_pushed(w, t, &pushing, "pre_push_hook", why),
+            PushVerdict::TargetProtected(why) => {
+                if !t.remote.is_empty() {
+                    w.record_protected_target(&t.endpoint_hash, &t.target, why)?;
                 }
-                w.dissolve(t, T::Pushing, reason, false)
+                fail_pushed(w, t, &pushing, "target_protected", why)
             }
             PushVerdict::Ambiguous(why) => {
                 for j in &pushing {

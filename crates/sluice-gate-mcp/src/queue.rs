@@ -98,6 +98,11 @@ pub(crate) struct JobSchema {
     /// Terminal time (RFC 3339).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<String>,
+    /// Only in the reply to `queue_enqueue`: warnings about the target (it
+    /// requires pull requests, is protected, or could not be checked). The
+    /// job is queued regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<Vec<String>>,
 }
 
 /// One gate of a train.
@@ -513,8 +518,28 @@ fn target_name(remote: &str, target: &str) -> String {
     }
 }
 
+/// Warnings about the target of a queued job (ADR-0025), probed with the
+/// server's own environment: the forge's protection as `gh` reports it and
+/// what the queue learned from a refused push. Blocking.
+pub(crate) fn enqueue_warnings(env: &EnvMap, dir: &Path, job: &QueueJobView) -> Vec<String> {
+    let learned = job
+        .learned_protection
+        .as_ref()
+        .map(|l| (l.first_seen.as_str(), l.evidence.as_str()));
+    sluice_gate_core::forge::enqueue_warnings(env, dir, &job.remote, &job.target, learned)
+}
+
+/// The structured reply of an enqueue: the job and its warnings.
+pub(crate) fn enqueue_value(job: &QueueJobView, warnings: &[String]) -> serde_json::Value {
+    let mut value = serde_json::to_value(job).unwrap_or_default();
+    if let (false, Some(o)) = (warnings.is_empty(), value.as_object_mut()) {
+        o.insert("warnings".to_owned(), warnings.into());
+    }
+    value
+}
+
 /// Text of a successful enqueue.
-pub(crate) fn enqueue_text(job: &QueueJobView) -> String {
+pub(crate) fn enqueue_text(job: &QueueJobView, warnings: &[String]) -> String {
     let mut out = format!(
         "queued {} (job {}) for {}",
         job.branch,
@@ -534,6 +559,12 @@ pub(crate) fn enqueue_text(job: &QueueJobView) -> String {
         "Stop here and tell the human the job id (`queue_status` shows the train id once there \
          is one). A human approves with `sluice queue approve <train id>`.\n",
     );
+    for w in warnings {
+        let _ = writeln!(out, "Warning: {w}");
+    }
+    if !warnings.is_empty() {
+        out.push_str("The job is queued anyway: tell the human about the warning.\n");
+    }
     out
 }
 
@@ -599,6 +630,11 @@ fn detail_error(job: &QueueJobView) -> Option<&str> {
     detail
         .get("error")
         .or_else(|| detail.get("message").filter(|_| prepare))
+        .or_else(|| {
+            detail
+                .get("output")
+                .filter(|_| job.reason.as_deref() == Some("target_protected"))
+        })
         .and_then(serde_json::Value::as_str)
         .and_then(|e| e.lines().next())
 }
@@ -664,7 +700,14 @@ fn job_line(job: &QueueJobView, target: &str, trusted: bool, out: &mut String) {
                     let _ = write!(out, " ({h})");
                 }
             }
-            if job.state == QueueJobState::Failed {
+            if job.state == QueueJobState::Failed
+                && job.reason.as_deref() == Some("target_protected")
+            {
+                out.push_str(
+                    "\n    the forge refuses direct pushes to the target: tell the human, do not \
+                     retry (the queue cannot land there; see docs/merge-queue.md)",
+                );
+            } else if job.state == QueueJobState::Failed {
                 let _ = write!(
                     out,
                     "\n    fix and commit on '{}', run `verify`, then call queue_retry with job_id {}",
@@ -855,8 +898,38 @@ mod tests {
     }
 
     #[test]
+    fn enqueue_warnings_are_in_the_text_and_the_structured_reply() {
+        let j = job(QueueJobState::Queued);
+        let w = vec!["origin/main requires a pull request".to_owned()];
+        let t = enqueue_text(&j, &w);
+        assert!(
+            t.contains("Warning: origin/main requires a pull request\n"),
+            "{t}"
+        );
+        assert!(t.contains("queued anyway"), "{t}");
+        let v = enqueue_value(&j, &w);
+        assert_eq!(v["warnings"][0], "origin/main requires a pull request");
+        let plain = enqueue_value(&j, &[]);
+        assert!(plain.get("warnings").is_none(), "{plain}");
+        let _: JobSchema = serde_json::from_value(v).expect("job mirror with warnings");
+    }
+
+    #[test]
+    fn a_target_protected_failure_says_tell_the_human_and_not_retry() {
+        let mut j = job(QueueJobState::Failed);
+        j.reason = Some("target_protected".into());
+        j.detail = Some(serde_json::json!({"output": "GH006: Protected branch update failed"}));
+        let mut out = String::new();
+        job_line(&j, "origin/main", false, &mut out);
+        assert!(out.contains("(target_protected)"), "{out}");
+        assert!(out.contains("GH006"), "{out}");
+        assert!(out.contains("tell the human, do not retry"), "{out}");
+        assert!(!out.contains("call queue_retry"), "{out}");
+    }
+
+    #[test]
     fn enqueue_text_names_branch_job_target_and_position() {
-        let t = enqueue_text(&job(QueueJobState::Queued));
+        let t = enqueue_text(&job(QueueJobState::Queued), &[]);
         assert!(
             t.starts_with("queued feat/a (job j1) for origin/main, position 2\n"),
             "{t}"

@@ -113,7 +113,9 @@ pre-commit's internal error): read the output, do not retry blindly.
 3. Call `queue_enqueue` with your absolute working directory.
 4. Stop. Tell the human the job id and the train id (`queue_status` shows
    trains and which are ready). A human approves with
-   `sluice queue approve <train id>`.
+   `sluice queue approve <train id>`. If the `queue_enqueue` result carries a
+   warning about the target (pull request required, protected, could not
+   check), pass it on: the job is queued anyway.
 5. If `queue_status` shows a conflict or a failed gate for your branch: rebase
    or fix it, commit, `verify` again, then `queue_retry` with the job id.
    `queue_enqueue` would answer `duplicate-branch`. `queue_cancel` withdraws a

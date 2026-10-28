@@ -973,6 +973,8 @@ Queue a committed branch for the next train.
 
 Defaults to the current branch of this worktree. Refuses a detached HEAD, a worktree with staged or unstaged changes to tracked files (untracked files do not matter), a branch that is already queued and a branch equal to the target.
 
+Warns (on stderr) when the target refuses direct pushes, as far as your `gh` login can tell or as an earlier refused push taught the queue; the branch is queued anyway.
+
 Usage: sluice queue enqueue [OPTIONS] [BRANCH]
 
 Arguments:
@@ -1132,6 +1134,7 @@ Besides the basics, the zero-config checks are:
 | `hooks` | Where the clone's hooks stand. With the entry point on (`sluice hooks on`): `ok` when it is effective and complete, `fail` with the reason when something displaced it or a hook of the repository has no Sluice script (fix: `sluice hooks on`). Otherwise: `ok` when a hook in the hooks directory (`core.hooksPath` or `.git/hooks`) calls sluice (for a husky v9 runner, `.husky/_` with an `h` file, the scripts it executes, `.husky/<hook>`, are inspected) or when the lefthook or pre-commit configuration calls sluice; `fail` when a hook manager (husky, lefthook, pre-commit) owns hooks that do not call sluice, or `.sluice.toml` has gates with hooks and the hook files do not call sluice (suggests `sluice hooks on`); `warn` when no hook calls sluice and there are hook files or gates with hooks to judge; `ok` when there is nothing to route. |
 | `repo-config` | Where `.sluice.toml` stands. Besides `ok` (parses) and `fail` (does not parse, or missing): in a clone with no `.sluice.toml` whose hooks go through Sluice it is `ok`, "gates are derived from the hooks (n unit(s) can be verified, m left out; see 'sluice gate list')". With the entry point off a missing `.sluice.toml` still fails. |
 | `cache` | In a repository: `warn` when the index has skip-worktree or assume-unchanged entries (it names up to 5 paths): the tree cannot be hashed, so the cache is disabled for this worktree. The detail gives `git update-index --no-skip-worktree <path>` / `--no-assume-unchanged <path>`. `ok` otherwise. |
+| `target-protection` | In a repository whose `[queue]` remote and target are known (the configured `target`, else the remote's HEAD as already fetched), shows the last answer the forge gave at a `queue enqueue` (kept 30 days): `ok` when the target accepts direct pushes, `warn` when it requires a pull request or is protected (the queue cannot land there, see [Targets protected against direct pushes](merge-queue.md#targets-protected-against-direct-pushes)). Doctor never asks the forge itself; with no recorded answer the check is not shown. |
 | `init` | In a git repository without `.sluice.toml`: `ok`, with the hint `run 'sluice init --dry-run'`. |
 
 The `containment` group (JSON `group: "containment"`; the S4 messages of

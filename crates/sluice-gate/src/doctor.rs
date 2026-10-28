@@ -37,6 +37,7 @@ use crate::hookentry;
 use crate::run::EXIT_ERROR;
 
 mod containment;
+mod target;
 
 /// Lines kept from the tail of each log in the bundle.
 const BUNDLE_LOG_LINES: usize = 2000;
@@ -578,6 +579,7 @@ fn check_repo(env: &EnvMap, paths: &RepoPaths) -> Vec<Check> {
     }
     if let Ok(cfg) = &config {
         out.extend(check_train_tools(env, cfg));
+        out.extend(target::check_target(env, paths, cfg));
     }
     out.push(check_hooks(env, paths, config.as_ref().ok()));
     out.push(check_markers(paths));

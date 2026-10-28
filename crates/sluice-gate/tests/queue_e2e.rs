@@ -1128,6 +1128,59 @@ fn declining_pre_push_hook_fails_the_train() {
     assert_eq!(q.bare_ref("refs/heads/main").unwrap(), base);
 }
 
+// ------------------------------------------- targets that refuse direct pushes
+
+/// The enqueue warns (stderr) when the target cannot be checked, and queues
+/// regardless: a warning never refuses (ADR-0025).
+#[test]
+fn enqueue_warns_when_the_target_cannot_be_checked_and_still_queues() {
+    let q = Q::new(GATE);
+    let (wa, _a) = q.worktree("feat/a", &[("n.txt", "n\n")]);
+    let out = q.run_in(&wa, &["queue", "enqueue"]);
+    assert!(out.status.success(), "{}", show(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("queued feat/a"));
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(err.contains("could not check origin/main"), "{err}");
+    let st = q.status();
+    assert!(
+        st["jobs"].as_array().is_some_and(|j| j.len() == 1),
+        "{st:#}"
+    );
+}
+
+/// A remote that refuses `main` like a protected branch fails the train with
+/// `target_protected`; the next enqueue warns from what was learned.
+#[test]
+fn a_refused_push_is_learned_and_the_next_enqueue_warns() {
+    let q = Q::new(GATE);
+    q.bare_hook(
+        "pre-receive",
+        "echo 'remote: error: GH006: Protected branch update failed for refs/heads/main.' >&2\nexit 1",
+    );
+    let (wa, _a) = q.worktree("feat/a", &[("n.txt", "n\n")]);
+    let ja = q.enqueue(&wa, &[]);
+    let t = q.wait_ready("ready", |_| true);
+    let out = q.approve(&t);
+    assert_eq!(out.status.code(), Some(1), "{}", show(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("target_protected"),
+        "{}",
+        show(&out)
+    );
+    let st = q.status();
+    assert_eq!(job(&st, &ja)["reason"], "target_protected");
+    let (wb, _b) = q.worktree("feat/b", &[("m.txt", "m\n")]);
+    let again = q.run_in(&wb, &["queue", "enqueue"]);
+    assert!(again.status.success(), "{}", show(&again));
+    let err = String::from_utf8_lossy(&again.stderr).to_string();
+    assert!(err.contains("refused a direct push on"), "{err}");
+    assert!(err.contains("GH006"), "{err}");
+    assert!(
+        err.contains("the queue cannot land on this target"),
+        "{err}"
+    );
+}
+
 // ------------------------------------------- the daemon vouches for its push
 
 /// A directory with a `tool` script that prints `tool <version>`.

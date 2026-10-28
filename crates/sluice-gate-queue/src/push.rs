@@ -24,6 +24,10 @@ pub enum PushVerdict {
     /// denied) or a refspec git refused locally (`error: src refspec`):
     /// nothing landed, members `failed`.
     Rejected(String),
+    /// A [`Rejected`](Self::Rejected) whose server text says the branch is
+    /// protected (ADR-0025): same effect, reason `target_protected`, and the
+    /// fact is remembered for the next enqueue. Carries the server's words.
+    TargetProtected(String),
     /// The repository's `pre-push` hook declined (exit 1, no ref line, no
     /// `fatal:` and no git `error:` line besides `failed to push some
     /// refs`): nothing was sent; members `failed` with `pre_push_hook`.
@@ -91,6 +95,65 @@ pub fn credentials_refused(stderr: &str) -> bool {
         || lower.contains("host key verification failed")
 }
 
+/// Phrases of a forge's refusal of a direct push to a protected branch.
+/// GitHub: `protected branch hook declined` (the ref line), `GH006:
+/// Protected branch update failed`; GitLab: `You are not allowed to push
+/// code to protected branches on this project`. All recalled from the
+/// forges' usual output, none produced against a live server by the tests.
+const PROTECTED_PHRASES: [&str; 4] = [
+    "protected branch hook declined",
+    "gh006",
+    "protected branch update failed",
+    "not allowed to push code to protected branches",
+];
+
+/// GitHub's `GH013: Repository rule violations found` also covers things
+/// that have nothing to do with the target (secret scanning, signatures):
+/// it counts only together with one of these words of a pull-request or
+/// status-check rule (`Changes must be made through a pull request`,
+/// `Required status check "x" is expected`).
+const RULE_PHRASES: [&str; 2] = ["gh013", "repository rule violations found"];
+const RULE_WORDS: [&str; 3] = ["pull request", "status check", "merge queue"];
+
+/// Generic fallback: a `pre-receive hook declined` ref line is a protected
+/// branch only when the server's text also says `protected branch` (Gitea:
+/// `Not allowed to push to protected branch`) or `TF402455` (Azure DevOps:
+/// `Pushes to this branch are not permitted; you must use a pull request`).
+fn protected_generic(lower: &str) -> bool {
+    lower.contains("protected branch") || lower.contains("tf402455")
+}
+
+/// The server's words when a refused push was a protected-branch refusal:
+/// the ref line's `summary` and `stderr` (`remote: ...` lines), at most
+/// three matching lines.
+fn protected_evidence(summary: &str, stderr: &str) -> Option<String> {
+    let lines: Vec<String> = std::iter::once(summary)
+        .chain(stderr.lines())
+        .map(|l| l.trim().trim_start_matches("remote:").trim().to_owned())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let lower: Vec<String> = lines.iter().map(|l| l.to_ascii_lowercase()).collect();
+    let any = |words: &[&str]| lower.iter().any(|l| words.iter().any(|w| l.contains(w)));
+    let hook = any(&["pre-receive hook declined"]);
+    let rule = any(&RULE_PHRASES) && any(&RULE_WORDS);
+    let hits: Vec<&str> = lines
+        .iter()
+        .zip(&lower)
+        .filter(|(_, l)| {
+            PROTECTED_PHRASES.iter().any(|p| l.contains(p))
+                || (rule
+                    && RULE_PHRASES
+                        .iter()
+                        .chain(&RULE_WORDS)
+                        .any(|p| l.contains(p)))
+                || (hook && protected_generic(l))
+        })
+        .map(|(l, _)| l.as_str())
+        .take(3)
+        .collect();
+    (!hits.is_empty()).then(|| hits.join("\n"))
+}
+
 /// Classifies the end of `git push --atomic --porcelain`.
 /// `exit` is `None` when the process was killed by a signal; `target_ref`
 /// is `refs/heads/<target>`.
@@ -155,7 +218,10 @@ pub fn classify(exit: Option<i32>, stdout: &str, stderr: &str, target_ref: &str)
             return None;
         }
         if s.contains("[remote rejected]") || s.contains("permission denied") {
-            return Some(PushVerdict::Rejected(s.to_owned()));
+            return Some(match protected_evidence(s, stderr) {
+                Some(why) => PushVerdict::TargetProtected(why),
+                None => PushVerdict::Rejected(s.to_owned()),
+            });
         }
         if s.contains("[rejected]") {
             return Some(PushVerdict::Moved(s.to_owned()));
@@ -597,5 +663,63 @@ mod tests {
         let a = push_args("origin", "main", "B", "S", false);
         assert_eq!(a.len(), 9);
         assert!(!a.iter().any(|x| x.contains("landed")));
+    }
+
+    fn rejected_with(summary: &str, stderr: &str) -> PushVerdict {
+        let out = format!(
+            "To /srv/r.git\n!\tabc:refs/heads/main\t[remote rejected] ({summary})\n\
+             !\tabc:refs/sluice/landed/abc\t[remote rejected] (atomic push failed)\nDone\n"
+        );
+        classify(Some(1), &out, stderr, T)
+    }
+
+    fn is_protected(v: &PushVerdict) -> bool {
+        matches!(v, PushVerdict::TargetProtected(_))
+    }
+
+    #[test]
+    fn github_protected_branch_texts_are_target_protected() {
+        let v = rejected_with("protected branch hook declined", "");
+        assert!(is_protected(&v), "{v:?}");
+        let err = "remote: error: GH006: Protected branch update failed for refs/heads/main.\n\
+                   remote: error: Changes must be made through a pull request.\n";
+        let v = rejected_with("pre-receive hook declined", err);
+        let PushVerdict::TargetProtected(why) = v else {
+            panic!("{v:?}")
+        };
+        assert!(why.contains("GH006"), "{why}");
+    }
+
+    #[test]
+    fn github_rule_violations_count_only_with_a_pull_request_or_check_rule() {
+        let err = "remote: error: GH013: Repository rule violations found for refs/heads/main.\n\
+                   remote: - Changes must be made through a pull request.\n";
+        let v = rejected_with("pre-receive hook declined", err);
+        assert!(is_protected(&v), "{v:?}");
+        let secrets = "remote: error: GH013: Repository rule violations found for refs/heads/main.\n\
+                       remote: - Push cannot contain secrets\n";
+        let v = rejected_with("pre-receive hook declined", secrets);
+        assert!(matches!(v, PushVerdict::Rejected(_)), "{v:?}");
+    }
+
+    #[test]
+    fn gitlab_and_generic_hook_texts_need_the_protected_phrase() {
+        let gitlab = "remote: GitLab: You are not allowed to push code to protected branches on \
+                      this project.\n";
+        assert!(is_protected(&rejected_with(
+            "pre-receive hook declined",
+            gitlab
+        )));
+        let gitea = "remote: Gitea: Not allowed to push to protected branch main\n";
+        assert!(is_protected(&rejected_with(
+            "pre-receive hook declined",
+            gitea
+        )));
+        // A bare hook refusal says nothing about protection.
+        let v = rejected_with("pre-receive hook declined", "remote: lint failed\n");
+        assert!(matches!(v, PushVerdict::Rejected(_)), "{v:?}");
+        // The phrase without a hook refusal is not a rejection of this kind.
+        let v = rejected_with("permission denied", "remote: protected branch docs\n");
+        assert!(matches!(v, PushVerdict::Rejected(_)), "{v:?}");
     }
 }

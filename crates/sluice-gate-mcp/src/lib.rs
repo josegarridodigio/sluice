@@ -86,7 +86,9 @@ prepare (often a lockfile out of sync): fix it, then `queue_retry`. `prepare_dir
 leaves files the tree lacks: fix `.gitignore` or the prepare), `gate_modified_tree` (a gate edits \
 tracked files: commit the result or fix the gate) and `member_config_invalid` (the branch's \
 `.sluice.toml` does not parse) are yours to fix; `key_input_failed` is the environment's: tell the \
-human; `pre_push_hook`: the repository's hook declined, read its output. `hook_gate_unverified` and `config_changed` mean the branch changes `.sluice.toml`, which \
+human; `pre_push_hook`: the repository's hook declined, read its output; `target_protected`: the forge \
+refuses direct pushes to the target: tell the human, do not retry (a `queue_enqueue` result with \
+a warning about the target is for the human too; the job is queued anyway). `hook_gate_unverified` and `config_changed` mean the branch changes `.sluice.toml`, which \
 the target's configuration judges: tell the human to land it first or retry with \
 `--trust-member-config`; never use that flag or ask for such a train to be approved. \
 A gate result `KILLED for lack of memory` is not a failure to retry unchanged: reduce the gate's \
@@ -1452,14 +1454,24 @@ impl Server {
         let env = Arc::clone(&self.env);
         let reply = blocking(move || {
             let request = queue::enqueue_facts(&env, &dir, params.branch.as_deref(), params.base)?;
-            queue::request(&env, &ClientMessage::QueueEnqueue { id: 1, request })
+            let reply = queue::request(&env, &ClientMessage::QueueEnqueue { id: 1, request })?;
+            Ok::<_, String>((reply, dir))
         })
         .await?;
         match reply {
-            Ok(ServerMessage::QueueJob { job, .. }) => {
-                result(queue::enqueue_text(&job), &job, false)
+            Ok((ServerMessage::QueueJob { job, .. }, dir)) => {
+                // The job is queued; the probe only warns (ADR-0025).
+                let env = Arc::clone(&self.env);
+                let probed = job.clone();
+                let warnings =
+                    blocking(move || queue::enqueue_warnings(&env, &dir, &probed)).await?;
+                result(
+                    queue::enqueue_text(&job, &warnings),
+                    &queue::enqueue_value(&job, &warnings),
+                    false,
+                )
             }
-            Ok(other) => Ok(tool_error(queue::failure(
+            Ok((other, _)) => Ok(tool_error(queue::failure(
                 "internal",
                 format!("unexpected reply to queue-enqueue: {other:?}"),
             ))),

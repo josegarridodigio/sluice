@@ -30,6 +30,7 @@ pub mod cpus;
 pub mod dirs;
 pub mod env;
 pub mod error;
+pub mod forge;
 pub mod git;
 pub mod heavy;
 pub mod hookgate;

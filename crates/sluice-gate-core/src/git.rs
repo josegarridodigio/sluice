@@ -106,7 +106,7 @@ pub(crate) const DEADLINE_POLL: Duration = Duration::from_millis(20);
 
 /// Reads a pipe to the end on a helper thread; the result arrives on the
 /// returned channel (never, when a stray grandchild keeps the pipe open).
-fn drain(mut pipe: impl std::io::Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
+pub(crate) fn drain(mut pipe: impl std::io::Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = Vec::new();

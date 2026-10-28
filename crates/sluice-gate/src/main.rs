@@ -398,6 +398,10 @@ enum QueueCommand {
     /// Defaults to the current branch of this worktree. Refuses a detached HEAD, a
     /// worktree with staged or unstaged changes to tracked files (untracked files do
     /// not matter), a branch that is already queued and a branch equal to the target.
+    ///
+    /// Warns (on stderr) when the target refuses direct pushes, as far as your `gh` login
+    /// can tell or as an earlier refused push taught the queue; the branch is queued
+    /// anyway.
     Enqueue {
         /// Branch to queue; defaults to the current branch.
         branch: Option<String>,

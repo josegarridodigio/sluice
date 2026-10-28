@@ -21,6 +21,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   started against their first eta (`backfilled`, `backfill_head_delay_ms` in
   `--json`, additive). `[scheduler] backfill = false` restores the strict reservation;
   the key is one-way (0.7.0 and older binaries reject it).
+- **Targets that refuse direct pushes: warned early, learned from a refused push**
+  (ADR-0025, issue #5; pull-request landing follows). `sluice queue enqueue` and the MCP
+  `queue_enqueue` ask the forge, with the caller's own `gh` login, whether the target
+  accepts direct pushes (GitHub first: the branch's rules, its `protected` flag and, when
+  readable, the classic protection; GitHub Enterprise hosts you are logged in to and SSH
+  aliases, resolved with `ssh -G`, are understood) and warn when it requires a pull request
+  or is protected, or say "could not check: <reason>" (`Unknown` never errors). The enqueue
+  always proceeds. A few seconds at most, cached for 5 minutes. `sluice doctor` (still
+  offline) shows the last answer an enqueue got as a `target-protection` check (`warn` for a
+  protection, `ok` otherwise). A push refused with a
+  protected-branch text (GitHub `GH006` / `protected branch hook declined`, GitLab, a
+  `pre-receive hook declined` that says `protected branch`) now fails with the reason
+  `target_protected` instead of `push_rejected` and is remembered per remote and target (the
+  additive table `queue_protected_targets`); the next enqueue warns from it even where `gh`
+  cannot tell. Agents are told to tell the human and not retry. The queue still cannot land
+  on such a target.
 - **Stalled jobs are reported, never killed** (ADR-0024). Every 5 s the daemon reads
   what each running job does: CPU time, block I/O, page faults and process count from
   its leaf cgroup (the process group without containment), plus the log bytes. A job

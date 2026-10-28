@@ -98,6 +98,7 @@ Reasons, with what you do:
 | `member_config_invalid` | the `.sluice.toml` your branch changes does not parse once merged | fix the file, `queue_retry` |
 | `hook_gate_unverified`, `config_changed` | the branch changes `.sluice.toml`; the target's configuration judges the train, so a gate the `pre-push` hook asks for may not be verified. `config_changed` is the warning shown on the member | tell the human: land the configuration change first, or the human runs `sluice queue retry <job> --trust-member-config` |
 | `pre_push_hook` | the repository's `pre-push` hook declined during the push | read its output in the detail |
+| `target_protected` | the forge refuses direct pushes to the target (protected branch, pull request required); the queue cannot land there | tell the human; do not retry |
 | `push_rejected`, `target_checked_out`, `tree_mismatch`, `internal` | the remote refused the push, the target is checked out locally, the merged tree differs from what git snapshots, an unexpected error | tell the human |
 
 `--trust-member-config` (on `sluice queue enqueue` and `sluice queue retry`)

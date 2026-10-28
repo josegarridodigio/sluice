@@ -62,6 +62,18 @@ CREATE TABLE IF NOT EXISTS queue_events (
   actor TEXT NOT NULL, note TEXT);
 ";
 
+/// Targets that refused a direct push as protected (ADR-0025), one row per
+/// endpoint and target. A table of its own, created in place by `init`
+/// without bumping `queue_schema`: older binaries do not know it and never
+/// read it.
+const PROTECTED_TARGETS_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS queue_protected_targets (
+  endpoint_hash TEXT NOT NULL, target TEXT NOT NULL,
+  first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL,
+  evidence TEXT NOT NULL, hits INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (endpoint_hash, target));
+";
+
 /// A logical refusal of a queue write; the transaction is rolled back.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Refusal {
@@ -320,6 +332,7 @@ pub struct MarkerRow {
 /// SQLite errors; [`Refusal::Schema`] when the tables are newer.
 pub fn init(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     tx.execute_batch(SCHEMA)?;
+    tx.execute_batch(PROTECTED_TARGETS_SCHEMA)?;
     add_column_if_missing(tx, "queue_trains", "prepare", "TEXT")?;
     add_column_if_missing(tx, "queue_trains", "config_source", "TEXT")?;
     add_column_if_missing(tx, "queue_trains", "config_hash", "TEXT")?;
@@ -678,6 +691,39 @@ pub fn marker(tx: &Transaction<'_>, train_id: &str) -> rusqlite::Result<Option<M
         &format!("SELECT {MARKER_COLS} FROM queue_push_markers WHERE train_id = ?1"),
         [train_id],
         marker_from_row,
+    )
+    .optional()
+}
+
+/// A target that refused a direct push as protected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtectedTarget {
+    /// First refusal (milliseconds since the epoch).
+    pub first_seen: u64,
+    /// The server's words at the last refusal.
+    pub evidence: String,
+}
+
+/// What is remembered about `target` on the endpoint `endpoint_hash`.
+///
+/// # Errors
+///
+/// SQLite errors.
+pub fn protected_target(
+    tx: &Transaction<'_>,
+    endpoint_hash: &str,
+    target: &str,
+) -> rusqlite::Result<Option<ProtectedTarget>> {
+    tx.query_row(
+        "SELECT first_seen, evidence FROM queue_protected_targets \
+         WHERE endpoint_hash = ?1 AND target = ?2",
+        params![endpoint_hash, target],
+        |r| {
+            Ok(ProtectedTarget {
+                first_seen: u(r.get(0)?),
+                evidence: r.get(1)?,
+            })
+        },
     )
     .optional()
 }
@@ -1348,6 +1394,46 @@ impl<'a, 'c> Writer<'a, 'c> {
         Ok(())
     }
 
+    /// Remembers that `target` on `endpoint_hash` refused a direct push as
+    /// protected (keeps the first date, refreshes the evidence).
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn record_protected_target(
+        &self,
+        endpoint_hash: &str,
+        target: &str,
+        evidence: &str,
+    ) -> rusqlite::Result<()> {
+        self.tx.execute(
+            "INSERT INTO queue_protected_targets(endpoint_hash, target, first_seen, last_seen, \
+             evidence) VALUES (?1, ?2, ?3, ?3, ?4) \
+             ON CONFLICT(endpoint_hash, target) DO UPDATE SET last_seen = ?3, evidence = ?4, \
+             hits = hits + 1",
+            params![endpoint_hash, target, i(self.now), evidence],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets a refusal: a push to the target landed, so it is not
+    /// protected (any longer).
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn clear_protected_target(
+        &self,
+        endpoint_hash: &str,
+        target: &str,
+    ) -> rusqlite::Result<()> {
+        self.tx.execute(
+            "DELETE FROM queue_protected_targets WHERE endpoint_hash = ?1 AND target = ?2",
+            params![endpoint_hash, target],
+        )?;
+        Ok(())
+    }
+
     /// Deletes a train's marker.
     ///
     /// # Errors
@@ -1870,6 +1956,64 @@ pub(crate) mod tests {
         })
         .unwrap();
         assert_eq!(v, QUEUE_SCHEMA_VERSION);
+    }
+
+    /// A database of an earlier release has no `queue_protected_targets`
+    /// table: `init` creates it in place, any number of times, without
+    /// bumping `queue_schema`; the tables an older binary reads are untouched.
+    #[test]
+    fn the_protected_targets_table_is_added_in_place_and_idempotently() {
+        let mut c = conn();
+        c.execute_batch(SCHEMA).unwrap();
+        c.execute("INSERT INTO queue_schema(version) VALUES (1)", [])
+            .unwrap();
+        assert_eq!(
+            columns(&mut c, "queue_protected_targets"),
+            Vec::<String>::new()
+        );
+        with(&mut c, init).unwrap();
+        with(&mut c, init).unwrap();
+        assert!(columns(&mut c, "queue_protected_targets").contains(&"evidence".to_owned()));
+        let v: i64 = with(&mut c, |tx| {
+            tx.query_row("SELECT max(version) FROM queue_schema", [], |r| r.get(0))
+        })
+        .unwrap();
+        assert_eq!(v, QUEUE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_refused_push_is_remembered_per_endpoint_and_target_until_a_push_lands() {
+        let mut c = conn();
+        with(&mut c, init).unwrap();
+        let f = fence("tok");
+        let known = |c: &mut Connection, hash: &str, target: &str| {
+            with(c, |tx| protected_target(tx, hash, target)).unwrap()
+        };
+        assert_eq!(known(&mut c, "h1", "main"), None);
+        with(&mut c, |tx| {
+            Writer::new(tx, &f, Actor::Runner)?.record_protected_target("h1", "main", "GH006 one")
+        })
+        .unwrap();
+        let first = known(&mut c, "h1", "main").expect("remembered");
+        assert_eq!(first.evidence, "GH006 one");
+        // Another endpoint or target knows nothing about it.
+        assert_eq!(known(&mut c, "h2", "main"), None);
+        assert_eq!(known(&mut c, "h1", "dev"), None);
+        // A second refusal keeps the date and refreshes the evidence.
+        with(&mut c, |tx| {
+            Writer::new(tx, &f, Actor::Runner)?.record_protected_target("h1", "main", "GH006 two")
+        })
+        .unwrap();
+        let again = known(&mut c, "h1", "main").expect("remembered");
+        assert_eq!(
+            (again.first_seen, again.evidence.as_str()),
+            (first.first_seen, "GH006 two")
+        );
+        with(&mut c, |tx| {
+            Writer::new(tx, &f, Actor::Runner)?.clear_protected_target("h1", "main")
+        })
+        .unwrap();
+        assert_eq!(known(&mut c, "h1", "main"), None);
     }
 
     #[test]

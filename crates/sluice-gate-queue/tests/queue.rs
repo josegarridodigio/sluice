@@ -251,6 +251,76 @@ async fn declining_pre_push_hook_fails_the_jobs() {
     d.shutdown().await;
 }
 
+/// A remote whose `pre-receive` hook refuses `main` like a protected branch.
+fn protect_remote(fx: &Fixture) {
+    use std::os::unix::fs::PermissionsExt;
+    let hook = fx.bare.join("hooks/pre-receive");
+    let text = "#!/bin/sh\necho 'remote: error: GH006: Protected branch update failed for \
+                refs/heads/main.' >&2\nexit 1\n";
+    std::fs::write(&hook, text).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Enqueues `branch`, waits for its train and approves it.
+async fn approve_branch(d: &Daemon, fx: &Fixture, branch: &str, file: &str) -> String {
+    let (wt, sha) = fx.branch(branch, "main", &[(file, "n\n")]);
+    let j = d.enqueue_ok(fx, &wt, branch, &sha, None).await;
+    let t = d.wait_train("ready", ready).await;
+    let hash = t.train_hash.as_deref().unwrap();
+    d.approve(fx, &t.train_id, hash, ApproveVia::Cli).await;
+    j.job_id
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_protected_target_fails_as_target_protected_and_is_remembered() {
+    let fx = Fixture::new(GATE_TRUE);
+    let base = fx.bare_ref("refs/heads/main").unwrap();
+    protect_remote(&fx);
+    let d = Daemon::start(&fx, user_config(false)).await;
+    let first = approve_branch(&d, &fx, "feat/a", "a1.txt").await;
+    let job = d.wait_job(&first, J::Failed).await;
+    assert_eq!(job.reason.as_deref(), Some("target_protected"));
+    let out = job.detail.unwrap()["output"].as_str().unwrap().to_owned();
+    assert!(out.contains("GH006"), "{out}");
+    assert_eq!(fx.bare_ref("refs/heads/main").unwrap(), base);
+    // The next enqueue to the target carries the learned fact, and queues.
+    let (wb, b) = fx.branch("feat/b", "main", &[("b.txt", "b\n")]);
+    let second = d.enqueue_ok(&fx, &wb, "feat/b", &b, None).await;
+    let learned = second.learned_protection.expect("learned");
+    assert!(learned.evidence.contains("GH006"), "{learned:?}");
+    assert_ne!(learned.first_seen, "");
+    d.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_landing_push_forgets_the_learned_protection() {
+    let fx = Fixture::new(GATE_TRUE);
+    protect_remote(&fx);
+    let d = Daemon::start(&fx, user_config(false)).await;
+    let first = approve_branch(&d, &fx, "feat/a", "a1.txt").await;
+    d.wait_job(&first, J::Failed).await;
+    // Protection removed: the next train lands and the fact is cleared.
+    std::fs::remove_file(fx.bare.join("hooks/pre-receive")).unwrap();
+    let (wb, b) = fx.branch("feat/b", "main", &[("b.txt", "b\n")]);
+    let second = d.enqueue_ok(&fx, &wb, "feat/b", &b, None).await;
+    assert!(second.learned_protection.is_some());
+    let t = d
+        .wait_train("ready", |t| ready(t) && t.members.len() == 1)
+        .await;
+    d.approve(
+        &fx,
+        &t.train_id,
+        t.train_hash.as_deref().unwrap(),
+        ApproveVia::Cli,
+    )
+    .await;
+    d.wait_job(&second.job_id, J::Landed).await;
+    let (wc, c) = fx.branch("feat/c", "main", &[("c.txt", "c\n")]);
+    let third = d.enqueue_ok(&fx, &wc, "feat/c", &c, None).await;
+    assert_eq!(third.learned_protection, None);
+    d.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hung_pre_push_hook_times_out_and_reconciles_to_ready() {
     let toml = format!("{GATE_TRUE}[queue]\npush_timeout = \"2s\"\n");

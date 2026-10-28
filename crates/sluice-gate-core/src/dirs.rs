@@ -23,6 +23,20 @@ pub fn state_dir(env: &EnvMap) -> PathBuf {
     PathBuf::from(home).join(".local/state/sluice")
 }
 
+/// `$XDG_CACHE_HOME/sluice` or `$HOME/.cache/sluice`: short-lived, disposable
+/// facts (the forge probe of the merge queue).
+#[must_use]
+pub fn cache_dir(env: &EnvMap) -> PathBuf {
+    if let Some(dir) = env.get("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir).join("sluice");
+    }
+    let home = env
+        .get("HOME")
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| "/".to_owned(), Clone::clone);
+    PathBuf::from(home).join(".cache/sluice")
+}
+
 /// Directory holding `<job-id>.log` files.
 #[must_use]
 pub fn logs_dir(env: &EnvMap) -> PathBuf {

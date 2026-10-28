@@ -105,6 +105,7 @@ Reasons a job shows (`waiting:` for a job still `queued`, otherwise next to `FAI
 | `member_config_invalid` | the merged `.sluice.toml` of a branch that changed it does not parse (the detail has the parse error), or a `--trust-member-config` job's file does not |
 | `conflict`, `merge_failed`, `dirty_merge` | the merge did not apply cleanly (`conflict` lists the paths) |
 | `push_rejected`, `pre_push_hook` | the remote or the repository's `pre-push` hook refused the push |
+| `target_protected` | the forge refuses direct pushes to the target (a protected branch, a pull request required); the detail carries the server's words. Retrying cannot help: see [Targets protected against direct pushes](#targets-protected-against-direct-pushes) |
 | `target_checked_out`, `tree_mismatch`, `internal` | local target checked out at landing time; the merged tree differs from what git snapshots; an unexpected error |
 
 `sluice queue enqueue` without `--base` refuses a branch whose own `.sluice.toml` does not
@@ -292,12 +293,32 @@ audit ref is pushed with it.
 The queue lands by pushing the merge commit to the target. A target branch that the forge
 only lets change through a pull request (GitHub "Require a pull request before merging",
 GitLab protected branches with "Allowed to push: No one", and similar) refuses that push
-with a server-side hook (`protected branch hook declined`): the train is verified and
-approved, then its jobs fail with `push_rejected` and nothing lands. Sluice cannot see this
-protection before pushing today (a `git push --dry-run` does not run the forge's hook), so
-**do not use the merge queue on such a target**: verify with `verify` / `sluice run` and land
-through the forge's pull requests instead. Early detection and a pull-request landing mode
-are tracked in issue #5.
+with a server-side hook (`protected branch hook declined`). A `git push --dry-run` does not
+run that hook, so Sluice finds out in two other ways, and neither refuses anything:
+
+- **At enqueue and in `sluice doctor`**, when `gh` can tell. `sluice queue enqueue` (and the
+  MCP `queue_enqueue`) asks the forge, with *your own* `gh` login (never the daemon's), whether
+  the target accepts direct pushes: it reads the rules that apply to the branch, the branch's
+  `protected` flag and, when it is readable, the classic branch protection, and prints a
+  warning for a target that requires a pull request or is protected, or "could not check:
+  <reason>" when it cannot tell (no `gh`, not logged in, a forge other than GitHub, no network,
+  no access). GitHub, GitHub Enterprise Server hosts you are logged in to, and SSH aliases
+  (resolved with `ssh -G`) are understood. The probe takes a few seconds at most and its answer
+  is cached for 5 minutes. `sluice doctor`, which never uses the network, shows the last answer
+  an enqueue got (kept 30 days) as the `target-protection` check. **The enqueue always
+  proceeds.**
+- **From a refused push.** A push rejected with a recognised protected-branch text (GitHub
+  `protected branch hook declined` / `GH006`, GitLab `You are not allowed to push code to
+  protected branches`, or a `pre-receive hook declined` that says `protected branch`) fails
+  the jobs with `target_protected` instead of `push_rejected`, and the queue remembers it for
+  that remote and target. The next enqueue to it warns from what was learned, even where `gh`
+  cannot tell. A push that lands forgets it.
+
+The queue **cannot land on such a target yet**: the train is verified and approved, then its
+jobs fail with `target_protected` and nothing lands. Until pull-request landing exists (issue
+#5), verify with `verify` / `sluice run` and land through the forge's pull requests instead.
+The probe describes your `gh` identity, not the SSH or HTTPS identity that pushes, so an
+administrator who can bypass the protection may still see the warning.
 
 ## Authenticated remotes (SSH, HTTPS)
 
