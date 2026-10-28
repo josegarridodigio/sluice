@@ -20,10 +20,11 @@ use sluice_gate_core::git::{self, EnvMap, RepoPaths};
 use sluice_gate_core::heavy::{HeavyMatcher, canonical_words};
 use sluice_gate_core::pkgscripts::{FsScripts, Scripts, pieces};
 
+use crate::hookentry;
 use crate::run::EXIT_ERROR;
 use crate::snippets::{GUARD, HookManager, Wire, snippet, snippet_with};
 
-mod atomic;
+pub(crate) mod atomic;
 mod detect;
 mod hooks;
 mod render;
@@ -107,9 +108,20 @@ struct Manual {
     original: Option<String>,
 }
 
-/// `sluice init [--force] [--dry-run]`.
-pub fn run(force: bool, dry_run: bool) -> ExitCode {
-    match execute(force, dry_run) {
+/// What `init` does with the hooks of a repository that already has some.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum HooksMode {
+    /// Rewrite the hook lines that became gates to `sluice run --hook <hook> <gate>`
+    /// (edits the repository's hook files).
+    Rewire,
+    /// Leave the repository's hook files alone: make Sluice the hooks entry point of
+    /// this clone (`sluice hooks on`), which runs them untouched.
+    Entry,
+}
+
+/// `sluice init [--force] [--dry-run] [--hooks <mode>]`.
+pub fn run(force: bool, dry_run: bool, hooks: HooksMode) -> ExitCode {
+    match execute(force, dry_run, hooks) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("sluice: error: {message}");
@@ -385,6 +397,8 @@ struct Plan {
     gates: Vec<GatePlan>,
     changes: Vec<FileChange>,
     set_hooks_path: bool,
+    /// Activate the hooks entry point (`--hooks entry`).
+    entry: bool,
     manual: Vec<Manual>,
     notes: Vec<String>,
     /// Snippet to print for the starter gates or a refused hooks directory.
@@ -536,7 +550,24 @@ fn config_and_snippet(
     Ok((config, snippet_text))
 }
 
-fn plan(root: &Path, paths: &RepoPaths, env: &EnvMap, force: bool) -> Result<Plan, String> {
+/// `core.hooksPath` as the repository's own configuration sets it, without the
+/// directory Sluice's hooks entry point adds.
+fn repository_hooks_path(root: &Path, paths: &RepoPaths, probe: &EnvMap) -> Option<String> {
+    let ours = hookentry::Layout::new(&paths.common_dir)
+        .dir()
+        .to_string_lossy()
+        .into_owned();
+    let entries = hookentry::gitcfg::hooks_path_entries(root, probe).ok()?;
+    hookentry::gitcfg::underlying(&entries, &ours)
+}
+
+fn plan(
+    root: &Path,
+    paths: &RepoPaths,
+    env: &EnvMap,
+    force: bool,
+    mode: HooksMode,
+) -> Result<Plan, String> {
     let config_path = root.join(REPO_CONFIG_FILE);
     if config_path.exists() && !force {
         return Err(format!(
@@ -544,9 +575,7 @@ fn plan(root: &Path, paths: &RepoPaths, env: &EnvMap, force: bool) -> Result<Pla
         ));
     }
     let probe = git::probe_env(env, Some(paths));
-    let hooks_path = git::run(&["config", "--get", "core.hooksPath"], root, &probe, true)
-        .ok()
-        .filter(|v| !v.is_empty());
+    let hooks_path = repository_hooks_path(root, paths, &probe);
     let layout = hooks::discover(root, &paths.common_dir, hooks_path.as_deref());
     let found = hooks::scan(&layout.files);
     let old = fs::read_to_string(&config_path).ok().and_then(|text| {
@@ -558,6 +587,7 @@ fn plan(root: &Path, paths: &RepoPaths, env: &EnvMap, force: bool) -> Result<Pla
     let mut from_hooks = gates_from_hooks(root, &layout.files, &found, old.as_ref());
     let mut stack = detect::detect(root);
     let hook_plan = hook_plan(root, &layout, hooks_path.as_deref());
+    let entry = mode == HooksMode::Entry && matches!(hook_plan, HookPlan::Existing);
     let mut gates = std::mem::take(&mut from_hooks.gates);
     let mut notes = from_hooks.notes;
     let mut unwired = Vec::new();
@@ -589,8 +619,13 @@ fn plan(root: &Path, paths: &RepoPaths, env: &EnvMap, force: bool) -> Result<Pla
         new: config,
         mode: None,
     }];
-    let (edits, manual) = hook_edits(&layout, &found, &from_hooks.rewires, &gates);
+    let (edits, manual) = if entry {
+        (Vec::new(), Vec::new())
+    } else {
+        hook_edits(&layout, &found, &from_hooks.rewires, &gates)
+    };
     changes.extend(edits);
+    notes.extend(entry_notes(&layout, mode, entry));
 
     let mut set_hooks_path = false;
     let mut snippet = snippet_text;
@@ -618,10 +653,45 @@ fn plan(root: &Path, paths: &RepoPaths, env: &EnvMap, force: bool) -> Result<Pla
         gates,
         changes,
         set_hooks_path,
+        entry,
         manual,
         notes,
         snippet,
     })
+}
+
+fn manager_name(manager: HookManager) -> &'static str {
+    match manager {
+        HookManager::Husky => "husky",
+        HookManager::Lefthook => "lefthook",
+        HookManager::PreCommit => "pre-commit",
+        HookManager::Plain => "plain hook files",
+    }
+}
+
+/// What `init` tells about the two ways of handling existing hooks.
+fn entry_notes(layout: &hooks::Layout, mode: HooksMode, entry: bool) -> Vec<String> {
+    if mode == HooksMode::Entry && !entry {
+        return vec![
+            "--hooks entry needs existing hook files to delegate to; there are none, so the \
+             usual setup applies"
+                .to_owned(),
+        ];
+    }
+    let manager = layout
+        .files
+        .iter()
+        .map(|f| f.manager)
+        .find(|m| *m != HookManager::Plain);
+    match (mode, manager) {
+        (HooksMode::Rewire, Some(manager)) => vec![format!(
+            "the hooks are managed by {}; `sluice init --hooks entry` (or `sluice hooks \
+             on`) leaves their files untouched and makes Sluice the hooks entry point of this \
+             clone instead of rewriting them",
+            manager_name(manager)
+        )],
+        _ => Vec::new(),
+    }
 }
 
 fn print_plan(plan: &Plan, root: &Path, dry_run: bool) {
@@ -658,6 +728,12 @@ fn print_plan(plan: &Plan, root: &Path, dry_run: bool) {
     if plan.set_hooks_path {
         println!(
             "  {} git config --local core.hooksPath .githooks",
+            if dry_run { "would run" } else { "ran" }
+        );
+    }
+    if plan.entry {
+        println!(
+            "  {} sluice hooks on (the repository's hook files stay as they are)",
             if dry_run { "would run" } else { "ran" }
         );
     }
@@ -733,14 +809,18 @@ fn write_changes(plan: &Plan, root: &Path, env: &EnvMap, paths: &RepoPaths) -> R
         )
         .map_err(|e| format!("cannot set core.hooksPath: {e}"))?;
     }
+    if plan.entry {
+        hookentry::activate::activate(paths, env)
+            .map_err(|e| format!("cannot turn the hooks entry point on: {e}"))?;
+    }
     Ok(())
 }
 
-fn execute(force: bool, dry_run: bool) -> Result<(), String> {
+fn execute(force: bool, dry_run: bool, mode: HooksMode) -> Result<(), String> {
     let env = config::process_env();
     let paths = discover_repo(&env)?;
     let root = paths.toplevel.clone();
-    let plan = plan(&root, &paths, &env, force)?;
+    let plan = plan(&root, &paths, &env, force, mode)?;
     if !dry_run {
         write_changes(&plan, &root, &env, &paths)?;
     }

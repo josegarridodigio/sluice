@@ -9,7 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `sluice hooks on|off|status`: Sluice becomes the git hooks entry point of a
+  clone without editing the repository (ADR-0021, wave H1). `on` gives the clone
+  a hooks directory under its git directory (one script for each hook the repository has, kept in sync)
+  and sets `core.hooksPath` through a file included by the last `[include]` of
+  the clone's git config, so husky's own `core.hooksPath` write on every install
+  does not displace it. Every hook runs `sluice hooks run`, which executes the
+  hook the repository would have run (husky, lefthook, pre-commit or plain)
+  untouched, with the same arguments, stdin, directory, environment and exit
+  code; a missing `sluice` binary never disables the repository's hooks. No
+  behaviour changes. See `docs/hooks.md`.
+- `sluice init --hooks entry` leaves the repository's hook files alone and
+  activates the entry point instead of rewiring them (`--hooks rewire`, the
+  default, is the previous behaviour).
+- The agent plugin's session start restores an activated clone whose entry point
+  was displaced and says so in the context; it never activates a clone by itself.
+
 ### Changed
+
+- `sluice doctor` no longer tells you to ignore a hook manager's hooks that
+  bypass Sluice: the `hooks` check fails when a manager owns hooks that do not
+  call sluice (suggesting `sluice hooks on`), and fails with the reason when an
+  activated entry point is displaced.
 
 ### Fixed
 

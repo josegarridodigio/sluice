@@ -33,6 +33,7 @@ use sluice_gate_daemon::store::{JobState, Store};
 use sluice_gate_proto::client;
 use sluice_gate_proto::{ClientMessage, FEATURE_QUEUE, ServerMessage};
 
+use crate::hookentry;
 use crate::run::EXIT_ERROR;
 
 mod containment;
@@ -575,7 +576,7 @@ fn check_repo(env: &EnvMap, paths: &RepoPaths) -> Vec<Check> {
     if let Ok(cfg) = &config {
         out.extend(check_train_tools(env, cfg));
     }
-    out.push(check_hooks(env, paths));
+    out.push(check_hooks(env, paths, config.as_ref().ok()));
     out.push(check_markers(paths));
     out.push(check_cache(env, paths));
     match &config {
@@ -1079,12 +1080,39 @@ fn husky_scripts_call_sluice(dir: &Path) -> bool {
     })
 }
 
-fn check_hooks(env: &EnvMap, paths: &RepoPaths) -> Check {
-    let probe = git::probe_env(env, Some(paths));
-    let dir = git::run(
+/// Whether any hook file of `dir` (or a husky v9 runner's scripts) mentions sluice.
+fn hooks_call_sluice(dir: &Path) -> bool {
+    fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|e| {
+            let name = e.file_name();
+            !name.to_string_lossy().ends_with(".sample")
+                && fs::read_to_string(e.path()).is_ok_and(|text| text.contains("sluice"))
+        })
+    }) || husky_scripts_call_sluice(dir)
+}
+
+/// Whether the configuration of `manager` in the worktree `root` calls
+/// sluice: lefthook and pre-commit hook files only start the manager, and
+/// `sluice init` wires the commands in its configuration.
+fn manager_config_calls_sluice(root: &Path, manager: hookentry::delegate::Manager) -> bool {
+    use hookentry::delegate::{LEFTHOOK_CONFIGS, Manager};
+    let mentions =
+        |file: &str| fs::read_to_string(root.join(file)).is_ok_and(|text| text.contains("sluice"));
+    match manager {
+        Manager::Lefthook => LEFTHOOK_CONFIGS
+            .iter()
+            .any(|c| mentions(c) || mentions(&c.replacen("lefthook", "lefthook-local", 1))),
+        Manager::PreCommit => mentions(".pre-commit-config.yaml"),
+        Manager::Husky | Manager::Plain | Manager::None => false,
+    }
+}
+
+/// The directory `core.hooksPath` names (the default hooks directory when unset).
+fn configured_hooks_dir(env: &EnvMap, paths: &RepoPaths, probe: &EnvMap) -> PathBuf {
+    git::run(
         &["config", "--get", "core.hooksPath"],
         &paths.toplevel,
-        &probe,
+        probe,
         true,
     )
     .ok()
@@ -1099,30 +1127,93 @@ fn check_hooks(env: &EnvMap, paths: &RepoPaths) -> Check {
             );
             paths.toplevel.join(v)
         },
-    );
-    let calls_sluice = fs::read_dir(&dir).is_ok_and(|entries| {
-        entries.flatten().any(|e| {
-            let name = e.file_name();
-            !name.to_string_lossy().ends_with(".sample")
-                && fs::read_to_string(e.path()).is_ok_and(|text| text.contains("sluice"))
-        })
-    }) || husky_scripts_call_sluice(&dir);
-    if calls_sluice {
-        check(
+    )
+}
+
+/// `hooks` for a clone Sluice owns the hooks entry point of (`sluice hooks on`).
+fn check_managed_hooks(ins: &hookentry::activate::Inspection) -> Check {
+    match ins.problem() {
+        None => check(
+            "hooks",
+            Status::Ok,
+            format!(
+                "git hooks go through sluice ({}); the repository's own hooks run untouched from {}",
+                ins.dir,
+                ins.underlying
+                    .as_deref()
+                    .unwrap_or("the default hooks directory")
+            ),
+        ),
+        Some(problem) => check(
+            "hooks",
+            Status::Fail,
+            format!(
+                "the hooks entry point of this clone is not working: {problem}; run 'sluice hooks on' to restore it"
+            ),
+        ),
+    }
+}
+
+fn check_hooks(env: &EnvMap, paths: &RepoPaths, config: Option<&RepoConfig>) -> Check {
+    let probe = git::probe_env(env, Some(paths));
+    let inspection = hookentry::activate::inspect(&paths.common_dir, &paths.toplevel, &probe);
+    if let Ok(ins) = &inspection
+        && ins.managed()
+    {
+        return check_managed_hooks(ins);
+    }
+    let dir = configured_hooks_dir(env, paths, &probe);
+    if hooks_call_sluice(&dir) {
+        return check(
             "hooks",
             Status::Ok,
             format!("a hook in {} calls sluice", dir.display()),
-        )
-    } else {
-        check(
+        );
+    }
+    let manager = hookentry::delegate::detect(&paths.toplevel, &dir);
+    if manager_config_calls_sluice(&paths.toplevel, manager) {
+        return check(
+            "hooks",
+            Status::Ok,
+            format!(
+                "the {} configuration of this clone calls sluice",
+                manager.label()
+            ),
+        );
+    }
+    let gated = config.is_some_and(|c| c.gates.values().any(|g| !g.hooks.is_empty()));
+    let owned_by_manager = !matches!(
+        manager,
+        hookentry::delegate::Manager::None | hookentry::delegate::Manager::Plain
+    );
+    let has_files = manager != hookentry::delegate::Manager::None;
+    if owned_by_manager || (gated && has_files) {
+        return check(
+            "hooks",
+            Status::Fail,
+            format!(
+                "the hooks of this clone ({}, in {}) do not call sluice, so their commands run outside the queue and the cache; \
+                 run 'sluice hooks on' (Sluice becomes the hooks entry point and runs them untouched) or wire them with 'sluice init'",
+                manager.label(),
+                dir.display()
+            ),
+        );
+    }
+    if gated || has_files {
+        return check(
             "hooks",
             Status::Warn,
             format!(
-                "no hook in {} calls sluice (see 'sluice hook print'); ignore this if a hook manager owns the hooks",
+                "no hook in {} calls sluice (see 'sluice hook print' or 'sluice hooks on')",
                 dir.display()
             ),
-        )
+        );
     }
+    check(
+        "hooks",
+        Status::Ok,
+        format!("no hooks in {} and no gate runs from a hook", dir.display()),
+    )
 }
 
 /// Paths of index entries marked skip-worktree (`S`) or assume-unchanged

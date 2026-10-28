@@ -33,6 +33,7 @@ use serde_json::{Value, json};
 use sluice_gate_core::config::{EnvMap, REPO_CONFIG_FILE, RepoConfig, UserConfig};
 use sluice_gate_core::heavy::HeavyMatcher;
 
+use crate::hookentry::{self, Restore};
 use crate::{clientlog, session_contain, shim};
 
 /// Longest the hook may take before it gives up silently.
@@ -245,6 +246,31 @@ fn contain(
     rx.recv_timeout(left).unwrap_or("timeout")
 }
 
+/// Restores the hooks entry point of the clone at `cwd` when it was activated
+/// (`sluice hooks on`) and something displaced it, within what is left of the
+/// budget. Returns the log label and the sentence for the context. A clone
+/// that was never activated is not touched: activation is explicit.
+fn hooks_entry(cwd: &Path, env: &EnvMap, start: Instant) -> (&'static str, &'static str) {
+    let left = budget(env).saturating_sub(start.elapsed());
+    if left.is_zero() {
+        return ("", "");
+    }
+    match hookentry::restore_within(cwd, env, left) {
+        Restore::Untouched => ("", ""),
+        Restore::Healthy => (" hooks=on", ""),
+        Restore::Restored => (
+            " hooks=restored",
+            " Sluice re-enabled its git hooks entry point in this clone (something had displaced \
+             it); the repository's own hooks still run unchanged.",
+        ),
+        Restore::Failed(_) => (
+            " hooks=displaced",
+            " The git hooks entry point of this clone (`sluice hooks on`) is displaced and could \
+             not be restored here; tell the user to run `sluice hooks on`.",
+        ),
+    }
+}
+
 /// What the hook does for `input`; the JSON to print, or `None`.
 pub fn respond(input: &str, env: &EnvMap) -> Option<String> {
     let start = Instant::now();
@@ -280,8 +306,10 @@ pub fn respond(input: &str, env: &EnvMap) -> Option<String> {
         start,
     );
 
-    let (text, decision) = context(&locate(&cwd));
-    let decision = format!("{decision} contained={contained}");
+    let (mut text, decision) = context(&locate(&cwd));
+    let (hooks_label, hooks_note) = hooks_entry(&cwd, env, start);
+    text.push_str(hooks_note);
+    let decision = format!("{decision} contained={contained}{hooks_label}");
     let _ = clientlog::record(
         env,
         &clientlog::Entry {

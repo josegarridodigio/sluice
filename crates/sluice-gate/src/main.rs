@@ -20,6 +20,7 @@ mod dirs;
 mod doctor;
 mod exec;
 mod guard;
+mod hookentry;
 mod init;
 mod logging;
 mod logs;
@@ -243,11 +244,28 @@ enum Command {
         /// Print the gates, the files and the diff of the hook edits; write nothing.
         #[arg(long)]
         dry_run: bool,
+        /// How existing hooks are handled: `rewire` edits the hook files (default);
+        /// `entry` leaves them untouched and makes Sluice the hooks entry point of
+        /// this clone (`sluice hooks on`).
+        #[arg(long, value_enum, default_value_t = init::HooksMode::Rewire)]
+        hooks: init::HooksMode,
     },
     /// Print hook integration snippets.
     Hook {
         #[command(subcommand)]
         command: HookCommand,
+    },
+    /// Make Sluice the git hooks entry point of this clone, without touching the repository.
+    ///
+    /// `on` gives the clone a hooks directory of its own (under its git directory) and points
+    /// `core.hooksPath` at it through a file included by the last `[include]` of the clone's
+    /// git config, so husky's own `core.hooksPath` writes do not displace it. Every hook runs
+    /// `sluice hooks run`, which executes the hook the repository would have run (husky,
+    /// lefthook, pre-commit or plain), untouched: same arguments, stdin, directory,
+    /// environment and exit code. `off` removes the include and the managed files.
+    Hooks {
+        #[command(subcommand)]
+        command: HooksCommand,
     },
     /// Show the log of a job.
     Logs {
@@ -500,6 +518,35 @@ enum CacheCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum HooksCommand {
+    /// Activate the entry point in this clone (idempotent).
+    On,
+    /// Remove the include and the managed files; the previous `core.hooksPath` applies again.
+    Off,
+    /// Show whether the entry point is on, what it delegates to and whether it is effective.
+    Status {
+        /// Print machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a hook as git would have without Sluice (called by the managed scripts).
+    ///
+    /// Executes the repository's own hook with the same arguments and stdin, replacing this
+    /// process; a hook that is not installed exits 0.
+    #[command(hide = true)]
+    Run {
+        /// The clone's git common directory (written into the scripts).
+        #[arg(long, value_name = "DIR")]
+        common_dir: Option<std::path::PathBuf>,
+        /// The hook's name.
+        hook: String,
+        /// The hook's arguments (after `--`).
+        #[arg(last = true)]
+        args: Vec<std::ffi::OsString>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum HookCommand {
     /// Print the snippet for a hook manager.
     Print {
@@ -546,10 +593,24 @@ fn main() -> ExitCode {
         Command::Cache {
             command: CacheCommand::Clear { gate },
         } => cache::clear(gate.as_deref()),
-        Command::Init { force, dry_run } => init::run(force, dry_run),
+        Command::Init {
+            force,
+            dry_run,
+            hooks,
+        } => init::run(force, dry_run, hooks),
         Command::Hook {
             command: HookCommand::Print { manager },
         } => hook_print(manager),
+        Command::Hooks { command } => match command {
+            HooksCommand::On => hookentry::on(),
+            HooksCommand::Off => hookentry::off(),
+            HooksCommand::Status { json } => hookentry::status(json),
+            HooksCommand::Run {
+                common_dir,
+                hook,
+                args,
+            } => hookentry::run(&hook, &args, common_dir.as_deref()),
+        },
         Command::Logs {
             job_id,
             timeline: true,

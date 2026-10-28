@@ -123,5 +123,13 @@ fn doctor_reads_the_scripts_a_husky_v9_runner_executes() {
     husky_v9(&sb, "npm run lint\n");
     let all = checks(&sb);
     let hooks = find(&all, "hooks");
-    assert_eq!(hooks[0]["status"], "warn", "{hooks:?}");
+    // A hook manager whose hooks do not call sluice: a failure (ADR-0021).
+    assert_eq!(hooks[0]["status"], "fail", "{hooks:?}");
+    assert!(
+        hooks[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("sluice hooks on"),
+        "{hooks:?}"
+    );
 }
