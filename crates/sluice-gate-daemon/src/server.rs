@@ -748,6 +748,14 @@ fn load_peaks(store: &Store) -> PeakCache {
         }
         Err(e) => tracing::warn!("cannot load the gate working sets: {e}"),
     }
+    match store.gate_bounds_recent(memory::PEAK_WINDOW) {
+        Ok(rows) => {
+            for r in rows {
+                peaks.push_bound((r.repo, r.gate, r.cmd_hash), r.anon_peak_bytes);
+            }
+        }
+        Err(e) => tracing::warn!("cannot load the gate memory lower bounds: {e}"),
+    }
     // Jobs rows can be pruned: a key without a known weight is no prior.
     match store.gate_memory_weights() {
         Ok(rows) => {
@@ -760,19 +768,26 @@ fn load_peaks(store: &Store) -> PeakCache {
     peaks
 }
 
+/// A peak in bytes per stats key.
+type KeyedPeaks = Vec<(StatsKey, u64)>;
+
 /// Hands the learned peaks of every key, and the priors drawn from them, to
 /// the scheduler (the stats mutex is never held with the state one).
 fn seed_peaks(shared: &Shared) {
-    let (known, priors): (Vec<(StatsKey, u64)>, _) = {
+    let (known, bounds, priors): (KeyedPeaks, KeyedPeaks, _) = {
         let peaks = lock(&shared.peaks);
         (
             peaks.expectations().map(|(k, v)| (k.clone(), v)).collect(),
+            peaks.lower_bounds().map(|(k, v)| (k.clone(), v)).collect(),
             peaks.priors(),
         )
     };
     let mut st = shared.state();
     for (key, bytes) in known {
         st.sched.set_learned_peak(key, Some(bytes));
+    }
+    for (key, bytes) in bounds {
+        st.sched.set_lower_bound(key, Some(bytes));
     }
     st.sched.set_peak_priors(priors);
 }
@@ -1461,14 +1476,7 @@ fn admit(shared: &Shared, now: u64) -> Vec<(String, sched::Admission)> {
     // Memory waits are folded into the budget column and reason: the log is
     // where they show.
     for note in &notes {
-        tracing::info!(
-            "{}",
-            if note.started {
-                sched::memory_started_line(note)
-            } else {
-                sched::memory_blocked_line(note)
-            }
-        );
+        tracing::info!("{}", sched::memory_note_line(note));
     }
     for (id, admission) in &started {
         match admission {
@@ -1653,7 +1661,11 @@ fn close_job(
                 s.insert_gate_stat(stat)?;
             }
             if let Some((_, working_set)) = &memory {
-                s.insert_gate_memory(working_set)?;
+                if working_set.is_lower_bound() {
+                    s.insert_gate_bound(working_set)?;
+                } else {
+                    s.insert_gate_memory(working_set)?;
+                }
             }
             Ok(())
         });
@@ -1701,11 +1713,12 @@ fn learned_stat(
     ))
 }
 
-/// What a finished job teaches the expected peak of its key (ADR-0019):
-/// passing runs and runs killed for lack of memory (they would otherwise
-/// leave a gate that keeps dying at "unknown" forever); a failure that is
-/// not a memory kill stopped early and teaches nothing. Needs a sampled
-/// working set.
+/// What a finished job teaches the expected peak of its key (ADR-0019,
+/// ADR-0022): passing runs and runs killed for lack of memory (they would
+/// otherwise leave a gate that keeps dying at "unknown" forever) are samples;
+/// a run that ended `fail` or `timeout` stopped early or stalled, so its peak
+/// is stored as a lower bound only. A cancelled or early-verdict kill, a
+/// cached or errored run teaches nothing. Needs a sampled working set.
 fn learned_memory(
     key: &StatsKey,
     usage: &JobUsage,
@@ -1715,7 +1728,8 @@ fn learned_memory(
 ) -> Option<(StatsKey, GateMemory)> {
     let killed = outcome.status == OutcomeStatus::Killed
         && outcome.killed_by.as_deref() == Some(memkill::KILLED_BY_MEMORY);
-    if !killed && !learns_from(outcome.status) {
+    let bound = matches!(outcome.status, OutcomeStatus::Fail | OutcomeStatus::Timeout);
+    if !killed && !bound && !learns_from(outcome.status) {
         return None;
     }
     Some((
@@ -1726,7 +1740,16 @@ fn learned_memory(
             cmd_hash: key.2.clone(),
             job_id: id.to_owned(),
             finished_at: now,
-            outcome: if killed { "killed" } else { "pass" }.to_owned(),
+            outcome: if killed {
+                "killed"
+            } else if outcome.status == OutcomeStatus::Timeout {
+                "timeout"
+            } else if bound {
+                "fail"
+            } else {
+                "pass"
+            }
+            .to_owned(),
             anon_peak_bytes: usage.memory_peak()?,
             peak_bytes: outcome.memory_peak_bytes.or(usage.cgroup_peak()),
             oom_killed: killed,
@@ -1750,21 +1773,30 @@ fn announce_closed(shared: &Shared, id: &str, closed: Closed) {
         // Never held with the state mutex; queued and running jobs of this
         // key use the new expected peak (and the priors drawn from every
         // key) at the next admission pass.
-        let (expected, priors) = {
+        let (expected, bound, priors) = {
             let mut peaks = lock(&shared.peaks);
-            peaks.push(
-                key.clone(),
-                PeakSample {
-                    anon_peak_bytes: working_set.anon_peak_bytes,
-                    killed: working_set.oom_killed,
-                },
-            );
-            if let Some(weight) = weight {
-                peaks.set_weight(key.clone(), weight);
+            if working_set.is_lower_bound() {
+                peaks.push_bound(key.clone(), working_set.anon_peak_bytes);
+            } else {
+                peaks.push(
+                    key.clone(),
+                    PeakSample {
+                        anon_peak_bytes: working_set.anon_peak_bytes,
+                        killed: working_set.oom_killed,
+                    },
+                );
+                if let Some(weight) = weight {
+                    peaks.set_weight(key.clone(), weight);
+                }
             }
-            (peaks.expected(&key), peaks.priors())
+            (
+                peaks.expected(&key),
+                peaks.lower_bound(&key),
+                peaks.priors(),
+            )
         };
         let mut st = shared.state();
+        st.sched.set_lower_bound(key.clone(), bound);
         st.sched.set_learned_peak(key, expected);
         st.sched.set_peak_priors(priors);
     }
@@ -2694,7 +2726,10 @@ fn status_report(shared: &Shared) -> StatusReport {
                     demand,
                     memory_bytes: v.memory_current,
                     memory_expected_bytes: v.memory_expected.map(|e| e.bytes),
-                    memory_expected_learned: v.memory_expected.map(|e| e.learned),
+                    memory_expected_learned: v
+                        .memory_expected
+                        .map(super::scheduler::Expected::learned),
+                    memory_expected_basis: v.memory_expected.map(|e| e.basis.as_str().to_owned()),
                 }
             })
             .collect();
@@ -2721,7 +2756,10 @@ fn status_report(shared: &Shared) -> StatusReport {
                     weight_cfg: Some(v.weight_cfg),
                     wait_detail: v.detail.map(str::to_owned),
                     memory_expected_bytes: v.memory_expected.map(|e| e.bytes),
-                    memory_expected_learned: v.memory_expected.map(|e| e.learned),
+                    memory_expected_learned: v
+                        .memory_expected
+                        .map(super::scheduler::Expected::learned),
+                    memory_expected_basis: v.memory_expected.map(|e| e.basis.as_str().to_owned()),
                 }
             })
             .collect();
@@ -3963,7 +4001,8 @@ mod tests {
     }
 
     /// ADR-0019: passing runs and runs killed for lack of memory teach the
-    /// expected peak; no other failure does; the weight still learns from
+    /// expected peak; failed and timed-out runs only leave a lower bound
+    /// (ADR-0022); nothing else teaches; the weight still learns from
     /// passing runs only.
     #[test]
     fn memory_is_learned_from_passes_and_memory_kills_only() {
@@ -3987,9 +4026,8 @@ mod tests {
         );
         assert_eq!(killed.peak_bytes, Some(4242), "the kernel's peak wins");
         for no in [
-            outcome(OutcomeStatus::Fail, None),
-            outcome(OutcomeStatus::Timeout, None),
             outcome(OutcomeStatus::Error, None),
+            outcome(OutcomeStatus::Cached, None),
             // Sluice's own cancel is not a memory kill.
             outcome(OutcomeStatus::Killed, Some("stop")),
             outcome(OutcomeStatus::Killed, None),
@@ -4006,5 +4044,46 @@ mod tests {
         // The weight's rule is unchanged.
         assert!(learns_from(OutcomeStatus::Pass));
         assert!(!learns_from(OutcomeStatus::Killed));
+    }
+
+    /// ADR-0022: a run that ended `fail` or `timeout` records its peak as a
+    /// lower bound; a pass, a memory kill and a cancel do not.
+    #[test]
+    fn failed_and_timed_out_runs_record_a_lower_bound() {
+        let usage = sampled(1000);
+        for (status, label) in [
+            (OutcomeStatus::Fail, "fail"),
+            (OutcomeStatus::Timeout, "timeout"),
+        ] {
+            let row = learned_memory(&key(), &usage, &outcome(status, None), "j", 5)
+                .expect("a bound")
+                .1;
+            assert_eq!(row.outcome, label);
+            assert_eq!((row.anon_peak_bytes, row.oom_killed), (1000, false));
+            assert!(row.is_lower_bound());
+        }
+        let pass = learned_memory(&key(), &usage, &outcome(OutcomeStatus::Pass, None), "j", 5);
+        assert!(!pass.unwrap().1.is_lower_bound());
+        let killed = outcome(OutcomeStatus::Killed, Some(memkill::KILLED_BY_MEMORY));
+        assert!(
+            !learned_memory(&key(), &usage, &killed, "j", 5)
+                .unwrap()
+                .1
+                .is_lower_bound()
+        );
+        // An early verdict or a cancel ends `killed` without the memory cause.
+        for no in [Some("stop"), Some("early-verdict"), None] {
+            let o = outcome(OutcomeStatus::Killed, no);
+            assert_eq!(learned_memory(&key(), &usage, &o, "j", 5), None);
+        }
+        // No sampled working set, no bound.
+        let fail = outcome(OutcomeStatus::Fail, None);
+        assert_eq!(
+            learned_memory(&key(), &JobUsage::default(), &fail, "j", 5),
+            None
+        );
+        // Weights and durations still learn from passes only.
+        assert!(!learns_from(OutcomeStatus::Fail));
+        assert!(!learns_from(OutcomeStatus::Timeout));
     }
 }

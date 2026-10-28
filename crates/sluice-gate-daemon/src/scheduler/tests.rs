@@ -258,6 +258,7 @@ fn q(id: &str, lane: &str, weight: u32, queued_at: u64) -> QueuedSnap {
         queued_at,
         expected_ms: None,
         expected_peak: None,
+        lower_bound: None,
     }
 }
 
@@ -269,6 +270,9 @@ fn r(id: &str, lane: &str, weight: u32) -> RunningSnap {
         weight,
         current: 0,
         expected_peak: None,
+        lower_bound: None,
+        learn_key: None,
+        probe: false,
     }
 }
 
@@ -302,7 +306,7 @@ fn snapshot<'a>(
 }
 
 static NO_LEARNED: Learned = BTreeMap::new();
-static NO_PRIORS: PeakPriors = BTreeMap::new();
+static NO_PRIORS: PeakPriors = Vec::new();
 
 /// A learned-statistics key of repository `/r`.
 fn lk(gate: &str) -> LearnKey {
@@ -1190,7 +1194,7 @@ fn two_eighteen_gib_gates_never_start_together() {
         decided
             .expected
             .iter()
-            .all(|e| e.learned && e.bytes == 18 * GIB)
+            .all(|e| e.learned() && e.bytes == 18 * GIB)
     );
     // The same snapshot without the rule starts both: the incident.
     let off = plan(&snapshot(10, &p, Pressure::default(), &[], &queued));
@@ -1344,7 +1348,11 @@ fn a_memory_wait_reports_budget_with_the_memory_detail() {
     assert_eq!(queued[0].detail, Some("memory"));
     assert_eq!(queued[0].memory_expected.map(|e| e.bytes), Some(18 * GIB));
     assert_eq!(running[0].memory_current, Some(0));
-    assert!(running[0].memory_expected.is_some_and(|e| e.learned));
+    assert!(
+        running[0]
+            .memory_expected
+            .is_some_and(super::Expected::learned)
+    );
     // The wait lands in the budget accumulator, the frozen column.
     s.admit(3_000, false);
     let rec = s.record("b", 3_000).unwrap();
@@ -1431,13 +1439,14 @@ fn budget_waits_leave_no_memory_note() {
 fn the_memory_log_lines_have_a_fixed_format() {
     let mut note = MemoryNote {
         started: false,
+        probe: false,
         job: "j7".into(),
-        repo: PathBuf::from("/home/someone/work/shop"),
+        repo: PathBuf::from("/srv/work/shop"),
         gate: "test".into(),
         waited_ms: 12_345,
         expected: Some(Expected {
             bytes: 18 * GIB,
-            learned: true,
+            basis: Basis::Learned,
         }),
         available_bytes: 12 * GIB,
         reserve_bytes: 3 * GIB,
@@ -1451,7 +1460,7 @@ fn the_memory_log_lines_have_a_fixed_format() {
     note.started = true;
     note.expected = Some(Expected {
         bytes: 6 * GIB,
-        learned: false,
+        basis: Basis::Guessed,
     });
     assert_eq!(
         memory_started_line(&note),
@@ -1526,25 +1535,25 @@ fn an_unknown_peak_is_guessed_from_the_weight_and_a_learned_one_replaces_it() {
     // `auto` on a budget of 12 is weight 6: half of the 27 GiB usable.
     let guess = f.estimate(None, 6, 12);
     assert_eq!(guess.bytes, 27 * GIB / 2);
-    assert!(!guess.learned);
+    assert!(!guess.learned());
     // A weight of 1 predicts a twelfth of it, never above the budget share.
     assert_eq!(f.estimate(None, 1, 12).bytes, 27 * GIB / 12);
     assert_eq!(f.estimate(None, 99, 12).bytes, 27 * GIB);
     // One learned sample is enough and replaces the guess.
     let learned = f.estimate(Some(2 * GIB), 6, 12);
-    assert_eq!((learned.bytes, learned.learned), (2 * GIB, true));
+    assert_eq!((learned.bytes, learned.learned()), (2 * GIB, true));
     // Through the scheduler: the key learns, the next pass uses it.
     let mut s = Scheduler::with_policy(policy(12));
     s.set_memory(Some(f), BTreeMap::new());
     s.enqueue(gate_job("t0", 6, 0));
     let expected = |s: &Scheduler| s.snapshot(1, false).1[0].memory_expected.unwrap();
-    assert!(!expected(&s).learned);
+    assert!(!expected(&s).learned());
     assert_eq!(expected(&s).bytes, 27 * GIB / 2);
     s.set_learned_peak(lk("test"), Some(3 * GIB));
-    assert!(expected(&s).learned);
+    assert!(expected(&s).learned());
     assert_eq!(expected(&s).bytes, 3 * GIB);
     s.set_learned_peak(lk("test"), None);
-    assert!(!expected(&s).learned);
+    assert!(!expected(&s).learned());
 }
 
 // ------------------------------------- memory cold-start prior (0.6.1)
@@ -1556,17 +1565,19 @@ fn with_priors<'a>(s: Snapshot<'a>, priors: &'a PeakPriors) -> Snapshot<'a> {
 }
 
 #[test]
-fn the_prior_is_the_largest_peak_of_lighter_or_equal_weights() {
+fn the_prior_is_the_p75_of_the_peaks_of_lighter_or_equal_weights() {
     let priors: PeakPriors = [(1, GIB / 2), (2, 2 * GIB), (8, 13 * GIB)]
         .into_iter()
         .collect();
     assert_eq!(prior_peak(&priors, 1), Some(GIB / 2));
-    assert_eq!(prior_peak(&priors, 2), Some(2 * GIB));
+    assert_eq!(prior_peak(&priors, 2), Some(2 * GIB), "nearest rank of two");
     assert_eq!(prior_peak(&priors, 7), Some(2 * GIB), "no heavier weight");
-    assert_eq!(prior_peak(&priors, 8), Some(13 * GIB));
-    // A lighter weight that peaks higher still counts for a heavier job.
-    let odd: PeakPriors = [(1, 3 * GIB), (4, GIB)].into_iter().collect();
-    assert_eq!(prior_peak(&odd, 6), Some(3 * GIB));
+    assert_eq!(prior_peak(&priors, 8), Some(13 * GIB), "rank 3 of 3");
+    // The 75th percentile, not the maximum: one heavy outlier of four stays out.
+    let four: PeakPriors = [(1, GIB), (1, 2 * GIB), (1, 3 * GIB), (1, 40 * GIB)]
+        .into_iter()
+        .collect();
+    assert_eq!(prior_peak(&four, 1), Some(3 * GIB));
     // Nothing at or below the weight, or no data at all: no prior.
     let heavy: PeakPriors = [(4, GIB)].into_iter().collect();
     assert_eq!(prior_peak(&heavy, 3), None);
@@ -1574,20 +1585,39 @@ fn the_prior_is_the_largest_peak_of_lighter_or_equal_weights() {
 }
 
 #[test]
-fn the_estimate_is_the_prior_capped_by_the_proxy_and_stays_a_guess() {
+fn the_estimate_is_learned_then_a_lower_bound_then_the_capped_prior() {
     let f = facts(22, 30, 3);
     let proxy = 27 * GIB / 12;
-    let primed = |learned, prior, w| f.estimate_primed(learned, prior, w, 12);
-    let low = primed(None, Some(20 * MIB), 1);
-    assert_eq!((low.bytes, low.learned), (20 * MIB, false), "still a guess");
-    assert_eq!(primed(None, Some(9 * GIB), 1).bytes, proxy, "capped");
-    assert_eq!(primed(None, None, 1).bytes, proxy, "no data: the proxy");
+    let est = |learned, bound, prior, w| f.estimate_primed(learned, bound, prior, w, 12);
+    // Learned wins over everything.
+    let own = est(Some(GIB), Some(5 * GIB), Some(20 * MIB), 1);
+    assert_eq!((own.bytes, own.basis), (GIB, Basis::Learned));
+    // A lower bound is the next evidence: 1.2 x, however big or small.
+    let low = est(None, Some(300 * MIB), Some(9 * GIB), 6);
+    assert_eq!((low.bytes, low.basis), (360 * MIB, Basis::LowerBound));
+    assert!(!low.learned(), "only a learned peak over-admits");
+    assert_eq!(
+        est(None, Some(10 * GIB), None, 1).bytes,
+        12 * GIB,
+        "above the guess"
+    );
+    // The prior is clamped to 1 GiB..=share; the share alone without data.
+    let guess = |prior| est(None, None, prior, 1);
+    assert_eq!(guess(Some(20 * MIB)).bytes, GIB, "the floor");
+    assert_eq!(guess(Some(2 * GIB)).bytes, 2 * GIB);
+    assert_eq!(guess(Some(9 * GIB)).bytes, proxy, "the cap");
+    assert_eq!(guess(None).bytes, proxy, "no data: the proxy");
+    assert_eq!(guess(None).basis, Basis::Guessed);
+    // A share below the floor wins: the cap is the weight's share.
+    let tiny = facts(4, 4, 3);
+    assert_eq!(
+        tiny.estimate_primed(None, None, Some(GIB), 1, 12).bytes,
+        GIB / 12
+    );
     assert_eq!(f.estimate(None, 1, 12).bytes, proxy);
-    let own = primed(Some(GIB), Some(20 * MIB), 1);
-    assert_eq!((own.bytes, own.learned), (GIB, true), "own peak wins");
 }
 
-/// The incident of 2026-10-26: a 13 GiB suite runs, about 1 GiB is free, and
+/// The incident of 2026-10-26: a 13 GiB suite runs, about 4 GiB are free, and
 /// three first-run weight-1 gates (really about 20 MiB each) queue behind it.
 #[test]
 fn first_run_light_gates_start_beside_a_big_suite_with_a_light_prior() {
@@ -1598,12 +1628,11 @@ fn first_run_light_gates_start_beside_a_big_suite_with_a_light_prior() {
         q("lint", "/lint", 1, 1),
         q("sec", "/sec", 1, 2),
     ];
-    let mem = facts(4, 30, 3);
-    // Free: 4 - 3 reserve = 1 GiB, below the 27/12 GiB proxy of each gate.
-    let s = with_memory(snapshot(10, &p, Pressure::default(), &run, &queued), mem);
-    let without = plan(&s);
-    assert_eq!(started(&without), Vec::new(), "the proxy keeps them out");
-    assert!(waits_of(&without).iter().all(|w| w.1 == WaitCause::Memory));
+    // Free: 7 - 3 reserve = 4 GiB; the proxy is 27/12 GiB per gate.
+    let s = with_memory(
+        snapshot(10, &p, Pressure::default(), &run, &queued),
+        facts(7, 30, 3),
+    );
     // The heavy suite's own weight (6) must not leak into weight-1 jobs.
     let priors: PeakPriors = [(1, 20 * MIB), (6, 13 * GIB)].into_iter().collect();
     let decided = plan(&with_priors(s, &priors));
@@ -1615,12 +1644,13 @@ fn first_run_light_gates_start_beside_a_big_suite_with_a_light_prior() {
             ("sec", Admission::Nominal)
         ]
     );
-    assert!(decided.expected.iter().all(|e| !e.learned));
-    assert!(decided.expected.iter().all(|e| e.bytes == 20 * MIB));
+    assert!(decided.expected.iter().all(|e| !e.learned()));
+    assert!(decided.expected.iter().all(|e| e.bytes == GIB), "the floor");
+    assert_eq!(decided.probes, Vec::<String>::new(), "they fit: no probe");
     // A prior only from heavier gates leaves the proxy in force.
     let heavy: PeakPriors = [(6, 13 * GIB)].into_iter().collect();
     let decided = plan(&with_priors(s, &heavy));
-    assert_eq!(started(&decided), Vec::new());
+    assert!(decided.expected.iter().all(|e| e.bytes == 27 * GIB / 12));
 }
 
 #[test]
@@ -1641,6 +1671,232 @@ fn a_prior_never_over_admits() {
         &priors,
     );
     assert_eq!(plan(&s).start, Vec::new(), "a guess, however small");
+}
+
+// ------------------------------------- first-run memory probe (ADR-0022)
+
+/// A queued job of weight `w` whose key is `gate` (no history unless set).
+fn keyed(id: &str, gate: &str, w: u32, queued_at: u64) -> QueuedSnap {
+    QueuedSnap {
+        learn_key: Some(lk(gate)),
+        ..q(id, &format!("/{id}"), w, queued_at)
+    }
+}
+
+/// One pass on a 31 GiB machine (28 usable, budget 12) beside a running
+/// weight-6 suite that holds 8 GiB and is expected to reach 20 GiB: 12 GiB of
+/// headroom, so `available - 3 - 12` is free.
+fn probe_pass(available: u64, run: &[RunningSnap], queued: &[QueuedSnap]) -> Plan {
+    let p = policy(12);
+    let s = snapshot(10, &p, Pressure::default(), run, queued);
+    plan(&with_memory(s, facts(available, 31, 3)))
+}
+
+fn suite() -> [RunningSnap; 1] {
+    [running("suite", 6, 8, 20)]
+}
+
+/// The evidence case: a key that never passed is guessed at half the usable
+/// memory (14 GiB) and does not fit, but a quarter of it is free: it starts.
+#[test]
+fn a_first_run_that_does_not_fit_its_guess_starts_as_a_probe() {
+    let queued = [keyed("first", "pytest", 6, 0)];
+    let waits = probe_pass(20, &suite(), &queued);
+    // free = 20 - 3 - 12 = 5 GiB < 14 GiB, and a quarter of 14 is 3.5.
+    assert_eq!(waits.expected[0].bytes, 14 * GIB);
+    assert_eq!(waits.expected[0].basis, Basis::Guessed);
+    assert_eq!(started(&waits), [("first", Admission::Nominal)]);
+    assert_eq!(waits.probes, ["first"]);
+    // Too little free for even a quarter: it waits for memory.
+    let none = probe_pass(17, &suite(), &queued);
+    assert_eq!(started(&none), Vec::new());
+    assert_eq!(
+        waits_of(&none),
+        [("first", WaitCause::Memory, Some("memory"))]
+    );
+    assert_eq!(none.probes, Vec::<String>::new());
+}
+
+#[test]
+fn only_one_probe_per_key_and_one_per_machine() {
+    // Two jobs of one key: the second finds the key running.
+    let same = [keyed("a", "pytest", 3, 0), keyed("b", "pytest", 3, 1)];
+    let decided = probe_pass(20, &suite(), &same);
+    assert_eq!(started(&decided), [("a", Admission::Nominal)]);
+    assert_eq!(
+        waits_of(&decided),
+        [("b", WaitCause::Memory, Some("memory"))]
+    );
+    // Two keys: one probe on the machine at a time.
+    let two = [keyed("a", "pytest", 3, 0), keyed("b", "build", 3, 1)];
+    let decided = probe_pass(20, &suite(), &two);
+    assert_eq!(decided.probes, ["a"]);
+    assert_eq!(
+        waits_of(&decided),
+        [("b", WaitCause::Memory, Some("memory"))]
+    );
+    // A probe already running holds the machine's only probe slot.
+    let mut running_probe = running("p", 3, 0, 3);
+    running_probe.probe = true;
+    let run = [suite()[0].clone(), running_probe];
+    let one = [keyed("b", "build", 3, 1)];
+    let decided = probe_pass(20, &run, &one);
+    assert_eq!(started(&decided), Vec::new());
+    // A job of the key that runs (probe or not) blocks the same key.
+    let mut same_key = running("k", 3, 0, 3);
+    same_key.learn_key = Some(lk("build"));
+    same_key.expected_peak = None;
+    let run = [suite()[0].clone(), same_key];
+    assert_eq!(started(&probe_pass(20, &run, &one)), Vec::new());
+}
+
+#[test]
+fn a_learned_peak_never_probes() {
+    let learned = [QueuedSnap {
+        expected_peak: Some(20 * GIB),
+        ..keyed("big", "test", 3, 0)
+    }];
+    let decided = probe_pass(20, &suite(), &learned);
+    assert_eq!(started(&decided), Vec::new(), "a learned peak is exact");
+    assert_eq!(decided.probes, Vec::<String>::new());
+}
+
+/// A running probe holds back the quarter it is expected to need, not its
+/// whole estimate: jobs that fit what is left start beside it.
+#[test]
+fn a_probe_holds_a_quarter_of_its_estimate_for_the_jobs_behind_it() {
+    let queued = [
+        keyed("probe", "pytest", 6, 0),
+        peaked("small", 1, 1, 1),
+        peaked("large", 1, 4, 2),
+    ];
+    // free = 20 - 3 - 12 = 5; the probe holds 3.5, 1.5 GiB are left.
+    let run = [running("suite", 3, 8, 20)];
+    let decided = probe_pass(20, &run, &queued);
+    assert_eq!(decided.probes, ["probe"]);
+    assert_eq!(
+        started(&decided),
+        [("probe", Admission::Nominal), ("small", Admission::Nominal)]
+    );
+    // And once running, the probe's headroom is a quarter as well.
+    let mut running_probe = running("probe", 6, 0, 14);
+    running_probe.expected_peak = None;
+    running_probe.probe = true;
+    let p = policy(12);
+    let run = [running_probe];
+    let s = with_memory(
+        snapshot(10, &p, Pressure::default(), &run, &[]),
+        facts(20, 31, 3),
+    );
+    assert_eq!(running_headroom(&s), Some(7 * GIB / 2));
+}
+
+#[test]
+fn a_lower_bound_is_the_estimate_and_a_key_with_one_probes_too() {
+    let queued = [QueuedSnap {
+        lower_bound: Some(5 * GIB),
+        ..keyed("again", "pytest", 3, 0)
+    }];
+    let decided = probe_pass(20, &suite(), &queued);
+    // 1.2 x 5 GiB = 6 GiB: does not fit the 5 GiB free; a quarter does.
+    assert_eq!(decided.expected[0].bytes, 6 * GIB);
+    assert_eq!(decided.expected[0].basis, Basis::LowerBound);
+    assert_eq!(decided.probes, ["again"]);
+    // A lower bound that fits starts normally, not as a probe.
+    let small = [QueuedSnap {
+        lower_bound: Some(GIB),
+        ..queued[0].clone()
+    }];
+    let decided = probe_pass(20, &suite(), &small);
+    assert_eq!(started(&decided), [("again", Admission::Nominal)]);
+    assert_eq!(decided.probes, Vec::<String>::new());
+    // A lower bound never over-admits.
+    let p = over_policy();
+    let big = [QueuedSnap {
+        lower_bound: Some(GIB),
+        ..keyed("s3", "pytest", 6, 3)
+    }];
+    let run = [
+        running("a", 6, 1, 1),
+        running("b", 6, 1, 1),
+        running("c", 6, 1, 1),
+    ];
+    let s = with_memory(
+        snapshot(10_000, &p, calm(8.0), &run, &big),
+        facts(200, 300, 3),
+    );
+    assert_eq!(plan(&s).start, Vec::new());
+}
+
+/// Through the scheduler: the probe is flagged, logged, holds the machine's
+/// probe slot, and the next first run waits behind it.
+#[test]
+fn the_scheduler_flags_logs_and_serialises_probes() {
+    let keyed_spec = |id: &str, gate: &str, w: u32, at: u64| {
+        let mut j = spec(id, None, "/r", w, at);
+        j.learn_key = Some(lk(gate));
+        j
+    };
+    let mut s = Scheduler::with_policy(policy(12));
+    s.set_learned_peak(lk("suite"), Some(20 * GIB));
+    s.enqueue(keyed_spec("j1", "suite", 6, 0));
+    let currents = BTreeMap::from([("j1".to_owned(), 8 * GIB)]);
+    s.set_memory(Some(facts(20, 31, 3)), currents.clone());
+    assert_eq!(s.admit(0, false), ["j1"], "alone: the progress exemption");
+    assert_eq!(s.take_memory_notes(), Vec::new(), "not a probe");
+    s.enqueue(keyed_spec("j2", "pytest", 3, 1));
+    s.enqueue(keyed_spec("j3", "build", 3, 2));
+    s.set_memory(Some(facts(20, 31, 3)), currents);
+    assert_eq!(s.admit(2, false), ["j2"], "one probe");
+    let notes = s.take_memory_notes();
+    assert_eq!(notes.len(), 2, "the probe starts, j3 is first seen waiting");
+    assert!(notes[0].probe && notes[0].started && !notes[1].started);
+    assert!(memory_note_line(&notes[1]).contains("job j3 (r:test) waits for memory"));
+    let line = memory_note_line(&notes[0]);
+    assert!(
+        line.contains("job j2 (r:test) starts as a memory probe"),
+        "{line}"
+    );
+    assert!(line.contains("expected 7.0 GiB guessed"), "{line}");
+    assert_eq!(s.admit(3, false), Vec::<String>::new(), "no second probe");
+    let (running, queued) = s.snapshot(4, false);
+    let basis = |v: &RunningView| v.memory_expected.map(|e| e.basis);
+    assert_eq!(basis(&running[1]), Some(Basis::Guessed));
+    assert_eq!(queued[0].detail, Some("memory"));
+}
+
+#[test]
+fn the_probe_line_has_a_fixed_format() {
+    let note = MemoryNote {
+        started: true,
+        probe: true,
+        job: "j9".into(),
+        repo: PathBuf::from("/work/shop"),
+        gate: "test".into(),
+        waited_ms: 0,
+        expected: Some(Expected {
+            bytes: 14 * GIB,
+            basis: Basis::Guessed,
+        }),
+        available_bytes: 20 * GIB,
+        reserve_bytes: 3 * GIB,
+        headroom_bytes: 12 * GIB,
+    };
+    assert_eq!(
+        memory_note_line(&note),
+        "job j9 (shop:test) starts as a memory probe: expected 14.0 GiB guessed, needs a \
+         quarter (3.5 GiB), free at start 20.0 GiB, reserve 3.0 GiB, waited 0.0s for memory"
+    );
+    let blocked = MemoryNote {
+        started: false,
+        probe: false,
+        expected: Some(Expected {
+            bytes: GIB,
+            basis: Basis::LowerBound,
+        }),
+        ..note
+    };
+    assert!(memory_note_line(&blocked).contains("expected 1.0 GiB lower-bound"));
 }
 
 // A tiny deterministic generator for the property tests.
@@ -1738,21 +1994,28 @@ fn started_jobs_never_exceed_free_memory_unless_alone() {
                     .available_bytes
                     .saturating_sub(memory.reserve_bytes)
                     .saturating_sub(held);
+                let probe = decided.probes.contains(id);
                 match admission {
+                    Admission::Nominal if probe => assert!(
+                        !e.learned() && probe_share(e.bytes) <= free,
+                        "switches {bits:04b}: probe {id} needs a quarter of {}",
+                        e.bytes
+                    ),
                     Admission::Nominal => assert!(
                         !busy || e.bytes <= free,
                         "switches {bits:04b}: {id} needs {} of {free}",
                         e.bytes
                     ),
                     Admission::Over => assert!(
-                        e.learned && e.bytes <= free,
+                        e.learned() && e.bytes <= free,
                         "switches {bits:04b}: over-admitted {id} blind or too big"
                     ),
                     Admission::Guard => unreachable!("not blocking"),
                 }
-                held += e.bytes;
+                held += if probe { probe_share(e.bytes) } else { e.bytes };
                 busy = true;
             }
+            assert!(decided.probes.len() <= 1, "one probe per machine");
         }
     }
 }

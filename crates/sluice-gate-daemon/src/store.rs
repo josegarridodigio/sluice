@@ -133,6 +133,8 @@ pub struct Store {
     sched: u32,
     /// The file has the `gate_memory` table (`containment_schema` 2).
     memory: bool,
+    /// The file has the `gate_memory_bound` table (`containment_schema` 3).
+    bounds: bool,
 }
 
 /// Scheduling facts written when a job is queued (`sched_schema` 1).
@@ -220,7 +222,8 @@ pub struct GateMemory {
     pub job_id: String,
     /// End time.
     pub finished_at: u64,
-    /// `pass` or `killed` (a run killed for lack of memory).
+    /// `pass` or `killed` (a run killed for lack of memory); `fail` or
+    /// `timeout` for a lower bound (`gate_memory_bound`, ADR-0022).
     pub outcome: String,
     /// Largest sampled `anon` + swap of the job (resident set without a
     /// cgroup), bytes.
@@ -230,6 +233,15 @@ pub struct GateMemory {
     pub peak_bytes: Option<u64>,
     /// The run was killed for lack of memory.
     pub oom_killed: bool,
+}
+
+impl GateMemory {
+    /// The row is a lower bound (a run that ended `fail` or `timeout`), not
+    /// a finished run's measured working set.
+    #[must_use]
+    pub fn is_lower_bound(&self) -> bool {
+        self.outcome == "fail" || self.outcome == "timeout"
+    }
 }
 
 /// A job with its timeline (`sluice logs --timeline`). The timeline fields
@@ -382,6 +394,7 @@ impl Store {
             path: path.to_path_buf(),
             sched: 0,
             memory: false,
+            bounds: false,
         };
         let fresh = store.init_schema()?;
         store.migrate(fresh, migrations)?;
@@ -395,6 +408,7 @@ impl Store {
         )
         .map_err(db)?;
         store.memory = true;
+        store.bounds = true;
         crate::meta::record_writer(&store.conn).map_err(db)?;
         Ok(store)
     }
@@ -449,11 +463,13 @@ impl Store {
             path: path.to_path_buf(),
             sched: 0,
             memory: false,
+            bounds: false,
         };
         store.check_version()?;
-        store.memory = crate::migrate::version(&store.conn, crate::migrate::CONTAINMENT_TABLE)
-            .map_err(db)?
-            >= 2;
+        let containment =
+            crate::migrate::version(&store.conn, crate::migrate::CONTAINMENT_TABLE).map_err(db)?;
+        store.memory = containment >= 2;
+        store.bounds = containment >= 3;
         // Only the columns this build knows are ever selected, so a newer
         // (additive) `sched_schema` reads fine.
         store.sched = crate::migrate::version(&store.conn, crate::migrate::SCHED_TABLE)
@@ -1172,11 +1188,31 @@ impl Store {
         if !self.memory {
             return Ok(());
         }
+        self.insert_memory_row("gate_memory", m)
+    }
+
+    /// Inserts the peak of a run that ended `fail` or `timeout`, a lower
+    /// bound of what its gate needs, and keeps the newest 20 of its key. A
+    /// file without `gate_memory_bound` ignores it.
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn insert_gate_bound(&self, m: &GateMemory) -> Result<()> {
+        if !self.bounds {
+            return Ok(());
+        }
+        self.insert_memory_row("gate_memory_bound", m)
+    }
+
+    /// `table` is one of the two constant names above, never user input.
+    fn insert_memory_row(&self, table: &str, m: &GateMemory) -> Result<()> {
         let tx = self.tx()?;
         let repo = path_str(&m.repo);
         tx.execute(
-            "INSERT INTO gate_memory (repo, gate, cmd_hash, job_id, finished_at, outcome, \
-             anon_peak_bytes, peak_bytes, oom_killed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            &format!(
+                "INSERT INTO {table} (repo, gate, cmd_hash, job_id, finished_at, outcome, \
+             anon_peak_bytes, peak_bytes, oom_killed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+            ),
             params![
                 repo,
                 m.gate,
@@ -1191,9 +1227,11 @@ impl Store {
         )
         .map_err(db)?;
         tx.execute(
-            "DELETE FROM gate_memory WHERE repo = ?1 AND gate = ?2 AND cmd_hash = ?3 \
-             AND rowid NOT IN (SELECT rowid FROM gate_memory WHERE repo = ?1 AND gate = ?2 \
-             AND cmd_hash = ?3 ORDER BY finished_at DESC, rowid DESC LIMIT ?4)",
+            &format!(
+                "DELETE FROM {table} WHERE repo = ?1 AND gate = ?2 AND cmd_hash = ?3 \
+                 AND rowid NOT IN (SELECT rowid FROM {table} WHERE repo = ?1 AND gate = ?2 \
+                 AND cmd_hash = ?3 ORDER BY finished_at DESC, rowid DESC LIMIT ?4)"
+            ),
             params![repo, m.gate, m.cmd_hash, GATE_MEMORY_KEEP],
         )
         .map_err(db)?;
@@ -1210,13 +1248,30 @@ impl Store {
         if !self.memory {
             return Ok(Vec::new());
         }
+        self.memory_rows_recent("gate_memory", per_key)
+    }
+
+    /// The newest `per_key` lower bounds (runs that ended `fail` or
+    /// `timeout`) of every key, oldest first within a key.
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn gate_bounds_recent(&self, per_key: usize) -> Result<Vec<GateMemory>> {
+        if !self.bounds {
+            return Ok(Vec::new());
+        }
+        self.memory_rows_recent("gate_memory_bound", per_key)
+    }
+
+    /// `table` is one of the two constant names above, never user input.
+    fn memory_rows_recent(&self, table: &str, per_key: usize) -> Result<Vec<GateMemory>> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT repo, gate, cmd_hash, job_id, finished_at, outcome, anon_peak_bytes, \
-                 peak_bytes, oom_killed FROM gate_memory \
-                 ORDER BY repo, gate, cmd_hash, finished_at DESC, rowid DESC",
-            )
+                 peak_bytes, oom_killed FROM {table} \
+                 ORDER BY repo, gate, cmd_hash, finished_at DESC, rowid DESC"
+            ))
             .map_err(db)?;
         let rows = stmt
             .query_map([], |r| {
@@ -1300,17 +1355,26 @@ impl Store {
     /// # Errors
     /// SQLite or busy errors.
     pub fn prune_gate_memory(&self, unseen_since_ms: u64) -> Result<usize> {
-        if !self.memory {
-            return Ok(0);
+        let mut deleted = 0;
+        for (present, table) in [
+            (self.memory, "gate_memory"),
+            (self.bounds, "gate_memory_bound"),
+        ] {
+            if present {
+                deleted += self
+                    .conn
+                    .execute(
+                        &format!(
+                            "DELETE FROM {table} WHERE (repo, gate, cmd_hash) IN \
+                             (SELECT repo, gate, cmd_hash FROM {table} \
+                              GROUP BY repo, gate, cmd_hash HAVING max(finished_at) < ?1)"
+                        ),
+                        [i(unseen_since_ms)],
+                    )
+                    .map_err(db)?;
+            }
         }
-        self.conn
-            .execute(
-                "DELETE FROM gate_memory WHERE (repo, gate, cmd_hash) IN \
-                 (SELECT repo, gate, cmd_hash FROM gate_memory GROUP BY repo, gate, cmd_hash \
-                  HAVING max(finished_at) < ?1)",
-                [i(unseen_since_ms)],
-            )
-            .map_err(db)
+        Ok(deleted)
     }
 
     fn timeline_of(&self, job: JobRow) -> Result<Timeline> {
@@ -1991,6 +2055,75 @@ mod tests {
                 .iter()
                 .all(|m| m.cmd_hash == "aaaa")
         );
+    }
+
+    #[test]
+    fn lower_bounds_live_in_their_own_table_and_prune_with_the_stats() {
+        let (_d, p) = tmp();
+        let s = Store::open(&p).unwrap();
+        let bound = |n: u64, key: &str| GateMemory {
+            repo: PathBuf::from("/r"),
+            gate: "test".into(),
+            cmd_hash: key.into(),
+            job_id: format!("j{n}"),
+            finished_at: n,
+            outcome: if n.is_multiple_of(2) {
+                "fail"
+            } else {
+                "timeout"
+            }
+            .into(),
+            anon_peak_bytes: 100 + n,
+            peak_bytes: None,
+            oom_killed: false,
+        };
+        assert!(bound(1, "a").is_lower_bound() && bound(2, "a").is_lower_bound());
+        for n in 0..25 {
+            s.insert_gate_bound(&bound(n, "aaaa")).unwrap();
+        }
+        s.insert_gate_bound(&bound(3, "bbbb")).unwrap();
+        // Released binaries read every row of `gate_memory`: none is there.
+        assert_eq!(s.gate_memory_recent(100).unwrap(), Vec::new());
+        let all = s.gate_bounds_recent(100).unwrap();
+        assert_eq!(all.iter().filter(|m| m.cmd_hash == "aaaa").count(), 20);
+        let recent = s.gate_bounds_recent(2).unwrap();
+        let a: Vec<u64> = recent
+            .iter()
+            .filter(|m| m.cmd_hash == "aaaa")
+            .map(|m| m.finished_at)
+            .collect();
+        assert_eq!(a, [23, 24], "newest two, oldest first");
+        assert_eq!(
+            recent.iter().find(|m| m.finished_at == 24),
+            Some(&bound(24, "aaaa"))
+        );
+        assert_eq!(s.prune_gate_memory(10).unwrap(), 1, "bbbb unseen since 3");
+        assert!(
+            s.gate_bounds_recent(100)
+                .unwrap()
+                .iter()
+                .all(|m| m.cmd_hash == "aaaa")
+        );
+    }
+
+    #[test]
+    fn lower_bounds_are_ignored_by_a_file_without_the_table() {
+        let (_d, p) = tmp();
+        v020_db(&p);
+        let s = Store::open_read_only(&p).unwrap();
+        let row = GateMemory {
+            repo: PathBuf::from("/r"),
+            gate: "test".into(),
+            cmd_hash: "aaaa".into(),
+            job_id: "j".into(),
+            finished_at: 1,
+            outcome: "fail".into(),
+            anon_peak_bytes: 1,
+            peak_bytes: None,
+            oom_killed: false,
+        };
+        s.insert_gate_bound(&row).unwrap();
+        assert_eq!(s.gate_bounds_recent(5).unwrap(), Vec::new());
     }
 
     #[test]

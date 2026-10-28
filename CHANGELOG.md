@@ -9,9 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **First-run memory probe** (ADR-0022). A gate with no passing run may start
+  as a *memory probe* when a quarter of its estimated peak is free, one probe per
+  gate and one per machine at a time; it never over-admits. The daemon log says
+  `starts as a memory probe`, and its real peak becomes the estimate.
+- **Lower bounds from failed runs.** Runs that end `fail` or `timeout` record
+  their peak (the `gate_memory_bound` table, `containment_schema` 3: additive,
+  released binaries ignore it and never read a bound as a measurement). The
+  estimate of a gate with no passing run is `1.2 x` the largest recent bound.
+- `memory_expected_basis` (`learned`, `lower-bound`, `guessed`) in the running
+  and queued jobs of `status --json`, spelled out in the text status and in the
+  "waits for memory" log line. Additive; `schema` stays 1.
+
 ### Changed
 
+- The guess for a gate that never ran is the 75th percentile of the learned
+  peaks of the gates of the same or lighter weight, clamped between 1 GiB and the
+  gate's weight share of the usable memory, instead of the share lowered to the
+  largest such peak; the share alone when nothing is learned. Weights and
+  durations still learn from passing runs only.
+
 ### Fixed
+
+- A gate that waited hours for memory on a guess several times above what it
+  uses (a 13.8 GiB guess against a 0.3 GiB run on a 30 GiB machine), or that kept
+  failing and so never learned, now starts as a probe and converges after one run.
 
 ## [0.7.0] - 2026-10-28
 

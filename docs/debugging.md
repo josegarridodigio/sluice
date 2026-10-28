@@ -313,9 +313,11 @@ the key.
 
 `sluice status` shows a job that fits the CPU budget but not the memory it is
 expected to use as `(budget: memory)`, with the expected peak next to it
-(`mem 18.0 GiB`; `~18.0 GiB` when it is only a guess from the weight because
-the gate has not run before), and in `--json` as `reason: "budget"` with
-`wait_detail: "memory"` and `memory_expected_bytes` / `memory_expected_learned`.
+(`mem 18.0 GiB`; `~2.2 GiB (guessed)` when it is a guess because the gate has
+not passed yet, `~0.4 GiB (lower bound)` when it comes from its failed runs), and
+in `--json` as `reason: "budget"` with `wait_detail: "memory"`,
+`memory_expected_bytes`, `memory_expected_learned` and `memory_expected_basis`
+(`learned`, `lower-bound` or `guessed`).
 Running jobs show `mem 3.1 GiB/18.0 GiB` (working set now over expected peak) and
 a `memory:` line gives what admission sees: `MemAvailable`, the reserve and
 what running jobs are still expected to grow by (`budget.memory` in JSON). The
@@ -329,6 +331,20 @@ rule off with `memory_aware = false`. The peak it learns is the working set
 (`anon` + swap), not `memory.peak`, which includes page cache and is shown only
 in a kill message.
 
+A gate that has never passed is estimated, not learned. Its estimate is, in
+order: `1.2 x` the largest peak of its last 5 runs that failed or timed out (a
+lower bound: a run that stops at the first error shows at least that much, never
+more), else the 75th percentile of the learned peaks of the gates of the same or
+lighter weight, clamped between 1 GiB and the job's weight share of the usable
+memory (the share alone when the daemon has learned nothing). While such a gate
+has no passing run, one job of it may start as a *memory probe* when a quarter of
+its estimate is free and no other job of the gate runs; at most one probe runs on
+the machine at a time, and a probe never over-admits (that needs a learned peak).
+A probe that needs far more than a quarter can be killed for lack of memory once;
+that run's peak is learned and the next run waits correctly. Runs that end `fail`
+or `timeout` store their peak in the `gate_memory_bound` table; a pass, a memory
+kill or a cancel does not, and weights and durations still learn from passes only.
+
 To see how long jobs actually waited for memory, grep the daemon log (see
 [Where everything is logged](#where-everything-is-logged)). The columns and the
 wire reason fold memory into the budget, so the log is the only record:
@@ -336,9 +352,12 @@ wire reason fold memory into the budget, so the log is the only record:
 ```text
 job j7 (shop:test) waits for memory: expected 18.0 GiB learned, free 12.0 GiB, running headroom 4.0 GiB
 job j7 (shop:test) started after waiting 12.3s for memory (expected 18.0 GiB learned, free at start 20.0 GiB, reserve 3.0 GiB)
+job j9 (shop:e2e) starts as a memory probe: expected 14.0 GiB guessed, needs a quarter (3.5 GiB), free at start 20.0 GiB, reserve 3.0 GiB, waited 0.0s for memory
 ```
 
-`grep "waits for memory"` finds every job that was held back (written once, when
+The expected figure ends with its basis: `learned`, `lower-bound` or `guessed`.
+`grep "memory probe"` finds the first runs that started on a quarter of their
+estimate. `grep "waits for memory"` finds every job that was held back (written once, when
 it first is; a job that never starts, because its client went away, still leaves
 this line) and `grep "after waiting"` gives the time of those that started.
 `free` is `MemAvailable`; `running headroom` is what the running jobs are still

@@ -436,14 +436,16 @@ gates memory policy: systemd-oomd at 30% for 3s
 
 `memory:` is what admission sees (`MemAvailable`, the reserve, and what the
 running jobs are still expected to grow by). A running job shows its working set
-over its expected peak (`~` when the peak is a guess from the weight because the
-gate has not run yet); a queued job shows `(budget: memory)` when it fits the CPU
+over its expected peak (`~` when the peak is not learned: a guess from the
+weight, or a lower bound from failed runs, with `(guessed)` or `(lower bound)`
+after it); a queued job shows `(budget: memory)` when it fits the CPU
 budget but not the memory it is expected to use. `gates memory policy` appears
 only where the gates' scope has its own `systemd-oomd` policy. In `--json`:
 `budget.memory` (`available_bytes`, `reserve_bytes`, `headroom_bytes`),
 `running[]` `memory_bytes`, `memory_expected_bytes`, `memory_expected_learned`,
+`memory_expected_basis` (`"learned"`, `"lower-bound"` or `"guessed"`),
 `queued[]` `wait_detail` (`"memory"`; `reason` stays `"budget"`),
-`memory_expected_bytes`, `memory_expected_learned`, and
+`memory_expected_bytes`, `memory_expected_learned`, `memory_expected_basis`, and
 `containment.gates_oom_policy` (`limit_percent`, `duration_secs`). All optional
 and additive.
 

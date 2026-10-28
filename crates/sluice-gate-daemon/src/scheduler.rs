@@ -9,7 +9,7 @@
 //! [`Scheduler`] only owns the queue state and applies the plan.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use sluice_gate_core::key::CacheKey;
@@ -31,16 +31,28 @@ pub type LearnKey = (PathBuf, String, String);
 /// [`LEARN_WINDOW`] runs ([`learned_weight`]), before the per-job clamp.
 pub type Learned = BTreeMap<LearnKey, u32>;
 
-/// The largest expected peak (bytes) among the learned keys of each weight:
-/// what a job with no history of its own is compared to
-/// ([`prior_peak`], ADR-0019 amended in 0.6.1).
-pub type PeakPriors = BTreeMap<u32, u64>;
+/// The expected peak (bytes) of every learned key with the weight it last ran
+/// with: what a job with no history of its own is compared to
+/// ([`prior_peak`], ADR-0019 amended in 0.6.1 and by ADR-0022).
+pub type PeakPriors = Vec<(u32, u64)>;
 
-/// The prior of a job of effective weight `weight`: the largest expected
-/// peak among the learned keys whose weight is at most `weight`; `None`
-/// without such a key (the weight proxy then stands alone).
+/// Floor of the capped prior (ADR-0022): a gate is never guessed below it
+/// from other gates' peaks.
+const PRIOR_FLOOR_BYTES: u64 = 1 << 30;
+
+/// The prior of a job of effective weight `weight` (ADR-0022): the 75th
+/// percentile (nearest rank) of the learned peaks of the keys whose weight is
+/// at most `weight`; `None` without such a key (the weight proxy then stands
+/// alone). [`MemoryFacts::estimate_primed`] bounds it to `1 GiB..=share`.
 pub fn prior_peak(priors: &PeakPriors, weight: u32) -> Option<u64> {
-    priors.range(..=weight).map(|(_, &bytes)| bytes).max()
+    let mut peaks: Vec<u64> = priors
+        .iter()
+        .filter(|(w, _)| *w <= weight)
+        .map(|&(_, bytes)| bytes)
+        .collect();
+    peaks.sort_unstable();
+    let rank = (peaks.len() * 3).div_ceil(4);
+    rank.checked_sub(1).map(|i| peaks[i])
 }
 
 /// Priority class of a job (ADR-0011 M6): a human always waits for it.
@@ -399,13 +411,49 @@ pub struct MemoryFacts {
     pub reserve_bytes: u64,
 }
 
+/// Where an expected peak comes from (ADR-0022).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Basis {
+    /// Earlier passing (or memory-killed) runs of the same gate.
+    Learned,
+    /// `1.2 x` the largest recent peak of runs that failed or timed out: the
+    /// gate needs at least that much, no run has shown more.
+    LowerBound,
+    /// The gates of the machine and the weight; no run of this gate says.
+    Guessed,
+}
+
+impl Basis {
+    /// The spelling used in `status` and the log.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Learned => "learned",
+            Self::LowerBound => "lower-bound",
+            Self::Guessed => "guessed",
+        }
+    }
+}
+
 /// The peak a job is expected to reach, and where the figure comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Expected {
     /// Bytes.
     pub bytes: u64,
-    /// From earlier runs of the same gate; `false` is a guess from the weight.
-    pub learned: bool,
+    /// Where the figure comes from.
+    pub basis: Basis,
+}
+
+impl Expected {
+    /// From earlier passing runs of the same gate (only such a figure may
+    /// over-admit).
+    pub fn learned(self) -> bool {
+        self.basis == Basis::Learned
+    }
+}
+
+/// What a first-run probe needs free: a quarter of the estimate (ADR-0022).
+fn probe_share(bytes: u64) -> u64 {
+    bytes / 4
 }
 
 impl MemoryFacts {
@@ -414,14 +462,16 @@ impl MemoryFacts {
         self.total_bytes.saturating_sub(self.reserve_bytes)
     }
 
-    /// The expected peak of a job: the learned one, else a guess from its
-    /// weight, `w / B` of [`Self::usable`] (the CPU weight is the only prior
-    /// the user already expressed), lowered to `prior` when the daemon knows
-    /// gates of that weight or lighter that peak below it. Only the learned
-    /// figure is marked [`Expected::learned`].
+    /// The expected peak of a job, in the order of ADR-0022: the learned one
+    /// ([`Basis::Learned`]); else `1.2 x` the largest recent lower bound
+    /// ([`Basis::LowerBound`]); else a guess ([`Basis::Guessed`]): the
+    /// weight share `w / B` of [`Self::usable`] (the CPU weight is the only
+    /// prior the user already expressed), or, when the daemon knows gates of
+    /// that weight or lighter, their `prior` clamped to `1 GiB..=share`.
     pub fn estimate_primed(
         &self,
         learned: Option<u64>,
+        lower_bound: Option<u64>,
         prior: Option<u64>,
         weight: u32,
         budget: u32,
@@ -429,21 +479,28 @@ impl MemoryFacts {
         if let Some(bytes) = learned {
             return Expected {
                 bytes,
-                learned: true,
+                basis: Basis::Learned,
+            };
+        }
+        if let Some(bound) = lower_bound {
+            return Expected {
+                bytes: bound.saturating_add(bound / 5),
+                basis: Basis::LowerBound,
             };
         }
         let share =
             u128::from(self.usable()) * u128::from(weight.min(budget)) / u128::from(budget.max(1));
         let proxy = u64::try_from(share).unwrap_or(u64::MAX);
         Expected {
-            bytes: prior.map_or(proxy, |p| p.min(proxy)),
-            learned: false,
+            bytes: prior.map_or(proxy, |p| p.max(PRIOR_FLOOR_BYTES).min(proxy)),
+            basis: Basis::Guessed,
         }
     }
 
-    /// [`Self::estimate_primed`] without a prior: the weight proxy alone.
+    /// [`Self::estimate_primed`] with neither a lower bound nor a prior: the
+    /// weight proxy alone.
     pub fn estimate(&self, learned: Option<u64>, weight: u32, budget: u32) -> Expected {
-        self.estimate_primed(learned, None, weight, budget)
+        self.estimate_primed(learned, None, None, weight, budget)
     }
 }
 
@@ -470,6 +527,9 @@ pub struct QueuedSnap {
     /// Peak memory learned from earlier runs of the key, bytes; `None`
     /// guesses it from the weight.
     pub expected_peak: Option<u64>,
+    /// Largest recent peak of the key's failed or timed-out runs, bytes (a
+    /// lower bound; used when `expected_peak` is `None`).
+    pub lower_bound: Option<u64>,
 }
 
 /// A running job in a [`Snapshot`].
@@ -488,6 +548,12 @@ pub struct RunningSnap {
     /// Peak learned from earlier runs of the key, bytes; `None` guesses it
     /// from the weight held.
     pub expected_peak: Option<u64>,
+    /// Largest recent lower bound of the key, bytes.
+    pub lower_bound: Option<u64>,
+    /// Learned-statistics key; `None` never learns.
+    pub learn_key: Option<LearnKey>,
+    /// The job started as a first-run memory probe (ADR-0022).
+    pub probe: bool,
 }
 
 /// Everything one admission decision depends on.
@@ -545,6 +611,9 @@ pub struct Plan {
     /// Expected peak of each job of `order`, parallel to it; empty with
     /// memory-aware admission off.
     pub expected: Vec<Expected>,
+    /// The jobs of `start` that start as first-run memory probes: they did
+    /// not fit their estimate, only a quarter of it (ADR-0022).
+    pub probes: Vec<String>,
 }
 
 fn overdue(s: &Snapshot<'_>, j: &QueuedSnap) -> bool {
@@ -621,11 +690,15 @@ struct MemPass {
     /// A job runs or was started in this pass: the progress exemption of
     /// [`MemPass::fits`] no longer applies.
     busy: bool,
+    /// A first-run probe runs or started in this pass (one per machine).
+    probing: bool,
+    /// Learn keys of the running jobs and of the jobs started in this pass
+    /// (one probe per key, and none beside a running job of the key).
+    keys: BTreeSet<LearnKey>,
 }
 
 impl MemPass {
     fn new(s: &Snapshot<'_>, facts: MemoryFacts, w: &[u32]) -> Self {
-        let budget = s.policy.budget;
         let held = running_headroom_of(s, &facts);
         Self {
             facts,
@@ -633,12 +706,16 @@ impl MemPass {
                 .queued
                 .iter()
                 .zip(w)
-                .map(|(j, &w)| {
-                    facts.estimate_primed(j.expected_peak, prior_peak(s.priors, w), w, budget)
-                })
+                .map(|(j, &w)| estimate_job(s, &facts, j.expected_peak, j.lower_bound, w))
                 .collect(),
             held,
             busy: !s.running.is_empty(),
+            probing: s.running.iter().any(|r| r.probe),
+            keys: s
+                .running
+                .iter()
+                .filter_map(|r| r.learn_key.clone())
+                .collect(),
         }
     }
 
@@ -661,14 +738,33 @@ impl MemPass {
     /// The job fits on a learned peak, with no `alone` exemption
     /// (over-admission never starts a job blind).
     fn fits_learned(&self, i: usize) -> bool {
-        self.peaks[i].learned && self.peaks[i].bytes <= self.free()
+        self.peaks[i].learned() && self.peaks[i].bytes <= self.free()
     }
 
-    /// The job starts: its whole expected peak counts from now on.
-    fn start(&mut self, i: usize) {
+    /// The job may start as a first-run probe (ADR-0022): its key has no
+    /// learned peak, no other job of the key runs, no probe runs on the
+    /// machine, and a quarter of its estimate is free. Over-admission never
+    /// probes (it needs a learned peak).
+    fn probe_ok(&self, i: usize, key: Option<&LearnKey>) -> bool {
+        let e = self.peaks[i];
+        !e.learned()
+            && !self.probing
+            && key.is_none_or(|k| !self.keys.contains(k))
+            && probe_share(e.bytes) <= self.free()
+    }
+
+    /// The job starts: its whole expected peak counts from now on, or a
+    /// quarter of it for a probe (what the probe is expected to need).
+    fn start(&mut self, i: usize, key: Option<&LearnKey>, probe: bool) {
         let e = self.peaks[i].bytes;
-        self.held = self.held.saturating_add(e);
+        self.held = self
+            .held
+            .saturating_add(if probe { probe_share(e) } else { e });
         self.busy = true;
+        self.probing |= probe;
+        if let Some(k) = key {
+            self.keys.insert(k.clone());
+        }
     }
 }
 
@@ -676,12 +772,29 @@ impl MemPass {
 /// (`max(0, expected - current)`, summed).
 fn running_headroom_of(s: &Snapshot<'_>, facts: &MemoryFacts) -> u64 {
     s.running.iter().fold(0, |held, r| {
-        let prior = prior_peak(s.priors, r.weight);
-        let e = facts
-            .estimate_primed(r.expected_peak, prior, r.weight, s.policy.budget)
-            .bytes;
+        let e = estimate_job(s, facts, r.expected_peak, r.lower_bound, r.weight).bytes;
+        // A probe is expected to need a quarter of its estimate.
+        let e = if r.probe { probe_share(e) } else { e };
         held.saturating_add(e.saturating_sub(r.current))
     })
+}
+
+/// The expected peak of a job of effective weight `weight` with the given
+/// learned peak and lower bound, under the pass's priors and budget.
+fn estimate_job(
+    s: &Snapshot<'_>,
+    facts: &MemoryFacts,
+    peak: Option<u64>,
+    lower_bound: Option<u64>,
+    weight: u32,
+) -> Expected {
+    facts.estimate_primed(
+        peak,
+        lower_bound,
+        prior_peak(s.priors, weight),
+        weight,
+        s.policy.budget,
+    )
 }
 
 /// What the running jobs are still expected to grow by, bytes; `None` with
@@ -770,11 +883,17 @@ impl<'s> Pass<'s> {
         self.mem.as_ref().is_none_or(|m| m.fits_learned(i))
     }
 
+    /// Job `i` does not fit its estimate but may start as a memory probe.
+    fn probe_mem(&self, i: usize) -> bool {
+        let key = self.s.queued[i].learn_key.as_ref();
+        self.mem.as_ref().is_some_and(|m| m.probe_ok(i, key))
+    }
+
     /// Admits job `i` into the pass: its weight and memory count from now on.
-    fn start(&mut self, i: usize) {
+    fn start(&mut self, i: usize, probe: bool) {
         self.held.push((self.s.queued[i].repo.as_path(), self.w[i]));
         if let Some(m) = &mut self.mem {
-            m.start(i);
+            m.start(i, self.s.queued[i].learn_key.as_ref(), probe);
         }
     }
 
@@ -814,10 +933,18 @@ impl<'s> Pass<'s> {
             let j = &s.queued[i];
             let fits_budget = self.used() + self.w[i] <= s.policy.budget;
             let fits_cap = self.fits_repo(i);
-            let fits_mem = self.fits_mem(i);
+            let mut fits_mem = self.fits_mem(i);
+            // A job that does not fit its estimate may still probe it
+            // (ADR-0022); a reserved head holds everything back.
+            let probe =
+                !fits_mem && reserved.is_none() && fits_budget && fits_cap && self.probe_mem(i);
+            fits_mem |= probe;
             if reserved.is_none() && fits_budget && fits_cap && fits_mem {
                 plan.start.push((j.id.clone(), Admission::Nominal));
-                self.start(i);
+                if probe {
+                    plan.probes.push(j.id.clone());
+                }
+                self.start(i, probe);
                 started.push(i);
                 continue;
             }
@@ -1004,6 +1131,8 @@ pub fn expected_ms(walls_ms: &[u64]) -> Option<u64> {
 pub struct MemoryNote {
     /// The job started (`true`) or was first seen memory-blocked (`false`).
     pub started: bool,
+    /// The job started as a first-run memory probe (ADR-0022).
+    pub probe: bool,
     /// Job id.
     pub job: String,
     /// Repository of the job.
@@ -1032,14 +1161,12 @@ impl MemoryNote {
         format!("job {} ({repo}:{})", self.job, self.gate)
     }
 
-    /// `18.0 GiB learned` / `18.0 GiB guessed`, `unknown` without an estimate.
+    /// `18.0 GiB learned` / `0.4 GiB lower-bound` / `18.0 GiB guessed`,
+    /// `unknown` without an estimate.
     fn expected_text(&self) -> String {
         self.expected.map_or_else(
             || "unknown".to_owned(),
-            |e| {
-                let how = if e.learned { "learned" } else { "guessed" };
-                format!("{} {how}", gib_text(e.bytes))
-            },
+            |e| format!("{} {}", gib_text(e.bytes), e.basis.as_str()),
         )
     }
 }
@@ -1052,6 +1179,34 @@ pub fn memory_blocked_line(n: &MemoryNote) -> String {
         n.expected_text(),
         gib_text(n.available_bytes),
         gib_text(n.headroom_bytes)
+    )
+}
+
+/// The line of a note: blocked, started after a wait, or probe start.
+pub fn memory_note_line(n: &MemoryNote) -> String {
+    if n.probe {
+        memory_probe_line(n)
+    } else if n.started {
+        memory_started_line(n)
+    } else {
+        memory_blocked_line(n)
+    }
+}
+
+/// The line logged when a job starts as a first-run memory probe: it did
+/// not fit its estimate, a quarter of it was free.
+pub fn memory_probe_line(n: &MemoryNote) -> String {
+    let needs = n.expected.map_or(0, |e| probe_share(e.bytes));
+    format!(
+        "{} starts as a memory probe: expected {}, needs a quarter ({}), free at start {}, \
+         reserve {}, waited {}.{}s for memory",
+        n.who(),
+        n.expected_text(),
+        gib_text(needs),
+        gib_text(n.available_bytes),
+        gib_text(n.reserve_bytes),
+        n.waited_ms / 1000,
+        n.waited_ms % 1000 / 100,
     )
 }
 
@@ -1071,7 +1226,7 @@ pub fn memory_started_line(n: &MemoryNote) -> String {
 /// The note of `spec` for this pass; `plan.order` and `plan.expected` are
 /// parallel, so the estimate is the one the pass decided on.
 fn memory_note(
-    started: bool,
+    (started, probe): (bool, bool),
     spec: &JobSpec,
     waited_ms: u64,
     plan: &Plan,
@@ -1085,6 +1240,7 @@ fn memory_note(
         .and_then(|i| plan.expected.get(i).copied());
     MemoryNote {
         started,
+        probe,
         job: spec.id.clone(),
         repo: spec.repo.clone(),
         gate: spec.gate.clone(),
@@ -1115,6 +1271,8 @@ struct Job {
     /// When a pass first left the job memory-blocked: the log line is
     /// written once.
     memory_blocked_at: Option<u64>,
+    /// The job started as a first-run memory probe (ADR-0022).
+    probe: bool,
     cause: WaitCause,
     detail: Option<&'static str>,
     accounted_at: u64,
@@ -1132,6 +1290,7 @@ impl Job {
             waits: [0; 5],
             memory_wait_ms: 0,
             memory_blocked_at: None,
+            probe: false,
             cause: WaitCause::Budget,
             detail: None,
             accounted_at,
@@ -1160,6 +1319,7 @@ impl Job {
             queued_at: self.spec.queued_at,
             expected_ms: self.spec.expected_ms,
             expected_peak: None,
+            lower_bound: None,
         }
     }
 
@@ -1171,6 +1331,9 @@ impl Job {
             weight: self.spec.weight,
             current: 0,
             expected_peak: None,
+            lower_bound: None,
+            learn_key: self.spec.learn_key.clone(),
+            probe: self.probe,
         }
     }
 }
@@ -1187,7 +1350,9 @@ pub struct Scheduler {
     learned: Learned,
     /// Learned peak memory (expected working set, bytes) by key.
     learned_peaks: BTreeMap<LearnKey, u64>,
-    /// Largest learned peak by weight ([`prior_peak`]).
+    /// Largest recent lower bound (peak of a failed or timed-out run) by key.
+    lower_bounds: BTreeMap<LearnKey, u64>,
+    /// Learned peak of every key with its weight ([`prior_peak`]).
     priors: PeakPriors,
     /// Memory facts of the last [`Scheduler::set_memory`]: `None` is the
     /// memory rule off.
@@ -1222,6 +1387,7 @@ impl Scheduler {
             running: Vec::new(),
             learned: Learned::new(),
             learned_peaks: BTreeMap::new(),
+            lower_bounds: BTreeMap::new(),
             priors: PeakPriors::new(),
             memory: None,
             currents: BTreeMap::new(),
@@ -1288,6 +1454,20 @@ impl Scheduler {
             }
             None => {
                 self.learned_peaks.remove(&key);
+            }
+        }
+    }
+
+    /// Replaces the lower bound of `key` (bytes, the largest recent peak of
+    /// its failed or timed-out runs); `None` removes it. Used while the key
+    /// has no learned peak.
+    pub fn set_lower_bound(&mut self, key: LearnKey, bound_bytes: Option<u64>) {
+        match bound_bytes {
+            Some(bytes) => {
+                self.lower_bounds.insert(key, bytes);
+            }
+            None => {
+                self.lower_bounds.remove(&key);
             }
         }
     }
@@ -1379,6 +1559,10 @@ impl Scheduler {
         key.and_then(|k| self.learned_peaks.get(k)).copied()
     }
 
+    fn bound_of(&self, key: Option<&LearnKey>) -> Option<u64> {
+        key.and_then(|k| self.lower_bounds.get(k)).copied()
+    }
+
     fn snaps(&self) -> (Vec<RunningSnap>, Vec<QueuedSnap>) {
         let running = self
             .running
@@ -1386,6 +1570,7 @@ impl Scheduler {
             .map(|j| RunningSnap {
                 current: self.currents.get(&j.spec.id).copied().unwrap_or(0),
                 expected_peak: self.peak_of(j.spec.learn_key.as_ref()),
+                lower_bound: self.bound_of(j.spec.learn_key.as_ref()),
                 ..j.running_snap()
             })
             .collect();
@@ -1394,6 +1579,7 @@ impl Scheduler {
             .iter()
             .map(|j| QueuedSnap {
                 expected_peak: self.peak_of(j.spec.learn_key.as_ref()),
+                lower_bound: self.bound_of(j.spec.learn_key.as_ref()),
                 ..j.queued_snap()
             })
             .collect();
@@ -1467,10 +1653,18 @@ impl Scheduler {
                 continue;
             };
             let mut job = self.queue.remove(idx);
-            if job.memory_wait_ms > 0
+            job.probe = plan.probes.contains(id);
+            if (job.memory_wait_ms > 0 || job.probe)
                 && let Some((facts, headroom)) = memory
             {
-                let note = memory_note(true, &job.spec, job.memory_wait_ms, &plan, facts, headroom);
+                let note = memory_note(
+                    (true, job.probe),
+                    &job.spec,
+                    job.memory_wait_ms,
+                    &plan,
+                    facts,
+                    headroom,
+                );
                 self.notes.push(note);
             }
             job.started_at = now;
@@ -1493,7 +1687,7 @@ impl Scheduler {
                     && let Some((facts, headroom)) = memory
                 {
                     job.memory_blocked_at = Some(now);
-                    let note = memory_note(false, &job.spec, 0, &plan, facts, headroom);
+                    let note = memory_note((false, false), &job.spec, 0, &plan, facts, headroom);
                     self.notes.push(note);
                 }
             }
@@ -1643,6 +1837,7 @@ impl Scheduler {
                 memory_expected: self.memory.map(|f| {
                     f.estimate_primed(
                         self.peak_of(j.spec.learn_key.as_ref()),
+                        self.bound_of(j.spec.learn_key.as_ref()),
                         prior_peak(&self.priors, j.spec.weight),
                         j.spec.weight,
                         self.policy.budget,

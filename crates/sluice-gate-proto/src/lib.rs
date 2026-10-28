@@ -904,10 +904,16 @@ pub fn gib_text(bytes: u64) -> String {
 }
 
 /// An expected peak: `18.0 GiB` when learned from earlier runs, `~18.0 GiB`
-/// when guessed from the weight.
-fn expected_text(bytes: u64, learned: Option<bool>) -> String {
+/// when it is not; a daemon that names the basis gets it spelled out
+/// (`~0.4 GiB (lower bound)`, `~2.2 GiB (guessed)`).
+fn expected_text(bytes: u64, learned: Option<bool>, basis: Option<&str>) -> String {
     let guess = if learned == Some(false) { "~" } else { "" };
-    format!("{guess}{}", gib_text(bytes))
+    let how = match basis {
+        Some("lower-bound") => " (lower bound)",
+        Some("guessed") => " (guessed)",
+        _ => "",
+    };
+    format!("{guess}{}{how}", gib_text(bytes))
 }
 
 impl MemoryBudget {
@@ -934,7 +940,11 @@ impl RunningJob {
             (Some(now), Some(expected)) => format!(
                 "  mem {}/{}",
                 gib_text(now),
-                expected_text(expected, self.memory_expected_learned)
+                expected_text(
+                    expected,
+                    self.memory_expected_learned,
+                    self.memory_expected_basis.as_deref()
+                )
             ),
             (Some(now), None) => format!("  mem {}", gib_text(now)),
             _ => String::new(),
@@ -947,7 +957,11 @@ impl QueuedJob {
     #[must_use]
     pub fn memory_text(&self) -> String {
         self.memory_expected_bytes.map_or_else(String::new, |b| {
-            format!("  mem {}", expected_text(b, self.memory_expected_learned))
+            let basis = self.memory_expected_basis.as_deref();
+            format!(
+                "  mem {}",
+                expected_text(b, self.memory_expected_learned, basis)
+            )
         })
     }
 
@@ -1151,6 +1165,12 @@ pub struct RunningJob {
     /// when it is a guess from the weight.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_expected_learned: Option<bool>,
+    /// Where `memory_expected_bytes` comes from: `learned` (earlier passing
+    /// or memory-killed runs), `lower-bound` (earlier failed or timed-out
+    /// runs, which only show the peak was at least that) or `guessed` (from
+    /// the weight and the gates of the machine). Absent from older daemons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_expected_basis: Option<String>,
 }
 
 /// A queued job in a status report.
@@ -1210,6 +1230,12 @@ pub struct QueuedJob {
     /// when it is a guess from the weight.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_expected_learned: Option<bool>,
+    /// Where `memory_expected_bytes` comes from: `learned` (earlier passing
+    /// or memory-killed runs), `lower-bound` (earlier failed or timed-out
+    /// runs, which only show the peak was at least that) or `guessed` (from
+    /// the weight and the gates of the machine). Absent from older daemons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_expected_basis: Option<String>,
 }
 
 /// Why a queued job is not running yet.
@@ -2589,5 +2615,42 @@ mod tests {
         assert!(!line_too_long("short"));
         assert!(!line_too_long(&"a".repeat(MAX_LINE_BYTES)));
         assert!(line_too_long(&"a".repeat(MAX_LINE_BYTES + 1)));
+    }
+
+    #[test]
+    fn the_memory_basis_is_spelled_out_and_older_daemons_still_render() {
+        let queued = |learned, basis: Option<&str>| QueuedJob {
+            memory_expected_bytes: Some(1 << 30),
+            memory_expected_learned: learned,
+            memory_expected_basis: basis.map(str::to_owned),
+            ..QueuedJob::default()
+        };
+        let text = |j: &QueuedJob| j.memory_text();
+        assert_eq!(text(&queued(Some(true), Some("learned"))), "  mem 1.0 GiB");
+        assert_eq!(
+            text(&queued(Some(false), Some("lower-bound"))),
+            "  mem ~1.0 GiB (lower bound)"
+        );
+        assert_eq!(
+            text(&queued(Some(false), Some("guessed"))),
+            "  mem ~1.0 GiB (guessed)"
+        );
+        // A daemon without the field: the text of 0.7.0.
+        assert_eq!(text(&queued(Some(false), None)), "  mem ~1.0 GiB");
+        // The field is additive: absent on the wire when unset, and a report
+        // without it parses.
+        let json = serde_json::to_string(&queued(Some(true), None)).unwrap();
+        assert!(!json.contains("memory_expected_basis"), "{json}");
+        let with = serde_json::to_string(&queued(Some(false), Some("guessed"))).unwrap();
+        assert!(
+            with.contains(r#""memory_expected_basis":"guessed""#),
+            "{with}"
+        );
+        assert_eq!(
+            serde_json::from_str::<QueuedJob>(&json)
+                .unwrap()
+                .memory_expected_basis,
+            None
+        );
     }
 }

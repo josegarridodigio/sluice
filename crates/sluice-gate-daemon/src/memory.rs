@@ -224,6 +224,9 @@ pub fn expected_peak(samples: &[PeakSample]) -> Option<u64> {
 #[derive(Debug, Default)]
 pub struct PeakCache {
     runs: HashMap<LearnKey, VecDeque<PeakSample>>,
+    /// Peaks of the newest runs of a key that ended `fail` or `timeout`
+    /// (newest last, at most [`PEAK_WINDOW`]): lower bounds, never samples.
+    bounds: HashMap<LearnKey, VecDeque<u64>>,
     /// Effective (admitted) weight of the newest run of a key whose weight
     /// is known; a key missing here is never used as a prior.
     weights: HashMap<LearnKey, u32>,
@@ -237,6 +240,30 @@ impl PeakCache {
         while runs.len() > PEAK_WINDOW {
             runs.pop_front();
         }
+    }
+
+    /// Adds the peak of a run of `key` that ended `fail` or `timeout`: the
+    /// run stopped before (or after a stall at) its full working set, so the
+    /// gate needs at least this much.
+    pub fn push_bound(&mut self, key: LearnKey, peak_bytes: u64) {
+        let bounds = self.bounds.entry(key).or_default();
+        bounds.push_back(peak_bytes);
+        while bounds.len() > PEAK_WINDOW {
+            bounds.pop_front();
+        }
+    }
+
+    /// The largest of the recent lower bounds of `key`, bytes.
+    #[must_use]
+    pub fn lower_bound(&self, key: &LearnKey) -> Option<u64> {
+        self.bounds.get(key)?.iter().copied().max()
+    }
+
+    /// Every key with a lower bound.
+    pub fn lower_bounds(&self) -> impl Iterator<Item = (&LearnKey, u64)> {
+        self.bounds
+            .keys()
+            .filter_map(|k| Some((k, self.lower_bound(k)?)))
     }
 
     /// Records the weight `key` last ran with.
@@ -258,19 +285,14 @@ impl PeakCache {
             .filter_map(|k| Some((k, self.expected(k)?)))
     }
 
-    /// The largest expected peak of the keys of each weight, for the gates
+    /// The expected peak of every learned key with its weight, for the gates
     /// with no history (`scheduler::prior_peak`); keys of unknown weight
     /// are left out.
     #[must_use]
     pub fn priors(&self) -> PeakPriors {
-        let mut priors = PeakPriors::new();
-        for (key, bytes) in self.expectations() {
-            if let Some(&weight) = self.weights.get(key) {
-                let slot = priors.entry(weight).or_insert(bytes);
-                *slot = (*slot).max(bytes);
-            }
-        }
-        priors
+        self.expectations()
+            .filter_map(|(key, bytes)| Some((*self.weights.get(key)?, bytes)))
+            .collect()
     }
 }
 
@@ -473,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn priors_are_the_largest_peak_per_weight_of_the_keys_with_a_known_weight() {
+    fn priors_are_the_expected_peak_of_every_key_with_a_known_weight() {
         let key = |g: &str| (std::path::PathBuf::from("/r"), g.to_owned(), String::new());
         let mut cache = PeakCache::default();
         cache.push(key("fmt"), sample(1, false));
@@ -485,9 +507,37 @@ mod tests {
         cache.set_weight(key("test"), 8);
         // A weight without samples teaches nothing; "orphan" has no weight.
         cache.set_weight(key("never-ran"), 2);
-        let priors = cache.priors();
-        assert_eq!(priors.len(), 2);
-        assert_eq!(priors[&1], 2 * GIB + 2 * GIB / 5, "the larger of the two");
-        assert_eq!(priors[&8], 12 * GIB);
+        let mut priors = cache.priors();
+        priors.sort_unstable();
+        assert_eq!(
+            priors,
+            [
+                (1, GIB + GIB / 5),
+                (1, 2 * GIB + 2 * GIB / 5),
+                (8, 12 * GIB)
+            ],
+            "one entry per learned key"
+        );
+    }
+
+    #[test]
+    fn lower_bounds_are_the_largest_recent_peak_of_failed_runs_and_never_samples() {
+        let key = (
+            std::path::PathBuf::from("/r"),
+            "test".to_owned(),
+            String::new(),
+        );
+        let mut cache = PeakCache::default();
+        assert_eq!(cache.lower_bound(&key), None);
+        cache.push_bound(key.clone(), 3 * GIB);
+        cache.push_bound(key.clone(), GIB);
+        assert_eq!(cache.lower_bound(&key), Some(3 * GIB), "the largest");
+        assert_eq!(cache.expected(&key), None, "a bound teaches no expectation");
+        assert_eq!(cache.lower_bounds().count(), 1);
+        // The window forgets the oldest: five newer, smaller bounds push 3 GiB out.
+        for _ in 0..PEAK_WINDOW {
+            cache.push_bound(key.clone(), GIB);
+        }
+        assert_eq!(cache.lower_bound(&key), Some(GIB));
     }
 }

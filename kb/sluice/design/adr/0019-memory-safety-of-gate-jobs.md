@@ -116,6 +116,13 @@ needs the gate's own learned peak. No schema change: the weight of a key comes f
 `jobs.weight` of the runs in `gate_memory`
 ([[sluice/changes/memory-cold-start-prior.md]]).
 
+**Amended again by ADR-0022 (first runs measure).** The prior is now the 75th percentile
+of those learned peaks, clamped to `1 GiB..=weight share`; runs that fail or time out
+leave a lower bound (`1.2 x` it is the estimate of a key with no pass); and a key with
+no passing run may start as a one-per-key, one-per-machine probe on a quarter of its
+estimate ([[sluice/design/adr/0022-first-run-memory-estimate.md]],
+[[sluice/changes/queue-q1-first-run-memory.md]]).
+
 ## Consequences
 
 - Two 18 GiB suites never start together on a 30 GiB machine; the second waits with

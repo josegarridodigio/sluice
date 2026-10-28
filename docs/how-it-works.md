@@ -88,7 +88,14 @@ run at once, and it makes identical simultaneous requests share one run.
   reserve (10 % of the machine's memory by default) and minus what the running
   jobs are still expected to grow by. A job that waits only for memory shows
   `(budget: memory)` in `sluice status`; the first job on an idle machine always
-  starts. If memory runs out anyway, gate processes are the preferred victims of
+  starts. A gate with no passing run yet has no learned figure: its estimate is
+  `1.2 x` the largest peak of its recent failed or timed-out runs (a lower
+  bound), else a guess from the weight and from what the daemon learned about
+  lighter or equal gates, and `status` says which (`learned`, `lower-bound`,
+  `guessed`). Such a first run may start as a *memory probe* as soon as a
+  quarter of its estimate is free, one probe per gate and one per machine at a
+  time, so a pessimistic guess cannot hold it back for hours; its real peak then
+  becomes the estimate. If memory runs out anyway, gate processes are the preferred victims of
   the kernel's OOM killer and of `systemd-oomd`, and a gate killed that way is
   reported as such (`killed_by = "memory"`), not as a test failure
   (`[admission] memory_aware`, `memory_reserve`, `memory_guard`; see

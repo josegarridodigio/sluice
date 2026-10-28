@@ -37,7 +37,7 @@ pub struct Migration {
 pub const CONTAINMENT_TABLE: &str = "containment_schema";
 
 /// `containment_schema` version this build reads and writes.
-pub const CONTAINMENT_SCHEMA_VERSION: u32 = 2;
+pub const CONTAINMENT_SCHEMA_VERSION: u32 = 3;
 
 /// Migration 0 -> 1 of the containment group: the `interventions` table
 /// (kills by the kernel OOM killer or `systemd-oomd` on Sluice's cgroups).
@@ -61,6 +61,21 @@ CREATE TABLE gate_memory (
 CREATE INDEX gate_memory_key ON gate_memory(repo, gate, cmd_hash, finished_at);
 ";
 
+/// Migration 2 -> 3 of the containment group (ADR-0022): `gate_memory_bound`,
+/// the peaks of runs that ended `fail` or `timeout`, lower bounds of what the
+/// gate needs. A table of its own, with the columns of `gate_memory`: released
+/// binaries read every row of `gate_memory` as a finished run's working set,
+/// so a bound stored there would be taken for a measurement.
+const CONTAINMENT_3: &str = "
+CREATE TABLE gate_memory_bound (
+  repo TEXT NOT NULL, gate TEXT NOT NULL, cmd_hash TEXT NOT NULL,
+  job_id TEXT NOT NULL, finished_at INTEGER NOT NULL, outcome TEXT NOT NULL,
+  anon_peak_bytes INTEGER NOT NULL, peak_bytes INTEGER,
+  oom_killed INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX gate_memory_bound_key
+  ON gate_memory_bound(repo, gate, cmd_hash, finished_at);
+";
+
 /// The `containment_schema` migrations, in order.
 pub const CONTAINMENT_MIGRATIONS: &[Migration] = &[
     Migration {
@@ -72,6 +87,11 @@ pub const CONTAINMENT_MIGRATIONS: &[Migration] = &[
         version: 2,
         name: "gate memory working sets",
         sql: CONTAINMENT_2,
+    },
+    Migration {
+        version: 3,
+        name: "gate memory lower bounds",
+        sql: CONTAINMENT_3,
     },
 ];
 

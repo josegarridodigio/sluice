@@ -40,7 +40,7 @@ status`, `client.log` and `daemon.log` lines, and the wording of errors.
 | Daemon features | `welcome.features` | `["exec", "queue-only", "queue"]` (0.2.0: `["queue"]`) |
 | Status JSON | `schema` | 1 |
 | Queue status JSON | `schema` | 1 |
-| Database | tables `schema`, `queue_schema` and `sched_schema` | 1, 1 and 1 (`containment_schema` is 2 from 0.6.0; older binaries ignore it) |
+| Database | tables `schema`, `queue_schema` and `sched_schema` | 1, 1 and 1 (`containment_schema` is 2 from 0.6.0 and 3 from the next release; older binaries ignore it) |
 | Exit codes, CLI flags, MCP tools | none | n/a |
 | Plugin | `plugin.json` `version`, follows the release | |
 
@@ -124,7 +124,8 @@ path, type and meaning. New optional fields and new counters may appear (0.6.0:
 `queue status` the train's `prepare`, `config_source` and `config_diff`, a gate's
 `note`, and the reasons `gate_modified_tree`, `prepare_failed`, `prepare_dirty`,
 `key_input_failed`, `hook_gate_unverified` and `member_config_invalid`; an
-outcome's `killed_by` may be `memory`);
+outcome's `killed_by` may be `memory`; the next release adds `memory_expected_basis`
+to running and queued jobs: `learned`, `lower-bound` or `guessed`);
 unknown queue job and train states are parsed as `unknown` by current clients.
 
 0.6.0 also changes where `systemd-oomd` acts: `sluice-daemon.scope` gets its own
@@ -160,7 +161,8 @@ queue's state in two independent schemas. Markers are not in it.
   and tracked by their own `sched_schema` version; older binaries ignore them.
 - The containment additions have their own `containment_schema` version
   (`interventions` in 0.5.0, version 1; the `gate_memory` table of memory-aware
-  admission in 0.6.0, version 2). A newer version is never an error for an older
+  admission in 0.6.0, version 2; the `gate_memory_bound` table of failed-run peaks,
+version 3). A newer version is never an error for an older
   binary, which finds nothing to apply and ignores the table; the migration is
   one new table, so no backup is written. `gate_stats` and `sched_schema` did
   not change: a column there would make 0.5.0 and older refuse the file.

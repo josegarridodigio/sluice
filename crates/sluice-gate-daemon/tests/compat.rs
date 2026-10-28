@@ -665,8 +665,8 @@ fn backups(dir: &Path) -> Vec<String> {
     names
 }
 
-/// A database of every release opens, gets `gate_memory` through
-/// `containment_schema` 2, and `sched_schema` and `gate_stats` stay as they
+/// A database of every release opens, gets `gate_memory` and
+/// `gate_memory_bound` through `containment_schema` 3, and `sched_schema` and `gate_stats` stay as they
 /// were (adding columns there would make released binaries refuse the file).
 #[test]
 fn every_old_database_gets_gate_memory_without_touching_the_scheduler_schema() {
@@ -677,10 +677,11 @@ fn every_old_database_gets_gate_memory_without_touching_the_scheduler_schema() {
         let conn = rusqlite::Connection::open(&db).unwrap();
         assert_eq!(
             migrate::version(&conn, CONTAINMENT_TABLE).unwrap(),
-            2,
+            3,
             "{release}"
         );
         assert!(table_exists(&conn, "gate_memory"), "{release}");
+        assert!(table_exists(&conn, "gate_memory_bound"), "{release}");
         assert_eq!(
             migrate::version(&conn, SCHED_TABLE).unwrap(),
             SCHED_SCHEMA_VERSION,
@@ -721,7 +722,7 @@ fn a_database_at_containment_v1_gains_gate_memory_in_place() {
     // with an intervention row.
     let conn = rusqlite::Connection::open(&db).unwrap();
     conn.execute_batch(
-        "DROP TABLE gate_memory; \
+        "DROP TABLE gate_memory; DROP TABLE gate_memory_bound; \
          DELETE FROM containment_schema; INSERT INTO containment_schema (version) VALUES (1); \
          INSERT INTO interventions (at_ms, session, leaf, cause, detail) \
          VALUES (5, 's', 'jobs/j', 'oom_kill', 'kept');",
@@ -732,8 +733,9 @@ fn a_database_at_containment_v1_gains_gate_memory_in_place() {
     let store = Store::open(&db).expect("a v1 containment group migrates");
     drop(store);
     let conn = rusqlite::Connection::open(&db).unwrap();
-    assert_eq!(migrate::version(&conn, CONTAINMENT_TABLE).unwrap(), 2);
+    assert_eq!(migrate::version(&conn, CONTAINMENT_TABLE).unwrap(), 3);
     assert!(table_exists(&conn, "gate_memory"));
+    assert!(table_exists(&conn, "gate_memory_bound"));
     assert_eq!(
         raw_count(
             &conn,
@@ -752,9 +754,9 @@ fn a_database_at_containment_v1_gains_gate_memory_in_place() {
     assert_eq!(backups(dir.path()), before);
 }
 
-/// The previous release (containment target 1) opens a file that is already
-/// at containment version 2: its migration step finds nothing to do and does
-/// not lower the version, and the rows of `gate_memory` stay.
+/// The previous releases (containment target 1, then 2) open a file that is
+/// already at containment version 3: their migration step finds nothing to
+/// do and does not lower the version, and the rows of `gate_memory` stay.
 #[test]
 fn a_release_that_knows_containment_v1_opens_a_v2_file() {
     use sluice_gate_daemon::migrate::{self, CONTAINMENT_MIGRATIONS, CONTAINMENT_TABLE};
@@ -770,8 +772,12 @@ fn a_release_that_knows_containment_v1_opens_a_v2_file() {
     // 0.5.0's own call: its migration list stops at version 1, target 1.
     let reached = migrate::apply(&conn, CONTAINMENT_TABLE, &CONTAINMENT_MIGRATIONS[..1], 1)
         .expect("an older release applies nothing and does not fail");
-    assert_eq!(reached, 2, "the newer version is left alone");
-    assert_eq!(migrate::version(&conn, CONTAINMENT_TABLE).unwrap(), 2);
+    assert_eq!(reached, 3, "the newer version is left alone");
+    // 0.6.0 to 0.7.0: containment target 2.
+    let reached = migrate::apply(&conn, CONTAINMENT_TABLE, &CONTAINMENT_MIGRATIONS[..2], 2)
+        .expect("a release at target 2 applies nothing and does not fail");
+    assert_eq!(reached, 3);
+    assert_eq!(migrate::version(&conn, CONTAINMENT_TABLE).unwrap(), 3);
     assert_eq!(raw_count(&conn, "SELECT count(*) FROM gate_memory"), 1);
     // And its scheduler check (`sched_schema` 1) still passes.
     assert_eq!(
@@ -782,4 +788,38 @@ fn a_release_that_knows_containment_v1_opens_a_v2_file() {
     // The current release reads what an older one left.
     let store = Store::open(&db).unwrap();
     assert_eq!(store.gate_memory_recent(5).unwrap().len(), 1);
+}
+
+/// A database at containment version 2 (0.6.0 to 0.7.0) gains the lower-bound
+/// table in place, keeps its `gate_memory` rows and needs no backup.
+#[test]
+fn a_database_at_containment_v2_gains_gate_memory_bound_in_place() {
+    use sluice_gate_daemon::migrate::{self, CONTAINMENT_TABLE};
+    let (dir, db) = copy_db("v0.5.0");
+    drop(Store::open(&db).unwrap());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "DROP TABLE gate_memory_bound; \
+         DELETE FROM containment_schema; INSERT INTO containment_schema (version) VALUES (2); \
+         INSERT INTO gate_memory (repo, gate, cmd_hash, job_id, finished_at, outcome, \
+         anon_peak_bytes, peak_bytes, oom_killed) VALUES ('/r', 'test', 'aa', 'j', 1, 'pass', 7, NULL, 0);",
+    )
+    .unwrap();
+    drop(conn);
+    let before = backups(dir.path());
+    let store = Store::open(&db).expect("a v2 containment group migrates");
+    assert_eq!(store.gate_memory_recent(5).unwrap().len(), 1, "kept");
+    assert_eq!(store.gate_bounds_recent(5).unwrap().len(), 0);
+    drop(store);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    assert_eq!(migrate::version(&conn, CONTAINMENT_TABLE).unwrap(), 3);
+    assert!(table_exists(&conn, "gate_memory_bound"));
+    assert_eq!(
+        backups(dir.path()),
+        before,
+        "an additive table needs no backup"
+    );
+    drop(conn);
+    drop(Store::open(&db).unwrap());
+    assert_eq!(backups(dir.path()), before);
 }
