@@ -71,4 +71,4 @@ each wave (fmt, clippy, test), then Matrix on the branch before any release.
 | H1 | done (verified through Sluice: fmt, clippy, test) |
 | H2 | H2a (husky and plain units, caching, status) done, verified through Sluice; H2b (lefthook and pre-commit adapters) done, verified through Sluice; real-tool tests pending in CI/Matrix |
 | H3 | implemented (hook units as gates, shared keys with the hook runs, `sluice gate list`, doctor, plugin text); done, verified through Sluice, see [[sluice/changes/hook-runner-h3.md]] |
-| H4 | documentation and agent text reconciled with the code (hooks page, CLI reference, README, plugin, CHANGELOG, KB); see [[sluice/changes/hook-runner-h4.md]]. Release pending: Matrix, real-tool tests in CI, the code findings listed in that note |
+| H4 | documentation and agent text reconciled with the code (hooks page, CLI reference, README, plugin, CHANGELOG, KB); see [[sluice/changes/hook-runner-h4.md]]. Code findings fixed; Matrix green with the real tools ([[sluice/fixes/hook-runner-ci.md]]); released as 0.7.0 |
