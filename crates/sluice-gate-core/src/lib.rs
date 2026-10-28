@@ -32,6 +32,7 @@ pub mod env;
 pub mod error;
 pub mod git;
 pub mod heavy;
+pub mod hookgate;
 pub mod key;
 pub mod logfile;
 pub mod lookup;

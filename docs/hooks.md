@@ -263,6 +263,49 @@ unit runs after a failure and the hook then exits 1; any other code (3, 130) end
 once with the unit's own code. Sluice never emits 3 on this path, so a 3 is always
 pre-commit's.
 
+## Verify and gates without `.sluice.toml`
+
+In a repository with no `.sluice.toml`, the **check units** of the hooks are the
+gates of `sluice run <gate>`, `sluice gate list` and the MCP tools `verify` and
+`gate_list`. They are the same units, with the same names and the same cache
+entries as the hook runs, so an agent that calls `verify` before `git commit`
+leaves the cache entries that the commit's hook then hits, and a commit leaves the
+ones a later `verify` hits. Nothing needs configuring: the hooks are read at the
+moment `verify` runs, like a hook run does.
+
+- **Names**: `<manager>:<hook>#<n>`, `n` the unit's position in its hook (`husky:pre-commit#2`,
+  `lefthook:pre-commit#1`, `pre-commit:pre-commit#1`, `plain:pre-push#1`). Adding a line
+  renumbers the units after it, and a renumbered unit is a cache miss once (the name
+  is part of the key), never a wrong hit.
+- **Which hooks**: `pre-commit`, `pre-merge-commit` and `pre-push`. `commit-msg` and
+  `prepare-commit-msg` receive the message file, which only a commit provides.
+  `verify` with no `gates` runs the `pre-commit` units, or all of them when the
+  repository has none.
+- **Not gates, with the reason** (listed by `gate_list` and `sluice gate list`):
+  a hook Sluice delegates (it does not understand it completely); a mutating unit
+  (`lint-staged`, a formatter with a write flag, a program not known to be read-only:
+  `verify` never edits files or the index outside a commit); and the units of a
+  hook whose condition does not hold now. lefthook's `pre-commit` units need
+  something staged and nothing partially staged, and pre-commit's would stash
+  unstaged changes: those depend on the staged set, so they are gates only while
+  the condition holds (stage the change, then `verify`).
+- **Same key**: the gate is the unit's own gate (command, `PATH` addition, tool version,
+  configuration hash), the key is derived from the working tree as the hook run does,
+  and git's own directory, which git puts first in the `PATH` of every hook, is left
+  out of the hashed `PATH`. A `verify` from an environment whose `PATH` differs from
+  the commit's (husky hashes the `PATH` it runs with) is a miss, not a wrong hit.
+  lefthook and pre-commit units run from `verify` without git's hook variables; the
+  key does not depend on them.
+
+With a `.sluice.toml` its gates are unchanged and no gate is derived from the hooks.
+A unit shares the cache entry of a configured gate only when running the unit as that
+gate is the same run: the unit has no `PATH` addition (so not husky's) and sees no git
+variables (so not lefthook's or pre-commit's), exactly one gate has the same command
+text, and that gate is cached, not queue-only, not path-scoped and declares no `env`.
+The unit then runs under the gate's name and definition (its `timeout` is dropped: a
+hook has none), so `verify` of the gate and the hook hit each other. Otherwise the
+unit keeps its own entry; `sluice hooks status` says which case applies and why.
+
 ## Compatibility
 
 | Manager | Runs as units | Always delegated | Cached |

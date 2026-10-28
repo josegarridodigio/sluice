@@ -10,11 +10,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use sluice_gate_core::config::EnvMap;
+use sluice_gate_core::config::{EnvMap, RepoConfig};
 
 use super::activate::resolve;
 use super::classify;
 use super::delegate::{Manager, detect};
+use super::gates::{self, Share};
 use super::grammar::{self, Script};
 use super::units::{Kind, Plan, Program, Unit};
 use super::{lefthook, precommit};
@@ -186,7 +187,7 @@ fn build(
 
 /// The JSON of one hook in `hooks status`: `mode` is `units` or `delegate`
 /// (with its `reason`).
-pub fn describe(hook: &str, plan: &Plan) -> serde_json::Value {
+pub fn describe(hook: &str, plan: &Plan, config: Option<&RepoConfig>) -> serde_json::Value {
     match plan {
         Plan::Delegate(reason) => {
             serde_json::json!({"hook": hook, "mode": "delegate", "reason": reason})
@@ -195,11 +196,16 @@ pub fn describe(hook: &str, plan: &Plan) -> serde_json::Value {
             let units: Vec<_> = program
                 .units()
                 .map(|u| {
-                    serde_json::json!({
+                    let mut unit = serde_json::json!({
                         "index": u.index,
+                        "name": u.name(),
                         "kind": u.kind.label(),
                         "command": u.command,
-                    })
+                    });
+                    if let Some(text) = config.and_then(|c| share_note(u, c)) {
+                        unit["shares"] = text.into();
+                    }
+                    unit
                 })
                 .collect();
             let mut entry = serde_json::json!({"hook": hook, "mode": "units", "units": units});
@@ -209,6 +215,18 @@ pub fn describe(hook: &str, plan: &Plan) -> serde_json::Value {
             }
             entry
         }
+    }
+}
+
+/// What `.sluice.toml` means for a unit's cache entry, `None` when no gate has
+/// its command.
+pub fn share_note(unit: &Unit, config: &RepoConfig) -> Option<String> {
+    match gates::share(unit, config) {
+        Share::NoMatch => None,
+        Share::Exact(name, _) => Some(format!("cache shared with gate `{name}`")),
+        Share::Differs(name, why) => Some(format!(
+            "same command as gate `{name}`, cache not shared: {why}"
+        )),
     }
 }
 

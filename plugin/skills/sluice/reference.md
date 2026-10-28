@@ -9,7 +9,7 @@ worktree. The server does not know your cwd.
 |---|---|
 | `verify` | Run gates and block until they finish. `gates` (names, run in order), `timeout_seconds` (per gate, 0 = none), `extra_args` (appended to every gate command and part of the cache key), `fail_fast` (default true: return at the first failing gate and cancel the pending ones; false waits for every gate). All selected gates start at once unless the user disabled `[mcp] verify_parallel`. |
 | `status` | Queued and running jobs; with `working_directory`, the cache state of that tree per gate (`hit`, `miss`, `uncached`, `error`). Never starts the daemon. |
-| `gate_list` | Gates of `.sluice.toml`: name, command, weight, timeout, hooks, cache flag. |
+| `gate_list` | Gates of `.sluice.toml`: name, command, weight, timeout, hooks, cache flag. Without a `.sluice.toml` and with the hooks entry point on: the check units of the hooks (`source: hook`, `manager`, named `<manager>:<hook>#<n>`) and `excluded`, the hooks and units that are not gates with the reason. |
 | `logs` | Tail of a job log; newest job by default. `job_id`, `tail` (default 100, max 2000). |
 | `queue_enqueue` | Put the committed branch (`branch`, default the current one; `base`, default the configured target) in the local merge queue. Refuses a detached HEAD and tracked uncommitted changes. |
 | `queue_status` | Trains, members, conflicts with paths, trains ready for a human. |
@@ -130,7 +130,9 @@ The rules it gives you include the memory one: a gate `KILLED for lack of
 memory` is not retried unchanged. Heavy commands include `cargo check` and
 `cargo doc`, which go through the queue like `cargo build`.
 
-Context variants: repository with `.sluice.toml` (rules and gate names); git
+Context variants: repository with `.sluice.toml` (rules and gate names);
+git repository without it whose hooks go through Sluice (the rules; the gates
+are the hooks' check units, see `gate_list`); git
 repository without it (propose Sluice once: `sluice init --dry-run`, show
 the output, `sluice init` only after the user agrees); anything else (one
 line). A missing or older binary yields a note asking you to tell the user
@@ -142,7 +144,8 @@ and, only with their consent, run the installer or `sluice update`.
   sees (`claude mcp list` shows the `sluice` server state). Install with the
   installer line from `SKILL.md`, then restart Claude Code.
 - `verify` says there is no `.sluice.toml`: the directory is not in a Sluice
-  repository; run the project's own commands as usual.
+  repository, or its hooks yield no unit Sluice can verify (`gate_list` and
+  `sluice hooks status` say why); run the project's own commands as usual.
 - `verify` reports the daemon unreachable: ask the human to run
   `sluice status` in a terminal; never run the gate in the shell.
 - A Bash command was denied with "This repository verifies through Sluice":

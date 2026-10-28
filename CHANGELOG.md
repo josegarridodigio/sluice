@@ -47,6 +47,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   text of recognised tools; pre-commit `language: system` + `always_run` +
   `pass_filenames: false`) are cached, keyed by tree, tool version and
   configuration. See `docs/hooks.md`.
+- Repositories without `.sluice.toml` use the check units of their hooks as gates
+  (ADR-0021, wave H3): `verify` and `gate_list` (MCP), `sluice run <gate>` and the new
+  `sluice gate list [--json]` see `<manager>:<hook>#<n>` for the units of `pre-commit`,
+  `pre-merge-commit` and `pre-push`, with the same cache entries as the hook runs, so a
+  `verify` before `git commit` makes the commit's hook a cache hit and the other way
+  round (husky, lefthook, pre-commit). `gate_list` also lists the hooks and units that
+  are not gates and why (delegated hooks, mutating units such as `lint-staged`, units
+  that depend on what is staged). With a `.sluice.toml` its gates are unchanged; a
+  unit whose command equals a cached, unscoped gate with no `env` shares that gate's
+  entry when the run is the same (plain hooks). `sluice doctor` no longer fails a
+  missing `.sluice.toml` in a clone whose hooks go through Sluice, and the agent
+  plugin's session context, skill and MCP instructions cover such repositories. See
+  `docs/hooks.md`.
 
 ### Changed
 

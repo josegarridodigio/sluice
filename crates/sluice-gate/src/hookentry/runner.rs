@@ -37,6 +37,7 @@ use sluice_gate_core::mode::{CacheMode, cache_mode};
 use sluice_gate_proto::client;
 
 use super::delegate::Manager;
+use super::gates::{self, Share};
 use super::plan::{self, Input};
 use super::precond;
 use super::units::{Kind, Plan, Program, Unit};
@@ -64,7 +65,12 @@ pub fn opt_out(env: &EnvMap) -> Option<String> {
 /// Everything resolved before the first unit runs.
 struct Prepared {
     repo: RepoContext,
+    /// The environment the hook runs with (git's `PATH` addition included).
     env: EnvMap,
+    /// The same without what only a git-run hook has, so that `verify` (no
+    /// hook around it) describes the same environment: what the cache key
+    /// hashes. See [`key_env`].
+    key_env: EnvMap,
 }
 
 /// Resolves the repository and checks the daemon is reachable (starting it on
@@ -74,10 +80,35 @@ fn prepare(root: &Path, env: &EnvMap) -> Result<Prepared, String> {
     let repo = lookup::resolve_repo_or_implicit(root, env, &mode).map_err(|e| e.to_string())?;
     let socket = client::ensure_daemon(env).map_err(|e| format!("{e:#}"))?;
     client::connect(&socket).map_err(|e| e.to_string())?;
+    let key_env = key_env(env, root);
     Ok(Prepared {
         repo,
         env: env.clone(),
+        key_env,
     })
+}
+
+/// `env` as `verify` would see it. git puts its own directory first in the
+/// `PATH` of every hook it runs (`git --exec-path`); the key of a unit with a
+/// `PATH` addition (husky) hashes the `PATH` it runs with, so that directory
+/// is left out of the hashed string, or a pass of `verify` (and of a commit
+/// made from another git) would never hit. The process still runs with the
+/// whole `PATH`.
+pub(super) fn key_env(env: &EnvMap, root: &Path) -> EnvMap {
+    let mut out = env.clone();
+    let Some(path) = env.get("PATH") else {
+        return out;
+    };
+    let Ok(exec) = git::run_output(&["--exec-path"], root, env) else {
+        return out;
+    };
+    let exec = String::from_utf8_lossy(&exec.stdout).trim().to_owned();
+    if let Some(rest) = path.strip_prefix(&format!("{exec}:"))
+        && !exec.is_empty()
+    {
+        out.insert("PATH".to_owned(), rest.to_owned());
+    }
+    out
 }
 
 /// Runs `hook` as units when Sluice understands it completely and the daemon
@@ -202,7 +233,7 @@ fn path_with(unit: &Unit, env: &EnvMap) -> String {
 
 /// The synthetic gate of a unit: no timeout (a hook has none), weight a
 /// ceiling that learned weights lower, cached only when it is a check.
-fn gate_of(unit: &Unit, env: &EnvMap) -> Gate {
+pub(super) fn gate_of(unit: &Unit, env: &EnvMap) -> Gate {
     let mut gate_env = BTreeMap::new();
     if !unit.path_prepend.is_empty() {
         gate_env.insert("PATH".to_owned(), path_with(unit, env));
@@ -223,12 +254,25 @@ fn gate_of(unit: &Unit, env: &EnvMap) -> Gate {
     }
 }
 
+/// The name and gate a unit runs under: its own, or those of the configured
+/// gate whose cache entry it can share exactly (see [`gates::share`]).
+fn identity(unit: &Unit, prep: &Prepared) -> (String, Gate) {
+    match gates::share(unit, &prep.repo.config) {
+        Share::Exact(name, gate) => (name, *gate),
+        Share::NoMatch | Share::Differs(..) => (unit.name(), gate_of(unit, &prep.key_env)),
+    }
+}
+
 /// Runs one unit and returns its exit code. A unit with `git_env` (every
 /// mutating one) keeps the variables git sets for the hook: it may edit or
 /// read the index the commit uses.
 fn run_one(unit: &Unit, hook: &str, prep: &Prepared) -> u8 {
-    let gate = gate_of(unit, &prep.env);
-    match prep.repo.select_unit(&unit.name(), gate, unit.git_env) {
+    let (name, gate) = identity(unit, prep);
+    let mut run_env = EnvMap::new();
+    if !unit.path_prepend.is_empty() {
+        run_env.insert("PATH".to_owned(), path_with(unit, &prep.env));
+    }
+    match prep.repo.select_unit(&name, gate, unit.git_env, &run_env) {
         Ok(res) => crate::run::run_unit(res, hook),
         Err(e) => {
             eprintln!(

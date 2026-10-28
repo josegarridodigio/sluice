@@ -12,6 +12,7 @@ mod daemon;
 mod queue;
 mod text;
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -33,6 +34,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sluice_gate_core::config::{RepoConfig, UserConfig};
 use sluice_gate_core::git::{self, EnvMap};
+use sluice_gate_core::hookgate::{HookExclusion, HookGateSource, HookGates};
 use sluice_gate_core::lookup::{self, Lookup, RepoContext, Resolved, RunMaterial};
 use sluice_gate_core::marker::{self, Marker};
 use sluice_gate_core::mode::{CacheMode, cache_mode};
@@ -63,7 +65,10 @@ commands through the shell: they bypass the queue and the cache and slow down ev
 agent on the machine. When `verify` reports FAIL, read the log tail in the result, fix the \
 code, and call `verify` again rather than re-running the commands yourself. A tree that \
 already passed is answered from the cache in milliseconds. `status` shows queued and running \
-jobs, `logs` shows a job's output, `gate_list` lists the gates of a repository. \
+jobs, `logs` shows a job's output, `gate_list` lists the gates of a repository: those of its `.sluice.toml` or, in a repository \
+without one whose git hooks go through Sluice, the check units of its hooks (it also says which \
+hooks and units are left out and why); `verify` runs them with the same cache entries as the \
+commit's hook, so a pass here makes the commit's hook a cache hit. \
 Merge queue: to land a finished branch, commit it, call `verify` and wait for it to pass, then \
 call `queue_enqueue` with your absolute working directory, and stop. Tell the human the job id \
 (and the train id from `queue_status`): a human approves the train with `sluice queue approve`. \
@@ -95,10 +100,12 @@ for memory is only queued. Never run a gate through the shell to get around eith
 /// # Errors
 ///
 /// When the transport fails to initialise or breaks.
-pub async fn serve(env: EnvMap) -> anyhow::Result<()> {
+pub async fn serve(env: EnvMap, hook_gates: HookGateSource) -> anyhow::Result<()> {
     init_tracing(&env);
     tracing::info!(version = SLUICE_VERSION, "sluice mcp starting");
-    let service = Server::new(env).serve(rmcp::transport::stdio()).await?;
+    let service = Server::new(env, hook_gates)
+        .serve(rmcp::transport::stdio())
+        .await?;
     let reason = service.waiting().await?;
     tracing::info!(?reason, "sluice mcp stopped");
     Ok(())
@@ -348,14 +355,52 @@ struct GateInfo {
     hooks: Vec<String>,
     /// Whether passes are cached.
     cache: bool,
+    /// `config` for a gate of `.sluice.toml`, `hook` for a unit of the
+    /// repository's git hooks (a repository without `.sluice.toml`).
+    source: &'static str,
+    /// The hook manager of a `hook` gate (`husky`, `lefthook`, `pre-commit`,
+    /// `plain`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manager: Option<String>,
+}
+
+/// A hook or unit of the repository's hooks that is not a gate.
+#[derive(Debug, Serialize, JsonSchema)]
+struct ExcludedInfo {
+    /// The hook.
+    hook: String,
+    /// The unit's name; absent when the whole hook is excluded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unit: Option<String>,
+    /// The unit's command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<String>,
+    /// Why it is not a gate.
+    reason: String,
+}
+
+impl From<HookExclusion> for ExcludedInfo {
+    fn from(e: HookExclusion) -> Self {
+        Self {
+            hook: e.hook,
+            unit: e.unit,
+            command: e.command,
+            reason: e.reason,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct GateList {
     /// Repository root.
     repository: PathBuf,
-    /// Gates of `.sluice.toml`, by name.
+    /// Gates of `.sluice.toml`, by name; without one, the check units of the
+    /// repository's hooks.
     gates: Vec<GateInfo>,
+    /// Hooks and units of the repository's hooks that are not gates, with
+    /// the reason (only for a repository without `.sluice.toml`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    excluded: Vec<ExcludedInfo>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -885,6 +930,8 @@ fn valid_job_id(id: &str) -> bool {
 #[derive(Clone)]
 struct Server {
     env: Arc<EnvMap>,
+    /// The gates a repository without `.sluice.toml` gets from its hooks.
+    hook_gates: HookGateSource,
     tool_router: ToolRouter<Self>,
 }
 
@@ -896,9 +943,10 @@ impl std::fmt::Debug for Server {
 
 #[tool_router]
 impl Server {
-    fn new(env: EnvMap) -> Self {
+    fn new(env: EnvMap, hook_gates: HookGateSource) -> Self {
         Self {
             env: Arc::new(env),
+            hook_gates,
             tool_router: Self::tool_router(),
         }
     }
@@ -1111,8 +1159,11 @@ impl Server {
         let dir = workdir(&params.working_directory)?;
         let env = Arc::clone(&self.env);
         let mode = cache_mode(&env);
-        let Some(repo) =
-            blocking_or_cancel(&ctx.ct, move || lookup::resolve_repo(&dir, &env, &mode)).await?
+        let source = Arc::clone(&self.hook_gates);
+        let Some(repo) = blocking_or_cancel(&ctx.ct, move || {
+            lookup::resolve_repo_hook_gates(&dir, &env, &mode, &*source)
+        })
+        .await?
         else {
             let report = VerifyReport {
                 repository: PathBuf::from(&params.working_directory),
@@ -1264,8 +1315,10 @@ impl Server {
         Ok(r)
     }
 
-    /// List the gates of the repository's .sluice.toml: name, command, weight,
-    /// timeout, hooks and cache flag.
+    /// List the gates of the repository: those of its .sluice.toml (name,
+    /// command, weight, timeout, hooks and cache flag) or, in a repository
+    /// without one, the check units of its git hooks, followed by the hooks
+    /// and units that are not gates and why.
     #[tool(output_schema = schema_for_output::<GateList>())]
     async fn gate_list(
         &self,
@@ -1273,17 +1326,19 @@ impl Server {
     ) -> Result<CallToolResult, McpError> {
         let dir = workdir(&params.working_directory)?;
         let env = Arc::clone(&self.env);
-        let (root, config, budget) = blocking(move || {
+        let source = Arc::clone(&self.hook_gates);
+        let listing = blocking(move || {
             let paths = git::discover(&dir, &env).map_err(|e| e.to_string())?;
-            let config = RepoConfig::load(&paths.toplevel).map_err(|e| e.to_string())?;
+            let (config, managers, excluded) = load_gates(&paths, &env, &*source)?;
             let budget = UserConfig::load(&env).map_or_else(
                 |_| sluice_gate_core::cpus::default_budget(),
                 |u| u.daemon.budget,
             );
-            Ok::<_, String>((paths.toplevel, config, budget))
+            Ok::<_, String>((paths.toplevel, config, budget, managers, excluded))
         })
         .await?
         .map_err(invalid)?;
+        let (root, config, budget, managers, excluded) = listing;
         let gates: Vec<GateInfo> = config
             .gates
             .iter()
@@ -1294,34 +1349,21 @@ impl Server {
                 timeout_seconds: g.timeout.as_secs(),
                 hooks: g.hooks.clone(),
                 cache: g.cache,
+                source: if managers.contains_key(name) {
+                    "hook"
+                } else {
+                    "config"
+                },
+                manager: managers.get(name).cloned(),
             })
             .collect();
-        let width = gates.iter().map(|g| g.name.len()).max().unwrap_or(0);
-        let mut out = String::new();
-        if gates.is_empty() {
-            out.push_str("no gates defined in .sluice.toml\n");
-        }
-        for (g, (_, gate)) in gates.iter().zip(&config.gates) {
-            let _ = writeln!(
-                out,
-                "{:<width$}  {}  (weight {}, timeout {}, hooks: {}, cache {})",
-                g.name,
-                gate.normalized_cmd(),
-                gate.weight,
-                humantime::format_duration(gate.timeout),
-                if g.hooks.is_empty() {
-                    "-".to_owned()
-                } else {
-                    g.hooks.join(", ")
-                },
-                if g.cache { "on" } else { "off" }
-            );
-        }
+        let out = gate_list_text(&gates, &config, &excluded);
         result(
             out,
             &GateList {
                 repository: root,
                 gates,
+                excluded: excluded.into_iter().map(ExcludedInfo::from).collect(),
             },
             false,
         )
@@ -1624,6 +1666,80 @@ impl ServerHandler for Server {
     }
 }
 
+/// A repository's gates, the manager of each gate derived from a hook (by
+/// gate name) and the hook units left out.
+type LoadedGates = (RepoConfig, BTreeMap<String, String>, Vec<HookExclusion>);
+
+/// The gates of a repository: `.sluice.toml`'s, or, when there is none, those
+/// of its hooks (with the manager of each and what was left out). A
+/// repository with neither is an error.
+fn load_gates(
+    paths: &git::RepoPaths,
+    env: &EnvMap,
+    source: &(dyn Fn(&git::RepoPaths, &EnvMap) -> HookGates + Send + Sync),
+) -> Result<LoadedGates, String> {
+    match RepoConfig::load(&paths.toplevel) {
+        Ok(config) => Ok((config, BTreeMap::new(), Vec::new())),
+        Err(sluice_gate_core::Error::ConfigNotFound(root)) => {
+            let derived = source(paths, env);
+            if derived.gates.is_empty() && derived.excluded.is_empty() {
+                return Err(sluice_gate_core::Error::ConfigNotFound(root).to_string());
+            }
+            let managers = derived
+                .gates
+                .iter()
+                .map(|g| (g.name.clone(), g.manager.clone()))
+                .collect();
+            let excluded = derived.excluded.clone();
+            Ok((lookup::hook_config(derived), managers, excluded))
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The text of `gate_list`.
+fn gate_list_text(gates: &[GateInfo], config: &RepoConfig, excluded: &[HookExclusion]) -> String {
+    let width = gates.iter().map(|g| g.name.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    if gates.is_empty() && excluded.is_empty() {
+        out.push_str("no gates defined in .sluice.toml\n");
+    }
+    if gates.is_empty() && !excluded.is_empty() {
+        out.push_str("no .sluice.toml and no hook unit that can be verified\n");
+    }
+    for (g, (_, gate)) in gates.iter().zip(&config.gates) {
+        let origin = g
+            .manager
+            .as_ref()
+            .map_or(String::new(), |m| format!(", from the {m} hook"));
+        let _ = writeln!(
+            out,
+            "{:<width$}  {}  (weight {}, timeout {}, hooks: {}, cache {}{origin})",
+            g.name,
+            gate.normalized_cmd(),
+            gate.weight,
+            humantime::format_duration(gate.timeout),
+            if g.hooks.is_empty() {
+                "-".to_owned()
+            } else {
+                g.hooks.join(", ")
+            },
+            if g.cache { "on" } else { "off" }
+        );
+    }
+    if !excluded.is_empty() {
+        out.push_str("not gates:\n");
+    }
+    for e in excluded {
+        let what = match (&e.unit, &e.command) {
+            (Some(unit), Some(cmd)) => format!("{unit} `{cmd}`"),
+            _ => format!("hook {}", e.hook),
+        };
+        let _ = writeln!(out, "  {what}: {}", e.reason);
+    }
+    out
+}
+
 /// Cache state of the directory's current tree per gate (`status`):
 /// repository root, text lines and JSON.
 fn cache_state(dir: &Path, env: &EnvMap) -> Result<(PathBuf, String, serde_json::Value), String> {
@@ -1837,14 +1953,20 @@ mod schema_tests {
 
     use super::*;
 
+    /// Definitions whose fields share a name with a field skipped elsewhere
+    /// but are always present (`ExcludedInfo::reason` is never empty).
+    const ALWAYS_PRESENT: &[&str] = &["ExcludedInfo"];
+
     fn required_names(value: &serde_json::Value, out: &mut Vec<String>) {
         match value {
             serde_json::Value::Object(map) => {
                 if let Some(serde_json::Value::Array(req)) = map.get("required") {
                     out.extend(req.iter().filter_map(|v| v.as_str().map(str::to_owned)));
                 }
-                for v in map.values() {
-                    required_names(v, out);
+                for (k, v) in map {
+                    if !ALWAYS_PRESENT.contains(&k.as_str()) {
+                        required_names(v, out);
+                    }
                 }
             }
             serde_json::Value::Array(items) => items.iter().for_each(|v| required_names(v, out)),
@@ -1904,7 +2026,9 @@ mod schema_tests {
 
     #[test]
     fn queue_tools_are_listed_with_descriptions_and_output_schemas() {
-        let tools = Server::new(EnvMap::new()).tool_router.list_all();
+        let tools = Server::new(EnvMap::new(), Arc::new(|_, _| HookGates::default()))
+            .tool_router
+            .list_all();
         for name in [
             "queue_enqueue",
             "queue_status",

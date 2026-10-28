@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use sluice_gate_core::config::EnvMap;
+use sluice_gate_core::config::{EnvMap, RepoConfig};
 use sluice_gate_core::git::{self, RepoPaths};
 
 use crate::run::EXIT_ERROR;
@@ -22,6 +22,7 @@ use crate::run::EXIT_ERROR;
 pub mod activate;
 pub mod classify;
 pub mod delegate;
+pub mod gates;
 pub mod gitcfg;
 pub mod grammar;
 pub mod lefthook;
@@ -156,11 +157,13 @@ fn hook_plans(
     paths: &RepoPaths,
     hooks_dir: &Path,
     env: &EnvMap,
+    wanted: &dyn Fn(&str) -> bool,
 ) -> Vec<(&'static str, units::Plan)> {
     let full = activate::resolve(hooks_dir, &paths.toplevel);
     let forced = runner::opt_out(env);
     activate::mirrored(&full)
         .into_iter()
+        .filter(|hook| wanted(hook))
         .map(|hook| {
             let planned = forced.clone().map_or_else(
                 || {
@@ -184,6 +187,7 @@ fn describe(
     ins: &activate::Inspection,
     env: &EnvMap,
     plans: &[(&'static str, units::Plan)],
+    config: Option<&RepoConfig>,
 ) -> serde_json::Value {
     let home = env.get("HOME").map(String::as_str);
     let hooks_dir = delegate::underlying_dir(ins.underlying.as_deref(), &paths.common_dir, home);
@@ -197,12 +201,15 @@ fn describe(
         "underlying": ins.underlying,
         "manager": manager.label(),
         "problem": ins.problem(),
-        "hooks": plans.iter().map(|(h, p)| plan::describe(h, p)).collect::<Vec<_>>(),
+        "hooks": plans
+            .iter()
+            .map(|(h, p)| plan::describe(h, p, config))
+            .collect::<Vec<_>>(),
     })
 }
 
 /// One line per hook for the text `status`.
-fn print_plans(plans: &[(&'static str, units::Plan)]) {
+fn print_plans(plans: &[(&'static str, units::Plan)], config: Option<&RepoConfig>) {
     for (hook, planned) in plans {
         match planned {
             units::Plan::Delegate(reason) => {
@@ -220,6 +227,12 @@ fn print_plans(plans: &[(&'static str, units::Plan)]) {
                 );
                 if let Some(pre) = program.precondition {
                     println!("    (delegated at run time unless {})", pre.describe());
+                }
+                for note in program
+                    .units()
+                    .filter_map(|u| config.and_then(|c| plan::share_note(u, c)).map(|n| (u, n)))
+                {
+                    println!("    {}: {}", note.0.name(), note.1);
                 }
             }
         }
@@ -242,8 +255,9 @@ pub fn status(json: bool) -> ExitCode {
         &paths.common_dir,
         env.get("HOME").map(String::as_str),
     );
-    let plans = hook_plans(&paths, &hooks_dir, &env);
-    let value = describe(&paths, &ins, &env, &plans);
+    let plans = hook_plans(&paths, &hooks_dir, &env, &|_| true);
+    let config = RepoConfig::load(&paths.toplevel).ok();
+    let value = describe(&paths, &ins, &env, &plans, config.as_ref());
     if json {
         println!("{value:#}");
         return ExitCode::SUCCESS;
@@ -273,7 +287,7 @@ pub fn status(json: bool) -> ExitCode {
     } else {
         println!("  enable with:     sluice hooks on");
     }
-    print_plans(&plans);
+    print_plans(&plans, config.as_ref());
     ExitCode::SUCCESS
 }
 

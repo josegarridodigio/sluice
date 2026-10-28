@@ -39,6 +39,7 @@ use sha2::{Digest, Sha256};
 use sluice_gate_core::agent::{self, Caller};
 use sluice_gate_core::config::HookPolicy;
 use sluice_gate_core::git::{self, EnvMap};
+use sluice_gate_core::hookgate::HookGates;
 use sluice_gate_core::key::CacheKey;
 use sluice_gate_core::logfile::{self, JobLog};
 use sluice_gate_core::lookup::{self, Lookup as CacheState, Resolved, RunMaterial};
@@ -53,6 +54,7 @@ use sluice_gate_proto::{
 
 use crate::clientlog;
 use crate::dirs;
+use crate::hookentry::gates;
 use sluice_gate_proto::client::{self, ClientError};
 
 /// Exit code when `agent_hook_policy = "fail-fast"` refuses to run.
@@ -930,7 +932,19 @@ fn explain(ctx: &Context, env: &EnvMap, mode: &CacheMode, extra: &[String]) -> E
 
 /// Resolves repository, config and derived environments.
 fn resolve(env: &EnvMap, cwd: &Path, args: &RunArgs, mode: &CacheMode) -> Result<Context, String> {
-    let res = lookup::resolve(cwd, env, &args.gate, mode).map_err(|e| e.to_string())?;
+    // Without `.sluice.toml` the gates are the check units of the hooks.
+    let res = match lookup::resolve(cwd, env, &args.gate, mode) {
+        Err(sluice_gate_core::Error::ConfigNotFound(_)) => {
+            let derive = |paths: &git::RepoPaths, env: &EnvMap| {
+                gates::hook_of_name(&args.gate).map_or_else(HookGates::default, |hook| {
+                    gates::derive(paths, env, Some(hook))
+                })
+            };
+            lookup::resolve_hook_gates(cwd, env, &args.gate, mode, &derive)
+        }
+        other => other,
+    }
+    .map_err(|e| e.to_string())?;
     Ok(Context {
         tail_lines: res.tail_lines(),
         res,

@@ -15,7 +15,8 @@
 //!    agent and its descendants into `ui`, the self-move line for the shells
 //!    in the env file; see [`crate::session_contain`]), within the same budget;
 //! 4. prints the `additionalContext` for the agent: the rules and the gate
-//!    names in a repository with `.sluice.toml`, an offer to set Sluice up in
+//!    names in a repository with `.sluice.toml` (or whose hooks go through
+//!    Sluice, where the gates are the hooks' check units), an offer to set Sluice up in
 //!    a git repository without it, a one-liner elsewhere;
 //! 5. logs one line to `logs/client.log`.
 //!
@@ -72,6 +73,9 @@ static OUTPUT: Mutex<()> = Mutex::new(());
 pub enum Place {
     /// A `.sluice.toml` is at or above the directory; its gate names.
     Configured(Vec<String>),
+    /// A git repository without `.sluice.toml` whose hooks go through Sluice
+    /// (`sluice hooks on`): its gates are derived from the hooks.
+    Hooked,
     /// A git repository without `.sluice.toml`.
     GitOnly,
     /// Neither.
@@ -92,14 +96,20 @@ pub fn locate(dir: &Path) -> Place {
         in_git |= d.join(".git").exists();
     }
     if in_git {
-        Place::GitOnly
+        if hookentry::find_common_dir(dir)
+            .is_some_and(|(_, common)| hookentry::Layout::new(&common).state_file().is_file())
+        {
+            Place::Hooked
+        } else {
+            Place::GitOnly
+        }
     } else {
         Place::Elsewhere
     }
 }
 
 /// The rules, in a repository with `.sluice.toml`.
-fn rules_text(gates: &[String]) -> String {
+fn rules_text(gates: &[String], derived: bool) -> String {
     let mut names = gates
         .iter()
         .take(MAX_GATES)
@@ -109,7 +119,11 @@ fn rules_text(gates: &[String]) -> String {
     if gates.len() > MAX_GATES {
         names.push_str(", ...");
     }
-    let gates = if names.is_empty() {
+    let gates = if derived {
+        " This repository has no .sluice.toml: its gates are the check units of its git hooks, \
+         which run through Sluice (`gate_list` lists them and the hooks left out)."
+            .to_owned()
+    } else if names.is_empty() {
         String::new()
     } else {
         format!(" Gates of this repository: {names}.")
@@ -149,7 +163,8 @@ const NON_GIT_TEXT: &str = "Sluice is installed; this directory is not a git rep
 /// The `additionalContext` for `place`, and the log decision.
 pub fn context(place: &Place) -> (String, &'static str) {
     match place {
-        Place::Configured(gates) => (rules_text(gates), "rules"),
+        Place::Configured(gates) => (rules_text(gates, false), "rules"),
+        Place::Hooked => (rules_text(&[], true), "rules-hooks"),
         Place::GitOnly => (INIT_TEXT.to_owned(), "init-offer"),
         Place::Elsewhere => (NON_GIT_TEXT.to_owned(), "non-git"),
     }
@@ -372,11 +387,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_clone_whose_hooks_go_through_sluice_and_has_no_config_is_hooked() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        assert_eq!(locate(tmp.path()), Place::GitOnly);
+        fs::create_dir_all(tmp.path().join(".git/sluice")).unwrap();
+        fs::write(tmp.path().join(".git/sluice/hooks.json"), "{}").unwrap();
+        assert_eq!(locate(tmp.path()), Place::Hooked);
+        let (text, decision) = context(&Place::Hooked);
+        assert_eq!(decision, "rules-hooks");
+        assert!(
+            text.contains("verify") && text.contains("check units"),
+            "{text}"
+        );
+        fs::write(tmp.path().join(".sluice.toml"), "version = 1\n").unwrap();
+        assert!(matches!(locate(tmp.path()), Place::Configured(_)));
+    }
+
+    #[test]
     fn contexts_are_short() {
         let many: Vec<String> = (0..40).map(|i| format!("gate-number-{i}")).collect();
         for place in [
             Place::Configured(many),
             Place::Configured(vec!["fmt".into(), "test".into()]),
+            Place::Hooked,
             Place::GitOnly,
             Place::Elsewhere,
         ] {

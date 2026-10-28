@@ -1,6 +1,6 @@
 ---
 name: sluice
-description: Use before running tests, linters, type checks or builds, before committing or pushing, and when landing a finished branch, in any repository that has a `.sluice.toml` at its root. Sluice is a shared verification queue and cache; this skill says how to verify through the `verify` MCP tool instead of the shell, what git hook exit code 3 means, and how to land work through the merge queue.
+description: Use before running tests, linters, type checks or builds, before committing or pushing, and when landing a finished branch, in any repository that has a `.sluice.toml` at its root, or whose git hooks go through Sluice (`sluice hooks on`). Sluice is a shared verification queue and cache; this skill says how to verify through the `verify` MCP tool instead of the shell, what git hook exit code 3 means, and how to land work through the merge queue.
 ---
 
 # Verifying and landing work with Sluice
@@ -8,6 +8,13 @@ description: Use before running tests, linters, type checks or builds, before co
 A repository with a `.sluice.toml` runs its tests, linters and type checks
 through Sluice: one queue and one cache shared by every agent on the machine.
 A tree that already passed is answered from the cache in milliseconds.
+
+A repository without a `.sluice.toml` whose git hooks go through Sluice (the
+session context says so) works the same way: its gates are the check units of
+its hooks (husky, lefthook, pre-commit or plain hooks), and a `verify` pass is
+the cache hit that the commit's hook then finds. `gate_list` shows those gates
+and the hooks or units that are not gates (formatters that edit files, hooks
+Sluice does not understand), each with the reason.
 
 ## Automatic setup in agent sessions
 
@@ -41,7 +48,11 @@ session. Never install or update on your own.
   set to your absolute directory inside the repository or worktree. Optional:
   `gates` (names), `timeout_seconds`, `extra_args`, `fail_fast` (default true).
 - With no `gates`, it runs the gates tagged `pre-commit` (or all of them if
-  none is tagged). Use `gate_list` to see the gates and their commands.
+  none is tagged); without a `.sluice.toml`, the check units of the
+  `pre-commit` hook (or of all the hooks if it has none). Use `gate_list` to
+  see the gates and their commands. A unit that is not listed (it edits files
+  or depends on what is staged) runs only inside the commit's hook: do not run
+  its command yourself, let the hook run it.
 - Never run a gate command through Bash (`cargo test`, `npm test`, `pytest`,
   linters, ...). It bypasses the queue and the cache. A guard hook may deny it
   and tell you which gate to verify instead.

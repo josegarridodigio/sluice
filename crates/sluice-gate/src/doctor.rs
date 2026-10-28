@@ -568,6 +568,9 @@ fn check_repo(env: &EnvMap, paths: &RepoPaths) -> Vec<Check> {
                 ),
             )
         }
+        Err(sluice_gate_core::Error::ConfigNotFound(_)) if entry_point_active(env, paths) => {
+            derived_gates_check(env, paths)
+        }
         Err(e) => check("repo-config", Status::Fail, e.to_string()),
     });
     if let Some(w) = warning {
@@ -584,15 +587,43 @@ fn check_repo(env: &EnvMap, paths: &RepoPaths) -> Vec<Check> {
             out.extend(check_scoped_gates(env, paths, cfg));
             out.push(check_weights(env, paths, cfg));
         }
-        Err(_) if !paths.toplevel.join(REPO_CONFIG_FILE).exists() => out.push(check(
-            "init",
-            Status::Ok,
-            "this repository has no .sluice.toml; run 'sluice init --dry-run' to see what Sluice \
-             would propose",
-        )),
+        Err(_)
+            if !paths.toplevel.join(REPO_CONFIG_FILE).exists()
+                && !entry_point_active(env, paths) =>
+        {
+            out.push(check(
+                "init",
+                Status::Ok,
+                "this repository has no .sluice.toml; run 'sluice init --dry-run' to see what \
+                 Sluice would propose",
+            ));
+        }
         Err(_) => {}
     }
     out
+}
+
+/// Sluice is this clone's hooks entry point (`sluice hooks on`).
+fn entry_point_active(env: &EnvMap, paths: &RepoPaths) -> bool {
+    let probe = git::probe_env(env, Some(paths));
+    hookentry::activate::inspect(&paths.common_dir, &paths.toplevel, &probe)
+        .is_ok_and(|ins| ins.managed())
+}
+
+/// `repo-config` of a clone that has no `.sluice.toml` and whose hooks go
+/// through Sluice: not a failure, its gates are derived from the hooks.
+fn derived_gates_check(env: &EnvMap, paths: &RepoPaths) -> Check {
+    let derived = hookentry::gates::derive(paths, env, None);
+    check(
+        "repo-config",
+        Status::Ok,
+        format!(
+            "no .sluice.toml; gates are derived from the hooks ({} unit(s) can be verified, {} \
+             left out; see 'sluice gate list')",
+            derived.gates.len(),
+            derived.excluded.len()
+        ),
+    )
 }
 
 /// Words `sh` runs without looking in `PATH`.

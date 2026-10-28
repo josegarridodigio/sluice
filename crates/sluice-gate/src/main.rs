@@ -19,6 +19,7 @@ mod daemon_cmd;
 mod dirs;
 mod doctor;
 mod exec;
+mod gate_list;
 mod guard;
 mod hookentry;
 mod init;
@@ -225,6 +226,11 @@ enum Command {
         /// Print machine-readable JSON instead of text.
         #[arg(long)]
         json: bool,
+    },
+    /// List the gates of the current repository.
+    Gate {
+        #[command(subcommand)]
+        command: GateCommand,
     },
     /// Inspect or clear cache markers for the current repository.
     Cache {
@@ -502,6 +508,18 @@ enum DaemonCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum GateCommand {
+    /// List the gates: those of `.sluice.toml` or, without one, the check units of the
+    /// repository's git hooks (named `<manager>:<hook>#<n>`), and the hooks and units
+    /// that are not gates, with the reason.
+    List {
+        /// Print machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum CacheCommand {
     /// Show, per gate, whether the current tree has a cached pass.
     Status {
@@ -587,6 +605,9 @@ fn main() -> ExitCode {
             quiet,
             argv,
         }),
+        Command::Gate {
+            command: GateCommand::List { json },
+        } => gate_list::list(json),
         Command::Cache {
             command: CacheCommand::Status { all },
         } => cache::status(all),
@@ -687,6 +708,12 @@ fn main() -> ExitCode {
 
 /// `sluice mcp`: the MCP stdio server on a multi-threaded tokio runtime
 /// (only this subcommand builds one; the `sluice run` hit path stays synchronous).
+/// The gates the MCP server derives from the hooks of a repository without
+/// `.sluice.toml`.
+fn hook_gate_source() -> sluice_gate_core::hookgate::HookGateSource {
+    std::sync::Arc::new(|paths, env| hookentry::gates::derive(paths, env, None))
+}
+
 fn mcp() -> ExitCode {
     let env = sluice_gate_core::config::process_env();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -699,7 +726,7 @@ fn mcp() -> ExitCode {
             return ExitCode::from(run::EXIT_ERROR);
         }
     };
-    match runtime.block_on(sluice_gate_mcp::serve(env)) {
+    match runtime.block_on(sluice_gate_mcp::serve(env, hook_gate_source())) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("sluice: error: {e:#}");

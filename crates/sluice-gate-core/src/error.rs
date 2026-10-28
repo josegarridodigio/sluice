@@ -48,7 +48,10 @@ pub enum Error {
     },
 
     /// `.sluice.toml` is missing from the worktree root.
-    #[error("no .sluice.toml found in {0} (run 'sluice init' there)")]
+    #[error(
+        "no .sluice.toml found in {0} (run 'sluice init' there; without one, gates come from \
+         hooks Sluice can run, see 'sluice hooks status')"
+    )]
     ConfigNotFound(PathBuf),
 
     /// A configuration file could not be parsed or failed validation.

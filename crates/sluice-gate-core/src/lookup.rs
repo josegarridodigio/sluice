@@ -12,6 +12,7 @@ use std::time::Duration;
 use crate::Result;
 use crate::config::{Gate, RepoConfig, UserConfig};
 use crate::git::{self, EnvMap, RepoPaths};
+use crate::hookgate::HookGates;
 use crate::key::{self, CacheKey, KeyMaterial, KeyTree};
 use crate::marker::{self, Marker, MarkerStore, MissRecord};
 use crate::mode::CacheMode;
@@ -99,6 +100,63 @@ pub fn resolve_repo_or_implicit(cwd: &Path, env: &EnvMap, mode: &CacheMode) -> R
     build_context(paths, config, env, mode)
 }
 
+/// [`resolve_repo_or_implicit`] for the front-ends that run gates: a
+/// repository with a `.sluice.toml` keeps its own gates untouched; without
+/// one, the check units of its hooks are the gates (`derive`). A repository
+/// with neither still reports [`crate::Error::ConfigNotFound`].
+///
+/// # Errors
+///
+/// See [`resolve_repo`].
+pub fn resolve_repo_hook_gates(
+    cwd: &Path,
+    env: &EnvMap,
+    mode: &CacheMode,
+    derive: &dyn Fn(&RepoPaths, &EnvMap) -> HookGates,
+) -> Result<RepoContext> {
+    let paths = git::discover(cwd, env)?;
+    let config = match RepoConfig::load(&paths.toplevel) {
+        Err(crate::Error::ConfigNotFound(root)) => {
+            let derived = derive(&paths, env);
+            if derived.gates.is_empty() {
+                return Err(crate::Error::ConfigNotFound(root));
+            }
+            hook_config(derived)
+        }
+        other => other?,
+    };
+    build_context(paths, config, env, mode)
+}
+
+/// The implicit configuration with the hook gates in it; each gate belongs to
+/// its hook (`hooks`), so `verify` picks the `pre-commit` ones by default.
+#[must_use]
+pub fn hook_config(derived: HookGates) -> RepoConfig {
+    let mut config = RepoConfig::implicit();
+    for g in derived.gates {
+        let mut gate = g.gate;
+        gate.hooks = vec![g.hook];
+        config.gates.insert(g.name, gate);
+    }
+    config
+}
+
+/// [`resolve_repo_hook_gates`] then [`RepoContext::select`]. The gate is
+/// checked before the user config is read, like [`resolve`].
+///
+/// # Errors
+///
+/// See [`resolve_repo_hook_gates`] and [`RepoContext::select`].
+pub fn resolve_hook_gates(
+    cwd: &Path,
+    env: &EnvMap,
+    gate_name: &str,
+    mode: &CacheMode,
+    derive: &dyn Fn(&RepoPaths, &EnvMap) -> HookGates,
+) -> Result<Resolved> {
+    resolve_repo_hook_gates(cwd, env, mode, derive)?.select(gate_name)
+}
+
 fn build_context(
     paths: git::RepoPaths,
     config: RepoConfig,
@@ -156,11 +214,19 @@ impl RepoContext {
     /// plus `gate.env`; unless `keep_git_env`, the variables git sets for
     /// hooks (`GIT_DIR`, `GIT_INDEX_FILE`, ...) are removed too, like for a
     /// configured gate. A unit that edits or reads the index needs them.
+    /// `run_env` is applied last: what the process sees when it differs from
+    /// what the key hashes (`gate.env`), see the hook runner's `PATH`.
     ///
     /// # Errors
     ///
     /// When git cannot list its local environment variables.
-    pub fn select_unit(&self, name: &str, gate: Gate, keep_git_env: bool) -> Result<Resolved> {
+    pub fn select_unit(
+        &self,
+        name: &str,
+        gate: Gate,
+        keep_git_env: bool,
+        run_env: &EnvMap,
+    ) -> Result<Resolved> {
         let mut child: EnvMap = if keep_git_env {
             self.env
                 .iter()
@@ -171,6 +237,7 @@ impl RepoContext {
             git::child_env(&self.env)?
         };
         child.extend(gate.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        child.extend(run_env.iter().map(|(k, v)| (k.clone(), v.clone())));
         Ok(Resolved {
             env: self.env.clone(),
             paths: self.paths.clone(),

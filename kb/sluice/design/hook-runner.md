@@ -1,5 +1,5 @@
 ---
-title: "Design: the hooks entry point and the unit runner (waves H1, H2a, H2b)"
+title: "Design: the hooks entry point and the unit runner (waves H1, H2a, H2b, H3)"
 tags: [sluice, design, hooks, husky, lefthook, pre-commit]
 ---
 
@@ -280,3 +280,83 @@ without `stages` delegate), `pre-push` (first-usable-ref rule and from/to refs),
 stages, `fail_fast`, `meta`. Each is a delegation with its reason in `hooks status`; a later wave can
 lift one at a time with measurements.
 
+
+## H3: hook units as gates (`verify`, `gate_list`, `sluice run`, `sluice gate list`)
+
+ADR-0021 decision 7. Code: `hookentry/gates.rs` (derivation and sharing), `sluice-gate-core`
+`hookgate.rs` and `lookup::resolve_repo_hook_gates` / `hook_config` / `resolve_hook_gates`,
+the MCP server (`serve(env, HookGateSource)`), `gate_list.rs`, `run.rs::resolve`, `doctor.rs`,
+`session_start.rs` (`Place::Hooked`).
+
+### Layering
+
+The planning lives in the `sluice` binary (it owns the adapters); the MCP crate cannot depend on
+it, so `sluice_gate_mcp::serve` receives a `HookGateSource` (`Fn(&RepoPaths, &EnvMap) -> HookGates`)
+and `sluice-gate-core` defines the data (`HookGate {name, manager, hook, gate}`, `HookExclusion`,
+`HookGates`). A repository **without** `.sluice.toml` whose derivation yields at least one gate gets
+`RepoConfig::implicit()` plus those gates (`gate.hooks = [hook]`, so the existing default selection
+"the `pre-commit` gates, else all" applies); with none, `ConfigNotFound` as before (its message now
+also points to `sluice hooks status`). With a `.sluice.toml` nothing is derived: its gates stay as they
+are.
+
+### Decisions
+
+1. **Which hooks**: `pre-commit`, `pre-merge-commit`, `pre-push` (`gates::GATE_HOOKS`), planned by the very
+   `plan::plan` a hook run uses, with the hooks directory of `hooks status` (the repository's own
+   `core.hooksPath` without Sluice's value), whether or not the entry point is on. `commit-msg` and
+   `prepare-commit-msg` receive the message file: excluded with that reason. Delegated hooks
+   (`Plan::Delegate`) contribute nothing and are listed with the reason. Only `Kind::Check` units are
+   gates; a `Mutating` unit is excluded ("may change files or the index"): `verify` must never edit
+   the user's files or index outside a commit. A hook with a mutating unit still contributes its checks;
+   a check after a mutating one is keyed (at the hook) on the tree after the mutation, so a `verify` pass
+   hits only when the mutation was a no-op: a miss, never a wrong hit.
+2. **Names**: unchanged, `<manager>:<hook>#<index>` (`Unit::name`). A command-derived scheme was
+   considered and rejected: two units can share a command, commands are long and contain characters
+   gate names avoid, and H2's keys and tests already hash this name. The cost: editing a hook renumbers the
+   units after the edit and costs one miss.
+3. **Key equality**: a hook gate *is* `runner::gate_of(unit, key_env)`, the gate the hook runner builds;
+   `verify` resolves it through `RepoContext::select` and the hook through `select_unit`, both then
+   `lookup::lookup` / `derive_key_at` over the same `Gate` and the same working-tree snapshot. What differs
+   is the environment around the run, so the only environment-dependent key input needed care:
+   **`PATH`** (husky hashes `gate.env["PATH"]`). git puts its exec path (`git --exec-path`) first in
+   the `PATH` of every hook; `runner::key_env` removes exactly that leading entry from the string that is
+   hashed, while the process still runs with the full `PATH` (`select_unit` gained `run_env`, applied after
+   `gate.env`). Both sides use `key_env`. An agent whose `PATH` differs from the commit's `PATH` gets a
+   miss (documented limitation: the `PATH` is the toolchain proxy chosen in H2a).
+   lefthook (`key_inputs`: version, dump hash) and pre-commit (`key_inputs` version, `key_files` config)
+   keys have no environment input.
+4. **git env**: `verify` runs units without git's hook variables (`select` = `git::child_env`). Mutating
+   units are never gates; lefthook and pre-commit keep `git_env` in hook runs because they ask git for the
+   staged files; from `verify` there is no commit in progress, so they read the real index, which is the
+   same index except for `git commit -a`/`<paths>` (a temporary index): in that case the hook sees a different
+   tree and the key differs (a miss). Their `key_inputs` commands do not read git's variables.
+5. **Preconditions** are evaluated when the gates are derived (`precond::check` in the caller's
+   environment): lefthook's `StagedNotPartial` and pre-commit's `WorktreeEqualsIndex` depend on the staged set
+   (pre-commit would stash unstaged changes: it must not run from `verify`). When the condition does not
+   hold now, those units are excluded with the reason and are gates again once it holds (stage the change,
+   then verify). `gate_list` is therefore a snapshot of "what can be verified now".
+6. **Output**: `gate_list` (MCP) and `sluice gate list [--json]` print each gate (`source: hook`, `manager`,
+   `hooks`, `cmd`, `cache`) and `excluded` (`hook`, `unit`, `command`, `reason`); `verify` reports the units
+   like gates. `sluice gate list` is new (the lead's brief named it; it did not exist). `sluice run <gate>`
+   (the gate stays a required argument) accepts the names; to avoid planning every hook, the hook is read
+   from the name (`gates::hook_of_name`). `cache status` and the MCP `status` cache section still read
+   `.sluice.toml` only (not extended). `doctor`: `repo-config` is `ok` ("gates are derived from the
+   hooks (n units can be verified, m left out)") when there is no `.sluice.toml` and the entry point is
+   active; with the entry point off it still fails.
+7. **Agent integration**: `session_start::Place::Hooked` (no config, `hooks.json` in the common dir, found
+   without spawning git) gives the rules with a sentence about derived gates (`rules-hooks` in the log); the skill,
+   its reference, the plugin README and the MCP instructions say that such repositories verify through
+   Sluice, that a `verify` pass warms the commit's hook, and that an excluded unit is left to the hook.
+   No rule was loosened.
+
+### Sharing with `.sluice.toml` (exact or not at all)
+
+`gates::share(unit, config)` returns `Exact(gate name, gate)`, `Differs(gate, reason)` or `NoMatch`.
+`runner::identity` runs an `Exact` unit under the gate's name and definition (timeout zeroed: a hook has none;
+weight kept), so the gate's key equals the unit's. Conditions, all required: the unit is a check with
+no git variables and no `PATH` addition; exactly one gate has the same command text (trimmed, exact);
+the gate is cached, `mode = "gate"`, not path-scoped (its key would cover fewer files than the hook
+sees) and has no `env` (the hook would run with variables its repository does not set). Consequently
+husky units never share (the `PATH` addition), lefthook/pre-commit units never share (`git_env`; their
+command is `lefthook run ...`), plain-hook units can. `hooks status` prints `cache shared with gate X` or
+`same command as gate X, cache not shared: <reason>`.

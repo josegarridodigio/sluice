@@ -28,14 +28,16 @@ step. Run `/reload-plugins` (or restart) and check `claude mcp list`: the
 Nothing else has to be added to `CLAUDE.md` or `PATH`: when a session starts,
 the plugin installs the shell shims, puts them first in the session's `PATH`
 and gives the agent the rules. In a git repository without a `.sluice.toml`
-the agent offers to run `sluice init` and asks you first.
+the agent offers to run `sluice init` and asks you first; when the clone's git
+hooks already go through Sluice (`sluice hooks on`), the agent gets the rules
+and verifies the hooks' check units instead.
 
 ## What is inside
 
 | Piece | File | What it does |
 |---|---|---|
 | MCP server | `.mcp.json` | Registers `sluice mcp`. Tools: `verify`, `status`, `gate_list`, `logs`, `queue_enqueue`, `queue_status`, `queue_approve`, `queue_retry`, `queue_cancel`. From a plugin they are named `mcp__plugin_sluice_sluice__<tool>`; use that form in permission rules. |
-| Skill | `skills/sluice/SKILL.md` (+ `reference.md`) | Loaded when the agent is about to run tests, linters or type checks, commit, push or land a branch in a repository with a `.sluice.toml`. Teaches `verify`, reading its result (a gate `KILLED for lack of memory` is not retried unchanged; a gate waiting for memory is only queued), exit code 3 from hooks, and the merge-queue flow (verify, `queue_enqueue`, stop, never approve; what to do for each queue reason; `--trust-member-config` is human-only). |
+| Skill | `skills/sluice/SKILL.md` (+ `reference.md`) | Loaded when the agent is about to run tests, linters or type checks, commit, push or land a branch in a repository with a `.sluice.toml` or whose git hooks go through Sluice. Teaches `verify`, reading its result (a gate `KILLED for lack of memory` is not retried unchanged; a gate waiting for memory is only queued), exit code 3 from hooks, and the merge-queue flow (verify, `queue_enqueue`, stop, never approve; what to do for each queue reason; `--trust-member-config` is human-only). |
 | Session hook | `hooks/hooks.json`, `hooks/session-start.sh` | `SessionStart` (`startup`, `resume`, `clear`, `compact`). Runs `sluice agent session-start`: installs the shims in `~/.local/share/sluice/shims`, prepends that directory to the session's `PATH` through `CLAUDE_ENV_FILE` (once) and adds the rules as context (verify before commits, never retry a queued command without Sluice, never approve merge trains, and a gate killed for lack of memory is not retried unchanged). A missing or older `sluice` is reported to the agent, which asks you before installing or updating. Test: `hooks/test-session-start.sh`. |
 | Guard hook | `hooks/hooks.json`, `hooks/guard.sh` | `PreToolUse` on `Bash`. Runs `sluice guard`: rewrites gate commands to `sluice run <gate> -v` and heavy commands (builds, test runners) to `sluice exec -- ...` so they share the machine's budget, as `allow` or `ask` depending on your permission settings; denies `sluice queue approve` and raw gate commands it does not rewrite. Falls back to the 0.2.0 deny-only shell logic with an older `sluice`. |
 

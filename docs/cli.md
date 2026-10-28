@@ -15,6 +15,7 @@ authoritative.
 | [`sluice mcp`](#sluice-mcp) | Start the MCP stdio server (spawned by the coding agent). |
 | [`sluice daemon`](#sluice-daemon) | Start the per-user daemon, or stop or restart it. |
 | [`sluice status`](#sluice-status) | Show the daemon, budget, system pressure, jobs and totals. |
+| [`sluice gate list`](#sluice-gate) | List the gates of this repository: those of `.sluice.toml` or, without one, the check units of its git hooks. |
 | [`sluice cache`](#sluice-cache) | Inspect or clear cache markers for the current repository. |
 | [`sluice init`](#sluice-init) | Detect the stack and the existing hooks, write `.sluice.toml` and rewire the hooks. |
 | [`sluice hook print`](#sluice-hook) | Print the snippet for a hook manager. |
@@ -30,7 +31,7 @@ authoritative.
 <summary>Full help</summary>
 
 ```text
-Sluice runs named gates (tests, linters, type checks) under a global concurrency budget and caches results per git tree so each tree is verified once. Git hooks call `sluice run`; coding agents call the MCP server started by `sluice mcp` (tools verify, status, gate_list, logs and the merge-queue tools queue_enqueue, queue_status, queue_approve, queue_retry, queue_cancel).
+Sluice runs named gates (tests, linters, type checks) under a global concurrency budget and caches results per git tree so each tree is verified once. Git hooks call `sluice run` (or, with `sluice hooks on`, Sluice runs the hooks' commands itself); coding agents call the MCP server started by `sluice mcp` (tools verify, status, gate_list, logs and the merge-queue tools queue_enqueue, queue_status, queue_approve, queue_retry, queue_cancel).
 
 On a cache miss `sluice run` hands the gate to the per-user daemon (`sluice daemon`), starting it on demand; when the daemon cannot be reached or started the gate runs in-process. `sluice status` shows the queue. `sluice exec -- <cmd>` runs any other heavy command under the same budget, without cache.
 
@@ -60,6 +61,7 @@ Commands:
   daemon  Start the per-user daemon (detached unless --foreground), or stop it
   doctor  Check the installation (git, PSI, daemon, lease, configs, hooks) and optionally collect a redacted diagnostics bundle for bug reports
   status  Show the daemon, budget, system pressure (PSI), running and queued jobs, and totals
+  gate    List the gates of the current repository
   cache   Inspect or clear cache markers for the current repository
   init    Write a `.sluice.toml` that fits the repository and wire its git hooks
   hook    Print hook integration snippets
@@ -455,6 +457,24 @@ Options:
 
 </details>
 
+### `sluice gate`
+
+```sh
+sluice gate list          # name, command, weight, timeout, hooks, cache, origin
+sluice gate list --json   # {schema, repository, gates[], excluded[]}
+```
+
+Lists the gates of the repository. With a `.sluice.toml` they are its gates,
+unchanged. Without one, they are the **check units of its git hooks**
+([ADR-0021](../kb/sluice/design/adr/0021-sluice-runs-the-repository-hooks.md),
+[Git hooks](hooks.md#verify-and-gates-without-sluicetoml)), named
+`<manager>:<hook>#<n>` (`husky:pre-commit#2`), followed by `not gates:`: the hooks
+and units that cannot be verified, each with the reason (a hook Sluice delegates, a
+unit that may edit files, a unit that needs what a commit stages). `sluice run
+<gate>` takes those names, and the MCP tools `verify` and `gate_list` use the same
+gates. A repository with neither a `.sluice.toml` nor such a unit still gets the
+"no .sluice.toml found" error.
+
 ### `sluice cache`
 
 Inspect or clear cache markers for the current repository.
@@ -718,6 +738,12 @@ sluice hooks status    # on or off, directory, repository hooks, manager, effect
 sluice hooks status --json
 sluice hooks off       # remove the include and the managed files
 ```
+
+In a repository without `.sluice.toml` the check units of the hooks are also the
+gates of `sluice run`, `sluice gate list` and the MCP tools, with the same cache
+entries as the hook runs ([Git hooks](hooks.md#verify-and-gates-without-sluicetoml)).
+`hooks status --json` names each unit (`name`) and, when `.sluice.toml` has a gate with the
+same command, says whether the unit shares that gate's cache entry (`shares`).
 
 `on` creates `<git common dir>/sluice/hooks/` with one script for each hook the
 repository has (and none for the others) and sets `core.hooksPath` to it through a file included by the last
