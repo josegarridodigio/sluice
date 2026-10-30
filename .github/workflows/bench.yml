@@ -1,0 +1,51 @@
+name: Bench
+
+# The README chart: N agents committing in parallel, without and with Sluice
+# (scripts/bench-agents.sh). On demand only: it takes most of an hour, and its
+# result is reviewed by a human before docs/assets/bench-*.svg is committed.
+on:
+  workflow_dispatch:
+    inputs:
+      agents:
+        description: "Agent counts, space-separated"
+        default: "1 2 4 8"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  agents:
+    name: agents in parallel, without and with Sluice
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # Worktrees and their target/ copies need more room than the root disk
+      # leaves; the runner's temporary disk is mounted at /mnt.
+      - name: Prepare the bench directory
+        run: |
+          sudo mkdir -p /mnt/bench
+          sudo chown "$(id -u):$(id -g)" /mnt/bench
+          nproc
+          free -g
+          df -h / /mnt
+      - name: Run the benchmark
+        env:
+          SLUICE_BENCH_DIR: /mnt/bench
+          AGENTS: ${{ inputs.agents }}
+        run: |
+          # shellcheck disable=SC2086
+          scripts/bench-agents.sh "$RUNNER_TEMP/bench-agents.csv" $AGENTS
+          cat "$RUNNER_TEMP/bench-agents.csv"
+      - name: Draw the chart
+        run: |
+          mkdir -p out
+          cp "$RUNNER_TEMP/bench-agents.csv" out/
+          python3 -I scripts/bench-chart.py out/bench-agents.csv out/bench-agents
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-agents
+          path: out/
