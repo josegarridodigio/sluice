@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Fixed
+
+## [0.9.0] - 2026-10-30
+
+### Added
+
 - **`status` says where the memory reserve and an estimate come from** (ADR-0026). The
   `memory:` line marks a reserve raised by the observed growth outside gates
   (`reserve_basis`), a running job that started alone beyond its estimate is flagged
@@ -32,8 +40,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`KILLED for lack of memory` advice**: the message names the memory used outside gates,
   says when other arguments did not lower the gate's memory, and tells the agent to rerun
   unchanged once memory is free or to tell the human (the agent rules and the skill agree).
-
-### Fixed
 
 ## [0.8.0] - 2026-10-28
 
@@ -723,7 +729,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PSI thresholds must be percentages (rejected at config load otherwise).
 - Findings of the Phase 1, 2, 3 and 4 reconciliation passes.
 
-[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/josegarridodigio/sluice/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/josegarridodigio/sluice/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/josegarridodigio/sluice/compare/v0.6.3...v0.7.0
 [0.6.3]: https://github.com/josegarridodigio/sluice/compare/v0.6.2...v0.6.3
