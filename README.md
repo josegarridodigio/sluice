@@ -33,6 +33,17 @@ shell tool has a timeout, so a hook that waits in a queue inside `git commit`
 makes the agent move on without the result. Sluice bounds the concurrency,
 removes the redundancy and never leaves an agent hanging.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/bench-agents-dark.svg">
+  <img alt="Time until every agent has committed: 1 agent 27 s without Sluice and 28 s with it; 2 agents 49 s and 40 s; 4 agents 103 s and 72 s; 8 agents 213 s and 119 s." src="docs/assets/bench-agents-light.svg">
+</picture>
+
+With one agent there is nothing to coordinate and Sluice costs about a second.
+From two agents on it removes the runs that verify a tree already verified and
+keeps the rest from fighting over the CPUs: 44 % less time with eight agents on
+a 4-CPU runner. Method, raw data and how to run it:
+[Agents in parallel](docs/validation.md#agents-in-parallel-ci).
+
 ## Features
 
 - **Per-tree cache.** The key is the exact content of the working tree plus the
@@ -42,7 +53,12 @@ removes the redundancy and never leaves an agent hanging.
   weighted budget; identical simultaneous requests share one run.
 - **PSI and memory admission.** New work is held while the machine is under real
   pressure (Linux PSI), and a gate starts only when the memory it is expected
-  to use (learned from its earlier runs) fits what is free.
+  to use fits what is free. The expectation is learned from the gate's earlier
+  runs, kept when an agent changes its arguments, and the reserve grows with
+  what the rest of the machine uses while heavy gates run.
+- **Backfilling and stalled jobs.** Small gates start beside a heavy one that
+  waits for room when they cannot delay it; a gate that stops making progress
+  is reported (`STALLED`), never killed.
 - **Git hooks** for Husky, lefthook, pre-commit/prek and plain `.githooks/`,
   failing fast inside agents instead of hanging.
 - **Hooks entry point (optional).** `sluice hooks on` makes Sluice the hooks
@@ -60,7 +76,8 @@ removes the redundancy and never leaves an agent hanging.
   cached pass.
 - **Local merge queue.** Agents enqueue committed branches; a human approves
   one atomic landing. The train's worktree can be prepared (`[queue] prepare`,
-  for example a dependency install) before its gates run.
+  for example a dependency install) before its gates run, and on a protected
+  target it lands through a pull request (`[queue] land = "pull-request"`).
 - **`sluice doctor` and `sluice update`** check the installation (with a
   redacted bug-report bundle) and upgrade in place.
 

@@ -80,3 +80,49 @@ little contention to remove; with a suite measured in minutes, or with more
 agents on fewer cores, the coalescing share is what grows. The commits are
 synthetic and agents never think between them. Raw outputs and caveats:
 `kb/sluice/changes/phase-5-validation.md`.
+
+## Agents in parallel (CI)
+
+The chart in the README. `scripts/bench-agents.sh` simulates N agents (1, 2,
+4 and 8), each in its own git worktree of this repository with its own
+`target/` (a copy of one warmed directory, as an agent's worktree has). Every
+agent makes two commits, all agents at the same time, and each commit runs the
+repository's pre-commit gates (`fmt`, `clippy`):
+
+- the first commit has the same content in every worktree (all agents start
+  from the same tree);
+- the second commit is the agent's own change;
+- both change a source file, so `clippy` really recompiles.
+
+Each agent count runs twice: without Sluice (the hook runs the gate commands
+directly) and with Sluice (the hook runs `sluice run --hook pre-commit
+<gate>`, private daemon, default budget). The order of the two alternates
+between agent counts so a warm page cache never favours the same one, and each
+starts from the same warmed `target/` and a fresh daemon state. The measure is
+the wall time until the last agent finished its last commit.
+
+It runs on demand in the `Bench` workflow (`.github/workflows/bench.yml`) on a
+GitHub-hosted runner, three rounds; `scripts/bench-chart.py` draws the medians.
+On a workstation the scenario without Sluice deliberately overloads the
+machine, so run it on a CI runner or a VM.
+
+### Result
+
+Runner: GitHub-hosted `ubuntu-latest`, 4 CPUs, 16 GiB. Three rounds
+(2026-10-30, release 0.9.0); raw data in
+[`docs/assets/bench-agents.csv`](assets/bench-agents.csv).
+
+| Agents | Without Sluice (s) | With Sluice (s) | Change | Gate runs with Sluice |
+|---|---|---|---|---|
+| 1 | 27 (27, 28, 27) | 28 (28, 29, 27) | +1 % | 4 of 4 |
+| 2 | 49 (49, 53, 48) | 40 (40, 42, 40) | −18 % | 6 of 8 |
+| 4 | 103 (103, 106, 100) | 72 (72, 73, 71) | −30 % | 10 of 16 |
+| 8 | 213 (213, 207, 214) | 119 (119, 116, 120) | −44 % | 18 of 32 |
+
+Reading it honestly: one agent has nothing to coordinate, so Sluice only adds
+its own overhead (about a second). From two agents on, two effects add up: the
+shared first commit is verified once and the other agents are coalesced onto
+that run (the runs column), and the commits that do differ wait in the queue
+instead of compiling at the same time on four CPUs. The gates here are short
+(a `clippy` of about 10 s); a test suite measured in minutes widens the gap,
+and agents that think between commits narrow it.

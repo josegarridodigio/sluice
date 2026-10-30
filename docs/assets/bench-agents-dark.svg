@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="380" viewBox="0 0 720 380" role="img" aria-labelledby="t d" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="t">Time until every agent has committed, without and with Sluice</title>
+<desc id="d">1 agent(s): 27 s without Sluice, 28 s with Sluice; 2 agent(s): 49 s without Sluice, 40 s with Sluice; 4 agent(s): 103 s without Sluice, 72 s with Sluice; 8 agent(s): 213 s without Sluice, 119 s with Sluice</desc>
+<text x="56" y="28" font-size="17" font-weight="600" fill="#f0f6fc">Time until every agent has committed</text>
+<text x="56" y="50" font-size="13" fill="#9198a1">Each agent makes 2 commits in its own worktree, running this repository's pre-commit gates (fmt, clippy).</text>
+<text x="56" y="68" font-size="13" fill="#9198a1">GitHub-hosted runner, 4 CPUs, 16 GiB of RAM; median of the runs. Lower is better.</text>
+<rect x="56" y="86" width="12" height="12" rx="2" fill="#3987e5"/>
+<text x="74" y="96.5" font-size="13" fill="#f0f6fc">With Sluice</text>
+<rect x="179.4" y="86" width="12" height="12" rx="2" fill="#d95926"/>
+<text x="197.4" y="96.5" font-size="13" fill="#f0f6fc">Without Sluice</text>
+<line x1="56" x2="696" y1="332.0" y2="332.0" stroke="#3d444d" stroke-width="1"/>
+<text x="48" y="336.0" font-size="12" text-anchor="end" fill="#9198a1">0</text>
+<line x1="56" x2="696" y1="280.0" y2="280.0" stroke="#3d444d" stroke-width="1"/>
+<text x="48" y="284.0" font-size="12" text-anchor="end" fill="#9198a1">60 s</text>
+<line x1="56" x2="696" y1="228.0" y2="228.0" stroke="#3d444d" stroke-width="1"/>
+<text x="48" y="232.0" font-size="12" text-anchor="end" fill="#9198a1">120 s</text>
+<line x1="56" x2="696" y1="176.0" y2="176.0" stroke="#3d444d" stroke-width="1"/>
+<text x="48" y="180.0" font-size="12" text-anchor="end" fill="#9198a1">180 s</text>
+<line x1="56" x2="696" y1="124.0" y2="124.0" stroke="#3d444d" stroke-width="1"/>
+<text x="48" y="128.0" font-size="12" text-anchor="end" fill="#9198a1">240 s</text>
+<path d="M111.0,332 V312.04706666666664 Q111.0,308.04706666666664 115.0,308.04706666666664 H131.0 Q135.0,308.04706666666664 135.0,312.04706666666664 V332 Z" fill="#3987e5"/>
+<text x="123.0" y="302.0" font-size="12" text-anchor="middle" fill="#f0f6fc">28</text>
+<path d="M137.0,332 V312.314 Q137.0,308.314 141.0,308.314 H157.0 Q161.0,308.314 161.0,312.314 V332 Z" fill="#d95926"/>
+<text x="149.0" y="302.3" font-size="12" text-anchor="middle" fill="#f0f6fc">27</text>
+<text x="136.0" y="282.0" font-size="13" font-weight="600" text-anchor="middle" fill="#f0f6fc">+1 %</text>
+<text x="136.0" y="354" font-size="13" text-anchor="middle" fill="#f0f6fc">1 agent</text>
+<path d="M271.0,332 V301.0135333333333 Q271.0,297.0135333333333 275.0,297.0135333333333 H291.0 Q295.0,297.0135333333333 295.0,301.0135333333333 V332 Z" fill="#3987e5"/>
+<text x="283.0" y="291.0" font-size="12" text-anchor="middle" fill="#f0f6fc">40</text>
+<path d="M297.0,332 V293.4839333333333 Q297.0,289.4839333333333 301.0,289.4839333333333 H317.0 Q321.0,289.4839333333333 321.0,293.4839333333333 V332 Z" fill="#d95926"/>
+<text x="309.0" y="283.5" font-size="12" text-anchor="middle" fill="#f0f6fc">49</text>
+<text x="296.0" y="263.5" font-size="13" font-weight="600" text-anchor="middle" fill="#f0f6fc">−18 %</text>
+<text x="296.0" y="354" font-size="13" text-anchor="middle" fill="#f0f6fc">2 agents</text>
+<path d="M431.0,332 V273.8244666666667 Q431.0,269.8244666666667 435.0,269.8244666666667 H451.0 Q455.0,269.8244666666667 455.0,273.8244666666667 V332 Z" fill="#3987e5"/>
+<text x="443.0" y="263.8" font-size="12" text-anchor="middle" fill="#f0f6fc">72</text>
+<path d="M457.0,332 V246.98293333333334 Q457.0,242.98293333333334 461.0,242.98293333333334 H477.0 Q481.0,242.98293333333334 481.0,246.98293333333334 V332 Z" fill="#d95926"/>
+<text x="469.0" y="237.0" font-size="12" text-anchor="middle" fill="#f0f6fc">103</text>
+<text x="456.0" y="217.0" font-size="13" font-weight="600" text-anchor="middle" fill="#f0f6fc">−30 %</text>
+<text x="456.0" y="354" font-size="13" text-anchor="middle" fill="#f0f6fc">4 agents</text>
+<path d="M591.0,332 V232.78866666666664 Q591.0,228.78866666666664 595.0,228.78866666666664 H611.0 Q615.0,228.78866666666664 615.0,232.78866666666664 V332 Z" fill="#3987e5"/>
+<text x="603.0" y="222.8" font-size="12" text-anchor="middle" fill="#f0f6fc">119</text>
+<path d="M617.0,332 V151.38093333333333 Q617.0,147.38093333333333 621.0,147.38093333333333 H637.0 Q641.0,147.38093333333333 641.0,151.38093333333333 V332 Z" fill="#d95926"/>
+<text x="629.0" y="141.4" font-size="12" text-anchor="middle" fill="#f0f6fc">213</text>
+<text x="616.0" y="121.4" font-size="13" font-weight="600" text-anchor="middle" fill="#f0f6fc">−44 %</text>
+<text x="616.0" y="354" font-size="13" text-anchor="middle" fill="#f0f6fc">8 agents</text>
+</svg>
