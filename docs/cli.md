@@ -431,7 +431,7 @@ running:  1
 queued:   1
   #1   e2e             app                  weight 4  waiting     12.0s  (budget: memory)  expected 3m  mem ~9.0 GiB
 containment: full
-gates memory policy: systemd-oomd at 30% for 3s
+gates memory policy: systemd-oomd at 30% for 8s
 ```
 
 `memory:` is what admission sees (`MemAvailable`, the reserve, and what the
@@ -1165,7 +1165,7 @@ why. None of them fails the run.
 [warn] weights        'test' needs about 9 but declares weight = 4: raise the number or use weight = "auto" (...)
 [ok  ] init           this repository has no .sluice.toml; run 'sluice init --dry-run' to see what Sluice would propose
 [ok  ] containment    full
-[ok  ] memory-policy  memory policy on: systemd-oomd acts on the agents scope at 30% memory pressure for 5s (derived from the system policy on user@UID.service, 50% / 20s; systemd 259, systemd-oomd active)
+[ok  ] memory-policy  memory policy on: systemd-oomd acts on the agents scope at 30% memory pressure for 15s (derived from the system policy on user@UID.service, 50% / 20s; systemd 259, systemd-oomd active)
 [ok  ] session        this shell is in tools (s-7f3a9c/tools); agent (pid 4242) is in ui
 ```
 

@@ -29,9 +29,9 @@ pub const PEAK_WINDOW: usize = 5;
 /// Margin over the largest sampled working set, as a divisor (a fifth, 20 %):
 /// the sampler can miss a sub-second spike.
 const MARGIN_DIVISOR: u64 = 5;
-/// Extra margin of a run killed for lack of memory, as a divisor (a quarter,
-/// 25 %): it stopped early, so its peak is only a lower bound of what the gate
-/// needs.
+/// Margin of a run killed for lack of memory, as a divisor (a quarter,
+/// 25 %), instead of [`MARGIN_DIVISOR`]: it stopped early, so its peak is only
+/// a lower bound of what the gate needs.
 const KILLED_MARGIN_DIVISOR: u64 = 4;
 
 /// `MemTotal` and `MemAvailable` of the machine, bytes.
@@ -122,17 +122,87 @@ pub fn cap_by_cgroups(info: MemInfo, proc_root: &Path, mount: &Path, extra: &[&P
         })
 }
 
-/// The facts of one admission pass: the machine's memory and the reserve of
-/// `[admission] memory_reserve`. `None` (the rule is off for the pass) when
-/// memory-aware admission is disabled or `meminfo` is unreadable.
+/// The facts of one admission pass: the machine's memory and the reserve,
+/// the larger of `[admission] memory_reserve` and the observed growth outside
+/// gates ([`observed_reserve`], ADR-0026). `None` (the rule is off for the
+/// pass) when memory-aware admission is disabled or `meminfo` is unreadable.
 #[must_use]
-pub fn facts(cfg: &AdmissionConfig, info: Option<MemInfo>) -> Option<MemoryFacts> {
+pub fn facts(
+    cfg: &AdmissionConfig,
+    info: Option<MemInfo>,
+    observed: Option<u64>,
+) -> Option<MemoryFacts> {
     let info = info.filter(|_| cfg.memory_aware)?;
+    let configured = cfg.memory_reserve_bytes(info.total_bytes);
+    let observed = observed
+        .map(|o| o.min(info.total_bytes / RESERVE_CAP_DIVISOR))
+        .filter(|&o| o > configured);
     Some(MemoryFacts {
         available_bytes: info.available_bytes,
         total_bytes: info.total_bytes,
-        reserve_bytes: cfg.memory_reserve_bytes(info.total_bytes),
+        reserve_bytes: observed.unwrap_or(configured),
+        reserve_observed: observed.is_some(),
     })
+}
+
+/// The observed reserve can take at most a quarter of `MemTotal`, so
+/// admission never freezes (ADR-0026).
+const RESERVE_CAP_DIVISOR: u64 = 4;
+
+/// Growth samples the observed reserve looks at (the newest ones).
+pub const GROWTH_WINDOW: usize = 20;
+
+/// Fewer samples than this give no observed reserve.
+const GROWTH_MIN_SAMPLES: usize = 5;
+
+/// A job whose own peak reached this many bytes records the growth outside
+/// gates during its run (a light job runs too briefly to say anything).
+pub const HEAVY_JOB_BYTES: u64 = 1 << 30;
+
+/// The observed reserve (ADR-0026): the P90 of how much the memory outside
+/// gate jobs grew during the newest [`GROWTH_WINDOW`] heavy jobs, `None`
+/// with fewer than five such jobs. `growths` in any order.
+#[must_use]
+pub fn observed_reserve(growths: &[u64]) -> Option<u64> {
+    if growths.len() < GROWTH_MIN_SAMPLES {
+        return None;
+    }
+    let mut v: Vec<u64> = growths.iter().take(GROWTH_WINDOW).copied().collect();
+    v.sort_unstable();
+    // Nearest rank: ceil(0.9 n), 1-based.
+    let rank = (v.len() * 9).div_ceil(10);
+    v.get(rank.saturating_sub(1)).copied()
+}
+
+/// Memory used outside gate jobs: `MemTotal - MemAvailable - Σ working sets
+/// of the running jobs`, bytes (ADR-0026).
+#[must_use]
+pub fn outside_gates(info: MemInfo, gates_bytes: u64) -> u64 {
+    info.total_bytes
+        .saturating_sub(info.available_bytes)
+        .saturating_sub(gates_bytes)
+}
+
+/// How much the memory outside gates grew during one job: its first reading
+/// and the largest since.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutsideTrack {
+    start: Option<u64>,
+    max: u64,
+}
+
+impl OutsideTrack {
+    /// Adds one reading, bytes.
+    pub fn observe(&mut self, bytes: u64) {
+        self.start.get_or_insert(bytes);
+        self.max = self.max.max(bytes);
+    }
+
+    /// Largest reading minus the first; `None` before any reading.
+    #[must_use]
+    pub fn growth(&self) -> Option<u64> {
+        self.start.map(|s| self.max.saturating_sub(s))
+    }
 }
 
 /// One reading of a job's memory.
@@ -198,25 +268,27 @@ pub struct PeakSample {
     pub killed: bool,
 }
 
-/// The expected peak of a gate: the largest working set of its newest
-/// [`PEAK_WINDOW`] runs (a killed run counts 25 % more: it stopped early),
-/// plus a 20 % margin. A maximum, not an average, so one sample is evidence
-/// enough; `None` without samples. `samples` are oldest first.
+/// The expected peak of a gate over its newest [`PEAK_WINDOW`] runs: the
+/// largest finished working set plus a 20 % margin, or the largest killed
+/// one plus 25 % (it stopped early), whichever is larger. Each margin is
+/// applied once (ADR-0026: compounding them made a killed run count 1.5 x).
+/// A maximum, not an average, so one sample is evidence enough; `None`
+/// without samples. `samples` are oldest first.
 #[must_use]
 pub fn expected_peak(samples: &[PeakSample]) -> Option<u64> {
     let window = &samples[samples.len().saturating_sub(PEAK_WINDOW)..];
-    let peak = window
+    window
         .iter()
         .map(|s| {
-            if s.killed {
-                s.anon_peak_bytes
-                    .saturating_add(s.anon_peak_bytes / KILLED_MARGIN_DIVISOR)
+            let divisor = if s.killed {
+                KILLED_MARGIN_DIVISOR
             } else {
-                s.anon_peak_bytes
-            }
+                MARGIN_DIVISOR
+            };
+            s.anon_peak_bytes
+                .saturating_add(s.anon_peak_bytes / divisor)
         })
-        .max()?;
-    Some(peak.saturating_add(peak / MARGIN_DIVISOR))
+        .max()
 }
 
 /// Recent finished runs of each key (newest last, at most [`PEAK_WINDOW`])
@@ -276,6 +348,16 @@ impl PeakCache {
     pub fn expected(&self, key: &LearnKey) -> Option<u64> {
         let runs = self.runs.get(key)?;
         expected_peak(&runs.iter().copied().collect::<Vec<_>>())
+    }
+
+    /// The largest expected peak of the other keys of `key`'s repository
+    /// and gate (other extra arguments; ADR-0026).
+    #[must_use]
+    pub fn family_expected(&self, key: &LearnKey) -> Option<u64> {
+        self.expectations()
+            .filter(|(k, _)| *k != key && crate::scheduler::same_family(k, key))
+            .map(|(_, bytes)| bytes)
+            .max()
     }
 
     /// Every key with its expected peak.
@@ -385,22 +467,71 @@ mod tests {
             available_bytes: 22 * GIB,
         });
         let cfg = AdmissionConfig::default();
-        let f = facts(&cfg, info).unwrap();
+        let f = facts(&cfg, info, None).unwrap();
         assert_eq!(
             (f.available_bytes, f.total_bytes, f.reserve_bytes),
             (22 * GIB, 30 * GIB, 3 * GIB)
         );
+        assert!(!f.reserve_observed);
         let off = AdmissionConfig {
             memory_aware: false,
             ..AdmissionConfig::default()
         };
-        assert_eq!(facts(&off, info), None, "switch off");
-        assert_eq!(facts(&cfg, None), None, "meminfo unreadable");
+        assert_eq!(facts(&off, info, None), None, "switch off");
+        assert_eq!(facts(&cfg, None, None), None, "meminfo unreadable");
         let fixed = AdmissionConfig {
             memory_reserve: "4G".into(),
             ..AdmissionConfig::default()
         };
-        assert_eq!(facts(&fixed, info).unwrap().reserve_bytes, 4 * GIB);
+        assert_eq!(facts(&fixed, info, None).unwrap().reserve_bytes, 4 * GIB);
+    }
+
+    #[test]
+    fn an_observed_growth_above_the_reserve_raises_it_up_to_a_quarter() {
+        let info = Some(MemInfo {
+            total_bytes: 30 * GIB,
+            available_bytes: 22 * GIB,
+        });
+        let cfg = AdmissionConfig::default();
+        // Below the configured 10 %: the configured reserve stays.
+        let f = facts(&cfg, info, Some(GIB)).unwrap();
+        assert_eq!((f.reserve_bytes, f.reserve_observed), (3 * GIB, false));
+        // Above it: the observed growth.
+        let f = facts(&cfg, info, Some(6 * GIB)).unwrap();
+        assert_eq!((f.reserve_bytes, f.reserve_observed), (6 * GIB, true));
+        // Never more than a quarter of the machine.
+        let f = facts(&cfg, info, Some(20 * GIB)).unwrap();
+        assert_eq!(f.reserve_bytes, 30 * GIB / 4);
+    }
+
+    #[test]
+    fn the_observed_reserve_is_the_p90_of_at_least_five_heavy_jobs() {
+        assert_eq!(observed_reserve(&[]), None);
+        assert_eq!(observed_reserve(&[GIB; 4]), None, "too few jobs");
+        let g: Vec<u64> = (1..=10).map(|n| n * GIB).collect();
+        assert_eq!(observed_reserve(&g), Some(9 * GIB));
+        // Only the newest twenty count (newest first).
+        let mut g = vec![GIB; 20];
+        g.extend([100 * GIB; 5]);
+        assert_eq!(observed_reserve(&g), Some(GIB));
+    }
+
+    #[test]
+    fn outside_memory_and_its_growth_during_a_job() {
+        let info = MemInfo {
+            total_bytes: 30 * GIB,
+            available_bytes: 10 * GIB,
+        };
+        assert_eq!(outside_gates(info, 12 * GIB), 8 * GIB);
+        assert_eq!(outside_gates(info, 40 * GIB), 0);
+        let mut t = OutsideTrack::default();
+        assert_eq!(t.growth(), None);
+        t.observe(8 * GIB);
+        t.observe(6 * GIB);
+        assert_eq!(t.growth(), Some(0), "it shrank");
+        t.observe(13 * GIB);
+        t.observe(9 * GIB);
+        assert_eq!(t.growth(), Some(5 * GIB), "largest minus first");
     }
 
     #[test]
@@ -462,8 +593,21 @@ mod tests {
             expected_peak(&[sample(2, false), sample(10, false), sample(3, false)]),
             Some(12 * GIB)
         );
-        // A killed run counts 25 % more: 8 * 1.25 * 1.2 = 12.
-        assert_eq!(expected_peak(&[sample(8, true)]), Some(12 * GIB));
+        // A killed run takes its own 25 % instead of the 20 %, never both
+        // (ADR-0026): 8 * 1.25 = 10, not 12.
+        assert_eq!(expected_peak(&[sample(8, true)]), Some(10 * GIB));
+        // Recorded case: kills at 12.7 GiB and passes up to 13.3 GiB give
+        // about 16 GiB (it was 19.05 GiB with the margins compounded).
+        let mib = |m: u64| PeakSample {
+            anon_peak_bytes: m << 20,
+            killed: false,
+        };
+        let killed = PeakSample {
+            killed: true,
+            ..mib(13_005)
+        };
+        let e = expected_peak(&[killed, mib(13_619)]).unwrap();
+        assert!((15 * GIB + GIB / 2..16 * GIB + GIB / 2).contains(&e), "{e}");
         // Only the newest five count: the 100 GiB run fell out.
         let mut runs = vec![sample(100, false)];
         runs.extend((0..5).map(|_| sample(5, false)));

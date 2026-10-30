@@ -37,7 +37,7 @@ pub struct Migration {
 pub const CONTAINMENT_TABLE: &str = "containment_schema";
 
 /// `containment_schema` version this build reads and writes.
-pub const CONTAINMENT_SCHEMA_VERSION: u32 = 3;
+pub const CONTAINMENT_SCHEMA_VERSION: u32 = 4;
 
 /// Migration 0 -> 1 of the containment group: the `interventions` table
 /// (kills by the kernel OOM killer or `systemd-oomd` on Sluice's cgroups).
@@ -76,6 +76,17 @@ CREATE INDEX gate_memory_bound_key
   ON gate_memory_bound(repo, gate, cmd_hash, finished_at);
 ";
 
+/// Migration 3 -> 4 of the containment group (ADR-0026): `outside_growth`,
+/// how much the memory used outside gate jobs grew while each heavy job ran,
+/// for the observed reserve of memory admission. A table of its own: older
+/// binaries never read it.
+const CONTAINMENT_4: &str = "
+CREATE TABLE outside_growth (
+  job_id TEXT NOT NULL, finished_at INTEGER NOT NULL,
+  gate_peak_bytes INTEGER NOT NULL, growth_bytes INTEGER NOT NULL);
+CREATE INDEX outside_growth_time ON outside_growth(finished_at);
+";
+
 /// The `containment_schema` migrations, in order.
 pub const CONTAINMENT_MIGRATIONS: &[Migration] = &[
     Migration {
@@ -92,6 +103,11 @@ pub const CONTAINMENT_MIGRATIONS: &[Migration] = &[
         version: 3,
         name: "gate memory lower bounds",
         sql: CONTAINMENT_3,
+    },
+    Migration {
+        version: 4,
+        name: "memory growth outside gates",
+        sql: CONTAINMENT_4,
     },
 ];
 

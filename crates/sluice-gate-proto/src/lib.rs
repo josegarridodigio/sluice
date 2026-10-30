@@ -949,6 +949,7 @@ fn expected_text(bytes: u64, learned: Option<bool>, basis: Option<&str>) -> Stri
     let guess = if learned == Some(false) { "~" } else { "" };
     let how = match basis {
         Some("lower-bound") => " (lower bound)",
+        Some("family") => " (same gate, other arguments)",
         Some("guessed") => " (guessed)",
         _ => "",
     };
@@ -960,8 +961,13 @@ impl MemoryBudget {
     /// `sluice status` and the MCP `status` tool.
     #[must_use]
     pub fn status_line(&self) -> String {
+        let observed = if self.reserve_basis.as_deref() == Some("observed") {
+            " (observed growth outside gates)"
+        } else {
+            ""
+        };
         format!(
-            "memory:   {} available, {} reserved, {} still to grow in running jobs",
+            "memory:   {} available, {} reserved{observed}, {} still to grow in running jobs",
             gib_text(self.available_bytes),
             gib_text(self.reserve_bytes),
             gib_text(self.headroom_bytes)
@@ -977,13 +983,18 @@ impl RunningJob {
     pub fn memory_text(&self) -> String {
         match (self.memory_bytes, self.memory_expected_bytes) {
             (Some(now), Some(expected)) => format!(
-                "  mem {}/{}",
+                "  mem {}/{}{}",
                 gib_text(now),
                 expected_text(
                     expected,
                     self.memory_expected_learned,
                     self.memory_expected_basis.as_deref()
-                )
+                ),
+                if self.memory_beyond_estimate == Some(true) {
+                    " (started alone beyond its estimate)"
+                } else {
+                    ""
+                }
             ),
             (Some(now), None) => format!("  mem {}", gib_text(now)),
             _ => String::new(),
@@ -1140,9 +1151,14 @@ pub struct MemoryBudget {
     /// `MemAvailable` at the last admission pass, bytes (swap is never
     /// counted).
     pub available_bytes: u64,
-    /// Memory kept for everything that is not a gate (`[admission]
-    /// memory_reserve`), bytes.
+    /// Memory kept for everything that is not a gate, bytes: `[admission]
+    /// memory_reserve`, or more when the memory outside gates was seen to
+    /// grow by more while heavy jobs ran (ADR-0026).
     pub reserve_bytes: u64,
+    /// Where `reserve_bytes` comes from: `configured` or `observed`. Absent
+    /// from older daemons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reserve_basis: Option<String>,
     /// What the running jobs are still expected to grow by (expected peak
     /// minus current, summed), bytes.
     pub headroom_bytes: u64,
@@ -1222,11 +1238,17 @@ pub struct RunningJob {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_expected_learned: Option<bool>,
     /// Where `memory_expected_bytes` comes from: `learned` (earlier passing
-    /// or memory-killed runs), `lower-bound` (earlier failed or timed-out
-    /// runs, which only show the peak was at least that) or `guessed` (from
-    /// the weight and the gates of the machine). Absent from older daemons.
+    /// or memory-killed runs), `family` (another command of the same gate),
+    /// `lower-bound` (earlier failed or timed-out runs, which only show the
+    /// peak was at least that) or `guessed` (from the weight and the gates of
+    /// the machine). Absent from older daemons.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_expected_basis: Option<String>,
+    /// `true` when the job started alone on an idle machine although its
+    /// expected peak did not fit the free memory (ADR-0026). Absent
+    /// otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_beyond_estimate: Option<bool>,
     /// Present while the job is stalled (ADR-0024): no progress for the
     /// whole quiet window. Sluice only reports it; the job is never ended.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1880,6 +1902,7 @@ mod tests {
                     available_bytes: 22 << 30,
                     reserve_bytes: 3 << 30,
                     headroom_bytes: 16 << 30,
+                    ..MemoryBudget::default()
                 }),
                 ..BudgetInfo::default()
             },

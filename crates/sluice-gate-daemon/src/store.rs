@@ -135,6 +135,8 @@ pub struct Store {
     memory: bool,
     /// The file has the `gate_memory_bound` table (`containment_schema` 3).
     bounds: bool,
+    /// The file has the `outside_growth` table (`containment_schema` 4).
+    growth: bool,
 }
 
 /// Scheduling facts written when a job is queued (`sched_schema` 1).
@@ -233,6 +235,24 @@ pub struct GateMemory {
     pub peak_bytes: Option<u64>,
     /// The run was killed for lack of memory.
     pub oom_killed: bool,
+}
+
+/// Rows of `outside_growth` kept (the reserve reads the newest 20).
+pub const OUTSIDE_GROWTH_KEEP: i64 = 200;
+
+/// How much the memory outside gate jobs grew while one heavy job ran
+/// (ADR-0026).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutsideGrowth {
+    /// Job id.
+    pub job_id: String,
+    /// End time.
+    pub finished_at: u64,
+    /// The job's own peak working set, bytes.
+    pub gate_peak_bytes: u64,
+    /// Largest memory outside gates during the run minus that at its first
+    /// sample, bytes (0 when it shrank).
+    pub growth_bytes: u64,
 }
 
 impl GateMemory {
@@ -395,6 +415,7 @@ impl Store {
             sched: 0,
             memory: false,
             bounds: false,
+            growth: false,
         };
         let fresh = store.init_schema()?;
         store.migrate(fresh, migrations)?;
@@ -409,6 +430,7 @@ impl Store {
         .map_err(db)?;
         store.memory = true;
         store.bounds = true;
+        store.growth = true;
         crate::meta::record_writer(&store.conn).map_err(db)?;
         Ok(store)
     }
@@ -464,12 +486,14 @@ impl Store {
             sched: 0,
             memory: false,
             bounds: false,
+            growth: false,
         };
         store.check_version()?;
         let containment =
             crate::migrate::version(&store.conn, crate::migrate::CONTAINMENT_TABLE).map_err(db)?;
         store.memory = containment >= 2;
         store.bounds = containment >= 3;
+        store.growth = containment >= 4;
         // Only the columns this build knows are ever selected, so a newer
         // (additive) `sched_schema` reads fine.
         store.sched = crate::migrate::version(&store.conn, crate::migrate::SCHED_TABLE)
@@ -1237,6 +1261,59 @@ impl Store {
         .map_err(db)?;
         tx.commit().map_err(db)?;
         Ok(())
+    }
+
+    /// Records how much the memory outside gate jobs grew while a heavy job
+    /// ran (ADR-0026) and keeps the newest [`OUTSIDE_GROWTH_KEEP`] rows. A
+    /// file without `outside_growth` ignores it.
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn insert_outside_growth(&self, g: &OutsideGrowth) -> Result<()> {
+        if !self.growth {
+            return Ok(());
+        }
+        let tx = self.tx()?;
+        tx.execute(
+            "INSERT INTO outside_growth (job_id, finished_at, gate_peak_bytes, growth_bytes)              VALUES (?1, ?2, ?3, ?4)",
+            params![
+                g.job_id,
+                i(g.finished_at),
+                i(g.gate_peak_bytes),
+                i(g.growth_bytes)
+            ],
+        )
+        .map_err(db)?;
+        tx.execute(
+            "DELETE FROM outside_growth WHERE rowid NOT IN (SELECT rowid FROM outside_growth              ORDER BY finished_at DESC, rowid DESC LIMIT ?1)",
+            [OUTSIDE_GROWTH_KEEP],
+        )
+        .map_err(db)?;
+        tx.commit().map_err(db)?;
+        Ok(())
+    }
+
+    /// The growth of the newest `limit` rows, newest first.
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn outside_growth_recent(&self, limit: usize) -> Result<Vec<u64>> {
+        if !self.growth {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT growth_bytes FROM outside_growth                  ORDER BY finished_at DESC, rowid DESC LIMIT ?1",
+            )
+            .map_err(db)?;
+        let rows = stmt
+            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map_err(db)?;
+        rows.map(|r| r.map(|v| u64::try_from(v).unwrap_or(0)).map_err(db))
+            .collect()
     }
 
     /// The newest `per_key` working sets of every key, oldest first within

@@ -41,6 +41,11 @@ pub struct MemoryEvidence<'a> {
     pub peak_bytes: Option<u64>,
     /// `MemAvailable` when the job ended.
     pub available_bytes: Option<u64>,
+    /// Memory used outside gate jobs when the job ended (ADR-0026).
+    pub outside_bytes: Option<u64>,
+    /// `(this run's working-set peak, the expected peak of the same gate run
+    /// with other arguments)`, when such a run is known (ADR-0026).
+    pub other_arguments: Option<(u64, u64)>,
     /// Time from spawn to exit.
     pub duration: Duration,
 }
@@ -96,17 +101,43 @@ pub fn memory_kill_message(e: &MemoryEvidence<'_>) -> Option<String> {
     if let Some(free) = e.available_bytes {
         facts.push(format!("{} available at the end", format_bytes(free)));
     }
+    if let Some(outside) = e.outside_bytes {
+        facts.push(format!("{} used outside gates", format_bytes(outside)));
+    }
     let detail = if facts.is_empty() {
         String::new()
     } else {
         format!(" ({})", facts.join("; "))
     };
+    // Agents reacted to a kill by changing the gate's arguments, which made
+    // a fresh estimate and the next kill without lowering the peak
+    // (ADR-0026): say so when the evidence shows it.
+    let arguments = e
+        .other_arguments
+        .filter(|&(run, other)| did_not_lower(run, other))
+        .map_or_else(String::new, |(_, other)| {
+            format!(
+                "; other arguments did not lower its memory (the same gate is expected to need \
+                 {} with other arguments)",
+                format_bytes(other)
+            )
+        });
     Some(format!(
-        "{} was killed for lack of memory after {:.1}s{detail}; running it again unchanged is \
-         likely to end the same way: lower its concurrency or free memory first",
+        "{} was killed for lack of memory after {:.1}s{detail}{arguments}. The machine did not \
+         have the memory this gate needs: run it again unchanged once memory is free (Sluice \
+         waits for it), or tell the human; lower its concurrency only if the gate's peak depends \
+         on it",
         e.gate,
         e.duration.as_secs_f64()
     ))
+}
+
+/// The run's working set reached at least 80 % of what the same gate with
+/// other arguments is expected to need, net of that expectation's 20 %
+/// margin: the arguments made no real difference.
+fn did_not_lower(run: u64, other_expected: u64) -> bool {
+    let other_peak = other_expected / 6 * 5;
+    run >= other_peak / 5 * 4
 }
 
 /// `18.1 GiB`, `512 MiB` or `4 KiB`-style text for a byte count.
@@ -150,8 +181,42 @@ mod tests {
             journal_hit: false,
             peak_bytes: Some(19_437_000_000),
             available_bytes: Some(1_500_000_000),
+            outside_bytes: None,
+            other_arguments: None,
             duration: Duration::from_millis(41_200),
         }
+    }
+
+    #[test]
+    fn the_message_tells_the_agent_to_retry_unchanged_and_names_useless_arguments() {
+        const GIB: u64 = 1 << 30;
+        let e = MemoryEvidence {
+            oom_group_kill: 1,
+            outside_bytes: Some(16 * GIB),
+            other_arguments: Some((11 * GIB, 16 * GIB)),
+            ..evidence(ExecStatus::Signaled(9))
+        };
+        let m = memory_kill_message(&e).unwrap();
+        assert!(m.contains("16.0 GiB used outside gates"), "{m}");
+        assert!(
+            m.contains("other arguments did not lower its memory (the same gate is expected to need 16.0 GiB with other arguments)"),
+            "{m}"
+        );
+        assert!(
+            m.contains("run it again unchanged once memory is free"),
+            "{m}"
+        );
+        assert!(
+            !m.contains("lower its concurrency or free memory first"),
+            "{m}"
+        );
+        // Arguments that really lowered the peak are not blamed.
+        let lowered = MemoryEvidence {
+            other_arguments: Some((4 * GIB, 16 * GIB)),
+            ..e
+        };
+        let m = memory_kill_message(&lowered).unwrap();
+        assert!(!m.contains("other arguments"), "{m}");
     }
 
     #[test]
@@ -236,7 +301,7 @@ mod tests {
         };
         let m = memory_kill_message(&e).unwrap();
         assert!(
-            m.starts_with("test was killed for lack of memory after 41.2s;"),
+            m.starts_with("test was killed for lack of memory after 41.2s. "),
             "{m}"
         );
         let only_peak = MemoryEvidence {
@@ -248,7 +313,7 @@ mod tests {
             ..only_peak
         })
         .unwrap();
-        assert!(m.contains("(job peak 3.0 GiB);"), "{m}");
+        assert!(m.contains("(job peak 3.0 GiB). "), "{m}");
     }
 
     #[test]

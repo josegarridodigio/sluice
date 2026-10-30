@@ -79,9 +79,10 @@ session. Never install or update on your own.
   the code, call `verify` again.
 - `KILLED for lack of memory ...` is not a test failure: the kernel or
   systemd-oomd (or Sluice's opt-in memory guard) ended the gate for lack of
-  memory. Do not retry it unchanged and never run it through the shell to get
-  around it: reduce its footprint (for example test concurrency) or tell the
-  human.
+  memory. Never run it through the shell to get around it. Follow its message:
+  run it again unchanged once memory is free (Sluice waits for it) or tell
+  the human. Other arguments or a lower concurrency rarely lower its memory
+  (the message says when they did not) and only start a fresh estimate.
 - A gate that `status` shows as waiting for memory (`(budget: memory)` in
   its text, `wait_detail` `memory` in the structured result) is only queued
   behind other gates: normal, wait. Do not run it outside Sluice.

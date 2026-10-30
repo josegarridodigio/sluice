@@ -373,6 +373,7 @@ mod tests {
             available_bytes: 22 << 30,
             reserve_bytes: 3 << 30,
             headroom_bytes: 16 << 30,
+            ..MemoryBudget::default()
         });
         r.running.push(RunningJob {
             gate: "test".into(),

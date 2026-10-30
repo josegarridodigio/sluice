@@ -165,8 +165,10 @@ pub fn cancel_message(job: &str, v: &Victim) -> String {
     use crate::memkill::format_bytes;
     format!(
         "{job} was cancelled by Sluice for lack of memory: job working set {}, MemAvailable {} \
-         below the reserve {} (the memory guard, [admission] memory_guard); running it again \
-         unchanged is likely to end the same way: lower its concurrency or free memory first",
+         below the reserve {} (the memory guard, [admission] memory_guard). The machine did not \
+         have the memory this gate needs: run it again unchanged once memory is free (Sluice \
+         waits for it), or tell the human; lower its concurrency only if the gate's peak depends \
+         on it",
         format_bytes(v.working_set),
         format_bytes(v.available),
         format_bytes(v.reserve)

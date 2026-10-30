@@ -147,7 +147,8 @@ Nothing is killed and nothing changes for you; `contained=` in the client log
 says what happened.
 
 The rules it gives you include the memory one: a gate `KILLED for lack of
-memory` is not retried unchanged. Heavy commands include `cargo check` and
+memory` is never rerun outside Sluice; it is rerun unchanged once memory is
+free, or the human is told. Heavy commands include `cargo check` and
 `cargo doc`, which go through the queue like `cargo build`.
 
 Context variants: repository with `.sluice.toml` (rules and gate names);

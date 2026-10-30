@@ -73,9 +73,11 @@ use crate::sampler::{self, JobUsage, Utilisation};
 use crate::scheduler::{
     self as sched, Class, Enqueued, HeadReservation, JobSpec, Policy, Pressure, Scheduler,
 };
+use crate::settle;
 use crate::stall::StallWatch;
 use crate::store::{
-    FinishMeta, GateMemory, GateStat, JobRow, JobState, QueuedMeta, RequestRow, Store,
+    FinishMeta, GateMemory, GateStat, JobRow, JobState, OutsideGrowth, QueuedMeta, RequestRow,
+    Store,
 };
 use crate::{Error, Result};
 use sluice_gate_core::config::{Fairness, QueueOrder, auto_ceiling};
@@ -313,6 +315,8 @@ struct JobEntry {
     guard_message: Option<String>,
     /// Progress record of the stalled-job detection, from the first read.
     stall: Option<StallWatch>,
+    /// Memory outside gate jobs while it runs (ADR-0026).
+    outside: memory::OutsideTrack,
 }
 
 /// What [`register`] hands to the connection handler.
@@ -357,6 +361,9 @@ struct Shared {
     state: Mutex<State>,
     store: Mutex<Store>,
     psi: Mutex<Admission>,
+    /// Admission settling after a memory kill (ADR-0026; never held
+    /// together with another mutex).
+    settle: Mutex<settle::Settle>,
     /// Utilisation sampler (never held together with another mutex).
     util: Mutex<Utilisation>,
     /// Learned gate statistics (never held together with another mutex).
@@ -364,6 +371,9 @@ struct Shared {
     /// Recent working sets of each gate, for the expected peak of memory-aware
     /// admission (never held together with another mutex).
     peaks: Mutex<PeakCache>,
+    /// Growth outside gates during the newest heavy jobs, newest first
+    /// (ADR-0026; never held together with another mutex).
+    growth: Mutex<std::collections::VecDeque<u64>>,
     /// The opt-in memory guard (never held together with another mutex).
     guard: Mutex<Guard>,
     /// CPUs of the daemon's affinity mask (`None`: every CPU of `/proc/stat`).
@@ -782,6 +792,23 @@ fn load_peaks(store: &Store) -> PeakCache {
     peaks
 }
 
+/// The growth outside gates of the newest heavy jobs, newest first.
+fn load_growth(store: &Store) -> std::collections::VecDeque<u64> {
+    store
+        .outside_growth_recent(memory::GROWTH_WINDOW)
+        .unwrap_or_else(|e| {
+            tracing::warn!("cannot load the memory growth outside gates: {e}");
+            Vec::new()
+        })
+        .into()
+}
+
+/// The observed reserve of the next admission passes (ADR-0026).
+fn observed_reserve(shared: &Shared) -> Option<u64> {
+    let growth: Vec<u64> = lock(&shared.growth).iter().copied().collect();
+    memory::observed_reserve(&growth)
+}
+
 /// A peak in bytes per stats key.
 type KeyedPeaks = Vec<(StatsKey, u64)>;
 
@@ -852,6 +879,7 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
     }
     let stats = load_stats(&store);
     let peaks = load_peaks(&store);
+    let growth = load_growth(&store);
     let (allowed_cpus, cpus) = daemon_cpus(&config.proc_root);
     let store = Mutex::new(store);
     if let Err(e) = reconcile_orphans(&store, &instance).await {
@@ -893,9 +921,11 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
         state: Mutex::new(State::new(&config)),
         store,
         psi: Mutex::new(Admission::new(&config.admission)),
+        settle: Mutex::new(settle::Settle::default()),
         util: Mutex::new(utilisation(&config.proc_root)),
         stats: Mutex::new(stats),
         peaks: Mutex::new(peaks),
+        growth: Mutex::new(growth),
         guard: Mutex::new(Guard::new(config.admission.memory_guard)),
         allowed_cpus,
         cpus,
@@ -1162,11 +1192,20 @@ fn sample_tick(shared: &Shared) -> bool {
     lock(&shared.util).observe(times, now, queued);
     if !gates.is_empty() {
         let samples = read_job_samples(shared, gates);
+        let info = memory::read_meminfo(proc_root);
         let mut st = shared.state();
         for (id, tasks, leader, working_set) in samples {
             if let Some(entry) = st.jobs.get_mut(&id) {
                 entry.usage.update(&tasks, leader);
                 entry.usage.observe_memory(working_set);
+            }
+        }
+        // Memory outside gates, the same reading for every running job.
+        if let Some(info) = info {
+            let gates: u64 = st.jobs.values().filter_map(|e| e.usage.memory_now()).sum();
+            let outside = memory::outside_gates(info, gates);
+            for entry in st.jobs.values_mut().filter(|e| e.process.is_some()) {
+                entry.outside.observe(outside);
             }
         }
     }
@@ -1228,6 +1267,80 @@ fn guard_tick(shared: &Shared, now: u64) {
     if let Some(victim) = victim {
         cancel_for_memory(shared, now, &victim, sample.full_avg10);
     }
+}
+
+/// Whether admission settles after a memory kill at `now` (ADR-0026): logs
+/// the end of a settling once.
+fn settling(shared: &Shared, now: u64) -> bool {
+    let low = shared.config.admission.memory_some_avg10_low;
+    let pressure = gates_some_avg10(shared);
+    let verdict = lock(&shared.settle).check(now, pressure, low);
+    match verdict {
+        settle::Verdict::Open => false,
+        settle::Verdict::Holds => true,
+        settle::Verdict::Resumed => {
+            tracing::info!(
+                memory_some_avg10 = ?pressure,
+                "admission resumes: the memory pressure of the killed gate has decayed"
+            );
+            false
+        }
+    }
+}
+
+/// Memory used outside gate jobs now (ADR-0026), `None` when `meminfo` is
+/// unreadable.
+fn outside_now(shared: &Shared) -> Option<u64> {
+    let info = memory::read_meminfo(&shared.config.proc_root)?;
+    let gates: u64 = shared
+        .state()
+        .jobs
+        .values()
+        .filter_map(|e| e.usage.memory_now())
+        .sum();
+    Some(memory::outside_gates(info, gates))
+}
+
+/// `(this run's working-set peak, the expected peak of the same gate with
+/// other arguments)` of job `id`, when both are known (ADR-0026).
+fn other_arguments(shared: &Shared, id: &str) -> Option<(u64, u64)> {
+    let (key, run) = {
+        let st = shared.state();
+        let e = st.jobs.get(id)?;
+        (e.stats_key.clone()?, e.usage.memory_peak()?)
+    };
+    let other = lock(&shared.peaks).family_expected(&key)?;
+    Some((run, other))
+}
+
+/// A gate job was killed for lack of memory: admission settles (ADR-0026).
+fn note_memory_kill(shared: &Shared, now: u64) {
+    let fresh = {
+        let mut s = lock(&shared.settle);
+        let fresh = s.since().is_none();
+        s.kill(now);
+        fresh
+    };
+    if fresh {
+        tracing::info!(
+            settle_ms = settle::SETTLE_MIN_MS,
+            "admission settles after a memory kill: no job starts until the memory pressure of the gates decays"
+        );
+    }
+}
+
+/// `some avg10` of the daemon scope's `memory.pressure`, else the system's.
+fn gates_some_avg10(shared: &Shared) -> Option<f64> {
+    let read = |p: &Path| {
+        std::fs::read_to_string(p)
+            .ok()
+            .and_then(|t| psi::parse_some_avg10(&t))
+    };
+    shared
+        .containment
+        .as_ref()
+        .and_then(|c| read(&c.tree().layout.daemon_scope_dir().join("memory.pressure")))
+        .or_else(|| read(&shared.config.psi_root.join("memory")))
 }
 
 /// `full avg10` of the daemon scope's `memory.pressure`; the system's memory
@@ -1380,6 +1493,9 @@ fn containment_tick(shared: &Shared, prune: bool) {
 fn record_interventions(shared: &Shared, rows: &[InterventionRow]) {
     for row in rows {
         let new = shared.store("recording an intervention", |s| s.record_intervention(row));
+        if new == Some(true) && is_gate_memory_kill(row) {
+            note_memory_kill(shared, now_ms());
+        }
         if new == Some(true) {
             // The file the guard and the MCP server read to tell the agent
             // (they never ask the daemon, and the guard may not).
@@ -1405,6 +1521,18 @@ fn record_interventions(shared: &Shared, rows: &[InterventionRow]) {
             );
         }
     }
+}
+
+/// A kernel or systemd-oomd kill of a gate job's leaf.
+fn is_gate_memory_kill(row: &InterventionRow) -> bool {
+    row.leaf.starts_with("jobs")
+        && matches!(
+            row.cause.as_str(),
+            interventions::CAUSE_OOMD_PRESSURE
+                | interventions::CAUSE_OOM_KILL
+                | interventions::CAUSE_OOM_GROUP_KILL
+                | interventions::CAUSE_SLUICE_MEMORY_GUARD
+        )
 }
 
 /// Recent interventions for the `status` reply; `None` when there is none.
@@ -1456,19 +1584,24 @@ fn admit(shared: &Shared, now: u64) -> Vec<(String, sched::Admission)> {
             ),
         )
     };
+    // After a memory kill nothing starts, and the starvation guard does not
+    // override it (ADR-0026 decision 4).
+    let settling = settling(shared, now);
+    let blocking = blocking || settling;
     let head = if blocking {
         shared.state().sched.head(now)
     } else {
         None
     };
-    let guard_due = head
-        .as_ref()
-        .is_some_and(|(_, queued_at)| lock(&shared.psi).starvation_override(*queued_at, now));
+    let guard_due = !settling
+        && head
+            .as_ref()
+            .is_some_and(|(_, queued_at)| lock(&shared.psi).starvation_override(*queued_at, now));
     let (idle_cpus, sampled_at) = {
         let u = lock(&shared.util);
         (u.idle_cpus(), u.sampled_at())
     };
-    let facts = memory::facts(a, gates_memory(shared));
+    let facts = memory::facts(a, gates_memory(shared), observed_reserve(shared));
     let (started, notes, backfills) = {
         let mut st = shared.state();
         // The working set each running job had at its last sample.
@@ -1665,6 +1798,7 @@ fn close_job(
         let memory = entry
             .as_ref()
             .and_then(|e| learned_memory(e.stats_key.as_ref()?, &e.usage, &outcome, id, now));
+        let growth = entry.as_ref().and_then(|e| outside_growth(e, id, now));
         let finish = FinishMeta {
             waits: record.as_ref().map_or([0; 5], |r| r.waits),
             cpu_ms: demand.map(|d| d.cpu_ms),
@@ -1693,8 +1827,12 @@ fn close_job(
                     s.insert_gate_memory(working_set)?;
                 }
             }
+            if let Some(g) = &growth {
+                s.insert_outside_growth(g)?;
+            }
             Ok(())
         });
+        remember_growth(shared, growth.as_ref());
         (entry.map(|e| e.events), started_at, learned, memory, weight)
     };
     Closed {
@@ -1737,6 +1875,31 @@ fn learned_stat(
             demand_milli: demand.demand_milli,
         },
     ))
+}
+
+/// Adds a heavy job's growth outside gates to the observed reserve.
+fn remember_growth(shared: &Shared, growth: Option<&OutsideGrowth>) {
+    if let Some(g) = growth {
+        let mut recent = lock(&shared.growth);
+        recent.push_front(g.growth_bytes);
+        recent.truncate(memory::GROWTH_WINDOW);
+    }
+}
+
+/// How much the memory outside gates grew while a heavy job ran (ADR-0026);
+/// `None` for a job whose own peak stayed under
+/// [`memory::HEAVY_JOB_BYTES`] or that was never sampled.
+fn outside_growth(entry: &JobEntry, id: &str, now: u64) -> Option<OutsideGrowth> {
+    let peak = entry.usage.memory_peak()?;
+    if peak < memory::HEAVY_JOB_BYTES {
+        return None;
+    }
+    Some(OutsideGrowth {
+        job_id: id.to_owned(),
+        finished_at: now,
+        gate_peak_bytes: peak,
+        growth_bytes: entry.outside.growth()?,
+    })
 }
 
 /// What a finished job teaches the expected peak of its key (ADR-0019,
@@ -2016,12 +2179,18 @@ fn memory_end(
         journal_hit,
         peak_bytes: end.peak_bytes,
         available_bytes: memkill::mem_available(&shared.config.proc_root),
+        outside_bytes: outside_now(shared),
+        other_arguments: other_arguments(shared, id),
         duration,
     };
-    memkill::memory_kill_message(&evidence).map(|message| MemoryKill {
+    let kill = memkill::memory_kill_message(&evidence).map(|message| MemoryKill {
         message,
         peak_bytes: end.peak_bytes,
-    })
+    });
+    if kill.is_some() {
+        note_memory_kill(shared, now);
+    }
+    kill
 }
 
 async fn launch_placed(shared: &Shared, id: &str, spec: ExecSpec) -> Option<Finished> {
@@ -2766,6 +2935,7 @@ fn status_report(shared: &Shared) -> StatusReport {
                         .memory_expected
                         .map(super::scheduler::Expected::learned),
                     memory_expected_basis: v.memory_expected.map(|e| e.basis.as_str().to_owned()),
+                    memory_beyond_estimate: v.beyond_estimate.then_some(true),
                     stalled: stall_view,
                 }
             })
@@ -2815,6 +2985,14 @@ fn status_report(shared: &Shared) -> StatusReport {
                 .map(|(f, headroom_bytes)| proto::MemoryBudget {
                     available_bytes: f.available_bytes,
                     reserve_bytes: f.reserve_bytes,
+                    reserve_basis: Some(
+                        if f.reserve_observed {
+                            "observed"
+                        } else {
+                            "configured"
+                        }
+                        .to_owned(),
+                    ),
                     headroom_bytes,
                 }),
         )
@@ -3282,6 +3460,7 @@ fn register_job(shared: &Shared, job: NewJob) -> std::result::Result<Registered,
                     killed_by: None,
                     guard_message: None,
                     stall: None,
+                    outside: memory::OutsideTrack::default(),
                 },
             );
             Ok(Registered {

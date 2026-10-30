@@ -687,8 +687,11 @@ pub const OOMD_DEFAULT_DURATION: Duration = Duration::from_secs(20);
 pub const DERIVED_LIMIT_CAP: f64 = 30.0;
 /// Fraction of the ancestor's limit the derived limit may use.
 pub const DERIVED_LIMIT_FRACTION: f64 = 0.6;
-/// Ceiling of the derived duration.
-pub const DERIVED_DURATION_CAP: Duration = Duration::from_secs(5);
+/// Ceiling of the derived duration: long enough for the pressure average
+/// of a gate the kernel just killed to decay before the agents' scope acts
+/// (ADR-0026: 5 s killed an agent 6 s after a gate kill), still below the
+/// vendor's 20 s on the user manager.
+pub const DERIVED_DURATION_CAP: Duration = Duration::from_secs(15);
 
 /// The policy `systemd-oomd` applies to the user manager (what watches us).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -859,7 +862,8 @@ pub fn resolve_ancestor_policy(
 }
 
 /// The policy for the agents scope: `limit = min(30 %, 0.6 x ancestor limit)`,
-/// `duration = min(5 s, ancestor duration / 4)`, never below 1 % and 1 s.
+/// `duration = min(15 s, 3/4 x ancestor duration)` in whole seconds, never
+/// below 1 % and 1 s (ADR-0026; it was `min(5 s, 1/4)`).
 /// Unknown ancestor values count as oomd's built-in 60 % and 20 s.
 #[must_use]
 pub fn derive_pressure_policy(ancestor: &AncestorPolicy) -> PressurePolicy {
@@ -868,11 +872,8 @@ pub fn derive_pressure_policy(ancestor: &AncestorPolicy) -> PressurePolicy {
         .min(DERIVED_LIMIT_CAP)
         .round()
         .clamp(1.0, 99.0);
-    let duration = ancestor
-        .duration
-        .unwrap_or(OOMD_DEFAULT_DURATION)
-        .checked_div(4)
-        .unwrap_or(DERIVED_DURATION_CAP)
+    let ancestor_secs = ancestor.duration.unwrap_or(OOMD_DEFAULT_DURATION).as_secs();
+    let duration = Duration::from_secs(ancestor_secs.saturating_mul(3) / 4)
         .min(DERIVED_DURATION_CAP)
         .max(Duration::from_secs(1));
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -1237,20 +1238,22 @@ mod tests {
 
     #[test]
     fn derived_policy_from_show_output() {
-        // 50 % / 20 s (Ubuntu): 30 % / 5 s
-        assert_eq!(derived(&show_text("2147483648", "20s"), "", ""), pp(30, 5));
+        // 50 % / 20 s (Ubuntu): 30 % / 15 s
+        assert_eq!(derived(&show_text("2147483648", "20s"), "", ""), pp(30, 15));
         // 80 % / 20 s (Fedora): the cap applies
-        assert_eq!(derived(&show_text("3435973836", "20s"), "", ""), pp(30, 5));
-        // 40 % / 8 s: 24 % / 2 s
-        assert_eq!(derived(&show_text("1717986918", "8s"), "", ""), pp(24, 2));
-        // not set anywhere: oomd's 60 % / 20 s give 30 % / 5 s
-        assert_eq!(derived(&show_text("0", "[not set]"), "", ""), pp(30, 5));
+        assert_eq!(derived(&show_text("3435973836", "20s"), "", ""), pp(30, 15));
+        // 40 % / 8 s: 24 % / 6 s
+        assert_eq!(derived(&show_text("1717986918", "8s"), "", ""), pp(24, 6));
+        // a long ancestor duration is capped at 15 s
+        assert_eq!(derived(&show_text("2147483648", "60s"), "", ""), pp(30, 15));
+        // not set anywhere: oomd's 60 % / 20 s give 30 % / 15 s
+        assert_eq!(derived(&show_text("0", "[not set]"), "", ""), pp(30, 15));
         // tiny ancestor values never go below 1 % and 1 s
         assert_eq!(derived(&show_text("42949673", "2s"), "", ""), pp(1, 1));
         // a duration in raw microseconds is understood
         assert_eq!(
             derived(&show_text("1717986918", "8000000"), "", ""),
-            pp(24, 2)
+            pp(24, 6)
         );
     }
 
@@ -1271,7 +1274,8 @@ Memory Pressure Monitored CGroups:\n\
 
     #[test]
     fn gates_policy_has_the_same_limit_and_a_shorter_duration() {
-        // 5 s agents (Ubuntu): 3 s, rounded up to whole seconds
+        // 15 s agents (Ubuntu): 8 s, rounded up to whole seconds
+        assert_eq!(derive_gates_policy(pp(30, 15)), pp(30, 8));
         assert_eq!(derive_gates_policy(pp(30, 5)), pp(30, 3));
         assert_eq!(derive_gates_policy(pp(24, 2)), pp(24, 1));
         assert_eq!(derive_gates_policy(pp(30, 20)), pp(30, 10));
@@ -1305,7 +1309,7 @@ Memory Pressure Monitored CGroups:\n\
     #[test]
     fn oomctl_dump_is_the_second_source() {
         // `show` has nothing (as on the development machine), oomctl names the manager.
-        assert_eq!(derived(&show_text("0", "[not set]"), OOMCTL, ""), pp(24, 2));
+        assert_eq!(derived(&show_text("0", "[not set]"), OOMCTL, ""), pp(24, 6));
         let info = parse_oomctl_dump(OOMCTL, MANAGER);
         assert_eq!(info.default_limit_percent, Some(60.0));
         assert_eq!(info.default_duration, Some(Duration::from_secs(20)));
@@ -1321,7 +1325,7 @@ Memory Pressure Monitored CGroups:\n\
 \t\tMemory Pressure Duration: 12s\n";
         let info = parse_oomctl_dump(dump, MANAGER);
         assert_eq!(info.monitored.limit_percent, Some(80.0));
-        assert_eq!(derive_pressure_policy(&info.monitored), pp(30, 3));
+        assert_eq!(derive_pressure_policy(&info.monitored), pp(30, 9));
         // a sibling that only shares a prefix is not an ancestor
         let sib = "Memory Pressure Monitored CGroups:\n\tPath: /user.slice/user-100\n\t\tMemory Pressure Limit: 10.00%\n";
         assert_eq!(
@@ -1339,9 +1343,9 @@ Memory Pressure Monitored CGroups:\n\
         );
         assert_eq!(parse_oomd_conf("# nothing\n"), (None, None));
         // the conf is the third source
-        assert_eq!(derived(&show_text("0", "[not set]"), "", conf), pp(30, 2));
+        assert_eq!(derived(&show_text("0", "[not set]"), "", conf), pp(30, 6));
         // everything missing: built-in
-        assert_eq!(derived("", "", ""), pp(30, 5));
+        assert_eq!(derived("", "", ""), pp(30, 15));
     }
 
     #[test]

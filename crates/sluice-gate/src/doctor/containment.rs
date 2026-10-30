@@ -796,7 +796,7 @@ mod tests {
         assert_eq!(
             c.detail,
             "memory policy on: systemd-oomd acts on the agents scope at 30% memory pressure for \
-             5s (derived from the system policy on user@UID.service, 50% / 20s; systemd 259, \
+             15s (derived from the system policy on user@UID.service, 50% / 20s; systemd 259, \
              systemd-oomd active)"
         );
         // Off, with each reason.

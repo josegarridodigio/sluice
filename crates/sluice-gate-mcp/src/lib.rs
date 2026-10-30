@@ -96,9 +96,10 @@ was closed without merging, or its branch is gone): tell the human, do not retry
 `hook_gate_unverified` and `config_changed` mean the branch changes `.sluice.toml`, which \
 the target's configuration judges: tell the human to land it first or retry with \
 `--trust-member-config`; never use that flag or ask for such a train to be approved. \
-A gate result `KILLED for lack of memory` is not a failure to retry unchanged: reduce the gate's \
-footprint (for example test concurrency) or tell the human; a gate that `status` shows waiting \
-for memory is only queued. Never run a gate through the shell to get around either. \
+A gate result `KILLED for lack of memory` means the machine lacked the memory the gate needs: \
+follow its message (run it again unchanged once memory is free, Sluice waits for it, or tell the \
+human); other arguments or a lower concurrency rarely lower its memory and start a fresh \
+estimate. A gate that `status` shows waiting for memory is only queued. Never run a gate through the shell to get around either. \
 A `verify` progress message or a `status` that reports its job STALLED (no CPU, I/O or output \
 for its quiet window) means the gate is probably hung, for example a test waiting forever: \
 look at the test and `logs`, and cancel your own `verify` call (the daemon then ends the job \

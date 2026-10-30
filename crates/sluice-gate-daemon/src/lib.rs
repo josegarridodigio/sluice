@@ -10,6 +10,7 @@
 //! - [`guard`]: the opt-in Sluice-side memory guard (cancels its own largest job).
 //! - [`memkill`]: telling a gate killed for lack of memory from one that failed.
 //! - [`reaper`]: companion process that kills the gate groups when the daemon dies.
+//! - [`settle`]: admission waits for the memory pressure of a killed gate to decay.
 //! - [`server`]: socket listener, protocol handling, subscribers, lifecycle.
 //!
 //! Design: `kb/sluice/design/executor.md`, `scheduler.md`, `protocol.md`,
@@ -28,6 +29,7 @@ pub mod reaper;
 pub mod sampler;
 pub mod scheduler;
 pub mod server;
+pub mod settle;
 pub mod stall;
 pub mod store;
 

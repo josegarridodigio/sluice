@@ -260,6 +260,7 @@ fn q(id: &str, lane: &str, weight: u32, queued_at: u64) -> QueuedSnap {
         queued_at,
         expected_ms: None,
         expected_peak: None,
+        family_peak: None,
         lower_bound: None,
     }
 }
@@ -272,6 +273,7 @@ fn r(id: &str, lane: &str, weight: u32) -> RunningSnap {
         weight,
         current: 0,
         expected_peak: None,
+        family_peak: None,
         lower_bound: None,
         learn_key: None,
         probe: false,
@@ -1144,6 +1146,7 @@ fn facts(available: u64, total: u64, reserve: u64) -> MemoryFacts {
         available_bytes: available * GIB,
         total_bytes: total * GIB,
         reserve_bytes: reserve * GIB,
+        reserve_observed: false,
     }
 }
 
@@ -1446,6 +1449,7 @@ fn the_memory_log_lines_have_a_fixed_format() {
     let mut note = MemoryNote {
         started: false,
         probe: false,
+        beyond: false,
         job: "j7".into(),
         repo: PathBuf::from("/srv/work/shop"),
         gate: "test".into(),
@@ -1594,7 +1598,7 @@ fn the_prior_is_the_p75_of_the_peaks_of_lighter_or_equal_weights() {
 fn the_estimate_is_learned_then_a_lower_bound_then_the_capped_prior() {
     let f = facts(22, 30, 3);
     let proxy = 27 * GIB / 12;
-    let est = |learned, bound, prior, w| f.estimate_primed(learned, bound, prior, w, 12);
+    let est = |learned, bound, prior, w| f.estimate_primed(learned, None, bound, prior, w, 12);
     // Learned wins over everything.
     let own = est(Some(GIB), Some(5 * GIB), Some(20 * MIB), 1);
     assert_eq!((own.bytes, own.basis), (GIB, Basis::Learned));
@@ -1617,10 +1621,29 @@ fn the_estimate_is_learned_then_a_lower_bound_then_the_capped_prior() {
     // A share below the floor wins: the cap is the weight's share.
     let tiny = facts(4, 4, 3);
     assert_eq!(
-        tiny.estimate_primed(None, None, Some(GIB), 1, 12).bytes,
+        tiny.estimate_primed(None, None, None, Some(GIB), 1, 12)
+            .bytes,
         GIB / 12
     );
     assert_eq!(f.estimate(None, 1, 12).bytes, proxy);
+}
+
+/// ADR-0026: a command hash with no history takes the largest learned peak
+/// of its gate's other commands; a larger lower bound of its own wins.
+#[test]
+fn an_unknown_hash_takes_its_family_peak_before_any_guess() {
+    let f = facts(22, 30, 3);
+    let est = |learned, family, bound| f.estimate_primed(learned, family, bound, None, 6, 12);
+    let fam = est(None, Some(16 * GIB), None);
+    assert_eq!((fam.bytes, fam.basis), (16 * GIB, Basis::Family));
+    assert!(!fam.learned() && !fam.guessed(), "evidence, not a guess");
+    // Its own learned peak wins over the family.
+    assert_eq!(est(Some(GIB), Some(16 * GIB), None).basis, Basis::Learned);
+    // The larger of the family and 1.2 x the lower bound.
+    let bound = est(None, Some(6 * GIB), Some(10 * GIB));
+    assert_eq!((bound.bytes, bound.basis), (12 * GIB, Basis::LowerBound));
+    let fam = est(None, Some(16 * GIB), Some(10 * GIB));
+    assert_eq!((fam.bytes, fam.basis), (16 * GIB, Basis::Family));
 }
 
 /// The incident of 2026-10-26: a 13 GiB suite runs, about 4 GiB are free, and
@@ -1767,6 +1790,57 @@ fn a_learned_peak_never_probes() {
     assert_eq!(decided.probes, Vec::<String>::new());
 }
 
+/// The recorded case (ADR-0026): agents added `--filter` or a lower
+/// concurrency to a 13 GiB suite; each new hash was guessed at about 1.3 GiB
+/// and probed beside the running suite. With its family's peak it waits.
+#[test]
+fn a_new_hash_of_a_running_gate_waits_on_its_family_peak() {
+    let mut running_suite = running("suite", 6, 8, 20);
+    running_suite.learn_key = Some(lk("test"));
+    let run = [running_suite];
+    let other_hash = (PathBuf::from("/r"), "test".to_owned(), "beef".to_owned());
+    let queued = [QueuedSnap {
+        learn_key: Some(other_hash.clone()),
+        family_peak: Some(16 * GIB),
+        ..q("filtered", "/filtered", 6, 0)
+    }];
+    let decided = probe_pass(20, &run, &queued);
+    assert_eq!(decided.expected[0].basis, Basis::Family);
+    assert_eq!(started(&decided), Vec::new());
+    assert_eq!(decided.probes, Vec::<String>::new());
+    // Even with no family peak (a guess), no probe beside a running job of
+    // the same gate under another hash.
+    let guessed = [QueuedSnap {
+        learn_key: Some(other_hash),
+        ..q("filtered", "/filtered", 6, 0)
+    }];
+    let decided = probe_pass(20, &run, &guessed);
+    assert_eq!(decided.expected[0].basis, Basis::Guessed);
+    assert_eq!(started(&decided), Vec::new());
+}
+
+/// The progress exemption stays but is visible: on an idle machine the first
+/// job starts beyond its estimate and the plan says so (ADR-0026).
+#[test]
+fn a_job_alone_beyond_its_estimate_is_flagged() {
+    let p = policy(12);
+    let queued = [peaked("big", 6, 20, 0)];
+    let s = with_memory(
+        snapshot(10, &p, Pressure::default(), &[], &queued),
+        facts(17, 31, 3),
+    );
+    let decided = plan(&s);
+    assert_eq!(started(&decided), [("big", Admission::Nominal)]);
+    assert_eq!(decided.beyond, ["big"]);
+    // A job that fits is not flagged.
+    let fits = [peaked("small", 6, 4, 0)];
+    let s = with_memory(
+        snapshot(10, &p, Pressure::default(), &[], &fits),
+        facts(17, 31, 3),
+    );
+    assert_eq!(plan(&s).beyond, Vec::<String>::new());
+}
+
 /// A running probe holds back the quarter it is expected to need, not its
 /// whole estimate: jobs that fit what is left start beside it.
 #[test]
@@ -1798,16 +1872,22 @@ fn a_probe_holds_a_quarter_of_its_estimate_for_the_jobs_behind_it() {
 }
 
 #[test]
-fn a_lower_bound_is_the_estimate_and_a_key_with_one_probes_too() {
+fn a_lower_bound_is_the_estimate_and_never_probes() {
     let queued = [QueuedSnap {
         lower_bound: Some(5 * GIB),
         ..keyed("again", "pytest", 3, 0)
     }];
     let decided = probe_pass(20, &suite(), &queued);
-    // 1.2 x 5 GiB = 6 GiB: does not fit the 5 GiB free; a quarter does.
+    // 1.2 x 5 GiB = 6 GiB: does not fit the 5 GiB free. A quarter would,
+    // but a lower bound is evidence (ADR-0026): it waits for its whole
+    // estimate.
     assert_eq!(decided.expected[0].bytes, 6 * GIB);
     assert_eq!(decided.expected[0].basis, Basis::LowerBound);
-    assert_eq!(decided.probes, ["again"]);
+    assert_eq!(decided.probes, Vec::<String>::new());
+    assert_eq!(
+        waits_of(&decided),
+        [("again", WaitCause::Memory, Some("memory"))]
+    );
     // A lower bound that fits starts normally, not as a probe.
     let small = [QueuedSnap {
         lower_bound: Some(GIB),
@@ -1849,7 +1929,10 @@ fn the_scheduler_flags_logs_and_serialises_probes() {
     let currents = BTreeMap::from([("j1".to_owned(), 8 * GIB)]);
     s.set_memory(Some(facts(20, 31, 3)), currents.clone());
     assert_eq!(s.admit(0, false), ["j1"], "alone: the progress exemption");
-    assert_eq!(s.take_memory_notes(), Vec::new(), "not a probe");
+    // Not a probe, but the exemption is logged (ADR-0026).
+    let notes = s.take_memory_notes();
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].beyond && !notes[0].probe);
     s.enqueue(keyed_spec("j2", "pytest", 3, 1));
     s.enqueue(keyed_spec("j3", "build", 3, 2));
     s.set_memory(Some(facts(20, 31, 3)), currents);
@@ -1876,6 +1959,7 @@ fn the_probe_line_has_a_fixed_format() {
     let note = MemoryNote {
         started: true,
         probe: true,
+        beyond: false,
         job: "j9".into(),
         repo: PathBuf::from("/work/shop"),
         gate: "test".into(),
@@ -1900,9 +1984,24 @@ fn the_probe_line_has_a_fixed_format() {
             bytes: GIB,
             basis: Basis::LowerBound,
         }),
-        ..note
+        ..note.clone()
     };
     assert!(memory_note_line(&blocked).contains("expected 1.0 GiB lower-bound"));
+    let beyond = MemoryNote {
+        probe: false,
+        beyond: true,
+        expected: Some(Expected {
+            bytes: 22 * GIB,
+            basis: Basis::Learned,
+        }),
+        available_bytes: 20 * GIB,
+        ..note
+    };
+    assert_eq!(
+        memory_note_line(&beyond),
+        "job j9 (shop:test) starts alone beyond its estimate: expected 22.0 GiB learned, free \
+         17.0 GiB, reserve 3.0 GiB, waited 0.0s for memory"
+    );
 }
 
 // A tiny deterministic generator for the property tests.
@@ -1955,6 +2054,7 @@ fn random_case(rng: &mut Lcg) -> (Vec<RunningSnap>, Vec<QueuedSnap>, MemoryFacts
         available_bytes: rng.below(total + 1) * GIB,
         total_bytes: total * GIB,
         reserve_bytes: rng.below(total / 4 + 1) * GIB,
+        reserve_observed: false,
     };
     (running, queued, memory)
 }

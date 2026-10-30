@@ -208,7 +208,7 @@ cpu_ceiling = ""               # e.g. "80%" of all CPUs; empty = none
 pids_max = 4096
 memory_policy = "oomd"         # oomd | none
 memory_pressure_limit = "auto" # or "30%"
-memory_pressure_duration = "auto"   # or "5s"
+memory_pressure_duration = "auto"   # or "15s"
 memory_high = ""               # opt-in per session, e.g. "8G"
 memory_max = ""                # opt-in per session
 gates_oom_score_adj = "auto"   # "auto" (800) or 0 to 1000
@@ -275,7 +275,7 @@ budget_share_max = 4
 | `containment.pids_max` | `4096` | `pids.max` of a session. Must be >= 1. |
 | `containment.memory_policy` | `"oomd"` | `oomd`: where `systemd-oomd` is active and systemd is 257 or newer, the agents scope gets its own memory pressure policy, so `systemd-oomd` acts inside it first and kills only the offending leaf. The gates' scope (`sluice-daemon.scope`) then gets its own policy with the same limit and half the duration (rounded up, at least 1s), so oomd tries the gates before the agents, and `daemon/` is marked `user.oomd_omit` so the daemon itself is never chosen. `none`: memory is only accounted. Never a `MemoryHigh` or `MemoryMax` by default. |
 | `containment.memory_pressure_limit` | `"auto"` | `ManagedOOMMemoryPressureLimit` of the agents scope (and of the gates' scope, see `memory_policy`): `"auto"` or `"1%"` to `"99%"`. `auto` reads the policy that watches your user manager (`systemctl show user@UID.service`, then `oomctl dump`, then `oomd.conf`, then oomd's built-in 60%) and uses `min(30%, 0.6 x its limit)`, so it always stays below it. |
-| `containment.memory_pressure_duration` | `"auto"` | `ManagedOOMMemoryPressureDurationUSec` of the agents scope: `"auto"` or a duration above zero. `auto` is `min(5s, the user manager's duration / 4)`, never below 1s. The gates' scope gets half of it, rounded up to whole seconds and never below 1s (see `memory_policy`). |
+| `containment.memory_pressure_duration` | `"auto"` | `ManagedOOMMemoryPressureDurationUSec` of the agents scope: `"auto"` or a duration above zero. `auto` is `min(15s, 3/4 of the user manager's duration)` in whole seconds, never below 1s (0.8.0 and older: `min(5s, /4)`). The gates' scope gets half of it, rounded up to whole seconds and never below 1s (see `memory_policy`). |
 | `containment.memory_high` | `""` | Opt-in `memory.high` per session, a size (`"8G"`, `"512M"`). Empty means none. Throttling without swap can raise pressure that `systemd-oomd` attributes to the whole user manager: advised only together with swap. |
 | `containment.memory_max` | `""` | Opt-in `memory.max` per session (the kernel kills inside the session when it is hit). Empty means none. |
 | `containment.gates_oom_score_adj` | `"auto"` | Floor of the `oom_score_adj` of gate and `exec` jobs: `"auto"` (800) or an integer from 0 to 1000. The kernel's OOM killer then prefers a gate's processes to the agents' (their browsers run at 300). A job never gets less than the daemon itself inherited, because an unprivileged process can only raise the value. Each job also gets `memory.oom.group = 1` on its own cgroup, so a killed job dies whole and is reported as `killed_by = "memory"`. Applied also where cgroups are unavailable. Needs 0.6.0: older binaries reject the key. |

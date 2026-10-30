@@ -141,9 +141,9 @@ fn rules_text(gates: &[String], derived: bool) -> String {
          4) Do not start several dev servers or watchers while gates run. \
          5) Never approve merge trains (`queue_approve`, `sluice queue approve`) and never push \
          to the target branch. \
-         6) A gate result `KILLED for lack of memory` is not a flaky failure: do not rerun it \
-         unchanged or outside Sluice; lower its footprint (e.g. test concurrency) or tell the \
-         human. \
+         6) A gate `KILLED for lack of memory` is no flaky failure: never rerun it outside \
+         Sluice; rerun it unchanged once memory is free or tell the human; new arguments rarely \
+         help. \
          7) A hook command that `gate_list` leaves out is run by the commit's hook: do not run it \
          by hand through the shell. \
          8) A job reported STALLED (`verify`, `status`) is probably hung: cancel your `verify`, \

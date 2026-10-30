@@ -263,7 +263,7 @@ not an ordinary failure and not "the daemon stopped": the job is `killed`,
 example
 
 ```text
-test was killed for lack of memory after 41.2s (job peak 18.1 GiB; 1.4 GiB available at the end); running it again unchanged is likely to end the same way: lower its concurrency or free memory first
+test was killed for lack of memory after 41.2s (job peak 18.1 GiB; 1.4 GiB available at the end; 14.2 GiB used outside gates). The machine did not have the memory this gate needs: run it again unchanged once memory is free (Sluice waits for it), or tell the human; lower its concurrency only if the gate's peak depends on it
 ```
 
 `sluice run` and `sluice exec` print it after the headline `KILLED for lack of
@@ -288,7 +288,7 @@ agents' limit, half the duration, rounded up to whole seconds), and `daemon/` ha
 `user.oomd_omit=1` so the daemon is never the victim. `sluice doctor`
 (`gates-memory-policy`) prints the figures and warns when `daemon/` lacks the
 attribute; `oomctl` lists both scopes, and `sluice status` shows
-`gates memory policy: systemd-oomd at 30% for 3s`. Without oomd (Debian and Arch
+`gates memory policy: systemd-oomd at 30% for 8s`. Without oomd (Debian and Arch
 by default) or below systemd 257 that policy does not exist: the kernel's
 preference and memory admission remain, and `sluice doctor` (`memory-guard`)
 suggests the opt-in guard.

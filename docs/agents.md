@@ -219,10 +219,13 @@ the same instructions. For agents without the plugin, paste this into `AGENTS.md
   on this tree`, call `verify` for that gate, then retry the git command.
 - For diagnosis use `sluice cache status` (what is cached for this tree) and
   `sluice logs` (newest job log) instead of re-running anything.
-- A gate result `KILLED for lack of memory ...` is not a test failure to retry
-  unchanged: the kernel or systemd-oomd ended it because the machine ran out of
-  memory. Reduce the gate's footprint (for example test concurrency) or tell the
-  human; never run the gate through the shell to get around it.
+- A gate result `KILLED for lack of memory ...` is not a test failure: the
+  kernel or systemd-oomd ended it because the machine ran out of memory. Follow
+  its message: run it again unchanged once memory is free (Sluice waits for
+  it) or tell the human. Changing its arguments or its concurrency rarely
+  lowers its memory (the message says when it did not) and makes Sluice
+  estimate the new command afresh. Never run the gate through the shell to get
+  around it.
 - A gate that `status` shows as waiting for memory (`(budget: memory)` in the text
   of MCP `status` and of `sluice status`, `wait_detail: "memory"` in the structured result) is only queued behind
   other gates: wait, do not run it outside Sluice.

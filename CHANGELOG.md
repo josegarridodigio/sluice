@@ -9,7 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`status` says where the memory reserve and an estimate come from** (ADR-0026). The
+  `memory:` line marks a reserve raised by the observed growth outside gates
+  (`reserve_basis`), a running job that started alone beyond its estimate is flagged
+  (`memory_beyond_estimate`), and the daemon log writes "starts alone beyond its
+  estimate" when that happens.
+
 ### Changed
+
+- **Memory admission keeps what it learned** (ADR-0026). A command of a gate with no
+  history (for example the same test gate with `--filter` or another concurrency) is
+  estimated from the gate's other commands instead of a guess; only a guess may start as a
+  first-run probe, never a lower bound; a memory-killed run counts 1.25 x its peak instead
+  of 1.5 x; after a gate is killed for memory no job starts for at least 10 s and until the
+  gates' memory pressure decays (the PSI starvation guard included); and the memory
+  reserve grows to the P90 of what the rest of the machine grew while heavy jobs ran
+  (at most a quarter of the RAM). New table `outside_growth` (containment schema 4;
+  older binaries ignore it).
+- **The agents' systemd-oomd window is 15 s** (`min(15s, 3/4` of the user manager's
+  duration`)`, was `min(5s, 1/4)`); the gates' scope follows at 8 s. A gate kill no longer
+  leaves residual pressure that ends an agent's session.
+- **`KILLED for lack of memory` advice**: the message names the memory used outside gates,
+  says when other arguments did not lower the gate's memory, and tells the agent to rerun
+  unchanged once memory is free or to tell the human (the agent rules and the skill agree).
 
 ### Fixed
 
