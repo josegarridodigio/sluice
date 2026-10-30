@@ -46,7 +46,7 @@ def load(path):
     with open(path, newline="") as f:
         for r in csv.DictReader(f):
             key = (int(r["agents"]), r["scenario"])
-            rows.setdefault(key, []).append(int(r["wall_ms"]) / 60000)
+            rows.setdefault(key, []).append(int(r["wall_ms"]) / 1000)
             meta = (r["cpus"], r["mem_gib"])
     agents = sorted({a for a, _ in rows})
     data = []
@@ -59,7 +59,7 @@ def load(path):
 
 
 def nice_max(v):
-    for step in (0.5, 1, 2, 5, 10, 15, 20, 30, 60):
+    for step in (0.5, 1, 2, 5, 10, 15, 20, 30, 60, 120, 300, 600):
         if v / step <= 5:
             return step * -(-v // step), step
     return v, v / 5
@@ -76,6 +76,12 @@ def column(x, y0, h, color):
 
 
 def svg(data, meta, t):
+    # Seconds below five minutes, minutes above.
+    if max(w for _, w, _ in data) >= 300:
+        data = [(a, wo / 60, wi / 60) for a, wo, wi in data]
+        unit, fmt = "min", "{:.1f}"
+    else:
+        unit, fmt = "s", "{:.0f}"
     ymax, step = nice_max(max(w for _, w, _ in data) * 1.05)
     plot_h = H - TOP - BOTTOM
     plot_w = W - LEFT - RIGHT
@@ -90,7 +96,8 @@ def svg(data, meta, t):
         '<desc id="d">'
         + escape(
             "; ".join(
-                f"{a} agent(s): {wo:.1f} min without Sluice, {wi:.1f} min with Sluice"
+                f"{a} agent(s): {fmt.format(wo)} {unit} without Sluice, "
+                f"{fmt.format(wi)} {unit} with Sluice"
                 for a, wo, wi in data
             )
         )
@@ -101,7 +108,7 @@ def svg(data, meta, t):
         "Each agent makes 2 commits in its own worktree, running this repository's "
         "pre-commit gates (fmt, clippy).</text>",
         f'<text x="{LEFT}" y="68" font-size="13" fill="{t["muted"]}">'
-        f"GitHub-hosted runner, {cpus} CPUs, {mem} GiB of RAM. Lower is better.</text>",
+        f"GitHub-hosted runner, {cpus} CPUs, {mem} GiB of RAM; median of the runs. Lower is better.</text>",
     ]
     # Legend: Sluice first (slot 1), then the baseline (slot 2).
     lx = LEFT
@@ -119,7 +126,7 @@ def svg(data, meta, t):
             f'<line x1="{LEFT}" x2="{W - RIGHT}" y1="{y:.1f}" y2="{y:.1f}" '
             f'stroke="{t["grid"]}" stroke-width="1"/>'
         )
-        label = f"{v:g} min" if v else "0"
+        label = f"{v:g} {unit}" if v else "0"
         out.append(
             f'<text x="{LEFT - 8}" y="{y + 4:.1f}" font-size="12" text-anchor="end" '
             f'fill="{t["muted"]}">{label}</text>'
@@ -134,7 +141,7 @@ def svg(data, meta, t):
             out.append(column(round(x, 1), y0, h, t[key]))
             out.append(
                 f'<text x="{x + BAR / 2:.1f}" y="{y0 - h - 6:.1f}" font-size="12" '
-                f'text-anchor="middle" fill="{t["text"]}">{val:.1f}</text>'
+                f'text-anchor="middle" fill="{t["text"]}">{fmt.format(val)}</text>'
             )
         top = y0 - max(wo, wi) * sy - 26
         change = (wi - wo) / wo * 100 if wo else 0

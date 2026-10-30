@@ -1,7 +1,7 @@
 name: Bench
 
 # The README chart: N agents committing in parallel, without and with Sluice
-# (scripts/bench-agents.sh). On demand only: it takes most of an hour, and its
+# (scripts/bench-agents.sh). On demand only: about 15 minutes per round, and its
 # result is reviewed by a human before docs/assets/bench-*.svg is committed.
 on:
   workflow_dispatch:
@@ -9,6 +9,9 @@ on:
       agents:
         description: "Agent counts, space-separated"
         default: "1 2 4 8"
+      rounds:
+        description: "Repetitions of the whole sweep (the chart shows the medians)"
+        default: "3"
 
 env:
   CARGO_TERM_COLOR: always
@@ -36,9 +39,13 @@ jobs:
         env:
           SLUICE_BENCH_DIR: /mnt/bench
           AGENTS: ${{ inputs.agents }}
+          ROUNDS: ${{ inputs.rounds }}
         run: |
-          # shellcheck disable=SC2086
-          scripts/bench-agents.sh "$RUNNER_TEMP/bench-agents.csv" $AGENTS
+          for round in $(seq "$ROUNDS"); do
+            echo "== round $round of $ROUNDS"
+            # shellcheck disable=SC2086
+            scripts/bench-agents.sh "$RUNNER_TEMP/bench-agents.csv" $AGENTS
+          done
           cat "$RUNNER_TEMP/bench-agents.csv"
       - name: Draw the chart
         run: |
