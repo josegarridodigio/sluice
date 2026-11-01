@@ -9,13 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Fixed
+
+## [0.10.0] - 2026-11-01
+
+### Added
+
 - **A kernel ceiling on every gate job** (ADR-0027, `[admission] memory_ceiling`, on by
   default with containment `full`, and `memory_floor`). Each second the daemon writes
   every job leaf's `memory.max` so that the jobs together never take the machine below
   the floor (half the memory reserve by default). `status` shows each running job's
   `ceiling` (`memory_ceiling_bytes` in the JSON).
-
-### Changed
 
 ### Fixed
 
@@ -742,7 +748,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PSI thresholds must be percentages (rejected at config load otherwise).
 - Findings of the Phase 1, 2, 3 and 4 reconciliation passes.
 
-[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/josegarridodigio/sluice/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/josegarridodigio/sluice/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/josegarridodigio/sluice/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/josegarridodigio/sluice/compare/v0.6.3...v0.7.0
