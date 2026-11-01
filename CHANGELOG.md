@@ -13,6 +13,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.10.1] - 2026-11-01
+
+### Changed
+
+- **Releases are announced with Shipcast.** `.github/launch.yml` and the Shipcast launch
+  workflow: on each published release, Shipcast's GitHub Action reads the code at the tag,
+  writes the launch article and posts, and opens them as a drafts pull request in the
+  launches repo; nothing is published until it is merged. CI only: the `sluice` binary
+  behaves exactly as 0.10.0.
+
+### Fixed
+
+- **The configuration reference said the 0.10.0 keys were unreleased.**
+  `admission.memory_ceiling` and `admission.memory_floor` need 0.10.0; 0.9.0 and older
+  reject them.
+
 ## [0.10.0] - 2026-11-01
 
 ### Added
@@ -748,7 +764,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PSI thresholds must be percentages (rejected at config load otherwise).
 - Findings of the Phase 1, 2, 3 and 4 reconciliation passes.
 
-[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/josegarridodigio/sluice/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/josegarridodigio/sluice/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/josegarridodigio/sluice/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/josegarridodigio/sluice/compare/v0.7.0...v0.8.0
