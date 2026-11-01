@@ -1,0 +1,30 @@
+# Shipcast: whether and how this project is launched (https://github.com/yeyo11/shipcast/blob/main/docs/launch-yml.md).
+# Each channel is auto (published without review), approval (published when you merge the drafts
+# pull request) or off. A channel publishes only once its secrets are set in the launches repo.
+enabled: true
+brand: josegarridodev
+language: en
+
+triggers:
+  release: true      # a published release
+  manual: true       # the workflow run by hand
+
+publishing:
+  blog: approval
+  devto: approval
+  bluesky: approval
+  mastodon: approval
+  instagram: off
+  reddit: off
+  hashnode: off
+  linkedin: off
+  newsletter: off
+  telegram: off
+  discord: off
+  githubDiscussions: off
+  threads: off
+  youtube: off
+
+# A demo makes the launch: a GIF in the repo, or the deployed project to record one from
+assets:
+  demo: docs/assets/demo.gif
