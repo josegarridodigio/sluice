@@ -1,0 +1,47 @@
+# Shipcast, in a project repo (written by `npx @yeyo11/shipcast init`).
+#
+# On a published release, or run by hand with a tag, Shipcast reads the code at that tag, writes the
+# launch content and opens a drafts pull request in your launches repo. Nothing is published until you
+# merge it. .github/launch.yml decides what is launched; a release is launched once, whatever re-runs.
+#
+# Secrets: SHIPCAST_GITHUB_TOKEN, and ANTHROPIC_API_KEY or OPENAI_API_KEY.
+# Variables (optional): SHIPCAST_AI_PROVIDER (anthropic or openai), SHIPCAST_AI_MODEL, SHIPCAST_DRY_RUN.
+name: Shipcast launch
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release's tag to launch (the latest release if empty)
+        required: false
+        type: string
+      dry-run:
+        description: Print what would be done; nothing is saved, written or published
+        required: false
+        default: false
+        type: boolean
+
+# One launch of a release at a time; launching twice is refused by the state either way
+concurrency:
+  group: shipcast-${{ github.event.release.tag_name || inputs.tag || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: yeyo11/shipcast-action@next
+        with:
+          command: launch
+          launches-repo: yeyo11/shipcast-demo-launches
+          github-token: ${{ secrets.SHIPCAST_GITHUB_TOKEN }}
+          ai-provider: ${{ vars.SHIPCAST_AI_PROVIDER || 'anthropic' }}
+          ai-api-key: ${{ (vars.SHIPCAST_AI_PROVIDER || 'anthropic') == 'openai' && secrets.OPENAI_API_KEY || secrets.ANTHROPIC_API_KEY }}
+          ai-model: ${{ vars.SHIPCAST_AI_MODEL }}
+          dry-run: ${{ inputs.dry-run == true || vars.SHIPCAST_DRY_RUN == 'true' }}
