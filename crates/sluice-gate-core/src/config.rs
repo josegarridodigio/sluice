@@ -958,6 +958,10 @@ pub struct DaemonConfig {
 /// The `[admission]` table.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent on/off keys of the configuration file"
+)]
 pub struct AdmissionConfig {
     /// Whether PSI-based admission is on.
     pub psi_enabled: bool,
@@ -999,6 +1003,14 @@ pub struct AdmissionConfig {
     /// with the largest working set, reported as `killed_by = "memory"`. For
     /// machines where `systemd-oomd` is absent or older than systemd 257.
     pub memory_guard: bool,
+    /// The kernel ceiling of every gate job (ADR-0027), on by default: each
+    /// second the daemon writes every job leaf's `memory.max` so that the jobs
+    /// together can never take the machine below `memory_floor`. Needs
+    /// containment `full`; `false` writes `max` again.
+    pub memory_ceiling: bool,
+    /// Memory the ceilings always leave free: `"auto"` (half of
+    /// `memory_reserve`) or a size such as `"2G"`.
+    pub memory_floor: String,
 }
 
 impl AdmissionConfig {
@@ -1010,6 +1022,18 @@ impl AdmissionConfig {
             total / 10
         } else {
             parse_size_bytes(&self.memory_reserve).unwrap_or(total / 10)
+        }
+    }
+
+    /// `memory_floor` in bytes on a machine with `total` bytes of memory
+    /// (`"auto"` is half of [`Self::memory_reserve_bytes`]).
+    #[must_use]
+    pub fn memory_floor_bytes(&self, total: u64) -> u64 {
+        let auto = self.memory_reserve_bytes(total) / 2;
+        if self.memory_floor.trim() == AUTO_RESERVE {
+            auto
+        } else {
+            parse_size_bytes(&self.memory_floor).unwrap_or(auto)
         }
     }
 }
@@ -1210,6 +1234,8 @@ impl Default for AdmissionConfig {
             memory_aware: true,
             memory_reserve: AUTO_RESERVE.to_owned(),
             memory_guard: false,
+            memory_ceiling: true,
+            memory_floor: AUTO_RESERVE.to_owned(),
         }
     }
 }
@@ -1266,6 +1292,13 @@ fn validate_admission(a: &AdmissionConfig, path: &Path) -> Result<()> {
             format!(
                 "admission.memory_reserve {reserve:?} must be \"auto\" or a size such as \"3G\""
             ),
+        ));
+    }
+    let floor = a.memory_floor.trim();
+    if floor != AUTO_RESERVE && parse_size_bytes(floor).is_none() {
+        return Err(config_err(
+            path,
+            format!("admission.memory_floor {floor:?} must be \"auto\" or a size such as \"2G\""),
         ));
     }
     for (name, value) in [
@@ -2061,6 +2094,30 @@ budget_share_max = 4
         );
         assert!(
             user_err("version = 1\n[admission]\nmemory_reserve = \"0\"").contains("memory_reserve")
+        );
+    }
+
+    #[test]
+    fn the_memory_ceiling_is_on_and_its_floor_is_half_the_reserve() {
+        let c = UserConfig::default();
+        assert!(c.admission.memory_ceiling);
+        let total = 30 << 30;
+        assert_eq!(c.admission.memory_floor_bytes(total), 3 << 29);
+        let c = UserConfig::parse(
+            "version = 1\n[admission]\nmemory_ceiling = false\nmemory_floor = \"2G\"\n",
+            Path::new("/u.toml"),
+        )
+        .unwrap();
+        assert!(!c.admission.memory_ceiling);
+        assert_eq!(c.admission.memory_floor_bytes(total), 2 << 30);
+        let c = UserConfig::parse(
+            "version = 1\n[admission]\nmemory_reserve = \"4G\"\n",
+            Path::new("/u.toml"),
+        )
+        .unwrap();
+        assert_eq!(c.admission.memory_floor_bytes(total), 2 << 30);
+        assert!(
+            user_err("version = 1\n[admission]\nmemory_floor = \"some\"").contains("memory_floor")
         );
     }
 

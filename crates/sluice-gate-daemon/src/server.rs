@@ -58,6 +58,7 @@ use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, interval_at, sleep, timeout};
 
+use crate::ceiling::{self, CeilingJob};
 use crate::containment::{self, Containment, ContainmentSetup};
 use crate::executor::{
     self, ExecSpec, ExecStatus, Finished, IoPriority, Launch, ProcessInfo, RunningHandle, Sink,
@@ -376,6 +377,11 @@ struct Shared {
     growth: Mutex<std::collections::VecDeque<u64>>,
     /// The opt-in memory guard (never held together with another mutex).
     guard: Mutex<Guard>,
+    /// Writes the kernel ceiling of every job leaf (ADR-0027).
+    ceiling: ceiling::Writer,
+    /// Jobs whose ceiling already fell below their usage, logged once (never
+    /// held together with another mutex).
+    ceiling_cut: Mutex<std::collections::HashSet<String>>,
     /// CPUs of the daemon's affinity mask (`None`: every CPU of `/proc/stat`).
     allowed_cpus: Option<std::collections::BTreeSet<u32>>,
     /// CPUs available to the daemon, for `status`.
@@ -927,6 +933,8 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
         peaks: Mutex::new(peaks),
         growth: Mutex::new(growth),
         guard: Mutex::new(Guard::new(config.admission.memory_guard)),
+        ceiling: ceiling::Writer::spawn(),
+        ceiling_cut: Mutex::new(std::collections::HashSet::new()),
         allowed_cpus,
         cpus,
         instance,
@@ -1210,6 +1218,7 @@ fn sample_tick(shared: &Shared) -> bool {
         }
     }
     guard_tick(shared, now);
+    ceiling_tick(shared);
     let mono = crate::stall::mono_ms();
     let stalls = stalls::due(shared, mono) && stalls::tick(shared, mono);
     changed || stalls
@@ -1266,6 +1275,57 @@ fn guard_tick(shared: &Shared, now: u64) {
     let victim = lock(&shared.guard).observe(now, sample, &jobs);
     if let Some(victim) = victim {
         cancel_for_memory(shared, now, &victim, sample.full_avg10);
+    }
+}
+
+/// The kernel ceiling's second (ADR-0027): writes each running job leaf's
+/// `memory.max` so that the jobs together never take the machine below the
+/// floor. A no-op without job leaves or with `[admission] memory_ceiling =
+/// false`.
+fn ceiling_tick(shared: &Shared) {
+    let a = &shared.config.admission;
+    let Some(c) = shared.containment.as_ref().filter(|_| a.memory_ceiling) else {
+        return;
+    };
+    let jobs_dir = c.tree().layout.jobs_dir();
+    let ids: Vec<String> = {
+        let st = shared.state();
+        st.jobs
+            .iter()
+            .filter(|(_, e)| e.process.is_some())
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    let jobs: Vec<CeilingJob> = ids
+        .into_iter()
+        .filter_map(|id| {
+            let anon = memory::read_anon(&jobs_dir.join(&id))?;
+            Some(CeilingJob { id, anon })
+        })
+        .collect();
+    let live: Vec<PathBuf> = jobs.iter().map(|j| jobs_dir.join(&j.id)).collect();
+    shared.ceiling.retain(&live);
+    lock(&shared.ceiling_cut).retain(|id| jobs.iter().any(|j| &j.id == id));
+    if jobs.is_empty() {
+        return;
+    }
+    let Some(info) = gates_memory(shared) else {
+        return;
+    };
+    let floor = a.memory_floor_bytes(info.total_bytes);
+    let ceilings = ceiling::ceilings(info.available_bytes, floor, &jobs);
+    for ((id, bytes), job) in ceilings.into_iter().zip(&jobs) {
+        if bytes < job.anon && lock(&shared.ceiling_cut).insert(id.clone()) {
+            tracing::warn!(
+                job = %id,
+                ceiling = %proto::gib_text(bytes),
+                anon = %proto::gib_text(job.anon),
+                available = %proto::gib_text(info.available_bytes),
+                floor = %proto::gib_text(floor),
+                "the machine is below the memory floor: the kernel ceiling of this job falls below its usage, the kernel reclaims or kills it"
+            );
+        }
+        shared.ceiling.set(&jobs_dir.join(&id), Some(bytes));
     }
 }
 
@@ -2881,6 +2941,12 @@ async fn handle_connection(shared: Arc<Shared>, stream: UnixStream) {
     }
 }
 
+/// The kernel ceiling last written to job `id`'s leaf (ADR-0027).
+fn ceiling_of(shared: &Shared, id: &str) -> Option<u64> {
+    let c = shared.containment.as_ref()?;
+    shared.ceiling.written(&c.tree().layout.jobs_dir().join(id))
+}
+
 #[allow(clippy::too_many_lines, reason = "one report, field by field")]
 fn status_report(shared: &Shared) -> StatusReport {
     let now = now_ms();
@@ -2912,6 +2978,7 @@ fn status_report(shared: &Shared) -> StatusReport {
                     .and_then(|e| e.usage.demand_so_far(elapsed_ms))
                     .map(|d| (d * 10.0).round() / 10.0);
                 let stall_view = stalls::view(st.jobs.get(&v.id));
+                let ceiling = ceiling_of(shared, &v.id);
                 RunningJob {
                     caller: caller(&v.id),
                     kind,
@@ -2936,6 +3003,7 @@ fn status_report(shared: &Shared) -> StatusReport {
                         .map(super::scheduler::Expected::learned),
                     memory_expected_basis: v.memory_expected.map(|e| e.basis.as_str().to_owned()),
                     memory_beyond_estimate: v.beyond_estimate.then_some(true),
+                    memory_ceiling_bytes: ceiling,
                     stalled: stall_view,
                 }
             })

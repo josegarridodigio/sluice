@@ -240,6 +240,13 @@ pub fn read_cgroup(leaf: &Path) -> Option<WorkingSet> {
     })
 }
 
+/// `anon` of a job's cgroup leaf (RAM only, swap excluded): what its kernel
+/// ceiling is computed from (ADR-0027). `None` without a readable leaf.
+#[must_use]
+pub fn read_anon(leaf: &Path) -> Option<u64> {
+    parse_anon(&std::fs::read_to_string(leaf.join("memory.stat")).ok()?)
+}
+
 /// Resident set of `pid`, bytes (`VmRSS` of `<proc_root>/<pid>/status`).
 fn rss_of(proc_root: &Path, pid: u32) -> Option<u64> {
     let status = std::fs::read_to_string(proc_root.join(pid.to_string()).join("status")).ok()?;

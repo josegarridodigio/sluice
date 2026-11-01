@@ -1,0 +1,9 @@
+# Written for the release after 0.9.0 (ADR-0027): `[admission] memory_ceiling`, the
+# kernel ceiling the daemon writes on every gate job leaf (on by default), and
+# `memory_floor`, the memory it always leaves free. Not a recording of a released
+# binary; 0.9.0 and older reject this file because `[admission]` refuses unknown keys.
+version = 1
+
+[admission]
+memory_ceiling = false
+memory_floor = "2G"

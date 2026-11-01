@@ -638,6 +638,21 @@ fn admission_memory_guard_fixture_parses() {
     assert!(!plain.admission.memory_guard);
 }
 
+/// ADR-0027: `[admission] memory_ceiling` and `memory_floor` parse; the ceiling is
+/// on and the floor is half the reserve without the keys.
+#[test]
+fn admission_memory_ceiling_fixture_parses() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/unreleased/admission-memory-ceiling.toml");
+    let text = fs::read_to_string(&path).unwrap();
+    let cfg = UserConfig::parse(&text, &path).unwrap();
+    assert!(!cfg.admission.memory_ceiling);
+    assert_eq!(cfg.admission.memory_floor_bytes(30 << 30), 2 << 30);
+    let plain = UserConfig::parse("version = 1\n", &path).unwrap();
+    assert!(plain.admission.memory_ceiling);
+    assert_eq!(plain.admission.memory_floor_bytes(30 << 30), 3 << 29);
+}
+
 /// ADR-0023: `[scheduler] backfill` parses, and is on without the key.
 #[test]
 fn scheduler_backfill_fixture_parses() {

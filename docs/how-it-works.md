@@ -124,8 +124,13 @@ run at once, and it makes identical simultaneous requests share one run.
   time, so a pessimistic guess cannot hold it back for hours; its real peak then
   becomes the estimate. If memory runs out anyway, gate processes are the preferred victims of
   the kernel's OOM killer and of `systemd-oomd`, and a gate killed that way is
-  reported as such (`killed_by = "memory"`), not as a test failure
-  (`[admission] memory_aware`, `memory_reserve`, `memory_guard`; see
+  reported as such (`killed_by = "memory"`), not as a test failure. Every job
+  also runs under a kernel ceiling (`memory.max` of its cgroup leaf) that the
+  daemon lowers as the machine fills, so the jobs can never take the last
+  `memory_floor` of memory: a job that would make the whole machine thrash is
+  killed inside its own cgroup instead, even when no process in userspace can
+  run (`[admission] memory_aware`, `memory_reserve`, `memory_guard`,
+  `memory_ceiling`, `memory_floor`; see
   [debugging.md](debugging.md#a-gate-killed-for-lack-of-memory)).
 - **Coalescing.** Two requests for the same tree and gate share one run; the
   second waits for the first one's result. If a marker appears while a request

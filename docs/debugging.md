@@ -309,6 +309,21 @@ the reserve) and never on anything but Sluice's own jobs. If it fires too often,
 lower the suites' parallelism or lower `memory_reserve`; to turn it off, remove
 the key.
 
+#### The kernel ceiling killed my job
+
+Every running job's cgroup leaf has a `memory.max` that the daemon rewrites each second
+(`[admission] memory_ceiling`, on by default with containment `full`): the job's `anon`
+plus its share of `MemAvailable − memory_floor`. When the machine falls below the floor
+(the gates grew, or something outside them did), the largest job's ceiling drops below
+its usage and the kernel kills it inside its cgroup, within about a second, instead of
+the whole machine thrashing for minutes before a global OOM. The job ends `killed` with
+`killed_by = "memory"` and the usual message, and the daemon log has a warning `the
+machine is below the memory floor: the kernel ceiling of this job falls below its
+usage`, with the ceiling, the job's `anon`, `MemAvailable` and the floor. `sluice
+status` shows each running job's `ceiling`. If it happens often, the gate does not fit
+beside what else runs: lower the suite's parallelism, run fewer agents, or tell the
+human; retrying unchanged once memory is free is the right move for an agent.
+
 ### A gate that waits for memory
 
 `sluice status` shows a job that fits the CPU budget but not the memory it is

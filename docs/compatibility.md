@@ -137,6 +137,13 @@ daemon simply creates it without the policy. The opt-in `[admission]
 memory_guard` and its `sluice_memory_guard` interventions are one-way like the
 other 0.6.0 keys (fixture `crates/sluice-gate-core/tests/fixtures/unreleased/admission-memory-guard.toml`).
 
+The release after 0.9.0 adds `[admission] memory_ceiling` and `memory_floor` (ADR-0027).
+They are one-way like the 0.6.0 keys: 0.9.0 and older binaries reject a user config that
+has them (fixture `crates/sluice-gate-core/tests/fixtures/unreleased/admission-memory-ceiling.toml`).
+The ceiling is on without the keys; it writes only the `memory.max` of Sluice's own job
+leaves, which an older daemon never reads. `status` JSON gains `memory_ceiling_bytes` per
+running job (additive, schema 1).
+
 0.6.1 adds the user config keys `[queue] tool_env` and `[queue] tool_path` (ADR-0020).
 They are one-way like the 0.6.0 keys: 0.6.0 and older binaries reject a user config that
 has them (fixture `crates/sluice-gate-core/tests/fixtures/unreleased/queue-tool-env.toml`).

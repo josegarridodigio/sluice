@@ -976,27 +976,37 @@ impl MemoryBudget {
 }
 
 impl RunningJob {
+    /// The job's kernel ceiling in the text status, `  ceiling 14.5 GiB`, or
+    /// nothing without one.
+    fn ceiling_text(&self) -> String {
+        self.memory_ceiling_bytes
+            .map(|c| format!("  ceiling {}", gib_text(c)))
+            .unwrap_or_default()
+    }
+
     /// The job's memory in the text status, `  mem 3.1 GiB/18.0 GiB`
     /// (current/expected; the expected peak has a `~` when it is a guess), or
     /// nothing when the daemon sent none.
     #[must_use]
     pub fn memory_text(&self) -> String {
         match (self.memory_bytes, self.memory_expected_bytes) {
-            (Some(now), Some(expected)) => format!(
-                "  mem {}/{}{}",
-                gib_text(now),
-                expected_text(
-                    expected,
-                    self.memory_expected_learned,
-                    self.memory_expected_basis.as_deref()
-                ),
-                if self.memory_beyond_estimate == Some(true) {
-                    " (started alone beyond its estimate)"
-                } else {
-                    ""
-                }
-            ),
-            (Some(now), None) => format!("  mem {}", gib_text(now)),
+            (Some(now), Some(expected)) => {
+                format!(
+                    "  mem {}/{}{}",
+                    gib_text(now),
+                    expected_text(
+                        expected,
+                        self.memory_expected_learned,
+                        self.memory_expected_basis.as_deref()
+                    ),
+                    if self.memory_beyond_estimate == Some(true) {
+                        " (started alone beyond its estimate)"
+                    } else {
+                        ""
+                    }
+                ) + &self.ceiling_text()
+            }
+            (Some(now), None) => format!("  mem {}{}", gib_text(now), self.ceiling_text()),
             _ => String::new(),
         }
     }
@@ -1249,6 +1259,11 @@ pub struct RunningJob {
     /// otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_beyond_estimate: Option<bool>,
+    /// The kernel ceiling last written to the job's `memory.max`, bytes
+    /// (ADR-0027). Absent without one (ceiling off, no job leaf, or older
+    /// daemons).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_ceiling_bytes: Option<u64>,
     /// Present while the job is stalled (ADR-0024): no progress for the
     /// whole quiet window. Sluice only reports it; the job is never ended.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1779,6 +1794,28 @@ pub fn line_too_long(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_running_job_shows_its_kernel_ceiling() {
+        let g = 1u64 << 30;
+        let mut j = super::RunningJob {
+            memory_bytes: Some(3 * g),
+            memory_expected_bytes: Some(16 * g),
+            memory_expected_learned: Some(true),
+            ..super::RunningJob::default()
+        };
+        assert!(!j.memory_text().contains("ceiling"), "{}", j.memory_text());
+        j.memory_ceiling_bytes = Some(14 * g + g / 2);
+        assert!(
+            j.memory_text().ends_with("  ceiling 14.5 GiB"),
+            "{}",
+            j.memory_text()
+        );
+        j.memory_expected_bytes = None;
+        assert_eq!(j.memory_text(), "  mem 3.0 GiB  ceiling 14.5 GiB");
+        let json = serde_json::to_string(&j).unwrap();
+        assert!(json.contains("\"memory_ceiling_bytes\""), "{json}");
+    }
+
     use super::*;
 
     #[test]

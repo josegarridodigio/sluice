@@ -16,6 +16,7 @@
 //! Design: `kb/sluice/design/executor.md`, `scheduler.md`, `protocol.md`,
 //! `psi-admission.md`.
 
+pub mod ceiling;
 pub mod containment;
 pub mod executor;
 pub mod guard;

@@ -168,6 +168,8 @@ overcommit_interval = "5s" # at most one over-admission per interval, none soone
 memory_aware = true        # 0.6.0, ADR-0019: admit by learned memory, not only by CPU; false = CPU-only admission
 memory_reserve = "auto"    # 0.6.0: memory left for the desktop and the agents: "auto" (10 % of MemTotal) or a size such as "3G"
 memory_guard = false       # 0.6.0: opt-in, cancel Sluice's own largest gate job under real memory exhaustion
+memory_ceiling = true      # ADR-0027: a kernel memory.max on every gate job leaf, so the jobs never take the floor
+memory_floor = "auto"      # ADR-0027: memory the ceilings always leave free: "auto" (half of memory_reserve) or a size
 
 [mcp]
 progress_interval = "15s"  # progress notifications while verify runs (floored at 1s, re-read per call)

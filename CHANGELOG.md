@@ -9,9 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A kernel ceiling on every gate job** (ADR-0027, `[admission] memory_ceiling`, on by
+  default with containment `full`, and `memory_floor`). Each second the daemon writes
+  every job leaf's `memory.max` so that the jobs together never take the machine below
+  the floor (half the memory reserve by default). `status` shows each running job's
+  `ceiling` (`memory_ceiling_bytes` in the JSON).
+
 ### Changed
 
 ### Fixed
+
+- **A gate that does not fit no longer freezes the machine.** On a machine with swap
+  full, a test suite started alone beyond its estimate ran into the last free memory and
+  the whole machine thrashed for 22 s to 2.5 min before each global OOM (six times in
+  two days); systemd-oomd and the daemon stalled with everything else. The kernel
+  ceiling now kills such a job inside its own cgroup within about a second of the
+  machine reaching the floor.
 
 ## [0.9.0] - 2026-10-30
 
