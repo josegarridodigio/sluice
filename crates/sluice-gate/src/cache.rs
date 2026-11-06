@@ -91,6 +91,9 @@ pub fn status(all: bool) -> ExitCode {
                     .map(|s| s.status_suffix())
                     .unwrap_or_default();
                 println!("{name:<16} {line}{scope}{note}");
+                if let Some(memory) = memory_line(&env, &repo.paths.toplevel, name) {
+                    println!("{:<16} {memory}", "");
+                }
             }
         }
         Ok(SnapshotFull::Unknown { reason }) => {
@@ -118,6 +121,24 @@ pub fn status(all: bool) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// The memory telemetry of the gate's newest finished job (ADR-0028), from
+/// the daemon's database opened read-only: `memory: last run 3m ago: swap
+/// 1.2 GiB, ...`. `None` without a database or a recorded run.
+fn memory_line(env: &EnvMap, toplevel: &std::path::Path, gate: &str) -> Option<String> {
+    let db = sluice_gate_core::dirs::database_path(env);
+    if !db.exists() {
+        return None;
+    }
+    let store = sluice_gate_daemon::store::Store::open_read_only(&db).ok()?;
+    let last = store.job_pressure_last(toplevel, gate).ok()??;
+    let finished = std::time::UNIX_EPOCH + std::time::Duration::from_millis(last.finished_at);
+    let at = age(&humantime::format_rfc3339_seconds(finished).to_string());
+    Some(format!(
+        "memory: last run {at} ago: {}",
+        last.summary.text(sluice_gate_proto::gib_text)
+    ))
 }
 
 /// `sluice cache clear [--gate <name>]`.

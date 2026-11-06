@@ -36,12 +36,16 @@ Decision: [[sluice/design/adr/0028-gate-jobs-do-not-degrade-the-desktop.md]] dec
   (`sluice status` and MCP `status`) prints `swap`, `psi` and `N process(es) outside its
   cgroup` per job and the desktop pressure on the `memory:` line. `MemoryBudget` no longer
   derives `Eq` (it holds `f64`).
+- `sluice cache status` prints under each gate a `memory: last run <age> ago: ...` line
+  from `Store::job_pressure_last` (daemon database opened read-only) formatted by
+  `telemetry::Summary::text`.
 
 ## How it was verified
 
 - Unit tests: `telemetry::tests` (pressure parsing, leaf reading, escapees in a fake
   `/proc` including orphaned and reused pids, session cgroup, peaks and notes, session
-  hysteresis), `store::tests::job_pressure_round_trips_and_a_file_without_the_table_ignores_it`,
+  hysteresis, `Summary::text`), `store::tests::job_pressure_round_trips_and_a_file_without_the_table_ignores_it`
+  (with `job_pressure_last`),
   `tests/compat.rs::a_database_at_containment_v4_gains_job_memory_pressure_in_place` and the
   older migration tests updated to drop the new table.
 - Real user manager: `crates/sluice-gate/tests/containment_daemon.rs`

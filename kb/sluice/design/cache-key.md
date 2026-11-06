@@ -229,7 +229,10 @@ Rules:
   the gate lines); a path-scoped gate's
   line gets ` [scoped: <n> of <total> files, <12 hex of the scope hash>]`
   (MCP `status`: `scope: {files, total, hash}` per gate). It runs the gates'
-  `key_inputs` to derive their keys. `--all` appends every stored marker
+  `key_inputs` to derive their keys. Under each gate, a `memory:` line gives the
+  memory telemetry of its newest finished job (swap, memory stall, the desktop's
+  pressure, processes outside its cgroup; ADR-0028), read from the daemon's database
+  opened read-only. `--all` appends every stored marker
   (gate, age, tree and key prefixes).
 - **Miss records**: a failed run, a timeout or a tree-changing pass writes
   `<key>.miss.json`:

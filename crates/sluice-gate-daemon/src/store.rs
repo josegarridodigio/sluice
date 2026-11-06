@@ -1370,6 +1370,34 @@ impl Store {
         Ok(())
     }
 
+    /// The memory telemetry of the newest finished job of `gate` in `repo`
+    /// (`sluice cache status`), `None` when there is none.
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn job_pressure_last(&self, repo: &Path, gate: &str) -> Result<Option<JobPressure>> {
+        if !self.pressure() {
+            return Ok(None);
+        }
+        let job: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT job_id FROM job_memory_pressure WHERE repo = ?1 AND gate = ?2 \
+                 ORDER BY finished_at DESC, rowid DESC LIMIT 1",
+                params![repo.to_string_lossy(), gate],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db)?;
+        let Some(job) = job else {
+            return Ok(None);
+        };
+        Ok(self
+            .job_pressure_recent(usize::try_from(JOB_PRESSURE_KEEP).unwrap_or(usize::MAX))?
+            .into_iter()
+            .find(|p| p.job_id == job))
+    }
+
     /// The newest `limit` job telemetry rows, newest first.
     ///
     /// # Errors
@@ -2431,6 +2459,18 @@ mod tests {
         let rows = s.job_pressure_recent(10).unwrap();
         assert_eq!(rows, vec![quiet, pressure_row("j1", 1)], "newest first");
         assert_eq!(s.job_pressure_recent(1).unwrap().len(), 1);
+        // The newest run of a gate in a repository, for `cache status`.
+        let last = s
+            .job_pressure_last(Path::new("/r"), "exec:playwright test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.job_id, "j2");
+        assert_eq!(s.job_pressure_last(Path::new("/r"), "lint").unwrap(), None);
+        assert_eq!(
+            s.job_pressure_last(Path::new("/other"), "exec:playwright test")
+                .unwrap(),
+            None
+        );
         // A read-only open of a database no migration has touched yet.
         let (_d2, old) = tmp();
         v020_db(&old);

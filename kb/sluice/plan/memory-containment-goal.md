@@ -53,10 +53,6 @@ where "Ask first" says so.
 - Log one line when a job crosses a threshold. Store the per-job peaks (new
   table, migration, schema bump).
 - Expose them in `status`, in the MCP `status` tool and in `sluice cache status`.
-  *Amended while implementing:* `sluice cache status` shows the cache state of the
-  gates for a tree, not runs, so the telemetry goes to `status` (CLI and MCP, one
-  shared text), the daemon log and `job_memory_pressure`; nothing is added to
-  `cache status`.
 
 ### B. ADR-0028 "Gate jobs do not degrade the desktop"
 

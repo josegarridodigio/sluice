@@ -463,6 +463,46 @@ pub struct Summary {
 }
 
 impl Summary {
+    /// One line for `sluice cache status`: `swap 1.2 GiB, memory stall
+    /// 30.0% some / 4.0% full, desktop 12.0%, 1 process outside its cgroup
+    /// (chrome, 95 MiB peak; moved back 1x)`; parts with nothing to say are
+    /// left out, `no swap, no memory stall` when all are.
+    #[must_use]
+    pub fn text(&self, gib: impl Fn(u64) -> String) -> String {
+        let mut parts = Vec::new();
+        if self.swap_peak_bytes > 0 {
+            parts.push(format!("swap {}", gib(self.swap_peak_bytes)));
+        }
+        if self.some_avg10_max >= 1.0 {
+            parts.push(format!(
+                "memory stall {:.1}% some / {:.1}% full",
+                self.some_avg10_max, self.full_avg10_max
+            ));
+        }
+        if let Some(s) = self.session_some_avg10_max.filter(|s| *s >= 1.0) {
+            parts.push(format!("desktop {s:.1}%"));
+        }
+        if self.escaped_processes > 0 {
+            parts.push(format!(
+                "{} process{} outside its cgroup ({}, {} peak; moved back {}x)",
+                self.escaped_processes,
+                if self.escaped_processes == 1 {
+                    ""
+                } else {
+                    "es"
+                },
+                self.escaped_names.join(" "),
+                gib(self.escaped_rss_peak_bytes),
+                self.reclaimed_processes
+            ));
+        }
+        if parts.is_empty() {
+            "no swap, no memory stall".to_owned()
+        } else {
+            parts.join(", ")
+        }
+    }
+
     /// Whether the job left anything worth a log line at its end: some
     /// swap, a measurable stall, or an escapee.
     #[must_use]
@@ -760,6 +800,13 @@ mod tests {
         assert!(matches!(failed, Note::ReclaimFailed(_, ref why) if why == "denied"));
         assert_eq!(t.summary().unwrap().reclaimed_processes, 1);
         assert!(!Summary::default().notable());
+        let gib = |b: u64| format!("{b}B");
+        assert_eq!(Summary::default().text(gib), "no swap, no memory stall");
+        assert_eq!(
+            s.text(gib),
+            "swap 4096B, memory stall 30.0% some / 20.0% full, desktop 20.0%, \
+             1 process outside its cgroup (chrome, 300B peak; moved back 0x)"
+        );
         assert_eq!(t.samples(), 3);
     }
 
