@@ -25,7 +25,7 @@ use crate::run::EXIT_ERROR;
 use crate::snippets::{GUARD, HookManager, Wire, snippet, snippet_with};
 
 pub(crate) mod atomic;
-mod detect;
+pub(crate) mod detect;
 mod hooks;
 mod render;
 
@@ -59,6 +59,10 @@ pub struct GatePlan {
     pub timeout: String,
     pub hooks: Vec<String>,
     pub key_inputs: Vec<String>,
+    /// Environment variables folded into the key (ADR-0029).
+    pub key_env: Vec<String>,
+    /// Untracked files folded into the key (the installed dependencies).
+    pub key_files: Vec<String>,
     pub env: Vec<(String, String)>,
     pub cache: bool,
     pub source: Source,
@@ -203,6 +207,12 @@ fn carried(name: &str, gate: &Gate, old_text: &str) -> GatePlan {
         timeout: humantime::format_duration(gate.timeout).to_string(),
         hooks: gate.hooks.clone(),
         key_inputs: gate.key_inputs.clone(),
+        key_env: gate.key_env.clone(),
+        key_files: gate
+            .key_files
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect(),
         env: gate
             .env
             .iter()
@@ -308,6 +318,8 @@ fn gate_from_command(
         timeout: kind.timeout().to_owned(),
         hooks: vec![candidate.hook.clone()],
         key_inputs: key_inputs_for(words, pm),
+        key_env: Vec::new(),
+        key_files: Vec::new(),
         env,
         cache: kind != Kind::Build,
         source: Source::Hook(files[candidate.file].rel.clone()),
@@ -601,6 +613,13 @@ fn plan(
             unwired.push(gate.name.clone());
         }
         gates.push(gate);
+    }
+    // The environment and installed state each stack's tools depend on
+    // (ADR-0029); a gate carried from the previous config keeps its table.
+    for gate in gates.iter_mut().filter(|g| g.carried.is_none()) {
+        let (key_env, key_files) = detect::environment_inputs(root, &gate.key_inputs);
+        gate.key_env = key_env;
+        gate.key_files = key_files;
     }
     if !unwired.is_empty() {
         notes.push(format!(

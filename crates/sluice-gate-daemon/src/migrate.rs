@@ -37,7 +37,7 @@ pub struct Migration {
 pub const CONTAINMENT_TABLE: &str = "containment_schema";
 
 /// `containment_schema` version this build reads and writes.
-pub const CONTAINMENT_SCHEMA_VERSION: u32 = 4;
+pub const CONTAINMENT_SCHEMA_VERSION: u32 = 5;
 
 /// Migration 0 -> 1 of the containment group: the `interventions` table
 /// (kills by the kernel OOM killer or `systemd-oomd` on Sluice's cgroups).
@@ -87,6 +87,22 @@ CREATE TABLE outside_growth (
 CREATE INDEX outside_growth_time ON outside_growth(finished_at);
 ";
 
+/// Migration 4 -> 5 of the containment group (ADR-0028): `job_memory_pressure`,
+/// the memory telemetry of each finished job (pressure, swap, page cache,
+/// processes that left its cgroup, the session's pressure meanwhile). A table
+/// of its own: older binaries never read it.
+const CONTAINMENT_5: &str = "
+CREATE TABLE job_memory_pressure (
+  job_id TEXT NOT NULL, finished_at INTEGER NOT NULL,
+  repo TEXT NOT NULL, gate TEXT NOT NULL,
+  some_avg10_max REAL NOT NULL, full_avg10_max REAL NOT NULL,
+  swap_peak_bytes INTEGER NOT NULL, file_peak_bytes INTEGER NOT NULL,
+  session_some_avg10_max REAL, session_full_avg10_max REAL,
+  escaped_processes INTEGER NOT NULL, escaped_rss_peak_bytes INTEGER NOT NULL,
+  escaped_names TEXT, reclaimed_processes INTEGER NOT NULL);
+CREATE INDEX job_memory_pressure_time ON job_memory_pressure(finished_at);
+";
+
 /// The `containment_schema` migrations, in order.
 pub const CONTAINMENT_MIGRATIONS: &[Migration] = &[
     Migration {
@@ -108,6 +124,11 @@ pub const CONTAINMENT_MIGRATIONS: &[Migration] = &[
         version: 4,
         name: "memory growth outside gates",
         sql: CONTAINMENT_4,
+    },
+    Migration {
+        version: 5,
+        name: "job memory pressure telemetry",
+        sql: CONTAINMENT_5,
     },
 ];
 

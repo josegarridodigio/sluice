@@ -59,6 +59,12 @@ fn gate_section(gate: &GatePlan) -> String {
     if !gate.key_inputs.is_empty() {
         let _ = writeln!(out, "key_inputs = {}", toml_list(&gate.key_inputs));
     }
+    if !gate.key_env.is_empty() {
+        let _ = writeln!(out, "key_env = {}", toml_list(&gate.key_env));
+    }
+    if !gate.key_files.is_empty() {
+        let _ = writeln!(out, "key_files = {}", toml_list(&gate.key_files));
+    }
     if !gate.env.is_empty() {
         let pairs: Vec<String> = gate
             .env

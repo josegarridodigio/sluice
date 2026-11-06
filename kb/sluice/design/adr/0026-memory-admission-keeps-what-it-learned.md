@@ -5,6 +5,9 @@ tags: [sluice, adr, daemon, memory, admission, containment, systemd-oomd]
 
 # ADR-0026: Memory admission keeps what it learned, and the agents' oomd window outlasts a gate kill
 
+Amended by [[sluice/design/adr/0028-gate-jobs-do-not-degrade-the-desktop.md]] (2026-11-06):
+no job starts beyond its estimate (decision 6) while the desktop session stalls on memory.
+
 Status: accepted (2026-10-30, user decision; decision 7: a 15 s window, not `omit`). Research: [[sluice/research/memory-review-2026-10-30.md]]. Amends
 [[sluice/design/adr/0019-memory-safety-of-gate-jobs.md]] (decision 1),
 [[sluice/design/adr/0022-first-run-memory-estimate.md]] (decision 3) and

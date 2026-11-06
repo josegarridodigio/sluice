@@ -144,6 +144,17 @@ The ceiling is on without the keys; it writes only the `memory.max` of Sluice's 
 leaves, which an older daemon never reads. `status` JSON gains `memory_ceiling_bytes` per
 running job (additive, schema 1).
 
+The release after 0.10.1 adds `[admission] swap_ceiling`, `swap_floor` and `desktop_guard`
+and `[containment] reclaim_escaped` (ADR-0028), and the gate key `key_env` (ADR-0029). They
+are one-way like the 0.6.0 keys: 0.10.1 and older binaries reject a user config or a
+`.sluice.toml` that has them (fixtures
+`crates/sluice-gate-core/tests/fixtures/unreleased/admission-desktop-swap.toml` and
+`gate-key-env.toml`). Without `key_env` every cache key is byte-identical to earlier
+releases. The database gains `job_memory_pressure` (`containment_schema` 5), a table older
+binaries never read. `status` JSON gains, per running job, `memory_swap_bytes`,
+`memory_pressure_some`, `memory_pressure_full`, `escaped_processes` and `escaped_bytes`, and
+`memory.session_some_avg10` / `session_full_avg10` (additive, schema 1).
+
 0.6.1 adds the user config keys `[queue] tool_env` and `[queue] tool_path` (ADR-0020).
 They are one-way like the 0.6.0 keys: 0.6.0 and older binaries reject a user config that
 has them (fixture `crates/sluice-gate-core/tests/fixtures/unreleased/queue-tool-env.toml`).

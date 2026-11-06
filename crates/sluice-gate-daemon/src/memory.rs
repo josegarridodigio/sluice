@@ -66,6 +66,15 @@ pub fn parse_meminfo(text: &str) -> Option<MemInfo> {
     })
 }
 
+/// `SwapTotal` and `SwapFree` of `<proc_root>/meminfo`, bytes; `None` when
+/// unreadable or when the machine has no swap.
+#[must_use]
+pub fn read_swap(proc_root: &Path) -> Option<(u64, u64)> {
+    let text = std::fs::read_to_string(proc_root.join("meminfo")).ok()?;
+    let total = kib_field(&text, "SwapTotal").filter(|t| *t > 0)?;
+    Some((total, kib_field(&text, "SwapFree")?))
+}
+
 /// Reads `<proc_root>/meminfo`.
 #[must_use]
 pub fn read_meminfo(proc_root: &Path) -> Option<MemInfo> {
@@ -251,6 +260,12 @@ pub fn read_anon(leaf: &Path) -> Option<u64> {
 fn rss_of(proc_root: &Path, pid: u32) -> Option<u64> {
     let status = std::fs::read_to_string(proc_root.join(pid.to_string()).join("status")).ok()?;
     kib_field(&status, "VmRSS")
+}
+
+/// Resident set of one process, bytes; `None` when it is gone.
+#[must_use]
+pub fn rss_bytes(proc_root: &Path, pid: u32) -> Option<u64> {
+    rss_of(proc_root, pid)
 }
 
 /// Summed resident set of `pids`: the working set of a job without a

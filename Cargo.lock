@@ -1181,6 +1181,7 @@ dependencies = [
  "humantime",
  "nix",
  "rusqlite",
+ "rustix",
  "serde_json",
  "sha2",
  "sluice-gate-core",

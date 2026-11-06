@@ -33,6 +33,7 @@ pub mod server;
 pub mod settle;
 pub mod stall;
 pub mod store;
+pub mod telemetry;
 
 /// Errors of the daemon crate.
 #[derive(Debug, thiserror::Error)]

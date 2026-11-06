@@ -588,6 +588,7 @@ fn check_repo(env: &EnvMap, paths: &RepoPaths) -> Vec<Check> {
     match &config {
         Ok(cfg) => {
             out.extend(check_scoped_gates(env, paths, cfg));
+            out.extend(check_key_env(cfg, &paths.toplevel));
             out.push(check_weights(env, paths, cfg));
         }
         Err(_)
@@ -960,8 +961,90 @@ const BUILD_INPUTS: &[&str] = &[
     "Makefile",
     "Dockerfile",
     ".nvmrc",
+    ".node-version",
+    ".python-version",
     ".tool-versions",
+    // Package manager settings and the lockfiles not listed above.
+    ".npmrc",
+    ".yarnrc.yml",
+    "bun.lock",
+    "bun.lockb",
+    // Lint and format settings of the toolchains (ADR-0029).
+    "rustfmt.toml",
+    ".rustfmt.toml",
+    "clippy.toml",
+    ".clippy.toml",
+    // Test runner configuration.
+    "angular.json",
+    "jest.config.*",
+    "vitest.config.*",
+    "playwright.config.*",
+    "karma.conf.*",
+    "pytest.ini",
+    "tox.ini",
+    "conftest.py",
 ];
+
+/// `key-env`: one warning per cached gate whose `key_inputs` name a
+/// toolchain (`rustc --version`, `node --version`, ...) but whose `key_env`
+/// leaves out the variables that change what that toolchain checks without
+/// changing the tree (ADR-0029). Never a failure.
+fn check_key_env(cfg: &RepoConfig, root: &Path) -> Vec<Check> {
+    let warnings: Vec<String> = cfg
+        .gates
+        .iter()
+        .filter(|(_, g)| g.cache && g.mode == sluice_gate_core::config::GateMode::Gate)
+        .filter_map(|(name, gate)| key_env_warning(name, gate, root))
+        .collect();
+    if warnings.is_empty() {
+        return Vec::new();
+    }
+    warnings
+        .into_iter()
+        .map(|w| check("key-env", Status::Warn, w))
+        .collect()
+}
+
+/// The warning of one gate, `None` when its `key_env` covers its toolchain.
+fn key_env_warning(name: &str, gate: &Gate, root: &Path) -> Option<String> {
+    let (expected, files) = crate::init::detect::environment_inputs(root, &gate.key_inputs);
+    let missing: Vec<&str> = expected
+        .iter()
+        .filter(|v| !gate.key_env.contains(v))
+        .map(String::as_str)
+        .collect();
+    let have_files: Vec<String> = gate
+        .key_files
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let missing_files: Vec<&str> = files
+        .iter()
+        .filter(|f| !have_files.contains(f))
+        .map(String::as_str)
+        .collect();
+    if missing.is_empty() && missing_files.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if !missing.is_empty() {
+        parts.push(format!(
+            "key_env leaves out {} (a change to them reuses a pass made with other values)",
+            missing.join(", ")
+        ));
+    }
+    if !missing_files.is_empty() {
+        parts.push(format!(
+            "key_files leaves out {} (the installed dependencies: a worktree whose install \
+             drifted from the lockfile reuses another's pass)",
+            missing_files.join(", ")
+        ));
+    }
+    Some(format!(
+        "gate '{name}': {}; needs sluice >= 0.11.0 to read key_env",
+        parts.join("; ")
+    ))
+}
 
 /// `scoped-gates`: one warning line per path-scoped gate whose scope looks
 /// too small (never a failure). Uses one snapshot of the working tree.
@@ -1679,6 +1762,45 @@ fn failed_job_logs(env: &EnvMap) -> Vec<(String, PathBuf)> {
             (j.id, path)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod key_env_tests {
+    use super::*;
+
+    fn gate(toml: &str) -> Gate {
+        let text = format!("version = 1\n[gates.t]\n{toml}\n");
+        RepoConfig::parse(&text, Path::new("/r/.sluice.toml"))
+            .unwrap()
+            .gates
+            .remove("t")
+            .unwrap()
+    }
+
+    #[test]
+    fn a_toolchain_without_its_environment_is_warned_about() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let bare = gate("cmd = \"cargo test\"\nkey_inputs = [\"rustc --version\"]");
+        let w = key_env_warning("t", &bare, root).unwrap();
+        assert!(w.contains("RUSTFLAGS") && w.contains("key_env"), "{w}");
+        let full = gate(
+            "cmd = \"cargo test\"\nkey_inputs = [\"rustc --version\"]\n\
+             key_env = [\"RUSTFLAGS\", \"RUSTDOCFLAGS\", \"CARGO_BUILD_TARGET\"]",
+        );
+        assert_eq!(key_env_warning("t", &full, root), None);
+        // No toolchain input: nothing to say.
+        assert_eq!(key_env_warning("t", &gate("cmd = \"make\""), root), None);
+        // npm: the installed state is expected as a key file.
+        std::fs::write(root.join("package.json"), "{}").unwrap();
+        let node = gate(
+            "cmd = \"npm test\"\nkey_inputs = [\"node --version\"]\n\
+             key_env = [\"NODE_OPTIONS\", \"NODE_ENV\"]",
+        );
+        let w = key_env_warning("t", &node, root).unwrap();
+        assert!(w.contains("node_modules/.package-lock.json"), "{w}");
+        assert!(!w.contains("key_env leaves out"), "{w}");
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,14 @@
+# Written for the release after 0.10.1 (ADR-0028): `[admission] swap_ceiling` and
+# `swap_floor`, the per-job swap ceiling and the swap it always leaves free,
+# `[admission] desktop_guard`, and `[containment] reclaim_escaped`. Not a recording
+# of a released binary; 0.10.1 and older reject this file because both tables
+# refuse unknown keys.
+version = 1
+
+[admission]
+swap_ceiling = false
+swap_floor = "3G"
+desktop_guard = false
+
+[containment]
+reclaim_escaped = false

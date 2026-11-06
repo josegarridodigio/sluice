@@ -247,3 +247,12 @@ found while closing the alpha, and crates.io publication when the user
 decides it. The next block is [[sluice/plan/zero-config-plan.md]]
 (v0.4.0), approved on 2026-10-23 after a trial on a real Angular project
 showed agents saturating the machine outside Sluice.
+
+Memory and cache follow-up (2026-11-06, after the 2026-11-05 desktop hang under
+0.10.0): [[sluice/plan/memory-containment-goal.md]] delivers per-job memory
+telemetry and real containment
+([[sluice/design/adr/0028-gate-jobs-do-not-degrade-the-desktop.md]]: escaped
+processes moved back, a swap ceiling, the desktop guard) and environment inputs
+of the cache key ([[sluice/design/adr/0029-environment-inputs-of-the-cache-key.md]]).
+Next: review a week of the new telemetry (thresholds, swap floor, escapes per
+gate) before the next memory decision.

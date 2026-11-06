@@ -5,6 +5,10 @@ tags: [sluice, adr, daemon, memory, containment, cgroup, oom, thrashing]
 
 # ADR-0027: Every gate job runs under a kernel ceiling that keeps a floor of memory free
 
+Amended by [[sluice/design/adr/0028-gate-jobs-do-not-degrade-the-desktop.md]] (2026-11-06):
+swap is now bounded per job (decision 6) and the exemption (decision 8) is held while the
+desktop guard holds.
+
 Status: accepted (2026-11-01, user decisions: a dynamic ceiling on every job, not only on
 jobs started beyond their estimate; the floor is half the reserve; swap left as it is).
 Research: [[sluice/research/memory-freeze-2026-11-01.md]]. Amends

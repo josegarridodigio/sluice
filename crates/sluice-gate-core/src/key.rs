@@ -89,13 +89,18 @@ pub struct KeyMaterial {
     pub key_inputs: Vec<(String, String)>,
     /// `(relative path as written, sha256 hex of content or the literal "absent")`.
     pub key_files: Vec<(String, String)>,
+    /// `(variable name, value)` of each `key_env` entry in the order written,
+    /// `None` when the variable is unset in the gate's environment (ADR-0029).
+    pub key_env: Vec<(String, Option<String>)>,
 }
 
 /// Derive the cache key.
 ///
 /// Layout: `KEY_PREFIX \0 tree \0 gate \0 cmd \0`, then `k=v \0` per env pair
 /// in sorted order, then `cmd \0 sha \0` per key input, then
-/// `path \0 sha_or_absent \0` per key file.
+/// `path \0 sha_or_absent \0` per key file, then `env:NAME \0 =value \0`
+/// (or `env:NAME \0 unset \0`) per `key_env` entry. Without `key_env` the
+/// bytes are exactly those of earlier releases.
 pub fn derive(material: &KeyMaterial) -> CacheKey {
     let mut h = Sha256::new();
     let mut field = |s: &str| {
@@ -116,6 +121,13 @@ pub fn derive(material: &KeyMaterial) -> CacheKey {
     for (path, sha) in &material.key_files {
         field(path);
         field(sha);
+    }
+    for (name, value) in &material.key_env {
+        field(&format!("env:{name}"));
+        match value {
+            Some(v) => field(&format!("={v}")),
+            None => field("unset"),
+        }
     }
     CacheKey(hex::encode(h.finalize()))
 }
@@ -147,6 +159,23 @@ pub fn command_with_args(normalized_cmd: &str, extra: &[String]) -> String {
 /// Trim a command and collapse every whitespace run into one space.
 pub fn normalize_cmd(cmd: &str) -> String {
     cmd.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The `key_env` entries of a gate read from its environment `env` (the
+/// sanitised caller environment plus the gate's `env` table, the one the
+/// gate command and its `key_inputs` see), each name once, in the order
+/// written (ADR-0029).
+#[must_use]
+pub fn collect_env(
+    names: &[String],
+    env: &BTreeMap<String, String>,
+) -> Vec<(String, Option<String>)> {
+    let mut seen = std::collections::BTreeSet::new();
+    names
+        .iter()
+        .filter(|n| seen.insert(n.as_str()))
+        .map(|n| (n.clone(), env.get(n).cloned()))
+        .collect()
 }
 
 /// Run the `key_inputs` commands and hash the `key_files`.
@@ -220,6 +249,7 @@ mod tests {
             env: BTreeMap::from([("A".into(), "1".into()), ("B".into(), "2".into())]),
             key_inputs: vec![("echo hi".into(), "f00".into())],
             key_files: vec![("Cargo.lock".into(), "absent".into())],
+            key_env: Vec::new(),
         }
     }
 
@@ -248,6 +278,45 @@ mod tests {
             KeyTree::Root(tree(&"c".repeat(40))).key_field(),
             "c".repeat(40)
         );
+    }
+
+    #[test]
+    fn key_env_extends_the_layout_and_tells_unset_from_empty() {
+        let mut m = material();
+        m.key_env = vec![
+            ("RUSTFLAGS".into(), Some("-D warnings".into())),
+            ("NODE_OPTIONS".into(), None),
+        ];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"sluice-cache-v1\0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0test\0npm test\0A=1\0B=2\0echo hi\0f00\0Cargo.lock\0absent\0");
+        bytes.extend_from_slice(b"env:RUSTFLAGS\0=-D warnings\0env:NODE_OPTIONS\0unset\0");
+        assert_eq!(derive(&m).as_str(), hex::encode(Sha256::digest(&bytes)));
+        assert_ne!(derive(&m), derive(&material()), "key_env changes the key");
+        let value = |v: Option<&str>| {
+            let mut m = material();
+            m.key_env = vec![("X".into(), v.map(str::to_owned))];
+            derive(&m)
+        };
+        assert_ne!(value(None), value(Some("")), "unset is not empty");
+        assert_ne!(value(Some("")), value(Some("unset")));
+        assert_ne!(value(Some("a")), value(Some("b")));
+        // An empty key_env is the old layout, byte for byte.
+        let mut empty = material();
+        empty.key_env = Vec::new();
+        assert_eq!(derive(&empty), derive(&material()));
+    }
+
+    #[test]
+    fn collect_env_reads_each_name_once_in_order() {
+        let env = BTreeMap::from([("A".to_owned(), "1".to_owned())]);
+        assert_eq!(
+            collect_env(&["B".into(), "A".into(), "B".into()], &env),
+            [
+                ("B".to_owned(), None),
+                ("A".to_owned(), Some("1".to_owned()))
+            ]
+        );
+        assert_eq!(collect_env(&[], &env), Vec::new());
     }
 
     #[test]

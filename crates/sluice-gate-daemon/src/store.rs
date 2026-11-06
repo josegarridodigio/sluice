@@ -131,12 +131,31 @@ pub struct Store {
     path: PathBuf,
     /// `sched_schema` version of the file (0: no timeline columns).
     sched: u32,
-    /// The file has the `gate_memory` table (`containment_schema` 2).
-    memory: bool,
-    /// The file has the `gate_memory_bound` table (`containment_schema` 3).
-    bounds: bool,
-    /// The file has the `outside_growth` table (`containment_schema` 4).
-    growth: bool,
+    /// `containment_schema` version of the file: 2 has `gate_memory`, 3
+    /// `gate_memory_bound`, 4 `outside_growth`, 5 `job_memory_pressure`.
+    containment: u32,
+}
+
+impl Store {
+    /// The file has the `gate_memory` table.
+    fn memory(&self) -> bool {
+        self.containment >= 2
+    }
+
+    /// The file has the `gate_memory_bound` table.
+    fn bounds(&self) -> bool {
+        self.containment >= 3
+    }
+
+    /// The file has the `outside_growth` table.
+    fn growth(&self) -> bool {
+        self.containment >= 4
+    }
+
+    /// The file has the `job_memory_pressure` table.
+    fn pressure(&self) -> bool {
+        self.containment >= 5
+    }
 }
 
 /// Scheduling facts written when a job is queued (`sched_schema` 1).
@@ -236,6 +255,25 @@ pub struct GateMemory {
     /// The run was killed for lack of memory.
     pub oom_killed: bool,
 }
+
+/// The memory telemetry of one finished job (`job_memory_pressure`,
+/// `containment_schema` 5, ADR-0028).
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobPressure {
+    /// Job id.
+    pub job_id: String,
+    /// End time.
+    pub finished_at: u64,
+    /// Repository identity.
+    pub repo: PathBuf,
+    /// Gate name (`exec:<label>` for exec jobs).
+    pub gate: String,
+    /// The peaks.
+    pub summary: crate::telemetry::Summary,
+}
+
+/// Rows of `job_memory_pressure` kept.
+pub const JOB_PRESSURE_KEEP: i64 = 5000;
 
 /// Rows of `outside_growth` kept (the reserve reads the newest 20).
 pub const OUTSIDE_GROWTH_KEEP: i64 = 200;
@@ -413,9 +451,7 @@ impl Store {
             conn,
             path: path.to_path_buf(),
             sched: 0,
-            memory: false,
-            bounds: false,
-            growth: false,
+            containment: 0,
         };
         let fresh = store.init_schema()?;
         store.migrate(fresh, migrations)?;
@@ -428,9 +464,7 @@ impl Store {
             crate::migrate::CONTAINMENT_SCHEMA_VERSION,
         )
         .map_err(db)?;
-        store.memory = true;
-        store.bounds = true;
-        store.growth = true;
+        store.containment = crate::migrate::CONTAINMENT_SCHEMA_VERSION;
         crate::meta::record_writer(&store.conn).map_err(db)?;
         Ok(store)
     }
@@ -484,16 +518,12 @@ impl Store {
             conn,
             path: path.to_path_buf(),
             sched: 0,
-            memory: false,
-            bounds: false,
-            growth: false,
+            containment: 0,
         };
         store.check_version()?;
         let containment =
             crate::migrate::version(&store.conn, crate::migrate::CONTAINMENT_TABLE).map_err(db)?;
-        store.memory = containment >= 2;
-        store.bounds = containment >= 3;
-        store.growth = containment >= 4;
+        store.containment = containment;
         // Only the columns this build knows are ever selected, so a newer
         // (additive) `sched_schema` reads fine.
         store.sched = crate::migrate::version(&store.conn, crate::migrate::SCHED_TABLE)
@@ -1209,7 +1239,7 @@ impl Store {
     /// # Errors
     /// SQLite or busy errors.
     pub fn insert_gate_memory(&self, m: &GateMemory) -> Result<()> {
-        if !self.memory {
+        if !self.memory() {
             return Ok(());
         }
         self.insert_memory_row("gate_memory", m)
@@ -1222,7 +1252,7 @@ impl Store {
     /// # Errors
     /// SQLite or busy errors.
     pub fn insert_gate_bound(&self, m: &GateMemory) -> Result<()> {
-        if !self.bounds {
+        if !self.bounds() {
             return Ok(());
         }
         self.insert_memory_row("gate_memory_bound", m)
@@ -1270,7 +1300,7 @@ impl Store {
     /// # Errors
     /// SQLite or busy errors.
     pub fn insert_outside_growth(&self, g: &OutsideGrowth) -> Result<()> {
-        if !self.growth {
+        if !self.growth() {
             return Ok(());
         }
         let tx = self.tx()?;
@@ -1293,12 +1323,106 @@ impl Store {
         Ok(())
     }
 
+    /// Records the memory telemetry of a finished job (ADR-0028) and keeps
+    /// the newest [`JOB_PRESSURE_KEEP`] rows. A file without
+    /// `job_memory_pressure` ignores it.
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn insert_job_pressure(&self, p: &JobPressure) -> Result<()> {
+        if !self.pressure() {
+            return Ok(());
+        }
+        let m = &p.summary;
+        let names = (!m.escaped_names.is_empty()).then(|| m.escaped_names.join(" "));
+        let tx = self.tx()?;
+        tx.execute(
+            "INSERT INTO job_memory_pressure (job_id, finished_at, repo, gate, some_avg10_max, \
+             full_avg10_max, swap_peak_bytes, file_peak_bytes, session_some_avg10_max, \
+             session_full_avg10_max, escaped_processes, escaped_rss_peak_bytes, escaped_names, \
+             reclaimed_processes) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                p.job_id,
+                i(p.finished_at),
+                p.repo.to_string_lossy(),
+                p.gate,
+                m.some_avg10_max,
+                m.full_avg10_max,
+                i(m.swap_peak_bytes),
+                i(m.file_peak_bytes),
+                m.session_some_avg10_max,
+                m.session_full_avg10_max,
+                m.escaped_processes,
+                i(m.escaped_rss_peak_bytes),
+                names,
+                m.reclaimed_processes,
+            ],
+        )
+        .map_err(db)?;
+        tx.execute(
+            "DELETE FROM job_memory_pressure WHERE rowid NOT IN (SELECT rowid FROM \
+             job_memory_pressure ORDER BY finished_at DESC, rowid DESC LIMIT ?1)",
+            [JOB_PRESSURE_KEEP],
+        )
+        .map_err(db)?;
+        tx.commit().map_err(db)?;
+        Ok(())
+    }
+
+    /// The newest `limit` job telemetry rows, newest first.
+    ///
+    /// # Errors
+    /// SQLite or busy errors.
+    pub fn job_pressure_recent(&self, limit: usize) -> Result<Vec<JobPressure>> {
+        if !self.pressure() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT job_id, finished_at, repo, gate, some_avg10_max, full_avg10_max, \
+                 swap_peak_bytes, file_peak_bytes, session_some_avg10_max, \
+                 session_full_avg10_max, escaped_processes, escaped_rss_peak_bytes, \
+                 escaped_names, reclaimed_processes FROM job_memory_pressure \
+                 ORDER BY finished_at DESC, rowid DESC LIMIT ?1",
+            )
+            .map_err(db)?;
+        let u = |v: i64| u64::try_from(v).unwrap_or(0);
+        let rows = stmt
+            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
+                Ok(JobPressure {
+                    job_id: r.get(0)?,
+                    finished_at: u(r.get(1)?),
+                    repo: PathBuf::from(r.get::<_, String>(2)?),
+                    gate: r.get(3)?,
+                    summary: crate::telemetry::Summary {
+                        some_avg10_max: r.get(4)?,
+                        full_avg10_max: r.get(5)?,
+                        swap_peak_bytes: u(r.get(6)?),
+                        file_peak_bytes: u(r.get(7)?),
+                        session_some_avg10_max: r.get(8)?,
+                        session_full_avg10_max: r.get(9)?,
+                        escaped_processes: r.get(10)?,
+                        escaped_rss_peak_bytes: u(r.get(11)?),
+                        reclaimed_processes: r.get(13)?,
+                        escaped_names: r
+                            .get::<_, Option<String>>(12)?
+                            .map(|n| n.split(' ').map(str::to_owned).collect())
+                            .unwrap_or_default(),
+                    },
+                })
+            })
+            .map_err(db)?;
+        rows.map(|r| r.map_err(db)).collect()
+    }
+
     /// The growth of the newest `limit` rows, newest first.
     ///
     /// # Errors
     /// SQLite or busy errors.
     pub fn outside_growth_recent(&self, limit: usize) -> Result<Vec<u64>> {
-        if !self.growth {
+        if !self.growth() {
             return Ok(Vec::new());
         }
         let mut stmt = self
@@ -1322,7 +1446,7 @@ impl Store {
     /// # Errors
     /// SQLite or busy errors.
     pub fn gate_memory_recent(&self, per_key: usize) -> Result<Vec<GateMemory>> {
-        if !self.memory {
+        if !self.memory() {
             return Ok(Vec::new());
         }
         self.memory_rows_recent("gate_memory", per_key)
@@ -1334,7 +1458,7 @@ impl Store {
     /// # Errors
     /// SQLite or busy errors.
     pub fn gate_bounds_recent(&self, per_key: usize) -> Result<Vec<GateMemory>> {
-        if !self.bounds {
+        if !self.bounds() {
             return Ok(Vec::new());
         }
         self.memory_rows_recent("gate_memory_bound", per_key)
@@ -1391,7 +1515,7 @@ impl Store {
     /// # Errors
     /// SQLite or busy errors.
     pub fn gate_memory_weights(&self) -> Result<Vec<(PathBuf, String, String, u32)>> {
-        if !self.memory {
+        if !self.memory() {
             return Ok(Vec::new());
         }
         let mut stmt = self
@@ -1434,8 +1558,8 @@ impl Store {
     pub fn prune_gate_memory(&self, unseen_since_ms: u64) -> Result<usize> {
         let mut deleted = 0;
         for (present, table) in [
-            (self.memory, "gate_memory"),
-            (self.bounds, "gate_memory_bound"),
+            (self.memory(), "gate_memory"),
+            (self.bounds(), "gate_memory_bound"),
         ] {
             if present {
                 deleted += self
@@ -2273,6 +2397,46 @@ mod tests {
         s.insert_gate_memory(&sample).unwrap();
         assert_eq!(s.gate_memory_recent(5).unwrap(), Vec::new());
         assert_eq!(s.prune_gate_memory(10).unwrap(), 0);
+    }
+
+    fn pressure_row(job: &str, at: u64) -> JobPressure {
+        JobPressure {
+            job_id: job.into(),
+            finished_at: at,
+            repo: PathBuf::from("/r"),
+            gate: "exec:playwright test".into(),
+            summary: crate::telemetry::Summary {
+                some_avg10_max: 12.5,
+                full_avg10_max: 3.25,
+                swap_peak_bytes: 1 << 30,
+                file_peak_bytes: 2 << 30,
+                session_some_avg10_max: Some(14.0),
+                session_full_avg10_max: None,
+                escaped_processes: 2,
+                escaped_rss_peak_bytes: 300 << 20,
+                reclaimed_processes: 2,
+                escaped_names: vec!["chrome-headless".into(), "crashpad".into()],
+            },
+        }
+    }
+
+    #[test]
+    fn job_pressure_round_trips_and_a_file_without_the_table_ignores_it() {
+        let (_d, p) = tmp();
+        let s = Store::open(&p).unwrap();
+        s.insert_job_pressure(&pressure_row("j1", 1)).unwrap();
+        let mut quiet = pressure_row("j2", 2);
+        quiet.summary.escaped_names.clear();
+        s.insert_job_pressure(&quiet).unwrap();
+        let rows = s.job_pressure_recent(10).unwrap();
+        assert_eq!(rows, vec![quiet, pressure_row("j1", 1)], "newest first");
+        assert_eq!(s.job_pressure_recent(1).unwrap().len(), 1);
+        // A read-only open of a database no migration has touched yet.
+        let (_d2, old) = tmp();
+        v020_db(&old);
+        let r = Store::open_read_only(&old).unwrap();
+        r.insert_job_pressure(&pressure_row("j3", 3)).unwrap();
+        assert_eq!(r.job_pressure_recent(5).unwrap(), Vec::new());
     }
 
     #[test]

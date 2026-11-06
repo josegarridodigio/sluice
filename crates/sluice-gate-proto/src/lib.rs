@@ -966,8 +966,17 @@ impl MemoryBudget {
         } else {
             ""
         };
+        let session = self
+            .session_some_avg10
+            .map(|some| {
+                format!(
+                    ", desktop memory pressure {some:.1}% some / {:.1}% full",
+                    self.session_full_avg10.unwrap_or(0.0)
+                )
+            })
+            .unwrap_or_default();
         format!(
-            "memory:   {} available, {} reserved{observed}, {} still to grow in running jobs",
+            "memory:   {} available, {} reserved{observed}, {} still to grow in running jobs{session}",
             gib_text(self.available_bytes),
             gib_text(self.reserve_bytes),
             gib_text(self.headroom_bytes)
@@ -984,11 +993,39 @@ impl RunningJob {
             .unwrap_or_default()
     }
 
+    /// The job's swap, memory pressure and escaped processes in the text
+    /// status (`  swap 1.2 GiB  psi 12.0%/4.0%  1 process outside its cgroup
+    /// (95 MiB)`), each only when there is something to say (ADR-0028).
+    fn pressure_text(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        if let Some(swap) = self.memory_swap_bytes.filter(|&b| b > 0) {
+            let _ = write!(out, "  swap {}", gib_text(swap));
+        }
+        if let Some(some) = self.memory_pressure_some.filter(|&s| s >= 1.0) {
+            let full = self.memory_pressure_full.unwrap_or(0.0);
+            let _ = write!(out, "  psi {some:.1}%/{full:.1}%");
+        }
+        if let Some(n) = self.escaped_processes.filter(|&n| n > 0) {
+            let _ = write!(
+                out,
+                "  {n} process{} outside its cgroup ({})",
+                if n == 1 { "" } else { "es" },
+                gib_text(self.escaped_bytes.unwrap_or(0))
+            );
+        }
+        out
+    }
+
     /// The job's memory in the text status, `  mem 3.1 GiB/18.0 GiB`
     /// (current/expected; the expected peak has a `~` when it is a guess), or
     /// nothing when the daemon sent none.
     #[must_use]
     pub fn memory_text(&self) -> String {
+        self.memory_core_text() + &self.pressure_text()
+    }
+
+    fn memory_core_text(&self) -> String {
         match (self.memory_bytes, self.memory_expected_bytes) {
             (Some(now), Some(expected)) => {
                 format!(
@@ -1151,7 +1188,7 @@ pub struct BudgetInfo {
 }
 
 /// What memory-aware admission sees (`status`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 #[allow(
     clippy::struct_field_names,
@@ -1172,6 +1209,14 @@ pub struct MemoryBudget {
     /// What the running jobs are still expected to grow by (expected peak
     /// minus current, summed), bytes.
     pub headroom_bytes: u64,
+    /// `some avg10` of the memory pressure of the user's desktop session
+    /// (`session.slice` of the user manager), percent (ADR-0028). Absent
+    /// when the daemon runs under no user manager, and from older daemons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_some_avg10: Option<f64>,
+    /// `full avg10` of the same, percent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_full_avg10: Option<f64>,
 }
 
 /// Linux pressure stall information.
@@ -1264,6 +1309,23 @@ pub struct RunningJob {
     /// daemons).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_ceiling_bytes: Option<u64>,
+    /// `memory.swap.current` of the job's cgroup, bytes (ADR-0028). Absent
+    /// without a job leaf or swap accounting, and from older daemons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_swap_bytes: Option<u64>,
+    /// `some avg10` of the job cgroup's memory pressure, percent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_pressure_some: Option<f64>,
+    /// `full avg10` of the job cgroup's memory pressure, percent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_pressure_full: Option<f64>,
+    /// Processes of the job that live outside its cgroup (their memory is
+    /// not counted, limited or killed with the job). Absent when none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub escaped_processes: Option<u32>,
+    /// Their summed resident set, bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub escaped_bytes: Option<u64>,
     /// Present while the job is stalled (ADR-0024): no progress for the
     /// whole quiet window. Sluice only reports it; the job is never ended.
     #[serde(skip_serializing_if = "Option::is_none")]

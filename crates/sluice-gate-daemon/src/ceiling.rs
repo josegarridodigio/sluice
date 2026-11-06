@@ -20,6 +20,12 @@
 //! own thread, because lowering `memory.max` below the usage is synchronous
 //! (the kernel reclaims or kills before the write returns) and must never
 //! block the sampler.
+//!
+//! ADR-0028 adds the same bound on swap ([`swap_ceilings`], written to
+//! `memory.swap.max` by a second [`Writer`]): with `S = SwapFree − swap
+//! floor`, each job may swap out `swap + S / n`; below the floor no job may
+//! swap out more than it has. All six freezes of 2026-11-01 happened with
+//! swap full: the jobs can no longer be the ones that fill it.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -78,6 +84,32 @@ pub fn ceilings(available: u64, floor: u64, jobs: &[CeilingJob]) -> Vec<(String,
         .collect()
 }
 
+/// One running job and the swap it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwapJob {
+    /// Job id (also the name of its leaf under `jobs/`).
+    pub id: String,
+    /// `memory.swap.current` of the leaf, bytes.
+    pub swap: u64,
+}
+
+/// The swap ceiling of each job, in the order of `jobs`, for a machine with
+/// `free` bytes of `SwapFree` that must keep `floor` bytes of swap free.
+/// Lowering `memory.swap.max` below the usage swaps nothing back in, so below
+/// the floor every job keeps what it has and swaps out no more: a job at its
+/// RAM ceiling then dies in its own cgroup instead of thrashing.
+#[must_use]
+pub fn swap_ceilings(free: u64, floor: u64, jobs: &[SwapJob]) -> Vec<(String, u64)> {
+    let n = jobs.len() as u64;
+    if n == 0 {
+        return Vec::new();
+    }
+    let share = free.saturating_sub(floor) / n;
+    jobs.iter()
+        .map(|j| (j.id.clone(), j.swap.saturating_add(share) / PAGE * PAGE))
+        .collect()
+}
+
 /// What the writer thread shares with the sampler.
 #[derive(Debug, Default)]
 struct Pending {
@@ -96,18 +128,25 @@ pub struct Writer {
 }
 
 impl Writer {
-    /// Starts the writer thread.
+    /// Starts the writer thread of `memory.max`.
     #[must_use]
     pub fn spawn() -> Self {
+        Self::spawn_for("memory.max")
+    }
+
+    /// Starts a writer thread of the leaf file `file` (`memory.max` or
+    /// `memory.swap.max`).
+    #[must_use]
+    pub fn spawn_for(file: &'static str) -> Self {
         let shared = Arc::new((Mutex::new(Pending::default()), Condvar::new()));
         let worker = Arc::clone(&shared);
         let _ = std::thread::Builder::new()
             .name("sluice-ceiling".into())
-            .spawn(move || run(&worker));
+            .spawn(move || run(&worker, file));
         Self { shared }
     }
 
-    /// Queues `value` for `leaf`'s `memory.max` (`None` writes `max`),
+    /// Queues `value` for `leaf`'s file (`None` writes `max`),
     /// replacing any value still waiting; skipped when the leaf already has
     /// it.
     pub fn set(&self, leaf: &Path, value: Option<u64>) {
@@ -156,7 +195,7 @@ impl Writer {
 /// The writer thread: takes one pending value at a time and writes it with
 /// the lock released, so a write the kernel holds (reclaim, OOM) delays only
 /// that leaf's next value.
-fn run(shared: &(Mutex<Pending>, Condvar)) {
+fn run(shared: &(Mutex<Pending>, Condvar), file: &str) {
     let (lock, cv) = shared;
     loop {
         let (leaf, v) = {
@@ -182,7 +221,7 @@ fn run(shared: &(Mutex<Pending>, Condvar)) {
             v.to_string()
         };
         // A leaf removed at job end is not an error: the job is gone.
-        if std::fs::write(leaf.join("memory.max"), text).is_ok() {
+        if std::fs::write(leaf.join(file), text).is_ok() {
             lock.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .written
@@ -196,6 +235,37 @@ mod tests {
     use super::*;
 
     const G: u64 = 1 << 30;
+
+    #[test]
+    fn swap_ceilings_share_the_free_swap_above_the_floor() {
+        let jobs = [
+            SwapJob {
+                id: "a".into(),
+                swap: G,
+            },
+            SwapJob {
+                id: "b".into(),
+                swap: 0,
+            },
+        ];
+        // 6 GiB free, 2 GiB floor: 2 GiB more for each.
+        assert_eq!(
+            swap_ceilings(6 * G, 2 * G, &jobs),
+            [("a".to_owned(), 3 * G), ("b".to_owned(), 2 * G)]
+        );
+        // Below the floor nobody swaps out more than it holds.
+        assert_eq!(
+            swap_ceilings(G, 2 * G, &jobs),
+            [("a".to_owned(), G), ("b".to_owned(), 0)]
+        );
+        assert_eq!(swap_ceilings(G, 0, &[]), Vec::new());
+        // Page granularity.
+        let odd = [SwapJob {
+            id: "c".into(),
+            swap: 4097,
+        }];
+        assert_eq!(swap_ceilings(0, 0, &odd), [("c".to_owned(), 4096)]);
+    }
 
     fn job(id: &str, anon: u64) -> CeilingJob {
         CeilingJob {

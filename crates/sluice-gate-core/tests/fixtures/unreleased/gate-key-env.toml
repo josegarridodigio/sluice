@@ -1,0 +1,10 @@
+# Written for the release after 0.10.1 (ADR-0029): `key_env` of a gate, the
+# environment variables whose value is folded into the cache key. Not a recording
+# of a released binary; 0.10.1 and older reject this file because a gate refuses
+# unknown keys.
+version = 1
+
+[gates.test]
+cmd = "cargo test"
+key_inputs = ["rustc --version"]
+key_env = ["RUSTFLAGS", "RUSTDOCFLAGS"]

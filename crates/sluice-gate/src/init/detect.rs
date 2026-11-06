@@ -210,6 +210,50 @@ pub fn gate_name(entry: &[String], script: Option<&str>) -> String {
     sanitize_name(&name)
 }
 
+/// The `key_env` and installed-state `key_files` of a gate, from the
+/// toolchain its `key_inputs` name (ADR-0029): variables that change what
+/// the stack's tools check without changing the tree, and the file the
+/// package manager rewrites on every install (so a worktree whose
+/// dependencies drifted from the lockfile never reuses another's pass).
+#[must_use]
+pub fn environment_inputs(root: &Path, key_inputs: &[String]) -> (Vec<String>, Vec<String>) {
+    let has = |cmd: &str| key_inputs.iter().any(|k| k == cmd);
+    let mut env: Vec<&str> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+    if has("node --version") {
+        env.extend(["NODE_OPTIONS", "NODE_ENV"]);
+        if let Some(state) = package_manager(root).and_then(|pm| installed_state(root, pm)) {
+            files.push(state.to_owned());
+        }
+    }
+    if has("rustc --version") {
+        env.extend(["RUSTFLAGS", "RUSTDOCFLAGS", "CARGO_BUILD_TARGET"]);
+    }
+    if key_inputs
+        .iter()
+        .any(|k| k.ends_with("python --version") || k == "python3 --version")
+    {
+        env.extend(["PYTHONPATH", "PYTHONOPTIMIZE"]);
+    }
+    if has("go version") {
+        env.extend(["GOFLAGS", "CGO_ENABLED", "GOOS", "GOARCH"]);
+    }
+    (env.into_iter().map(str::to_owned).collect(), files)
+}
+
+/// The file `pm` rewrites on every install, relative to `root`: npm's
+/// hidden lockfile, pnpm's modules manifest, Yarn Berry's install state or
+/// Yarn Classic's integrity file. `None` for Bun (no such file).
+fn installed_state(root: &Path, pm: Pm) -> Option<&'static str> {
+    match pm {
+        Pm::Npm => Some("node_modules/.package-lock.json"),
+        Pm::Pnpm => Some("node_modules/.modules.yaml"),
+        Pm::Yarn if root.join(".yarnrc.yml").is_file() => Some(".yarn/install-state.gz"),
+        Pm::Yarn => Some("node_modules/.yarn-integrity"),
+        Pm::Bun => None,
+    }
+}
+
 fn read(root: &Path, file: &str) -> Option<String> {
     fs::read_to_string(root.join(file)).ok()
 }
@@ -228,6 +272,8 @@ fn gate(
         timeout: kind.timeout().to_owned(),
         hooks: vec![kind.default_hook().to_owned()],
         key_inputs,
+        key_env: Vec::new(),
+        key_files: Vec::new(),
         env: Vec::new(),
         cache: kind != Kind::Build,
         source: Source::Detected(reason),
@@ -623,6 +669,35 @@ mod tests {
 
     /// Files of a fixture and the prepare command expected for them.
     type PrepareCase<'a> = (&'a [(&'a str, &'a str)], Option<&'a str>);
+
+    #[test]
+    fn environment_inputs_follow_the_toolchain_and_the_package_manager() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let rust = environment_inputs(root, &["rustc --version".to_owned()]);
+        assert_eq!(rust.0, ["RUSTFLAGS", "RUSTDOCFLAGS", "CARGO_BUILD_TARGET"]);
+        assert_eq!(rust.1, Vec::<String>::new());
+        assert_eq!(environment_inputs(root, &[]), (Vec::new(), Vec::new()));
+        let node = || environment_inputs(root, &["node --version".to_owned()]);
+        // No package.json: the variables, no installed state.
+        assert_eq!(
+            node(),
+            (vec!["NODE_OPTIONS".into(), "NODE_ENV".into()], Vec::new())
+        );
+        std::fs::write(root.join("package.json"), "{}").unwrap();
+        assert_eq!(node().1, ["node_modules/.package-lock.json"]);
+        std::fs::write(root.join("pnpm-lock.yaml"), "").unwrap();
+        assert_eq!(node().1, ["node_modules/.modules.yaml"]);
+        std::fs::remove_file(root.join("pnpm-lock.yaml")).unwrap();
+        std::fs::write(root.join("yarn.lock"), "").unwrap();
+        assert_eq!(node().1, ["node_modules/.yarn-integrity"]);
+        std::fs::write(root.join(".yarnrc.yml"), "").unwrap();
+        assert_eq!(node().1, [".yarn/install-state.gz"]);
+        let py = environment_inputs(root, &[".venv/bin/python --version".to_owned()]);
+        assert_eq!(py.0, ["PYTHONPATH", "PYTHONOPTIMIZE"]);
+        let go = environment_inputs(root, &["go version".to_owned()]);
+        assert_eq!(go.0, ["GOFLAGS", "CGO_ENABLED", "GOOS", "GOARCH"]);
+    }
 
     #[test]
     fn the_prepare_command_follows_the_lockfile() {

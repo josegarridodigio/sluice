@@ -412,6 +412,12 @@ pub struct Gate {
     /// Repo-relative files whose content is folded into the cache key.
     #[serde(default)]
     pub key_files: Vec<PathBuf>,
+    /// Environment variables whose value (or absence) in the gate's
+    /// environment is folded into the cache key (ADR-0029): settings such as
+    /// `RUSTFLAGS` or `NODE_OPTIONS` that change what the gate checks without
+    /// changing the tree. Needs sluice >= 0.11.0.
+    #[serde(default)]
+    pub key_env: Vec<String>,
     /// Extra environment for the gate; also part of the key.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -707,6 +713,17 @@ impl RepoConfig {
                     ));
                 }
             }
+            for var in &gate.key_env {
+                if var.is_empty() || var.contains(['=', '\0']) {
+                    return Err(config_err(
+                        path,
+                        format!(
+                            "gates.{name}.key_env: {var:?} must be an environment variable \
+                             name (not empty, no `=`)"
+                        ),
+                    ));
+                }
+            }
             if let Some(paths) = &gate.paths {
                 if paths.is_empty() {
                     return Err(config_err(
@@ -769,6 +786,8 @@ hooks = ["pre-commit", "pre-push"]
 # key_inputs = ["node --version"]
 # Ignored/untracked files whose content must invalidate the cache.
 # key_files = [".env.test"]
+# Environment variables whose value must invalidate the cache.
+# key_env = ["NODE_OPTIONS"]
 # Extra environment for the gate (also part of the key).
 # env = { NODE_ENV = "test" }
 "#
@@ -1011,6 +1030,20 @@ pub struct AdmissionConfig {
     /// Memory the ceilings always leave free: `"auto"` (half of
     /// `memory_reserve`) or a size such as `"2G"`.
     pub memory_floor: String,
+    /// The swap ceiling of every gate job (ADR-0028), on by default: each
+    /// second the daemon writes every job leaf's `memory.swap.max` so that
+    /// the jobs together can never take the machine's free swap below
+    /// `swap_floor`. Needs containment `full` and swap; `false` writes `max`
+    /// again.
+    pub swap_ceiling: bool,
+    /// Swap the swap ceilings always leave free: `"auto"` (a quarter of
+    /// `SwapTotal`) or a size such as `"2G"`.
+    pub swap_floor: String,
+    /// The desktop guard (ADR-0028), on by default: while the memory
+    /// pressure of the user's desktop session (`session.slice`) is high, no
+    /// job starts (the starvation guard still applies) and the kernel
+    /// ceilings keep the whole `memory_reserve` free instead of the floor.
+    pub desktop_guard: bool,
 }
 
 impl AdmissionConfig {
@@ -1034,6 +1067,20 @@ impl AdmissionConfig {
             auto
         } else {
             parse_size_bytes(&self.memory_floor).unwrap_or(auto)
+        }
+    }
+
+    /// `swap_floor` in bytes on a machine with `swap_total` bytes of swap
+    /// (`"auto"` is a quarter of it), never more than the swap itself.
+    #[must_use]
+    pub fn swap_floor_bytes(&self, swap_total: u64) -> u64 {
+        let auto = swap_total / 4;
+        if self.swap_floor.trim() == AUTO_RESERVE {
+            auto
+        } else {
+            parse_size_bytes(&self.swap_floor)
+                .unwrap_or(auto)
+                .min(swap_total)
         }
     }
 }
@@ -1236,6 +1283,9 @@ impl Default for AdmissionConfig {
             memory_guard: false,
             memory_ceiling: true,
             memory_floor: AUTO_RESERVE.to_owned(),
+            swap_ceiling: true,
+            swap_floor: AUTO_RESERVE.to_owned(),
+            desktop_guard: true,
         }
     }
 }
@@ -1299,6 +1349,15 @@ fn validate_admission(a: &AdmissionConfig, path: &Path) -> Result<()> {
         return Err(config_err(
             path,
             format!("admission.memory_floor {floor:?} must be \"auto\" or a size such as \"2G\""),
+        ));
+    }
+    let swap_floor = a.swap_floor.trim();
+    if swap_floor != AUTO_RESERVE && parse_size_bytes(swap_floor).is_none() {
+        return Err(config_err(
+            path,
+            format!(
+                "admission.swap_floor {swap_floor:?} must be \"auto\" or a size such as \"2G\""
+            ),
         ));
     }
     for (name, value) in [
@@ -2119,6 +2178,33 @@ budget_share_max = 4
         assert!(
             user_err("version = 1\n[admission]\nmemory_floor = \"some\"").contains("memory_floor")
         );
+    }
+
+    #[test]
+    fn the_swap_ceiling_and_the_desktop_guard_are_on_by_default() {
+        let c = UserConfig::default();
+        assert!(c.admission.swap_ceiling);
+        assert!(c.admission.desktop_guard);
+        assert!(c.containment.reclaim_escaped);
+        let swap = 8 << 30;
+        assert_eq!(c.admission.swap_floor_bytes(swap), 2 << 30);
+        assert_eq!(c.admission.swap_floor_bytes(0), 0, "no swap, no floor");
+        let c = UserConfig::parse(
+            "version = 1\n[admission]\nswap_ceiling = false\nswap_floor = \"3G\"\n\
+             desktop_guard = false\n[containment]\nreclaim_escaped = false\n",
+            Path::new("/u.toml"),
+        )
+        .unwrap();
+        assert!(!c.admission.swap_ceiling);
+        assert!(!c.admission.desktop_guard);
+        assert!(!c.containment.reclaim_escaped);
+        assert_eq!(c.admission.swap_floor_bytes(swap), 3 << 30);
+        assert_eq!(
+            c.admission.swap_floor_bytes(1 << 30),
+            1 << 30,
+            "capped by the swap"
+        );
+        assert!(user_err("version = 1\n[admission]\nswap_floor = \"half\"").contains("swap_floor"));
     }
 
     #[test]

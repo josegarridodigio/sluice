@@ -77,9 +77,10 @@ use crate::scheduler::{
 use crate::settle;
 use crate::stall::StallWatch;
 use crate::store::{
-    FinishMeta, GateMemory, GateStat, JobRow, JobState, OutsideGrowth, QueuedMeta, RequestRow,
-    Store,
+    FinishMeta, GateMemory, GateStat, JobPressure, JobRow, JobState, OutsideGrowth, QueuedMeta,
+    RequestRow, Store,
 };
+use crate::telemetry;
 use crate::{Error, Result};
 use sluice_gate_core::config::{Fairness, QueueOrder, auto_ceiling};
 
@@ -318,6 +319,8 @@ struct JobEntry {
     stall: Option<StallWatch>,
     /// Memory outside gate jobs while it runs (ADR-0026).
     outside: memory::OutsideTrack,
+    /// Memory pressure, swap and escaped processes of the job (ADR-0028).
+    telemetry: telemetry::JobTelemetry,
 }
 
 /// What [`register`] hands to the connection handler.
@@ -379,9 +382,17 @@ struct Shared {
     guard: Mutex<Guard>,
     /// Writes the kernel ceiling of every job leaf (ADR-0027).
     ceiling: ceiling::Writer,
+    /// Writes the swap ceiling of every job leaf (ADR-0028).
+    swap_ceiling: ceiling::Writer,
     /// Jobs whose ceiling already fell below their usage, logged once (never
     /// held together with another mutex).
     ceiling_cut: Mutex<std::collections::HashSet<String>>,
+    /// The cgroup standing for the user's desktop session (ADR-0028), read
+    /// only; `None` when the daemon runs under no user manager.
+    session_dir: Option<PathBuf>,
+    /// The session's last memory pressure and its warning state (never held
+    /// together with another mutex).
+    session: Mutex<(Option<telemetry::Pressure>, telemetry::SessionWatch)>,
     /// CPUs of the daemon's affinity mask (`None`: every CPU of `/proc/stat`).
     allowed_cpus: Option<std::collections::BTreeSet<u32>>,
     /// CPUs available to the daemon, for `status`.
@@ -934,7 +945,13 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
         growth: Mutex::new(growth),
         guard: Mutex::new(Guard::new(config.admission.memory_guard)),
         ceiling: ceiling::Writer::spawn(),
+        swap_ceiling: ceiling::Writer::spawn_for("memory.swap.max"),
         ceiling_cut: Mutex::new(std::collections::HashSet::new()),
+        session_dir: telemetry::session_cgroup(
+            &config.proc_root,
+            Path::new(sluice_gate_core::cgroup::CGROUP_MOUNT),
+        ),
+        session: Mutex::new((None, telemetry::SessionWatch::default())),
         allowed_cpus,
         cpus,
         instance,
@@ -1198,8 +1215,11 @@ fn sample_tick(shared: &Shared) -> bool {
         (st.sched.has_queued(), gates)
     };
     lock(&shared.util).observe(times, now, queued);
+    let session = session_tick(shared);
     if !gates.is_empty() {
-        let samples = read_job_samples(shared, gates);
+        let table = sampler::scan_processes(proc_root);
+        telemetry_tick(shared, &table, session);
+        let samples = read_job_samples(shared, &table, gates);
         let info = memory::read_meminfo(proc_root);
         let mut st = shared.state();
         for (id, tasks, leader, working_set) in samples {
@@ -1222,6 +1242,140 @@ fn sample_tick(shared: &Shared) -> bool {
     let mono = crate::stall::mono_ms();
     let stalls = stalls::due(shared, mono) && stalls::tick(shared, mono);
     changed || stalls
+}
+
+/// Reads the session's memory pressure (ADR-0028), keeps it for `status`
+/// and logs when the desktop becomes degraded or recovers.
+fn session_tick(shared: &Shared) -> Option<telemetry::Pressure> {
+    let pressure = shared
+        .session_dir
+        .as_deref()
+        .and_then(telemetry::read_pressure);
+    let change = {
+        let mut session = lock(&shared.session);
+        session.0 = pressure;
+        session.1.observe(pressure)
+    };
+    if let (Some(change), Some(p)) = (change, pressure) {
+        let jobs: Vec<String> = {
+            let st = shared.state();
+            st.jobs
+                .iter()
+                .filter(|(_, e)| e.process.is_some())
+                .map(|(id, e)| {
+                    let mem = e
+                        .usage
+                        .memory_now()
+                        .map_or_else(String::new, |b| format!(" {}", proto::gib_text(b)));
+                    format!("{id} ({}{mem})", e.request.name())
+                })
+                .collect()
+        };
+        match change {
+            telemetry::SessionChange::Degraded => tracing::warn!(
+                some_avg10 = p.some_avg10,
+                full_avg10 = p.full_avg10,
+                running = %jobs.join(", "),
+                "the desktop session is under memory pressure"
+            ),
+            telemetry::SessionChange::Recovered => tracing::info!(
+                some_avg10 = p.some_avg10,
+                running = %jobs.join(", "),
+                "the desktop session's memory pressure is back to normal"
+            ),
+        }
+    }
+    pressure
+}
+
+/// The memory telemetry's second (ADR-0028): for every running job with a
+/// cgroup leaf, reads the leaf's pressure, swap and page cache and finds the
+/// job's processes that live outside the leaf; logs each new escape and the
+/// first memory stall of a job.
+fn telemetry_tick(
+    shared: &Shared,
+    table: &[sampler::ProcEntry],
+    session: Option<telemetry::Pressure>,
+) {
+    let Some(c) = shared.containment.as_ref() else {
+        return;
+    };
+    let jobs_dir = c.tree().layout.jobs_dir();
+    let mount = Path::new(sluice_gate_core::cgroup::CGROUP_MOUNT);
+    let jobs: Vec<(String, Vec<(u32, u64)>)> = {
+        let st = shared.state();
+        st.jobs
+            .iter()
+            .filter(|(_, e)| e.process.is_some())
+            .map(|(id, e)| (id.clone(), e.telemetry.known_escapees()))
+            .collect()
+    };
+    let readings: Vec<_> = jobs
+        .into_iter()
+        .map(|(id, known)| {
+            let leaf = jobs_dir.join(&id);
+            let reading = telemetry::read_leaf(&leaf);
+            let escapees = leaf.strip_prefix(mount).map_or_else(
+                |_| Vec::new(),
+                |rel| {
+                    let rel = format!("/{}", rel.display());
+                    let procs = telemetry::leaf_procs(&leaf);
+                    telemetry::find_escapees(&shared.config.proc_root, table, &procs, &rel, &known)
+                },
+            );
+            (id, reading, escapees)
+        })
+        .collect();
+    let reclaim = shared.config.user.containment.reclaim_escaped;
+    let mut st = shared.state();
+    for (id, reading, escapees) in readings {
+        let Some(entry) = st.jobs.get_mut(&id) else {
+            continue;
+        };
+        let mut notes = entry.telemetry.observe(reading, session, escapees.clone());
+        if reclaim {
+            let leaf = jobs_dir.join(&id);
+            for e in escapees {
+                let result = telemetry::reclaim(&leaf, e.pid);
+                notes.push(entry.telemetry.reclaimed(e, result));
+            }
+        }
+        for note in notes {
+            match note {
+                telemetry::Note::Escaped(e) => tracing::warn!(
+                    job = %id,
+                    pid = e.pid,
+                    comm = %e.comm,
+                    cgroup = %e.cgroup,
+                    rss = %proto::gib_text(e.rss_bytes),
+                    "a process of the job left its cgroup: its memory escapes the job's accounting, ceiling and kill"
+                ),
+                telemetry::Note::Reclaimed(e) => tracing::info!(
+                    job = %id,
+                    pid = e.pid,
+                    comm = %e.comm,
+                    from = %e.cgroup,
+                    "moved a process of the job back into its cgroup"
+                ),
+                telemetry::Note::ReclaimFailed(e, why) => tracing::warn!(
+                    job = %id,
+                    pid = e.pid,
+                    comm = %e.comm,
+                    cgroup = %e.cgroup,
+                    "could not move a process of the job back into its cgroup: {why}"
+                ),
+                telemetry::Note::Stalled {
+                    full_avg10,
+                    swap_bytes,
+                } => tracing::warn!(
+                    job = %id,
+                    full_avg10,
+                    swap = %proto::gib_text(swap_bytes),
+                    "the job is stalled on memory"
+                ),
+            }
+        }
+    }
 }
 
 /// The memory the gates may use: the machine's `meminfo`, capped by the
@@ -1305,6 +1459,8 @@ fn ceiling_tick(shared: &Shared) {
         .collect();
     let live: Vec<PathBuf> = jobs.iter().map(|j| jobs_dir.join(&j.id)).collect();
     shared.ceiling.retain(&live);
+    shared.swap_ceiling.retain(&live);
+    swap_ceiling_tick(shared, &jobs_dir, &jobs);
     lock(&shared.ceiling_cut).retain(|id| jobs.iter().any(|j| &j.id == id));
     if jobs.is_empty() {
         return;
@@ -1312,7 +1468,14 @@ fn ceiling_tick(shared: &Shared) {
     let Some(info) = gates_memory(shared) else {
         return;
     };
-    let floor = a.memory_floor_bytes(info.total_bytes);
+    // While the desktop is under memory pressure the jobs keep the whole
+    // reserve free, not only the floor (ADR-0028).
+    let floor = if desktop_degraded(shared) {
+        a.memory_floor_bytes(info.total_bytes)
+            .max(a.memory_reserve_bytes(info.total_bytes))
+    } else {
+        a.memory_floor_bytes(info.total_bytes)
+    };
     let ceilings = ceiling::ceilings(info.available_bytes, floor, &jobs);
     for ((id, bytes), job) in ceilings.into_iter().zip(&jobs) {
         if bytes < job.anon && lock(&shared.ceiling_cut).insert(id.clone()) {
@@ -1327,6 +1490,39 @@ fn ceiling_tick(shared: &Shared) {
         }
         shared.ceiling.set(&jobs_dir.join(&id), Some(bytes));
     }
+}
+
+/// The swap ceiling's second (ADR-0028): writes each running job leaf's
+/// `memory.swap.max` so that the jobs together never take the machine's free
+/// swap below the swap floor. A no-op without swap or with `[admission]
+/// swap_ceiling = false`.
+fn swap_ceiling_tick(shared: &Shared, jobs_dir: &Path, jobs: &[CeilingJob]) {
+    let a = &shared.config.admission;
+    if !a.swap_ceiling || jobs.is_empty() {
+        return;
+    }
+    let Some((total, free)) = memory::read_swap(&shared.config.proc_root) else {
+        return;
+    };
+    let swap: Vec<ceiling::SwapJob> = jobs
+        .iter()
+        .map(|j| ceiling::SwapJob {
+            id: j.id.clone(),
+            swap: telemetry::read_leaf(&jobs_dir.join(&j.id))
+                .swap_bytes
+                .unwrap_or(0),
+        })
+        .collect();
+    for (id, bytes) in ceiling::swap_ceilings(free, a.swap_floor_bytes(total), &swap) {
+        shared.swap_ceiling.set(&jobs_dir.join(&id), Some(bytes));
+    }
+}
+
+/// Whether the desktop guard holds (ADR-0028): `[admission] desktop_guard`
+/// and the session's memory pressure is above the warning level (until it
+/// falls under the clear level).
+fn desktop_degraded(shared: &Shared) -> bool {
+    shared.config.admission.desktop_guard && lock(&shared.session).1.degraded()
 }
 
 /// Whether admission settles after a memory kill at `now` (ADR-0026): logs
@@ -1461,10 +1657,14 @@ type JobSample = (String, Vec<sampler::TaskReading>, Option<u64>, WorkingSet);
 /// Reads the CPU tasks and the memory of every running gate (`(id, pgid,
 /// leader pid)`). The working set is `anon` + swap of the job's leaf, or, when
 /// the machine gives no leaf, the summed resident set of its process group.
-fn read_job_samples(shared: &Shared, gates: Vec<(String, i32, u32)>) -> Vec<JobSample> {
+fn read_job_samples(
+    shared: &Shared,
+    table: &[sampler::ProcEntry],
+    gates: Vec<(String, i32, u32)>,
+) -> Vec<JobSample> {
     let proc_root = &shared.config.proc_root;
     let groups: std::collections::HashSet<i32> = gates.iter().map(|g| g.1).collect();
-    let members = sampler::group_members(proc_root, &groups);
+    let members = sampler::members_of(table, &groups);
     gates
         .into_iter()
         .map(|(id, pgid, leader)| {
@@ -1647,7 +1847,9 @@ fn admit(shared: &Shared, now: u64) -> Vec<(String, sched::Admission)> {
     // After a memory kill nothing starts, and the starvation guard does not
     // override it (ADR-0026 decision 4).
     let settling = settling(shared, now);
-    let blocking = blocking || settling;
+    // While the desktop is under memory pressure nothing starts, not even a
+    // job alone on the machine; the starvation guard still applies.
+    let blocking = blocking || settling || desktop_degraded(shared);
     let head = if blocking {
         shared.state().sched.head(now)
     } else {
@@ -1859,6 +2061,7 @@ fn close_job(
             .as_ref()
             .and_then(|e| learned_memory(e.stats_key.as_ref()?, &e.usage, &outcome, id, now));
         let growth = entry.as_ref().and_then(|e| outside_growth(e, id, now));
+        let pressure = entry.as_ref().and_then(|e| job_pressure(e, id, now));
         let finish = FinishMeta {
             waits: record.as_ref().map_or([0; 5], |r| r.waits),
             cpu_ms: demand.map(|d| d.cpu_ms),
@@ -1887,10 +2090,7 @@ fn close_job(
                     s.insert_gate_memory(working_set)?;
                 }
             }
-            if let Some(g) = &growth {
-                s.insert_outside_growth(g)?;
-            }
-            Ok(())
+            record_memory_rows(s, growth.as_ref(), pressure.as_ref())
         });
         remember_growth(shared, growth.as_ref());
         (entry.map(|e| e.events), started_at, learned, memory, weight)
@@ -1904,6 +2104,22 @@ fn close_job(
         memory,
         weight,
     }
+}
+
+/// The rows of a finished job's memory outside gates (ADR-0026) and of its
+/// memory telemetry (ADR-0028).
+fn record_memory_rows(
+    s: &Store,
+    growth: Option<&OutsideGrowth>,
+    pressure: Option<&JobPressure>,
+) -> crate::Result<()> {
+    if let Some(g) = growth {
+        s.insert_outside_growth(g)?;
+    }
+    if let Some(p) = pressure {
+        s.insert_job_pressure(p)?;
+    }
+    Ok(())
 }
 
 /// What a finished job teaches the learned weight and expected time of its
@@ -1944,6 +2160,39 @@ fn remember_growth(shared: &Shared, growth: Option<&OutsideGrowth>) {
         recent.push_front(g.growth_bytes);
         recent.truncate(memory::GROWTH_WINDOW);
     }
+}
+
+/// The memory telemetry of a finished job (ADR-0028), `None` when it was
+/// never sampled with a leaf; logs one summary line when the job swapped,
+/// stalled on memory or had processes outside its cgroup.
+fn job_pressure(entry: &JobEntry, id: &str, now: u64) -> Option<JobPressure> {
+    let summary = entry.telemetry.summary()?;
+    if summary.notable() {
+        tracing::info!(
+            job = %id,
+            some_avg10_max = summary.some_avg10_max,
+            full_avg10_max = summary.full_avg10_max,
+            swap_peak = %proto::gib_text(summary.swap_peak_bytes),
+            session_some_avg10_max = summary.session_some_avg10_max,
+            escaped = summary.escaped_processes,
+            escaped_rss_peak = %proto::gib_text(summary.escaped_rss_peak_bytes),
+            escaped_names = %summary.escaped_names.join(" "),
+            "job memory telemetry"
+        );
+    }
+    Some(JobPressure {
+        job_id: id.to_owned(),
+        finished_at: now,
+        repo: entry
+            .stats_key
+            .as_ref()
+            .map_or_else(PathBuf::new, |k| k.0.clone()),
+        gate: entry
+            .stats_key
+            .as_ref()
+            .map_or_else(|| entry.request.name(), |k| k.1.clone()),
+        summary,
+    })
 }
 
 /// How much the memory outside gates grew while a heavy job ran (ADR-0026);
@@ -2162,12 +2411,37 @@ async fn launch(shared: &Arc<Shared>, id: &str, mut spec: ExecSpec) -> Option<La
         _ => None,
     };
     if let Some(c) = &shared.containment {
+        if shared.config.user.containment.reclaim_escaped {
+            kill_leftovers(shared, c, id);
+        }
         c.release_job(id);
     }
     finished.map(|finished| Launched {
         finished,
         memory_kill,
     })
+}
+
+/// Kills what is left of a job once it ended (ADR-0028): every process still
+/// in its leaf and every process seen outside it that is still alive.
+fn kill_leftovers(shared: &Shared, c: &Containment, id: &str) {
+    let known = shared
+        .state()
+        .jobs
+        .get(id)
+        .map(|e| e.telemetry.known_escapees())
+        .unwrap_or_default();
+    let leaf = c.tree().layout.jobs_dir().join(id);
+    let (signalled, leaf_killed) =
+        telemetry::kill_leftovers(&shared.config.proc_root, &leaf, &known);
+    if signalled > 0 || leaf_killed {
+        tracing::info!(
+            job = %id,
+            escaped_killed = signalled,
+            leaf_killed,
+            "killed what was left of the job after it ended"
+        );
+    }
 }
 
 /// The `cg-exec` argv prefix of a job: placed in its leaf when containment
@@ -2954,6 +3228,7 @@ fn status_report(shared: &Shared) -> StatusReport {
         let adm = lock(&shared.psi);
         (adm.info(), adm.blocked_ms_total(), adm.blocking())
     };
+    let session = lock(&shared.session).0;
     let (running, queued, total, used, cap, over_admissions, backfill, memory) = {
         let st = shared.state();
         let (running, queued) = st.sched.snapshot(now, psi_blocking);
@@ -2979,6 +3254,11 @@ fn status_report(shared: &Shared) -> StatusReport {
                     .map(|d| (d * 10.0).round() / 10.0);
                 let stall_view = stalls::view(st.jobs.get(&v.id));
                 let ceiling = ceiling_of(shared, &v.id);
+                let tele = st.jobs.get(&v.id).map(|e| &e.telemetry);
+                let leaf = tele
+                    .filter(|t| t.samples() > 0)
+                    .map(telemetry::JobTelemetry::now);
+                let escaped = tele.map(telemetry::JobTelemetry::escaped_now);
                 RunningJob {
                     caller: caller(&v.id),
                     kind,
@@ -3004,6 +3284,11 @@ fn status_report(shared: &Shared) -> StatusReport {
                     memory_expected_basis: v.memory_expected.map(|e| e.basis.as_str().to_owned()),
                     memory_beyond_estimate: v.beyond_estimate.then_some(true),
                     memory_ceiling_bytes: ceiling,
+                    memory_swap_bytes: leaf.and_then(|l| l.swap_bytes),
+                    memory_pressure_some: leaf.and_then(|l| l.pressure).map(|p| p.some_avg10),
+                    memory_pressure_full: leaf.and_then(|l| l.pressure).map(|p| p.full_avg10),
+                    escaped_processes: escaped.map(|e| e.0).filter(|&n| n > 0),
+                    escaped_bytes: escaped.filter(|e| e.0 > 0).map(|e| e.1),
                     stalled: stall_view,
                 }
             })
@@ -3062,6 +3347,8 @@ fn status_report(shared: &Shared) -> StatusReport {
                         .to_owned(),
                     ),
                     headroom_bytes,
+                    session_some_avg10: session.map(|p| p.some_avg10),
+                    session_full_avg10: session.map(|p| p.full_avg10),
                 }),
         )
     };
@@ -3529,6 +3816,7 @@ fn register_job(shared: &Shared, job: NewJob) -> std::result::Result<Registered,
                     guard_message: None,
                     stall: None,
                     outside: memory::OutsideTrack::default(),
+                    telemetry: telemetry::JobTelemetry::default(),
                 },
             );
             Ok(Registered {

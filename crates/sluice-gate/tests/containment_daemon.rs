@@ -701,3 +701,133 @@ fn the_gates_scope_has_a_policy_ahead_of_the_agents_and_the_daemon_is_omitted() 
     }
     drop(stack);
 }
+
+/// A gate whose child moves itself out of the job's leaf the way Chromium
+/// does (ADR-0028): `systemd-run --user --scope` asks the user manager for a
+/// transient scope holding its own pid, then `exec`s a marked `sleep`. Like
+/// Playwright's browser (started `detached`), it runs in a session and
+/// process group of its own (`setsid`), so the job's group kill misses it. The
+/// scope goes under the test's own slice, so the drop guard always stops it.
+fn escape_gate(stack_prefix: &str, runtime: &str, marker: &str) -> String {
+    let unit = format!("{stack_prefix}-escapee");
+    let slice = format!("{stack_prefix}.slice");
+    format!(
+        r#"
+[gates.escape]
+cmd = "XDG_RUNTIME_DIR={runtime} DBUS_SESSION_BUS_ADDRESS=unix:path={runtime}/bus setsid systemd-run --user --scope --quiet --collect --slice={slice} --unit={unit} -- sleep {marker} </dev/null >/dev/null 2>&1 & sleep 4"
+"#
+    )
+}
+
+/// Pids of live processes running `sleep <marker>` (`systemd-run` runs it
+/// by its absolute path).
+fn marked_sleeps(marker: &str) -> Vec<u32> {
+    let is_marked = |pid: u32| {
+        let raw = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let argv: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
+        argv.len() >= 2 && argv[0].ends_with(b"sleep") && argv[1] == marker.as_bytes()
+    };
+    fs::read_dir("/proc")
+        .map(|d| {
+            d.flatten()
+                .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+                .filter(|p| is_marked(*p))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Builds a stack whose gate escapes; `None` (after printing why) when the
+/// host cannot be contained or has no `systemd-run`.
+fn escape_stack(case: &str, user_config: &str, marker: &str) -> Option<Stack> {
+    if StdCommand::new("systemd-run")
+        .arg("--version")
+        .output()
+        .map_or(true, |o| !o.status.success())
+    {
+        println!("skipped: needs systemd-run");
+        return None;
+    }
+    let probe = Stack::new(case, "", true)?;
+    let runtime = probe.manager_runtime.clone()?;
+    let prefix = probe.prefix.clone();
+    drop(probe);
+    let stack = Stack::new(case, &escape_gate(&prefix, &runtime, marker), true)?;
+    if !user_config.is_empty() {
+        stack.sb.write_user_config(user_config);
+    }
+    Some(stack)
+}
+
+#[test]
+fn an_escaping_process_is_moved_back_and_dies_with_the_job() {
+    let marker = format!("{}.731", 60 + std::process::id() % 97);
+    let Some(stack) = escape_stack("escape", "", &marker) else {
+        return;
+    };
+    stack.start_daemon();
+    let out = stack.run(&["run", "escape"]);
+    assert!(
+        out.status.success(),
+        "{out:?}\nlog:\n{}",
+        stack.daemon_log()
+    );
+    let log = stack.daemon_log();
+    assert!(
+        log.contains("a process of the job left its cgroup"),
+        "the escape was not seen; log:\n{log}"
+    );
+    assert!(
+        log.contains("moved a process of the job back into its cgroup"),
+        "the escapee was not moved back; log:\n{log}"
+    );
+    assert!(
+        wait_for(Duration::from_secs(5), || marked_sleeps(&marker).is_empty()),
+        "the escapee outlived its job: {:?}\nlog:\n{log}",
+        marked_sleeps(&marker)
+    );
+    assert!(
+        log.contains("job memory telemetry"),
+        "no telemetry summary for a job with an escapee; log:\n{log}"
+    );
+}
+
+#[test]
+fn with_reclaim_off_an_escapee_is_only_reported() {
+    let marker = format!("{}.733", 60 + std::process::id() % 97);
+    let Some(stack) = escape_stack(
+        "noreclaim",
+        "[containment]\nreclaim_escaped = false\n",
+        &marker,
+    ) else {
+        return;
+    };
+    stack.start_daemon();
+    let out = stack.run(&["run", "escape"]);
+    assert!(
+        out.status.success(),
+        "{out:?}\nlog:\n{}",
+        stack.daemon_log()
+    );
+    let log = stack.daemon_log();
+    assert!(
+        log.contains("a process of the job left its cgroup"),
+        "log:\n{log}"
+    );
+    assert!(
+        !log.contains("moved a process of the job back"),
+        "log:\n{log}"
+    );
+    let left = marked_sleeps(&marker);
+    assert_eq!(
+        left.len(),
+        1,
+        "the escapee keeps running: {left:?}\nlog:\n{log}"
+    );
+    assert!(
+        !cgroup_of(left[0]).contains("/jobs/"),
+        "it stayed outside the job: {}",
+        cgroup_of(left[0])
+    );
+    // The drop guard stops the test slice, the escapee's scope with it.
+}

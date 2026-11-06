@@ -331,6 +331,7 @@ fn old_keys_are_derived_identically() {
                     .collect(),
                 key_inputs: pairs(&e["key_inputs"]),
                 key_files: pairs(&e["key_files"]),
+                key_env: Vec::new(),
             };
             keyed_checked |= e["gate"] == "keyed";
             let derived = key::derive(&material);
@@ -651,6 +652,45 @@ fn admission_memory_ceiling_fixture_parses() {
     let plain = UserConfig::parse("version = 1\n", &path).unwrap();
     assert!(plain.admission.memory_ceiling);
     assert_eq!(plain.admission.memory_floor_bytes(30 << 30), 3 << 29);
+}
+
+/// ADR-0028: `[admission] swap_ceiling`, `swap_floor`, `desktop_guard` and
+/// `[containment] reclaim_escaped` parse; all are on without the keys.
+#[test]
+fn admission_desktop_swap_fixture_parses() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/unreleased/admission-desktop-swap.toml");
+    let text = fs::read_to_string(&path).unwrap();
+    let cfg = UserConfig::parse(&text, &path).unwrap();
+    assert!(!cfg.admission.swap_ceiling);
+    assert!(!cfg.admission.desktop_guard);
+    assert!(!cfg.containment.reclaim_escaped);
+    assert_eq!(cfg.admission.swap_floor_bytes(8 << 30), 3 << 30);
+    let plain = UserConfig::parse("version = 1\n", &path).unwrap();
+    assert!(plain.admission.swap_ceiling);
+    assert!(plain.admission.desktop_guard);
+    assert!(plain.containment.reclaim_escaped);
+    assert_eq!(plain.admission.swap_floor_bytes(8 << 30), 2 << 30);
+}
+
+/// ADR-0029: a gate's `key_env` parses; without it the list is empty (and the
+/// key bytes are those of earlier releases, `old_keys_are_derived_identically`).
+#[test]
+fn gate_key_env_fixture_parses() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/unreleased/gate-key-env.toml");
+    let text = fs::read_to_string(&path).unwrap();
+    let cfg = RepoConfig::parse(&text, &path).unwrap();
+    assert_eq!(cfg.gates["test"].key_env, ["RUSTFLAGS", "RUSTDOCFLAGS"]);
+    let plain = RepoConfig::parse("version = 1\n[gates.t]\ncmd = \"x\"\n", &path).unwrap();
+    assert_eq!(plain.gates["t"].key_env, Vec::<String>::new());
+    let bad = RepoConfig::parse(
+        "version = 1\n[gates.t]\ncmd = \"x\"\nkey_env = [\"A=B\"]\n",
+        &path,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(bad.contains("key_env"), "{bad}");
 }
 
 /// ADR-0023: `[scheduler] backfill` parses, and is on without the key.

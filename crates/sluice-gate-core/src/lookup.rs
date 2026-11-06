@@ -493,11 +493,15 @@ pub fn derive_key_at<'e>(
     root_dir: &Path,
     child_env: impl FnOnce() -> Result<&'e EnvMap>,
 ) -> Result<(String, CacheKey)> {
-    let (key_inputs, key_files) = if gate.key_inputs.is_empty() && gate.key_files.is_empty() {
-        (Vec::new(), Vec::new())
-    } else {
-        key::collect_inputs(&gate.key_inputs, &gate.key_files, root_dir, child_env()?)?
-    };
+    let (key_inputs, key_files, key_env) =
+        if gate.key_inputs.is_empty() && gate.key_files.is_empty() && gate.key_env.is_empty() {
+            (Vec::new(), Vec::new(), Vec::new())
+        } else {
+            let env = child_env()?;
+            let (inputs, files) =
+                key::collect_inputs(&gate.key_inputs, &gate.key_files, root_dir, env)?;
+            (inputs, files, key::collect_env(&gate.key_env, env))
+        };
     let cmd = key_command(gate, extra);
     let material = KeyMaterial {
         tree,
@@ -506,6 +510,7 @@ pub fn derive_key_at<'e>(
         env: gate.env.clone(),
         key_inputs,
         key_files,
+        key_env,
     };
     Ok((cmd, key::derive(&material)))
 }

@@ -205,41 +205,76 @@ pub(crate) fn stat_fields(stat: &str) -> Option<Vec<&str>> {
     Some(rest.split_whitespace().collect())
 }
 
+/// One process of the machine, from its `/proc/<pid>/stat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcEntry {
+    /// Process id.
+    pub pid: u32,
+    /// Parent process id (field 4).
+    pub ppid: u32,
+    /// Process group (field 5).
+    pub pgrp: i32,
+    /// Start time in clock ticks since boot (field 22): with the pid, the
+    /// identity of a process across samples (pids are reused).
+    pub start: u64,
+}
+
+/// Parses one `/proc/<pid>/stat`; `None` without a process group (the one
+/// field the CPU sampler needs). A missing parent or start time reads 0.
+#[must_use]
+pub fn parse_proc_entry(pid: u32, stat: &str) -> Option<ProcEntry> {
+    let f = stat_fields(stat)?;
+    // Indices after the comm: 0 state, 1 ppid, 2 pgrp, ..., 19 starttime.
+    let field = |i: usize| f.get(i).and_then(|v| v.parse::<u64>().ok());
+    Some(ProcEntry {
+        pid,
+        ppid: field(1).and_then(|v| u32::try_from(v).ok()).unwrap_or(0),
+        pgrp: f.get(2)?.parse().ok()?,
+        start: field(19).unwrap_or(0),
+    })
+}
+
+/// Every process under `proc_root` whose `stat` could be read: one pass over
+/// `/proc` that the CPU sampler and the escape detection share (ADR-0028).
+#[must_use]
+pub fn scan_processes(proc_root: &Path) -> Vec<ProcEntry> {
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
+            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+            parse_proc_entry(pid, &stat)
+        })
+        .collect()
+}
+
+/// The members of each process group in `pgids`, from a [`scan_processes`]
+/// table: `pgid -> pids`.
+#[must_use]
+pub fn members_of<S: std::hash::BuildHasher>(
+    table: &[ProcEntry],
+    pgids: &HashSet<i32, S>,
+) -> HashMap<i32, Vec<u32>> {
+    let mut out: HashMap<i32, Vec<u32>> = HashMap::new();
+    for p in table.iter().filter(|p| pgids.contains(&p.pgrp)) {
+        out.entry(p.pgrp).or_default().push(p.pid);
+    }
+    out
+}
+
 /// The process group of each process under `proc_root` whose group is in
 /// `pgids`: `pgid -> pids`.
 pub fn group_members<S: std::hash::BuildHasher>(
     proc_root: &Path,
     pgids: &HashSet<i32, S>,
 ) -> HashMap<i32, Vec<u32>> {
-    let mut out: HashMap<i32, Vec<u32>> = HashMap::new();
     if pgids.is_empty() {
-        return out;
+        return HashMap::new();
     }
-    let Ok(entries) = std::fs::read_dir(proc_root) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|n| n.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-            continue;
-        };
-        // Field 5 is the process group (index 2 after the comm).
-        let Some(pgrp) =
-            stat_fields(&stat).and_then(|f| f.get(2).and_then(|v| v.parse::<i32>().ok()))
-        else {
-            continue;
-        };
-        if pgids.contains(&pgrp) {
-            out.entry(pgrp).or_default().push(pid);
-        }
-    }
-    out
+    members_of(&scan_processes(proc_root), pgids)
 }
 
 /// The tasks of `pid` with their `schedstat`; `None` for a task whose
@@ -554,6 +589,17 @@ mod tests {
         members.sort_unstable();
         assert_eq!(members, [100, 101]);
         assert_eq!(group_members(root, &HashSet::<i32>::new()), HashMap::new());
+        // A short stat line (no start time) still gives its group.
+        assert_eq!(
+            parse_proc_entry(7, "7 (sh) S 1 7 7 0 0\n"),
+            Some(ProcEntry {
+                pid: 7,
+                ppid: 1,
+                pgrp: 7,
+                start: 0
+            })
+        );
+        assert_eq!(parse_proc_entry(7, "7 (sh) S\n"), None);
         let mut tasks = read_tasks(root, 100);
         tasks.sort_unstable();
         assert_eq!(

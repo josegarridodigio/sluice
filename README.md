@@ -191,7 +191,10 @@ Sluice is alpha: complete enough for early adopters, not yet proven by long use.
   automatically; other agents need `sluice shim install` and a `PATH` entry.
   A `.sluice.toml` with `weight = "auto"` needs 0.4.0.
 - **A hit is a local optimisation.** CI stays authoritative, and inputs git
-  cannot see must be declared (`key_inputs`, `key_files`).
+  cannot see must be declared: toolchain versions (`key_inputs`), ignored
+  files and installed dependencies (`key_files`), environment variables
+  (`key_env`). `sluice init` writes the usual ones and `sluice doctor` warns
+  about gaps.
 - **Per-worktree caches.** Tools that keep state inside the checkout, such as
   `node_modules/.cache`, need one copy per worktree.
 

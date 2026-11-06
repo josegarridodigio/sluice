@@ -9,9 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Memory telemetry of every job** (ADR-0028). Each second the daemon records, per running
+  job, its memory pressure, swap, page cache and the processes that left its cgroup, and the
+  memory pressure of the user's desktop session. The log says when a process leaves a job,
+  when a job stalls on memory and when the desktop is under memory pressure; each job's peaks
+  are stored, and `status` shows them.
+- **`key_env`: environment variables in the cache key** (ADR-0029). A gate can name variables
+  such as `RUSTFLAGS` or `NODE_OPTIONS` whose value must invalidate its cache; requests with
+  other values never share a pass or a running job. `sluice init` writes them per toolchain,
+  together with the file the Node package manager rewrites on every install, and `sluice
+  doctor` warns when a gate leaves them out. Keys of gates without `key_env` are unchanged.
+- **A swap ceiling on every job** (ADR-0028, `[admission] swap_ceiling`, `swap_floor`): the
+  jobs together can no longer take the machine's free swap below a floor (a quarter of the
+  swap by default).
+- **The desktop guard** (ADR-0028, `[admission] desktop_guard`): while the desktop session
+  stalls on memory, no job starts and the kernel ceilings keep the whole memory reserve free.
+
 ### Changed
 
+- **Processes stay in their job** (ADR-0028, `[containment] reclaim_escaped`). A process that
+  moves itself out of its job's cgroup, as Chromium and so every Playwright browser does, is
+  moved back within a second, and whatever is left of a job when it ends is killed. Its memory
+  now counts, is limited and dies with the job.
+- `sluice doctor` knows more build inputs for path-scoped gates: toolchain pins, package
+  manager settings, lint settings and test runner configuration files.
+
 ### Fixed
+
+- **A desktop could hang under heavy gate jobs although no memory ran out.** On a 30 GiB
+  machine a 15 GiB test suite, browser tests and builds outside Sluice pushed the desktop into
+  swap until the shell stopped answering; the browsers had left their jobs, so their memory
+  was neither counted nor limited. Browsers now stay in their jobs, the jobs cannot fill the
+  swap, and no job starts while the desktop is under memory pressure.
 
 ## [0.10.1] - 2026-11-01
 

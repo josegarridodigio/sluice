@@ -123,8 +123,17 @@ key = sha256(
   sorted(env k=v)    \0
   for each key_input: cmd \0 stdout_sha256 \0
   for each key_file:  path \0 content_sha256_or_"absent" \0
+  for each key_env:   "env:" name \0 ("=" value | "unset") \0
 )
 ```
+
+`key_env` (Sluice >= 0.11.0, ADR-0029,
+[[sluice/design/adr/0029-environment-inputs-of-the-cache-key.md]]): each named variable
+once, in the order written, read from the gate's environment (the sanitised caller
+environment plus the gate's `env` table, the same map `key_inputs` run with); an unset
+variable hashes as `unset`, a set one as `=` followed by its value, so unset and empty
+differ. A gate without `key_env` hashes exactly the bytes above without that line, so
+every earlier key and marker is unchanged.
 
 Hex-encoded, 64 chars. The marker filename is the key.
 

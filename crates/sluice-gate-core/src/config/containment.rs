@@ -118,6 +118,12 @@ pub struct ContainmentConfig {
     pub gates_memory_max: String,
     /// Optional `memory.swap.max` of the `jobs/` cgroup; empty means none.
     pub gates_memory_swap_max: String,
+    /// Keep every process of a job inside its leaf (ADR-0028), on by
+    /// default: a process that leaves the leaf (Chromium moves its browser
+    /// into a systemd scope of its own) is moved back within a second, and
+    /// whatever is left of the job when it ends, inside the leaf or outside,
+    /// is killed. `false` only reports such processes.
+    pub reclaim_escaped: bool,
 }
 
 impl Default for ContainmentConfig {
@@ -140,6 +146,7 @@ impl Default for ContainmentConfig {
             gates_oom_score_adj: GatesOomScoreAdj::Auto,
             gates_memory_max: String::new(),
             gates_memory_swap_max: String::new(),
+            reclaim_escaped: true,
         }
     }
 }

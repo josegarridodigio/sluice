@@ -726,6 +726,7 @@ fn a_database_at_containment_v1_gains_gate_memory_in_place() {
     let conn = rusqlite::Connection::open(&db).unwrap();
     conn.execute_batch(
         "DROP TABLE gate_memory; DROP TABLE gate_memory_bound; DROP TABLE outside_growth; \
+         DROP TABLE job_memory_pressure; \
          DELETE FROM containment_schema; INSERT INTO containment_schema (version) VALUES (1); \
          INSERT INTO interventions (at_ms, session, leaf, cause, detail) \
          VALUES (5, 's', 'jobs/j', 'oom_kill', 'kept');",
@@ -743,6 +744,7 @@ fn a_database_at_containment_v1_gains_gate_memory_in_place() {
     assert!(table_exists(&conn, "gate_memory"));
     assert!(table_exists(&conn, "gate_memory_bound"));
     assert!(table_exists(&conn, "outside_growth"));
+    assert!(table_exists(&conn, "job_memory_pressure"));
     assert_eq!(
         raw_count(
             &conn,
@@ -818,7 +820,7 @@ fn a_database_at_containment_v3_gains_outside_growth_in_place() {
     drop(Store::open(&db).unwrap());
     let conn = rusqlite::Connection::open(&db).unwrap();
     conn.execute_batch(
-        "DROP TABLE outside_growth; \
+        "DROP TABLE outside_growth; DROP TABLE job_memory_pressure; \
          DELETE FROM containment_schema; INSERT INTO containment_schema (version) VALUES (3); \
          INSERT INTO gate_memory (repo, gate, cmd_hash, job_id, finished_at, outcome, \
          anon_peak_bytes, peak_bytes, oom_killed) VALUES ('/r', 'test', 'aa', 'j', 1, 'pass', 7, NULL, 0);",
@@ -850,6 +852,40 @@ fn a_database_at_containment_v3_gains_outside_growth_in_place() {
     );
 }
 
+/// A database at containment version 4 (0.9.0 to 0.10.1) gains
+/// `job_memory_pressure` in place (ADR-0028), keeps its rows and needs no backup.
+#[test]
+fn a_database_at_containment_v4_gains_job_memory_pressure_in_place() {
+    use sluice_gate_daemon::migrate::{self, CONTAINMENT_TABLE};
+    let (dir, db) = copy_db("v0.5.0");
+    drop(Store::open(&db).unwrap());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "DROP TABLE job_memory_pressure; \
+         DELETE FROM containment_schema; INSERT INTO containment_schema (version) VALUES (4); \
+         INSERT INTO outside_growth (job_id, finished_at, gate_peak_bytes, growth_bytes) \
+         VALUES ('j', 1, 2, 3);",
+    )
+    .unwrap();
+    drop(conn);
+    let before = backups(dir.path());
+    let store = Store::open(&db).expect("a v4 containment group migrates");
+    assert_eq!(store.outside_growth_recent(5).unwrap(), [3], "kept");
+    assert_eq!(store.job_pressure_recent(5).unwrap(), Vec::new());
+    drop(store);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    assert_eq!(
+        migrate::version(&conn, CONTAINMENT_TABLE).unwrap(),
+        migrate::CONTAINMENT_SCHEMA_VERSION
+    );
+    assert!(table_exists(&conn, "job_memory_pressure"));
+    assert_eq!(
+        backups(dir.path()),
+        before,
+        "an additive table needs no backup"
+    );
+}
+
 /// A database at containment version 2 (0.6.0 to 0.7.0) gains the lower-bound
 /// table in place, keeps its `gate_memory` rows and needs no backup.
 #[test]
@@ -859,7 +895,7 @@ fn a_database_at_containment_v2_gains_gate_memory_bound_in_place() {
     drop(Store::open(&db).unwrap());
     let conn = rusqlite::Connection::open(&db).unwrap();
     conn.execute_batch(
-        "DROP TABLE gate_memory_bound; DROP TABLE outside_growth; \
+        "DROP TABLE gate_memory_bound; DROP TABLE outside_growth; DROP TABLE job_memory_pressure; \
          DELETE FROM containment_schema; INSERT INTO containment_schema (version) VALUES (2); \
          INSERT INTO gate_memory (repo, gate, cmd_hash, job_id, finished_at, outcome, \
          anon_peak_bytes, peak_bytes, oom_killed) VALUES ('/r', 'test', 'aa', 'j', 1, 'pass', 7, NULL, 0);",
