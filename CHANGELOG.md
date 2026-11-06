@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Fixed
+
+## [0.11.0] - 2026-11-06
+
+### Added
+
 - **Memory telemetry of every job** (ADR-0028). Each second the daemon records, per running
   job, its memory pressure, swap, page cache and the processes that left its cgroup, and the
   memory pressure of the user's desktop session. The log says when a process leaves a job,
@@ -793,7 +801,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PSI thresholds must be percentages (rejected at config load otherwise).
 - Findings of the Phase 1, 2, 3 and 4 reconciliation passes.
 
-[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/josegarridodigio/sluice/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/josegarridodigio/sluice/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/josegarridodigio/sluice/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/josegarridodigio/sluice/compare/v0.8.0...v0.9.0
