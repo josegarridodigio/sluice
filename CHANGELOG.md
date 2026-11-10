@@ -9,11 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Fixed
+
+## [0.12.0] - 2026-11-10
+
+### Added
+
 - **`env_remove` in a gate** (ADR-0030): variables removed from the gate's environment
   before `env` applies, for markers such as an agent session's that `env` cannot unset.
 - **`[daemon] pass_env`** (ADR-0030): variables the daemon keeps besides its allowlist.
-
-### Changed
 
 ### Fixed
 
@@ -813,7 +819,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PSI thresholds must be percentages (rejected at config load otherwise).
 - Findings of the Phase 1, 2, 3 and 4 reconciliation passes.
 
-[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/josegarridodigio/sluice/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/josegarridodigio/sluice/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/josegarridodigio/sluice/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/josegarridodigio/sluice/compare/v0.9.0...v0.10.0
