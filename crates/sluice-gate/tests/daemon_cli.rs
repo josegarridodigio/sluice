@@ -352,3 +352,124 @@ fn a_custom_socket_directory_is_private() {
     assert_eq!(mode, 0o700);
     assert_eq!(state_mode, 0o700);
 }
+
+/// The names in `/proc/<pid>/environ`.
+fn environ_names(pid: u64) -> Vec<String> {
+    fs::read(format!("/proc/{pid}/environ"))
+        .expect("read environ")
+        .split(|b| *b == 0)
+        .filter_map(|e| {
+            let e = String::from_utf8_lossy(e);
+            e.split_once('=').map(|(k, _)| k.to_owned())
+        })
+        .collect()
+}
+
+/// ADR-0030: an autostarting client gives the daemon only the allowlisted
+/// variables, so another session's id and token never sit in the process
+/// every gate job descends from; a later caller's job sees neither.
+#[test]
+fn an_autostarted_daemon_keeps_only_the_allowlisted_environment() {
+    let sb = Sandbox::new(
+        r#"
+[gates.env]
+cmd = "env | grep -c FOO_SESSION_SECRET; exit 0"
+cache = false
+"#,
+    );
+    sb.sluice()
+        .args(["run", "env"])
+        .env("FOO_SESSION_SECRET", "abc")
+        .env("CLAUDIO_API_TOKEN", "t")
+        .env("TERM", "xterm")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("env PASS"));
+    let pid = sb.status_json()["daemon"]["pid"].as_u64().unwrap();
+    let names = environ_names(pid);
+    for gone in ["FOO_SESSION_SECRET", "CLAUDIO_API_TOKEN", "TERM"] {
+        assert!(!names.iter().any(|n| n == gone), "{gone} in {names:?}");
+    }
+    for kept in ["PATH", "HOME", "XDG_RUNTIME_DIR"] {
+        assert!(
+            names.iter().any(|n| n == kept),
+            "{kept} missing from {names:?}"
+        );
+    }
+    assert!(
+        !names.iter().any(|n| n == "SLUICE_DAEMON_REEXEC"),
+        "an autostarted daemon is already clean: {names:?}"
+    );
+}
+
+/// ADR-0030: a daemon started by hand from a session's shell re-executes
+/// itself (same pid) with the allowlisted variables and names, never shows,
+/// the dropped ones that look like credentials in its log.
+#[test]
+fn a_daemon_started_by_hand_restarts_in_a_clean_environment() {
+    let sb = Sandbox::standard();
+    let child = StdCommand::new(Sandbox::binary())
+        .args(["daemon", "--foreground"])
+        .current_dir(&sb.home)
+        .env_clear()
+        .envs(sb.env())
+        .env("CLAUDIO_API_TOKEN", "do-not-log-me")
+        .env("CLAUDIO_CHAT_ID", "c1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sluice daemon");
+    assert!(
+        wait_for(Duration::from_secs(10), || sb.socket().exists()),
+        "the daemon never listened"
+    );
+    let pid = u64::from(child.id());
+    assert_eq!(sb.status_json()["daemon"]["pid"].as_u64(), Some(pid));
+    let names = environ_names(pid);
+    assert!(
+        !names.iter().any(|n| n.starts_with("CLAUDIO_")),
+        "{names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "SLUICE_DAEMON_REEXEC"),
+        "{names:?}"
+    );
+    sb.sluice().args(["run", "lint"]).assert().success();
+    sb.sluice().args(["daemon", "stop"]).assert().success();
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("look like credentials (CLAUDIO_API_TOKEN)"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("do-not-log-me"), "{stderr}");
+    assert!(!stderr.contains("CLAUDIO_CHAT_ID"), "{stderr}");
+}
+
+/// `env_remove` unsets a variable of the caller's environment for the gate,
+/// which `env` cannot do (an empty value is still set).
+#[test]
+fn env_remove_unsets_a_caller_variable() {
+    let sb = Sandbox::new(
+        r#"
+[gates.clean]
+cmd = "test -z \"${AI_AGENT+set}\""
+env_remove = ["AI_AGENT"]
+cache = false
+
+[gates.dirty]
+cmd = "test -z \"${AI_AGENT+set}\""
+cache = false
+"#,
+    );
+    sb.sluice()
+        .args(["run", "clean"])
+        .env("AI_AGENT", "x")
+        .assert()
+        .success();
+    sb.sluice()
+        .args(["run", "dirty"])
+        .env("AI_AGENT", "x")
+        .assert()
+        .failure();
+}

@@ -384,6 +384,21 @@ fn default_true() -> bool {
     true
 }
 
+/// Refuses an entry of `names` (the list at `field`) that is not an
+/// environment variable name: empty, or with `=` or NUL.
+fn check_var_names(path: &Path, field: &str, names: &[String]) -> Result<()> {
+    match names
+        .iter()
+        .find(|v| v.is_empty() || v.contains(['=', '\0']))
+    {
+        Some(var) => Err(config_err(
+            path,
+            format!("{field}: {var:?} must be an environment variable name (not empty, no `=`)"),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// One `[gates.<name>]` table.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -421,6 +436,14 @@ pub struct Gate {
     /// Extra environment for the gate; also part of the key.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Variables removed from the gate's environment (the caller's, or the
+    /// train tool environment), applied before `env`: markers such as an
+    /// agent session's that change what a tool does and that `env` cannot
+    /// unset (an empty value is still set). Not part of the key, like the
+    /// rest of the caller's environment; `key_env` sees the result. Needs
+    /// sluice >= 0.12.0.
+    #[serde(default)]
+    pub env_remove: Vec<String>,
     /// Gates that must pass first (reserved, unimplemented in v1).
     #[serde(default)]
     pub depends_on: Vec<String>,
@@ -455,6 +478,15 @@ pub enum GateMode {
 }
 
 impl Gate {
+    /// Applies the gate's environment to `env`: removes every `env_remove`
+    /// variable, then sets every `env` entry.
+    pub fn apply_env(&self, env: &mut EnvMap) {
+        for var in &self.env_remove {
+            env.remove(var);
+        }
+        env.extend(self.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+
     /// True for `mode = "queue-only"`.
     pub fn is_queue_only(&self) -> bool {
         self.mode == GateMode::QueueOnly
@@ -713,13 +745,15 @@ impl RepoConfig {
                     ));
                 }
             }
-            for var in &gate.key_env {
-                if var.is_empty() || var.contains(['=', '\0']) {
+            check_var_names(path, &format!("gates.{name}.key_env"), &gate.key_env)?;
+            check_var_names(path, &format!("gates.{name}.env_remove"), &gate.env_remove)?;
+            for var in &gate.env_remove {
+                if gate.env.contains_key(var) {
                     return Err(config_err(
                         path,
                         format!(
-                            "gates.{name}.key_env: {var:?} must be an environment variable \
-                             name (not empty, no `=`)"
+                            "gates.{name}.env_remove: {var:?} is also set by gates.{name}.env; \
+                             keep one of the two"
                         ),
                     ));
                 }
@@ -790,6 +824,8 @@ hooks = ["pre-commit", "pre-push"]
 # key_env = ["NODE_OPTIONS"]
 # Extra environment for the gate (also part of the key).
 # env = { NODE_ENV = "test" }
+# Variables removed from the gate's environment (needs Sluice 0.12.0).
+# env_remove = ["AI_AGENT"]
 "#
 }
 
@@ -972,6 +1008,12 @@ pub struct DaemonConfig {
     pub idle_exit: Duration,
     /// Behaviour when the last subscriber of a job goes away.
     pub last_subscriber_gone: LastSubscriberGone,
+    /// Variables the daemon keeps from the environment it was started in,
+    /// besides its fixed allowlist (`env::daemon_env`): for example a proxy
+    /// or a toolchain variable that trains need with `[queue] tool_env =
+    /// "daemon"`. Agent-detection and per-invocation variables are removed
+    /// even when named here.
+    pub pass_env: Vec<String>,
 }
 
 /// The `[admission]` table.
@@ -1262,6 +1304,7 @@ impl Default for DaemonConfig {
             log_retention_days: 7,
             idle_exit: Duration::ZERO,
             last_subscriber_gone: LastSubscriberGone::Cancel,
+            pass_env: Vec::new(),
         }
     }
 }
@@ -1417,6 +1460,7 @@ impl UserConfig {
         if cfg.daemon.budget < 1 {
             return Err(config_err(path, "daemon.budget must be >= 1"));
         }
+        check_var_names(path, "daemon.pass_env", &cfg.daemon.pass_env)?;
         if cfg.daemon.nice > 19 {
             return Err(config_err(path, "daemon.nice must be in 0..=19"));
         }
@@ -2067,6 +2111,9 @@ budget_share_max = 4
         assert_eq!(c.daemon.last_subscriber_gone, LastSubscriberGone::Finish);
         assert!(user_err("version = 1\n[daemon]\nnice = 20").contains("daemon.nice"));
         assert!(user_err("version = 1\n[daemon]\nbudget = 0").contains("daemon.budget"));
+        assert!(
+            user_err("version = 1\n[daemon]\npass_env = [\"A=B\"]").contains("daemon.pass_env")
+        );
         assert!(user_err("version = 1\n[daemon]\nbogus = 1").contains("bogus"));
         assert!(user_err("version = 3").contains("version"));
     }

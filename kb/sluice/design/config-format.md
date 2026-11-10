@@ -76,6 +76,7 @@ Field reference:
 | `gates.<name>.key_inputs` | list of commands | `[]` | Each command's stdout (via `sh -c` in the worktree root, with exactly the gate's environment and nothing inherited from the process that derives the key, stderr discarded) is part of the key. Keep them fast; they run on every invocation that consults the cache, including hits. A failing command makes the run uncached (notice on stderr), never a gate failure. |
 | `gates.<name>.key_files` | list of paths | `[]` | Relative to repo root. Content hash is part of the key. For files git ignores. Missing file hashes as "absent". |
 | `gates.<name>.env` | table | `{}` | Added to the gate's environment and to the key. |
+| `gates.<name>.env_remove` | list of names | `[]` | Removed from the gate's environment before `env` applies (`Gate::apply_env`, ADR-0030). Not in the key. A name also in `env` is an error. Release after 0.11.0. |
 | `gates.<name>.depends_on` | list | `[]` | Gate names; validated (must exist, no self-reference) but not scheduled in v1. |
 | `gates.<name>.cache` | bool | `true` | `false` makes the gate always run (still queued). |
 | `gates.<name>.mode` | `"gate"` \| `"queue-only"` | `"gate"` | Needs sluice ≥ 0.3.0 (older binaries refuse the file: ``unknown field `mode` ``). `queue-only`: the gate always runs under the budget, never looks up, writes a marker or a miss record, and simultaneous identical requests (same tree, definition and extra arguments) share one run; the agent `fail-fast` hook policy does not apply (the hook waits). Its `cache` is treated as `false`; an explicit `cache = true` is an error (`gates.<name>: mode = "queue-only" never caches; remove cache = true`), `cache = false` is accepted. `sluice hook print` and `sluice doctor` warn when a queue-only gate has `hooks`. |
@@ -148,6 +149,7 @@ ionice_level = 7
 log_retention_days = 7
 idle_exit = "0s"           # 0 = never exit when idle
 last_subscriber_gone = "cancel"   # cancel | finish
+pass_env = []              # release after 0.11.0 (ADR-0030): names kept besides the daemon's allowlist
 
 [queue]
 enabled = true             # user-level kill switch for the merge queue runner
@@ -225,6 +227,7 @@ Environment variables (highest precedence):
 | `SLUICE_TEST_GUARD_WATCHDOG_MS` | Test-only: the guard's watchdog in milliseconds instead of 500. Not a user setting. |
 | `SLUICE_TEST_CLIENT_LOG_CAP` | Test-only: byte cap that triggers the `client.log` rotation instead of 5 MiB. Not a user setting. |
 | `SLUICE_CONFIG` | Override the user config path (ignored when empty). |
+| `SLUICE_DAEMON_REEXEC` | Internal (ADR-0030): set by `sluice daemon` on the process it re-executes into the allowlisted environment; its value names the dropped credential-looking variables. Never passed to jobs. |
 | `SLUICE_VERSION`, `SLUICE_INSTALL_DIR` | `scripts/install.sh` only: release tag to install (default latest) and target directory (default `$HOME/.local/bin`). |
 | `SLUICE_UPDATE_BASE_URL` | `sluice update`: directory or `file://` URL with the archives, `SHA256SUMS` and `LATEST`, instead of GitHub releases. |
 

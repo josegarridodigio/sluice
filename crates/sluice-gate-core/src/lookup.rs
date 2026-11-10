@@ -236,7 +236,7 @@ impl RepoContext {
         } else {
             git::child_env(&self.env)?
         };
-        child.extend(gate.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        gate.apply_env(&mut child);
         child.extend(run_env.iter().map(|(k, v)| (k.clone(), v.clone())));
         Ok(Resolved {
             env: self.env.clone(),
@@ -402,7 +402,7 @@ impl Resolved {
             return Ok(env);
         }
         let mut env = git::child_env(&self.env)?;
-        env.extend(self.gate.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        self.gate.apply_env(&mut env);
         Ok(self.child_env.get_or_init(|| env))
     }
 

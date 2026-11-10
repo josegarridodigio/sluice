@@ -1,0 +1,8 @@
+# Written for the release after 0.11.0 (ADR-0030): `env_remove` of a gate, the
+# variables removed from the gate's environment. Not a recording of a released
+# binary; 0.11.0 and older reject this file because a gate refuses unknown keys.
+version = 1
+
+[gates.e2e]
+cmd = "npx playwright test"
+env_remove = ["AI_AGENT", "CLAUDIO_CHAT_ID"]

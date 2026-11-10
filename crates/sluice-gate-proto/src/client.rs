@@ -584,18 +584,20 @@ fn spawn_daemon(env: &EnvMap, socket: &Path, log_path: &Path) -> Spawn {
         Ok(p) => p,
         Err(e) => return Spawn::Failed(format!("cannot find myself: {e}")),
     };
-    // The daemon outlives this hook or terminal: give it a neutral
-    // environment without anything that describes this invocation (git hook
-    // variables, agent and job variables, the shim directory in `PATH`). The
-    // user's agent-detection variables come from their config; an unreadable
-    // config falls back to the defaults (the daemon reports it itself).
-    let detection = UserConfig::load(env)
-        .map(|u| u.agent_detection)
+    // The daemon outlives this hook or terminal and every gate job descends
+    // from it: give it only the allowlisted environment (ADR-0030), without
+    // anything that describes this invocation (an agent session and its
+    // credentials, git hook, job and shim variables). The user's
+    // agent-detection variables and `[daemon] pass_env` come from their
+    // config; an unreadable config falls back to the defaults (the daemon
+    // reports it itself).
+    let (detection, pass) = UserConfig::load(env)
+        .map(|u| (u.agent_detection, u.daemon.pass_env))
         .unwrap_or_default();
     let mut cmd = Command::new(exe);
     cmd.arg("daemon")
         .env_clear()
-        .envs(daemon_env(env, &detection))
+        .envs(daemon_env(env, &detection, &pass))
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err))

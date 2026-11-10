@@ -9,9 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`env_remove` in a gate** (ADR-0030): variables removed from the gate's environment
+  before `env` applies, for markers such as an agent session's that `env` cannot unset.
+- **`[daemon] pass_env`** (ADR-0030): variables the daemon keeps besides its allowlist.
+
 ### Changed
 
 ### Fixed
+
+- **The daemon no longer keeps the environment of the session that started it**
+  (ADR-0030). It keeps an allowlist (`PATH`, `HOME`, the locale, `XDG_*`, the session bus,
+  `SLUICE_*` and a few more), and `sluice daemon` started by hand re-executes itself with
+  it. Before, an agent session that autostarted the daemon left its id and token in the
+  process every gate job descends from, so ancestry-based agent checks treated a human's
+  jobs as the agent's, and train gates received the token. The daemon log names (never
+  shows) the dropped variables that look like credentials.
 
 ## [0.11.0] - 2026-11-06
 

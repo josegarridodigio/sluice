@@ -248,6 +248,7 @@ pub(super) fn gate_of(unit: &Unit, env: &EnvMap) -> Gate {
         key_files: unit.key_files.clone(),
         key_env: Vec::new(),
         env: gate_env,
+        env_remove: Vec::new(),
         depends_on: Vec::new(),
         cache: unit.kind == Kind::Check,
         mode: GateMode::Gate,

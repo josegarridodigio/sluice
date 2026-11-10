@@ -13,6 +13,15 @@
 //! the user config, then `info`. `daemon.log` is rotated at start (when
 //! larger than `[debug] daemon_log_max_mib`) and by the daemon's daily task.
 //!
+//! Clean environment (ADR-0030): before anything else, `sluice daemon` checks
+//! its own environment against `env::daemon_env`; when it holds more (a
+//! daemon started by hand from an agent's shell, by a systemd unit, by an
+//! older client) it re-executes itself, same pid and arguments, with only
+//! the allowlisted variables, so no gate job descends from a process that
+//! carries another session's markers or credentials. The re-executed process
+//! logs the names (never the values) of the dropped variables that look like
+//! credentials.
+//!
 //! `sluice daemon restart [--debug] [--force]` stops the daemon (refusing
 //! when gates are running unless `--force`) and starts a fresh detached one,
 //! with `SLUICE_LOG=debug` for that instance only when `--debug` is given.
@@ -332,13 +341,103 @@ async fn shutdown_signal() {
     }
 }
 
+/// What [`clean_environment`] found, reported once tracing is up.
+enum EnvCheck {
+    /// The environment was already the allowlisted one.
+    Clean,
+    /// This process is the re-executed one; the names of the dropped
+    /// variables that look like credentials (maybe none).
+    Reexecuted(Vec<String>),
+    /// Re-executing failed; the daemon runs with what it inherited.
+    Failed {
+        /// Why.
+        error: String,
+        /// Inherited variables outside the allowlist that look like
+        /// credentials.
+        credentials: Vec<String>,
+    },
+}
+
+/// Re-executes this process with only the allowlisted environment
+/// (`env::daemon_env`, ADR-0030) unless it already has it or is the
+/// re-executed one. Must run while single-threaded. Returns only when it did
+/// not re-execute.
+fn clean_environment(env: &EnvMap, user: &UserConfig) -> EnvCheck {
+    use sluice_gate_core::env::{REEXEC_VAR, daemon_env, looks_like_credential};
+    use std::os::unix::process::CommandExt as _;
+    if let Some(names) = env.get(REEXEC_VAR) {
+        return EnvCheck::Reexecuted(
+            names
+                .split(',')
+                .filter(|n| !n.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        );
+    }
+    let clean = daemon_env(env, &user.agent_detection, &user.daemon.pass_env);
+    if clean == *env && sluice_gate_core::config::process_env_is_utf8() {
+        return EnvCheck::Clean;
+    }
+    let credentials: Vec<String> = env
+        .keys()
+        .filter(|k| !clean.contains_key(*k) && looks_like_credential(k))
+        .cloned()
+        .collect();
+    let mut args = std::env::args_os();
+    let argv0 = args.next().unwrap_or_else(|| "sluice".into());
+    let error = match std::env::current_exe() {
+        Ok(exe) => std::process::Command::new(exe)
+            .arg0(argv0)
+            .args(args)
+            .env_clear()
+            .envs(&clean)
+            .env(REEXEC_VAR, credentials.join(","))
+            .exec()
+            .to_string(),
+        Err(e) => format!("cannot find myself: {e}"),
+    };
+    EnvCheck::Failed { error, credentials }
+}
+
+/// Logs the outcome of [`clean_environment`].
+fn report_environment(check: &EnvCheck) {
+    match check {
+        EnvCheck::Clean => {}
+        EnvCheck::Reexecuted(names) if names.is_empty() => {
+            tracing::info!("environment: restarted with the allowlisted variables only (ADR-0030)");
+        }
+        EnvCheck::Reexecuted(names) => tracing::warn!(
+            "environment: the daemon was started from an environment holding variables that look \
+             like credentials ({}); it restarted without them (ADR-0030). Whoever started it \
+             (an agent's shell, a service unit) passes them to its own children",
+            names.join(", ")
+        ),
+        EnvCheck::Failed { error, credentials } if credentials.is_empty() => tracing::warn!(
+            "environment: cannot restart with the allowlisted variables only ({error}); every \
+             gate job descends from this process and its inherited environment"
+        ),
+        EnvCheck::Failed { error, credentials } => tracing::warn!(
+            "environment: cannot restart with the allowlisted variables only ({error}); this \
+             process keeps variables that look like credentials ({}), visible to every gate job \
+             through its ancestry. Start the daemon from a clean environment",
+            credentials.join(", ")
+        ),
+    }
+}
+
 /// `sluice daemon [--foreground]`.
 pub fn start(foreground: bool) -> ExitCode {
     let env: EnvMap = sluice_gate_core::config::process_env();
-    let config = match UserConfig::load(&env)
-        .map_err(anyhow::Error::from)
-        .and_then(|user| daemon_config(&env, &user, !foreground))
-    {
+    let user = match UserConfig::load(&env) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("sluice: error: {e:#}");
+            return ExitCode::from(EXIT_ERROR);
+        }
+    };
+    // Still single-threaded: re-execute into the allowlisted environment.
+    let env_check = clean_environment(&env, &user);
+    let config = match daemon_config(&env, &user, !foreground) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("sluice: error: {e:#}");
@@ -364,6 +463,7 @@ pub fn start(foreground: bool) -> ExitCode {
         return ExitCode::from(EXIT_ERROR);
     }
     init_tracing(config.log.level.as_deref().unwrap_or("info"));
+    report_environment(&env_check);
     if let Some(reason) = dirs::plan_socket(&env)
         .ok()
         .and_then(|l| l.fallback_reason())

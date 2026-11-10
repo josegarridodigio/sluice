@@ -183,7 +183,7 @@ pub fn share(unit: &Unit, config: &RepoConfig) -> Share {
         Some("the gate is not cached")
     } else if gate.paths.is_some() {
         Some("the gate is path-scoped, its key covers fewer files than the hook sees")
-    } else if !gate.env.is_empty() {
+    } else if !gate.env.is_empty() || !gate.env_remove.is_empty() {
         Some("the gate sets environment variables the hook does not")
     } else {
         None

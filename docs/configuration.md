@@ -37,6 +37,7 @@ key_inputs = ["node --version"]
 key_files  = [".env.test", "node_modules/.package-lock.json"]
 key_env    = ["NODE_OPTIONS"]
 env        = { NODE_ENV = "test" }
+env_remove = ["AI_AGENT"]
 paths        = ["src/**", "package.json", "package-lock.json"]
 paths_ignore = ["src/**/*.md"]
 ```
@@ -70,6 +71,7 @@ Gate names match `[a-z0-9][a-z0-9_-]*` and are at most 64 characters.
 | `key_files` | list of paths | `[]` | Relative to the repository root, no `..`. The content hash is part of the key. For files git ignores; a missing file counts as "absent". `sluice init` adds the file the Node package manager rewrites on every install (`node_modules/.package-lock.json`, `node_modules/.modules.yaml`, `.yarn/install-state.gz` or `node_modules/.yarn-integrity`), so a worktree whose dependencies drifted from the lockfile never reuses another's pass. |
 | `key_env` | list of variable names | `[]` | The value of each variable in the gate's environment (the caller's, sanitised, plus `env`), or the fact that it is unset, is folded into the cache key (ADR-0029): settings such as `RUSTFLAGS` or `NODE_OPTIONS` change what a gate checks without changing the tree. Requests with different values never share a cached pass or a running job. `sluice init` writes the usual ones per toolchain and `sluice doctor` warns when a gate leaves them out. Needs the release after 0.10.1: older binaries reject the key. |
 | `env` | table | `{}` | Added to the gate's environment and to the key. |
+| `env_remove` | list of variable names | `[]` | Removed from the gate's environment (the caller's, or the train tool environment) before `env` is applied (ADR-0030). For markers that change what a tool does, such as an agent session's variables, which `env` cannot unset: an empty value is still set. A name may not also be in `env`. Not part of the key; `key_env` sees the result. Needs the release after 0.11.0: older binaries reject the key. |
 | `cache` | bool | `true` | `false` makes the gate always run (still queued). |
 | `mode` | `"gate"` \| `"queue-only"` | `"gate"` | `queue-only`: always runs under the budget, never cached, identical simultaneous requests share one run, and the `fail-fast` policy does not apply (the hook waits). `cache = true` is an error with it. `sluice hook print` and `sluice doctor` warn when a queue-only gate has `hooks`. Needs Sluice 0.3.0 or later. |
 | `paths` | list of patterns | unset | When set, the cache key covers only the tree entries matching one of these patterns, plus `.sluice.toml`. Must not be empty. Needs 0.3.0 or later. |
@@ -236,6 +238,7 @@ budget_share_max = 4
 | `daemon.log_retention_days` | `7` | Job logs older than this are pruned daily by the daemon. |
 | `daemon.idle_exit` | `0s` | Parsed but has no effect: the daemon never exits when idle. |
 | `daemon.last_subscriber_gone` | `cancel` | `cancel` or `finish`: what happens to a job when everyone waiting for it is gone. |
+| `daemon.pass_env` | `[]` | Variable names the daemon keeps from the environment it was started in, besides its allowlist (ADR-0030): `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LANGUAGE`, `TZ`, `TMPDIR`, `DBUS_SESSION_BUS_ADDRESS`, `CI`, `LC_*`, `XDG_*`, `SLUICE_*`. Everything else, an agent session's id and token included, is dropped, and `sluice daemon` started by hand re-executes itself without it. Gate jobs of `run`, `verify` and hooks never depended on it (they run in the requesting client's environment); name here what trains need with `[queue] tool_env = "daemon"`, such as a proxy. Agent-detection variables are dropped even when named. Needs the release after 0.11.0. |
 | `admission.psi_enabled` | `true` | Hold new work while the machine is under pressure (Linux PSI). |
 | `admission.cpu_some_avg10_max` | `60.0` | Percent, 0 to 100: do not admit new jobs above this. |
 | `admission.memory_some_avg10_max` | `20.0` | Percent, 0 to 100. |

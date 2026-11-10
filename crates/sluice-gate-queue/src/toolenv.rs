@@ -17,7 +17,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use sluice_gate_core::config::{AgentDetectionConfig, ToolEnv, UserQueueConfig};
-use sluice_gate_core::env::{self, daemon_env};
+use sluice_gate_core::env;
 use sluice_gate_proto::QueueToolEnv;
 
 use crate::git::EnvMap;
@@ -163,7 +163,7 @@ fn compute(queue: &UserQueueConfig, inputs: &Inputs<'_>) -> ResolvedToolEnv {
     }
     let resolved = match inputs.login_shell {
         Some(shell) => env::login_env(inputs.daemon_env, shell, inputs.deadline)
-            .map(|raw| daemon_env(&raw, inputs.detection)),
+            .map(|raw| env::strip_invocation_env(&raw, inputs.detection)),
         None => env::login_tool_env(inputs.daemon_env, inputs.detection, inputs.deadline)
             .map(|login| login.env),
     };

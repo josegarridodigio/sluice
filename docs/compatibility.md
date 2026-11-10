@@ -155,6 +155,13 @@ binaries never read. `status` JSON gains, per running job, `memory_swap_bytes`,
 `memory_pressure_some`, `memory_pressure_full`, `escaped_processes` and `escaped_bytes`, and
 `memory.session_some_avg10` / `session_full_avg10` (additive, schema 1).
 
+The release after 0.11.0 adds the gate key `env_remove` and the user config key
+`[daemon] pass_env` (ADR-0030). They are one-way like the 0.6.0 keys: 0.11.0 and older
+binaries reject a `.sluice.toml` or a user config that has them (fixture
+`crates/sluice-gate-core/tests/fixtures/unreleased/gate-env-remove.toml`). Cache keys are
+unchanged. The daemon's own environment is now an allowlist: a daemon started by hand
+re-executes itself once with `SLUICE_DAEMON_REEXEC` set; nothing on the wire changes.
+
 0.6.1 adds the user config keys `[queue] tool_env` and `[queue] tool_path` (ADR-0020).
 They are one-way like the 0.6.0 keys: 0.6.0 and older binaries reject a user config that
 has them (fixture `crates/sluice-gate-core/tests/fixtures/unreleased/queue-tool-env.toml`).

@@ -1195,7 +1195,12 @@ async fn build_inner(core: &Arc<Core>, train: &TrainRow, config: Option<RepoConf
                 cmd: gate.cmd.trim().to_owned(),
                 extra: Vec::new(),
                 cwd: train.worktree.clone(),
-                child_env: core.tool_env.clone(),
+                child_env: {
+                    // The daemon sets `env` on top; the removals happen here.
+                    let mut env = core.tool_env.clone();
+                    gate.apply_env(&mut env);
+                    env
+                },
                 probe_env: core.git.env().clone(),
                 caller: Caller::Human,
                 session: Some(format!("queue:{}", train.id)),
@@ -2007,7 +2012,7 @@ pub(crate) fn derive_key(
         wt,
         || {
             let mut e = child_env.clone();
-            e.extend(gate.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+            gate.apply_env(&mut e);
             Ok(&*env.insert(e))
         },
     )?;

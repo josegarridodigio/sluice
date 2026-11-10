@@ -499,16 +499,17 @@ impl Shared {
     }
 }
 
-/// The daemon's own environment made neutral (`env::daemon_env`, so a daemon
-/// started by hand matches an autostarted one) and sanitised like a client's
+/// The daemon's own environment made neutral (`env::daemon_env`, the
+/// allowlist of ADR-0030, so a daemon started by hand or by an older client
+/// matches an autostarted one) and sanitised like a client's
 /// `child_env`; falls back to dropping `GIT_*` and `CLAUDE*` when git cannot
 /// list its local variables.
 fn sanitised_env() -> BTreeMap<String, String> {
     let env: BTreeMap<String, String> = sluice_gate_core::config::process_env();
-    let detection = sluice_gate_core::config::UserConfig::load(&env)
-        .map(|u| u.agent_detection)
+    let (detection, pass) = sluice_gate_core::config::UserConfig::load(&env)
+        .map(|u| (u.agent_detection, u.daemon.pass_env))
         .unwrap_or_default();
-    let env = sluice_gate_core::env::daemon_env(&env, &detection);
+    let env = sluice_gate_core::env::daemon_env(&env, &detection, &pass);
     git::child_env(&env).unwrap_or_else(|e| {
         tracing::warn!("cannot sanitise the environment through git: {e}");
         env.into_iter()

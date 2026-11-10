@@ -693,6 +693,26 @@ fn gate_key_env_fixture_parses() {
     assert!(bad.contains("key_env"), "{bad}");
 }
 
+/// ADR-0030: a gate's `env_remove` parses; without it the list is empty; a
+/// name also set by `env` is refused.
+#[test]
+fn gate_env_remove_fixture_parses() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/unreleased/gate-env-remove.toml");
+    let text = fs::read_to_string(&path).unwrap();
+    let cfg = RepoConfig::parse(&text, &path).unwrap();
+    assert_eq!(cfg.gates["e2e"].env_remove, ["AI_AGENT", "CLAUDIO_CHAT_ID"]);
+    let plain = RepoConfig::parse("version = 1\n[gates.t]\ncmd = \"x\"\n", &path).unwrap();
+    assert_eq!(plain.gates["t"].env_remove, Vec::<String>::new());
+    let both = RepoConfig::parse(
+        "version = 1\n[gates.t]\ncmd = \"x\"\nenv = { A = \"1\" }\nenv_remove = [\"A\"]\n",
+        &path,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(both.contains("env_remove"), "{both}");
+}
+
 /// ADR-0023: `[scheduler] backfill` parses, and is on without the key.
 #[test]
 fn scheduler_backfill_fixture_parses() {

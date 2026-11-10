@@ -1,12 +1,15 @@
-//! The neutral environment of the daemon (ADR-0018 section 1).
+//! The neutral environment of the daemon (ADR-0018 section 1, ADR-0030).
 //!
 //! The daemon outlives the client that autostarts it, so whatever that
-//! client's environment says about *its own* invocation (an agent session, a
-//! running job, a disabled cache, the shim directory in `PATH`) must not
-//! become the daemon's environment: every train push and every gate the
-//! daemon runs would inherit it. [`daemon_env`] is the one function that
-//! removes those variables; it is applied when a client spawns the daemon and
-//! again by the daemon itself, so a daemon started by hand is neutral too.
+//! client's environment says about *its own* invocation (an agent session and
+//! its credentials, a running job, a disabled cache, the shim directory in
+//! `PATH`) must not become the daemon's environment: every train gate inherits
+//! it, and every gate job descends from the daemon process. [`daemon_env`]
+//! keeps an allowlist (ADR-0030); it is applied when a client spawns the
+//! daemon, by `sluice daemon` itself (which re-executes into it) and to the
+//! train tool environment. [`strip_invocation_env`] is the older denylist, still
+//! applied to what a login shell prints, which describes the user, not a
+//! session.
 
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -25,7 +28,7 @@ use crate::which;
 /// disabled cache, the shim directory, a per-session shim or hook toggle).
 /// Not here, because they are configuration: `SLUICE_CONFIG`, `SLUICE_LOG`,
 /// `SLUICE_SOCKET`, `SLUICE_UPDATE_BASE_URL`, `SLUICE_INSTALL_DIR`.
-const STRIPPED: [&str; 8] = [
+const STRIPPED: [&str; 10] = [
     crate::JOB_ENV_VAR,
     "SLUICE_AGENT",
     "SLUICE_CACHE",
@@ -36,7 +39,59 @@ const STRIPPED: [&str; 8] = [
     "SLUICE_SHIMS",
     // `SLUICE_GUARD=0|deny`: the client's command-guard mode.
     "SLUICE_GUARD",
+    // Set by the repository hook entry point for the hook it delegates to.
+    "SLUICE_HOOKS_DELEGATE",
+    // Set by `sluice daemon` when it re-executes itself (ADR-0030).
+    REEXEC_VAR,
 ];
+
+/// Set by `sluice daemon` on the process it re-executes into a clean
+/// environment: its value is the comma-separated names of the dropped
+/// variables that look like credentials (possibly empty). Its presence stops a
+/// second re-execution; [`daemon_env`] removes it.
+pub const REEXEC_VAR: &str = "SLUICE_DAEMON_REEXEC";
+
+/// Variables the daemon keeps by exact name (ADR-0030). They describe the
+/// user and the machine, not the invocation: where things are, the locale, the
+/// session bus that systemd scopes go through, and `CI` (a machine-wide
+/// property of a CI runner).
+const KEPT: [&str; 11] = [
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LANGUAGE",
+    "TZ",
+    "TMPDIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "CI",
+];
+
+/// Variables the daemon keeps by prefix: the locale (`LC_*`), the XDG base
+/// and runtime directories (`XDG_*`) and Sluice's own configuration
+/// (`SLUICE_*`, minus the per-invocation ones in [`STRIPPED`]).
+const KEPT_PREFIXES: [&str; 3] = ["LC_", "XDG_", "SLUICE_"];
+
+/// True when `name` looks like it holds a credential: one of its
+/// `_`-separated words is `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `KEY`,
+/// `APIKEY` or `CREDENTIALS` (case-insensitive). Used to name, never to show,
+/// what the daemon drops.
+#[must_use]
+pub fn looks_like_credential(name: &str) -> bool {
+    const WORDS: [&str; 7] = [
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "KEY",
+        "APIKEY",
+        "CREDENTIALS",
+    ];
+    name.split('_')
+        .any(|w| WORDS.iter().any(|c| w.eq_ignore_ascii_case(c)))
+}
 
 /// Removes `dir` from a `PATH`-style list, comparing lexically and, when both
 /// exist, by canonical path; every other entry (empty ones included) is kept
@@ -58,16 +113,39 @@ fn path_without(path: &str, dir: &Path) -> String {
         .join(":")
 }
 
-/// The environment the daemon runs in, derived from `env`.
+/// The environment the daemon runs in, derived from `env` (ADR-0030).
 ///
-/// Removes `GIT_*`, `CLAUDE*`, `SLUICE_JOB`, `SLUICE_AGENT`, `SLUICE_CACHE`,
-/// `SLUICE_DISABLE`, `SLUICE_SESSION_LEAF`, `SLUICE_SHIM_DIR`, `SLUICE_SHIMS`,
-/// `SLUICE_GUARD`, every variable
-/// named by `detection` (`env_any_set` and the keys of `env_any_equals`) and,
-/// from `PATH`, the Sluice shim directory (`SLUICE_SHIM_DIR`, else the
-/// default one) and nothing else. Everything else (`CI`, `LC_*`, `HOME`, the
-/// rest of `PATH`) is the user's and stays.
-pub fn daemon_env(env: &EnvMap, detection: &AgentDetectionConfig) -> EnvMap {
+/// Keeps only the allowlist ([`KEPT`], the [`KEPT_PREFIXES`] and the user's
+/// `[daemon] pass_env`), then applies [`strip_invocation_env`], which still
+/// wins: an agent-detection or per-invocation variable is never kept, even
+/// when `pass` names it. Everything else (an agent session's id and token, a
+/// terminal's variables, the user's API keys) is dropped: gate jobs take
+/// their environment from the client that asks for them, and trains from the
+/// login shell.
+pub fn daemon_env(env: &EnvMap, detection: &AgentDetectionConfig, pass: &[String]) -> EnvMap {
+    let kept: EnvMap = env
+        .iter()
+        .filter(|(k, _)| {
+            KEPT.contains(&k.as_str())
+                || KEPT_PREFIXES.iter().any(|p| k.starts_with(p))
+                || pass.iter().any(|p| p == *k)
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    strip_invocation_env(&kept, detection)
+}
+
+/// Removes from `env` what describes one invocation rather than the user.
+///
+/// Removes `GIT_*`, `CLAUDE*`, the per-invocation `SLUICE_*` variables
+/// (`SLUICE_JOB`, `SLUICE_AGENT`, `SLUICE_CACHE`, `SLUICE_DISABLE`,
+/// `SLUICE_SESSION_LEAF`, `SLUICE_SHIM_DIR`, `SLUICE_SHIMS`, `SLUICE_GUARD`,
+/// `SLUICE_HOOKS_DELEGATE`, `SLUICE_DAEMON_REEXEC`), every variable named by
+/// `detection` (`env_any_set` and the keys of `env_any_equals`) and, from
+/// `PATH`, the Sluice shim directory (`SLUICE_SHIM_DIR`, else the default
+/// one). Everything else stays. Applied to a login shell's environment, which
+/// describes the user (ADR-0020); the daemon's own goes through [`daemon_env`].
+pub fn strip_invocation_env(env: &EnvMap, detection: &AgentDetectionConfig) -> EnvMap {
     let shim_dir: Option<PathBuf> = env
         .get(which::SHIM_DIR_VAR)
         .filter(|v| !v.is_empty())
@@ -239,7 +317,7 @@ fn spawn_retrying_busy(cmd: &mut Command) -> std::io::Result<std::process::Child
 /// `LOGNAME` and `LANG` from `base` when present, `SHELL`, `TERM=dumb`), stdin
 /// from `/dev/null`, stderr discarded and its own process group; when it has
 /// not exited after `deadline` the whole group gets SIGTERM, then SIGKILL after
-/// 2 s. The result is raw: pass it through [`daemon_env`] (or use
+/// 2 s. The result is raw: pass it through [`strip_invocation_env`] (or use
 /// [`login_tool_env`]).
 ///
 /// # Errors
@@ -320,14 +398,14 @@ pub fn login_env(base: &EnvMap, shell: &Path, deadline: Duration) -> Result<EnvM
 pub struct LoginTools {
     /// The shell that printed it.
     pub shell: PathBuf,
-    /// The environment, already neutral ([`daemon_env`]).
+    /// The environment, already neutral ([`strip_invocation_env`]).
     pub env: EnvMap,
 }
 
 /// The login environment of the user as the environment trains run their tools
 /// in: the shell of [`login_shell`]`(base)` through [`login_env`], then
-/// [`daemon_env`] (per-invocation and agent variables, and the shim directory
-/// in `PATH`, removed).
+/// [`strip_invocation_env`] (per-invocation and agent variables, and the shim
+/// directory in `PATH`, removed).
 ///
 /// # Errors
 ///
@@ -339,7 +417,7 @@ pub fn login_tool_env(
 ) -> Result<LoginTools, LoginEnvError> {
     let shell = login_shell(base);
     let raw = login_env(base, &shell, deadline)?;
-    let mut env = daemon_env(&raw, detection);
+    let mut env = strip_invocation_env(&raw, detection);
     // The login shell starts with a minimal environment, so it may not know
     // where the daemon's shim directory is (`SLUICE_SHIM_DIR`,
     // `XDG_DATA_HOME`): remove the one the daemon's own environment names too.
@@ -389,7 +467,7 @@ mod tests {
             ("SLUICE_CONFIG", "/c.toml"),
             ("PATH", "/bin"),
         ]);
-        let out = daemon_env(&e, &AgentDetectionConfig::default());
+        let out = daemon_env(&e, &AgentDetectionConfig::default(), &[]);
         assert_eq!(
             out,
             env(&[
@@ -415,7 +493,100 @@ mod tests {
             ("TERM_PROGRAM", "agent"),
             ("TERM", "xterm"),
         ]);
-        assert_eq!(daemon_env(&e, &det), env(&[("TERM", "xterm")]));
+        assert_eq!(strip_invocation_env(&e, &det), env(&[("TERM", "xterm")]));
+        assert_eq!(daemon_env(&e, &det, &[]), EnvMap::new());
+    }
+
+    #[test]
+    fn keeps_only_the_allowlist() {
+        let e = env(&[
+            ("PATH", "/bin"),
+            ("HOME", "/h"),
+            ("USER", "u"),
+            ("LANG", "C.UTF-8"),
+            ("LC_TIME", "C"),
+            ("XDG_RUNTIME_DIR", "/run/user/1"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1/bus"),
+            ("SLUICE_TEST_X", "1"),
+            ("SLUICE_HOOKS_DELEGATE", "pre-commit"),
+            (REEXEC_VAR, ""),
+            ("CLAUDIO_CHAT_ID", "c1"),
+            ("CLAUDIO_API_TOKEN", "t"),
+            ("AI_AGENT", "x"),
+            ("BRAVE_API_KEY", "k"),
+            ("TERM", "xterm"),
+            ("SSH_AUTH_SOCK", "/s"),
+            ("NODE_OPTIONS", "--x"),
+        ]);
+        assert_eq!(
+            daemon_env(&e, &AgentDetectionConfig::default(), &[]),
+            env(&[
+                ("PATH", "/bin"),
+                ("HOME", "/h"),
+                ("USER", "u"),
+                ("LANG", "C.UTF-8"),
+                ("LC_TIME", "C"),
+                ("XDG_RUNTIME_DIR", "/run/user/1"),
+                ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1/bus"),
+                ("SLUICE_TEST_X", "1"),
+            ])
+        );
+    }
+
+    #[test]
+    fn pass_env_adds_names_but_never_detection_variables() {
+        let det = AgentDetectionConfig {
+            env_any_set: vec!["AI_AGENT".to_owned()],
+            env_any_equals: BTreeMap::new(),
+        };
+        let e = env(&[
+            ("HTTPS_PROXY", "http://p"),
+            ("AI_AGENT", "x"),
+            ("CLAUDECODE", "1"),
+        ]);
+        let pass = [
+            "HTTPS_PROXY".to_owned(),
+            "AI_AGENT".to_owned(),
+            "CLAUDECODE".to_owned(),
+        ];
+        assert_eq!(
+            daemon_env(&e, &det, &pass),
+            env(&[("HTTPS_PROXY", "http://p")])
+        );
+    }
+
+    #[test]
+    fn daemon_env_is_idempotent() {
+        let e = env(&[
+            ("PATH", "/xdg/sluice/shims:/usr/bin"),
+            ("XDG_DATA_HOME", "/xdg"),
+            ("CLAUDIO_API_TOKEN", "t"),
+        ]);
+        let det = AgentDetectionConfig::default();
+        let once = daemon_env(&e, &det, &[]);
+        assert_eq!(daemon_env(&once, &det, &[]), once);
+    }
+
+    #[test]
+    fn credential_names_are_recognised_by_word() {
+        for name in [
+            "CLAUDIO_API_TOKEN",
+            "BRAVE_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "DB_PASSWORD",
+            "github_token",
+            "OPENAI_APIKEY",
+        ] {
+            assert!(looks_like_credential(name), "{name}");
+        }
+        for name in [
+            "CLAUDIO_CHAT_ID",
+            "KEYBOARD",
+            "TOKENIZERS_PARALLELISM",
+            "PATH",
+        ] {
+            assert!(!looks_like_credential(name), "{name}");
+        }
     }
 
     #[test]
@@ -424,7 +595,7 @@ mod tests {
             ("SLUICE_SHIM_DIR", "/data/shims"),
             ("PATH", "/usr/bin:/data/shims:/shims-not:/opt/bin:"),
         ]);
-        let out = daemon_env(&e, &AgentDetectionConfig::default());
+        let out = daemon_env(&e, &AgentDetectionConfig::default(), &[]);
         assert_eq!(out["PATH"], "/usr/bin:/shims-not:/opt/bin:");
     }
 
@@ -434,7 +605,7 @@ mod tests {
             ("XDG_DATA_HOME", "/xdg"),
             ("PATH", "/xdg/sluice/shims:/usr/bin"),
         ]);
-        let out = daemon_env(&e, &AgentDetectionConfig::default());
+        let out = daemon_env(&e, &AgentDetectionConfig::default(), &[]);
         assert_eq!(out["PATH"], "/usr/bin");
     }
 
@@ -449,13 +620,13 @@ mod tests {
             ("SLUICE_SHIM_DIR", real.to_str().unwrap()),
             ("PATH", &format!("/usr/bin:{}", link.display())),
         ]);
-        let out = daemon_env(&e, &AgentDetectionConfig::default());
+        let out = daemon_env(&e, &AgentDetectionConfig::default(), &[]);
         assert_eq!(out["PATH"], "/usr/bin");
     }
 
     #[test]
     fn an_env_without_path_stays_without_path() {
-        let out = daemon_env(&env(&[("CI", "1")]), &AgentDetectionConfig::default());
+        let out = daemon_env(&env(&[("CI", "1")]), &AgentDetectionConfig::default(), &[]);
         assert_eq!(out, env(&[("CI", "1")]));
     }
 
