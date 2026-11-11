@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [0.12.1] - 2026-11-11
+
+### Fixed
+
 - **The escape detection could move the whole desktop session into a job** (ADR-0028
   amendment). A `0` in a dying job's `cgroup.procs` made every process of the machine look
   like the job's; the daemon moved the user's session, agents and browser into the job's
@@ -827,7 +831,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PSI thresholds must be percentages (rejected at config load otherwise).
 - Findings of the Phase 1, 2, 3 and 4 reconciliation passes.
 
-[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.12.1...HEAD
+[0.12.1]: https://github.com/josegarridodigio/sluice/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/josegarridodigio/sluice/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/josegarridodigio/sluice/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/josegarridodigio/sluice/compare/v0.10.0...v0.10.1
