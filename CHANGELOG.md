@@ -13,6 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The escape detection could move the whole desktop session into a job** (ADR-0028
+  amendment). A `0` in a dying job's `cgroup.procs` made every process of the machine look
+  like the job's; the daemon moved the user's session, agents and browser into the job's
+  cgroup, and the job's out-of-memory kill ended them all. The detection now ignores pids 0
+  to 2, never touches the daemon, its ancestors, `init.scope` or the desktop session, and
+  treats more than 64 escapees of one job as a detection error it does not act on. Until
+  the update, `[containment] reclaim_escaped = false` avoids it.
+
 ## [0.12.0] - 2026-11-10
 
 ### Added

@@ -14,6 +14,16 @@
 //!   into a systemd scope of its own, so its memory escapes the job's
 //!   accounting, ceiling and `cgroup.kill`;
 //!
+//! The detection can never reach beyond the job (2026-11-11 incident: the
+//! kernel listed a `0` in a dying job's `cgroup.procs`, every process of the
+//! machine became a child of the job, and the daemon moved the whole desktop
+//! session into the leaf, where the job's OOM group kill ended it): pids 0
+//! to 2 are never a job's process ([`leaf_procs`], [`find_escapees`]); the
+//! daemon, its ancestors (the user manager) and the processes of the system,
+//! of `init.scope` and of `session.slice` are never an escapee
+//! ([`protected_pids`], [`foreign_cgroup`]); and a tick that finds more than
+//! [`MAX_ESCAPEES`] for one job is a detection error, never acted on.
+//!
 //! and, once per tick, the `memory.pressure` of the user's session
 //! (`session.slice` of the user manager, read only, [`session_cgroup`]).
 //! [`JobTelemetry`] keeps the peaks of a job and says what is worth a log
@@ -117,8 +127,55 @@ pub fn read_leaf(leaf: &Path) -> LeafReading {
 #[must_use]
 pub fn leaf_procs(leaf: &Path) -> HashSet<u32> {
     std::fs::read_to_string(leaf.join("cgroup.procs"))
-        .map(|t| t.lines().filter_map(|l| l.trim().parse().ok()).collect())
+        .map(|t| {
+            t.lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .filter(|&pid| !is_system_root(pid))
+                .collect()
+        })
         .unwrap_or_default()
+}
+
+/// More escapees than this for one job in one tick is a detection error (a
+/// job whose browser spawns renderers moves a handful of processes): the
+/// tick is logged and nothing is recorded, moved or later killed.
+pub const MAX_ESCAPEES: usize = 64;
+
+/// Pid 0 (what `cgroup.procs` prints for a task whose pid the kernel cannot
+/// translate, such as a dying one), 1 (init) and 2 (the kernel threads'
+/// parent): never a job's process, and the roots under which every other
+/// process descends.
+#[must_use]
+pub fn is_system_root(pid: u32) -> bool {
+    pid <= 2
+}
+
+/// The pids that are never an escapee: `own` (the daemon) and its ancestors
+/// in `table` (the user manager, init).
+#[must_use]
+pub fn protected_pids(table: &[ProcEntry], own: u32) -> HashSet<u32> {
+    let parent: HashMap<u32, u32> = table.iter().map(|p| (p.pid, p.ppid)).collect();
+    let mut out = HashSet::new();
+    let mut pid = own;
+    while out.insert(pid) && !is_system_root(pid) {
+        match parent.get(&pid) {
+            Some(&parent_pid) => pid = parent_pid,
+            None => break,
+        }
+    }
+    out
+}
+
+/// True for a cgroup that no job process can have escaped to: outside the
+/// user slice (the system, the root), the user manager's own `init.scope`
+/// and the desktop session (`session.slice`). Chromium escapes into a scope
+/// of `app.slice`.
+#[must_use]
+pub fn foreign_cgroup(cg: &str) -> bool {
+    !cg.starts_with("/user.slice/")
+        || cg.ends_with("/init.scope")
+        || cg.contains("/session.slice/")
+        || cg.ends_with("/session.slice")
 }
 
 /// The cgroup v2 path of `pid` (`/user.slice/...`, the `0::` line of
@@ -159,27 +216,35 @@ pub struct Escapee {
 /// since still counts), and live outside the leaf. `table` is this tick's
 /// process table, `leaf_rel` the leaf's cgroup path as `/proc/<pid>/cgroup`
 /// prints it. Only the processes found outside the leaf's `cgroup.procs`
-/// have their `cgroup` file read.
+/// have their `cgroup` file read. The walk never starts from or reports a
+/// system root ([`is_system_root`]), a `protected` pid or a process in a
+/// [`foreign_cgroup`], and never descends through them.
 #[must_use]
-pub fn find_escapees<S: std::hash::BuildHasher>(
+pub fn find_escapees<S: std::hash::BuildHasher, P: std::hash::BuildHasher>(
     proc_root: &Path,
     table: &[ProcEntry],
     procs: &HashSet<u32, S>,
     leaf_rel: &str,
     known: &[(u32, u64)],
+    protected: &HashSet<u32, P>,
 ) -> Vec<Escapee> {
     let mut children: HashMap<u32, Vec<&ProcEntry>> = HashMap::new();
     let by_pid: HashMap<u32, &ProcEntry> = table.iter().map(|p| (p.pid, p)).collect();
     for p in table {
         children.entry(p.ppid).or_default().push(p);
     }
-    let mut stack: Vec<u32> = procs.iter().copied().collect();
+    let mut stack: Vec<u32> = procs
+        .iter()
+        .copied()
+        .filter(|&p| !is_system_root(p) && !protected.contains(&p))
+        .collect();
     let mut seen: HashSet<u32> = stack.iter().copied().collect();
     let mut out = Vec::new();
     // Known escapees still alive (same start time) are roots of their own.
     let mut roots: Vec<&ProcEntry> = known
         .iter()
         .filter_map(|&(pid, start)| by_pid.get(&pid).filter(|p| p.start == start).copied())
+        .filter(|p| !is_system_root(p.pid) && !protected.contains(&p.pid))
         .collect();
     loop {
         let next = if let Some(pid) = stack.pop() {
@@ -194,19 +259,27 @@ pub fn find_escapees<S: std::hash::BuildHasher>(
             break;
         };
         for child in next {
-            if !seen.insert(child.pid) {
+            if is_system_root(child.pid)
+                || protected.contains(&child.pid)
+                || !seen.insert(child.pid)
+            {
                 continue;
             }
-            stack.push(child.pid);
             if procs.contains(&child.pid) {
+                stack.push(child.pid);
                 continue;
             }
             let Some(cg) = cgroup_of(proc_root, child.pid) else {
                 continue;
             };
             if inside(&cg, leaf_rel) {
+                stack.push(child.pid);
                 continue;
             }
+            if foreign_cgroup(&cg) {
+                continue;
+            }
+            stack.push(child.pid);
             out.push(Escapee {
                 pid: child.pid,
                 start: child.start,
@@ -245,9 +318,14 @@ pub fn kill_leftovers(proc_root: &Path, leaf: &Path, escapees: &[(u32, u64)]) ->
         && !leaf_procs(leaf).is_empty()
         && std::fs::write(leaf.join("cgroup.kill"), "1").is_ok();
     let mut signalled = 0;
-    for &(pid, start) in escapees {
-        if kill_if_same(proc_root, pid, start) {
-            signalled += 1;
+    // Never more than a job can have moved out, never a system root or the
+    // daemon itself: a list that says otherwise is a detection error.
+    if escapees.len() <= MAX_ESCAPEES {
+        let own = std::process::id();
+        for &(pid, start) in escapees {
+            if !is_system_root(pid) && pid != own && kill_if_same(proc_root, pid, start) {
+                signalled += 1;
+            }
         }
     }
     (signalled, leaf_killed)
@@ -608,6 +686,97 @@ mod tests {
         }
     }
 
+    /// 2026-11-11: a `0` in the leaf's `cgroup.procs` made pid 1 and 2 (and
+    /// so every process) children of the job, and the daemon moved the user's
+    /// whole session into the leaf. A 0, the system roots, the daemon and its
+    /// ancestors, `init.scope` and `session.slice` are never reached.
+    #[test]
+    fn the_walk_never_leaves_the_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let user = "/user.slice/user-1000.slice/user@1000.service";
+        let leaf = format!("{user}/sluice.slice/sluice-daemon.scope/jobs/j1");
+        for (pid, cg) in [
+            (1, "/init.scope".to_owned()),
+            (2, "/".to_owned()),
+            (30, format!("{user}/init.scope")),
+            (
+                31,
+                format!("{user}/session.slice/org.gnome.Shell@wayland.service"),
+            ),
+            (32, format!("{user}/app.slice/app-claudio-1.scope")),
+            (
+                33,
+                format!("{user}/sluice.slice/sluice-daemon.scope/daemon"),
+            ),
+            (34, "/system.slice/sshd.service".to_owned()),
+            (40, leaf.clone()),
+            (
+                41,
+                format!("{user}/app.slice/app-com.google.Chrome-41.scope"),
+            ),
+        ] {
+            write(root, &format!("{pid}/cgroup"), &format!("0::{cg}\n"));
+            write(root, &format!("{pid}/comm"), "x\n");
+        }
+        let table = [
+            entry(1, 0, 1),
+            entry(2, 0, 2),
+            entry(30, 1, 30),
+            entry(31, 30, 31),
+            entry(32, 30, 32),
+            entry(33, 30, 33),
+            entry(34, 1, 34),
+            entry(40, 33, 40),
+            entry(41, 40, 41),
+        ];
+        let write_procs = |text: &str| {
+            let leaf_dir = root.join("leaf");
+            std::fs::create_dir_all(&leaf_dir).unwrap();
+            std::fs::write(leaf_dir.join("cgroup.procs"), text).unwrap();
+            leaf_procs(&leaf_dir)
+        };
+        let procs = write_procs("0\n40\n1\n");
+        assert_eq!(procs, HashSet::from([40]));
+        let protected = protected_pids(&table, 33);
+        assert_eq!(protected, HashSet::from([33, 30, 1]));
+        // Even when a 0 slips through, only the job's real escapee is found.
+        let poisoned = HashSet::from([0, 2, 40]);
+        let found = find_escapees(
+            root,
+            &table,
+            &poisoned,
+            &leaf,
+            &[(1, 1), (31, 31)],
+            &protected,
+        );
+        assert_eq!(found.iter().map(|e| e.pid).collect::<Vec<_>>(), [41]);
+        // Without the protected set, the session and init.scope are still
+        // never escapees (pid 30's children are only reached through 30).
+        let found = find_escapees(root, &table, &poisoned, &leaf, &[(30, 30)], &HashSet::new());
+        assert_eq!(found.iter().map(|e| e.pid).collect::<Vec<_>>(), [41]);
+        assert!(foreign_cgroup("/"));
+        assert!(foreign_cgroup(&format!("{user}/init.scope")));
+        assert!(foreign_cgroup(&format!("{user}/session.slice")));
+        assert!(!foreign_cgroup(&format!("{user}/app.slice/app-x.scope")));
+    }
+
+    #[test]
+    fn leftovers_never_kill_a_system_root_the_daemon_or_an_implausible_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let leaf = dir.path().join("leaf");
+        std::fs::create_dir_all(&leaf).unwrap();
+        let me = std::process::id();
+        // Start times that would match nothing anyway; the guard returns
+        // before any pidfd is opened for these.
+        assert_eq!(
+            kill_leftovers(dir.path(), &leaf, &[(0, 0), (1, 0), (me, 0)]),
+            (0, false)
+        );
+        let many: Vec<(u32, u64)> = (100..100 + 65).map(|p| (p, 0)).collect();
+        assert_eq!(kill_leftovers(dir.path(), &leaf, &many), (0, false));
+    }
+
     #[test]
     fn escapees_are_the_descendants_living_outside_the_leaf() {
         let dir = tempfile::tempdir().unwrap();
@@ -636,7 +805,7 @@ mod tests {
             entry(20, 1, 104),
         ];
         let procs = HashSet::from([10]);
-        let found = find_escapees(root, &table, &procs, leaf, &[]);
+        let found = find_escapees(root, &table, &procs, leaf, &[], &HashSet::new());
         let pids: Vec<u32> = found.iter().map(|e| e.pid).collect();
         assert_eq!(pids, [12, 13]);
         assert_eq!(found[0].comm, "chrome-headless");
@@ -645,11 +814,25 @@ mod tests {
         // The job's own processes gone, 12 orphaned (ppid 1): still tracked
         // through `known`, with its child; a reused pid (other start) is not.
         let orphaned = [entry(12, 1, 102), entry(13, 12, 103), entry(20, 1, 104)];
-        let found = find_escapees(root, &orphaned, &HashSet::new(), leaf, &[(12, 102)]);
+        let found = find_escapees(
+            root,
+            &orphaned,
+            &HashSet::new(),
+            leaf,
+            &[(12, 102)],
+            &HashSet::new(),
+        );
         assert_eq!(found.iter().map(|e| e.pid).collect::<Vec<_>>(), [12, 13]);
         let reused = [entry(12, 1, 999)];
         assert_eq!(
-            find_escapees(root, &reused, &HashSet::new(), leaf, &[(12, 102)]),
+            find_escapees(
+                root,
+                &reused,
+                &HashSet::new(),
+                leaf,
+                &[(12, 102)],
+                &HashSet::new()
+            ),
             Vec::new()
         );
         // A leaf path that is only a prefix of another name is not "inside".

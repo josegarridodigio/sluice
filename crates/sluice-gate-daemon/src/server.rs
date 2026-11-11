@@ -1311,19 +1311,39 @@ fn telemetry_tick(
             .map(|(id, e)| (id.clone(), e.telemetry.known_escapees()))
             .collect()
     };
+    let protected = telemetry::protected_pids(table, std::process::id());
     let readings: Vec<_> = jobs
         .into_iter()
         .map(|(id, known)| {
             let leaf = jobs_dir.join(&id);
             let reading = telemetry::read_leaf(&leaf);
-            let escapees = leaf.strip_prefix(mount).map_or_else(
+            let mut escapees = leaf.strip_prefix(mount).map_or_else(
                 |_| Vec::new(),
                 |rel| {
                     let rel = format!("/{}", rel.display());
                     let procs = telemetry::leaf_procs(&leaf);
-                    telemetry::find_escapees(&shared.config.proc_root, table, &procs, &rel, &known)
+                    telemetry::find_escapees(
+                        &shared.config.proc_root,
+                        table,
+                        &procs,
+                        &rel,
+                        &known,
+                        &protected,
+                    )
                 },
             );
+            if escapees.len() > telemetry::MAX_ESCAPEES {
+                // A detection error, never a real escape: acting on it once
+                // moved a whole desktop session into a job (2026-11-11).
+                tracing::error!(
+                    job = %id,
+                    found = escapees.len(),
+                    max = telemetry::MAX_ESCAPEES,
+                    "the escape detection found more processes than a job can have moved out; \
+                     ignoring this reading (nothing moved, recorded or killed)"
+                );
+                escapees.clear();
+            }
             (id, reading, escapees)
         })
         .collect();

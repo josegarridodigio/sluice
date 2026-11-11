@@ -136,3 +136,12 @@ spot:
 - The GNOME Shell hang itself is not explained; capturing the shell's threads during the
   next hang (`top -H`, a stack) needs a second machine with SSH access to this one.
 - Zero-config hook units use the same containment; nothing to change there.
+
+## Amendment (2026-11-11): the detection never reaches beyond the job
+
+A `0` in a dying job's `cgroup.procs` made every process a descendant of the job and the
+daemon moved the user's desktop session into the leaf, where the job's OOM group kill
+ended it. The walk now ignores pids 0 to 2, never reports or descends through the daemon,
+its ancestors or a process outside `/user.slice/`, in `init.scope` or in `session.slice`,
+and more than 64 escapees for one job in one tick is a detection error that is logged and
+never acted on. See [[sluice/fixes/escape-detection-reclaimed-the-session.md]].
