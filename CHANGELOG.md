@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The escape detection no longer pulls back processes Sluice itself placed**
+  (ADR-0028 amendment): those in its agents scope or in the tree of another Sluice
+  instance, as Sluice's own containment tests create. Moving them back into the job
+  broke what those tests check. Escapes into any other scope, Chromium's included, are
+  still moved back.
 - **The documentation matches 0.12.1.** The README no longer says containment cannot
   hold a process that moves itself out (0.11.0 moves it back), describes what was
   validated on which machines, lists the memory containment among the features and says

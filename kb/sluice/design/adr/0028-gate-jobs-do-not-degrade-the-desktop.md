@@ -145,3 +145,20 @@ ended it. The walk now ignores pids 0 to 2, never reports or descends through th
 its ancestors or a process outside `/user.slice/`, in `init.scope` or in `session.slice`,
 and more than 64 escapees for one job in one tick is a detection error that is logged and
 never acted on. See [[sluice/fixes/escape-detection-reclaimed-the-session.md]].
+
+## Amendment (2026-11-13): Sluice's own slice is never an escape
+
+Under 0.12.1 with `reclaim_escaped = true`, the daemon running Sluice's own `test` gate
+pulled back the processes that the `containment_daemon` integration tests place in their
+own Sluice trees (`sluice.slice/sluice-test.slice/...`, a nested daemon's agents scope and
+session leaves). The tests that check those placements failed in 3 of 4 local runs
+(`a_restart_reuses_the_agents_scope`, `status_and_doctor_show_a_real_session`).
+
+The detection now skips a process that Sluice itself placed below the daemon's own
+slice: its agents scope (the agent sessions' leaves), or any slice below it (the tree of
+another Sluice instance, such as the test suite's). Every other cgroup is still an
+escape and is moved back:
+
+- Chromium's `app.slice/app-*.scope`.
+- A `systemd-run --user --scope` unit, even one started right in Sluice's slice.
+See [[sluice/fixes/escape-detection-nested-sluice-trees.md]].

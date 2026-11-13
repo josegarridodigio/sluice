@@ -1288,6 +1288,14 @@ fn session_tick(shared: &Shared) -> Option<telemetry::Pressure> {
     pressure
 }
 
+/// `dir` as `/proc/<pid>/cgroup` prints it (`/user.slice/...`), or `None`
+/// when it is not below `mount`.
+fn cgroup_rel(dir: &Path, mount: &Path) -> Option<String> {
+    dir.strip_prefix(mount)
+        .ok()
+        .map(|rel| format!("/{}", rel.display()))
+}
+
 /// The memory telemetry's second (ADR-0028): for every running job with a
 /// cgroup leaf, reads the leaf's pressure, swap and page cache and finds the
 /// job's processes that live outside the leaf; logs each new escape and the
@@ -1302,6 +1310,9 @@ fn telemetry_tick(
     };
     let jobs_dir = c.tree().layout.jobs_dir();
     let mount = Path::new(sluice_gate_core::cgroup::CGROUP_MOUNT);
+    // Processes in Sluice's own slice were placed there by Sluice (a session
+    // leaf, or the tree of a nested instance such as the test suite's).
+    let slice_rel = cgroup_rel(&c.tree().layout.slice_dir(), mount);
     let jobs: Vec<(String, Vec<(u32, u64)>)> = {
         let st = shared.state();
         st.jobs
@@ -1328,6 +1339,7 @@ fn telemetry_tick(
                         &rel,
                         &known,
                         &protected,
+                        slice_rel.as_deref(),
                     )
                 },
             );
