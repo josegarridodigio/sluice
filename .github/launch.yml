@@ -14,7 +14,7 @@ publishing:
   devto: approval
   bluesky: approval
   mastodon: approval
-  instagram: off
+  instagram: approval
   reddit: off
   hashnode: off
   linkedin: approval
@@ -23,7 +23,7 @@ publishing:
   discord: off
   githubDiscussions: off
   threads: approval
-  youtube: off
+  youtube: approval
 
 # A demo makes the launch: a GIF in the repo, or the deployed project to record one from
 assets:
