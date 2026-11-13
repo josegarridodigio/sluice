@@ -1450,9 +1450,7 @@ fn commit_config(fx: &Fixture, toml: &str) {
 /// The lines a prepare command appended to `counter` (`pwd`: the merge
 /// worktree, or `<train>-base` for the base probe).
 fn prepare_dirs(counter: &std::path::Path) -> Vec<String> {
-    std::fs::read_to_string(counter)
-        .map(|s| s.lines().map(str::to_owned).collect())
-        .unwrap_or_default()
+    std::fs::read_to_string(counter).map_or_default(|s| s.lines().map(str::to_owned).collect())
 }
 
 /// A gate that needs a git-ignored file only `prepare` creates passes, the

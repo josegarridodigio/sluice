@@ -507,8 +507,7 @@ impl Shared {
 fn sanitised_env() -> BTreeMap<String, String> {
     let env: BTreeMap<String, String> = sluice_gate_core::config::process_env();
     let (detection, pass) = sluice_gate_core::config::UserConfig::load(&env)
-        .map(|u| (u.agent_detection, u.daemon.pass_env))
-        .unwrap_or_default();
+        .map_or_default(|u| (u.agent_detection, u.daemon.pass_env));
     let env = sluice_gate_core::env::daemon_env(&env, &detection, &pass);
     git::child_env(&env).unwrap_or_else(|e| {
         tracing::warn!("cannot sanitise the environment through git: {e}");
@@ -2450,8 +2449,7 @@ fn kill_leftovers(shared: &Shared, c: &Containment, id: &str) {
         .state()
         .jobs
         .get(id)
-        .map(|e| e.telemetry.known_escapees())
-        .unwrap_or_default();
+        .map_or_default(|e| e.telemetry.known_escapees());
     let leaf = c.tree().layout.jobs_dir().join(id);
     let (signalled, leaf_killed) =
         telemetry::kill_leftovers(&shared.config.proc_root, &leaf, &known);
@@ -3740,8 +3738,7 @@ fn register_job(shared: &Shared, job: NewJob) -> std::result::Result<Registered,
     let (demands_milli, expected_ms) = job
         .stats_key
         .as_ref()
-        .map(|k| lock(&shared.stats).history(k))
-        .unwrap_or_default();
+        .map_or_default(|k| lock(&shared.stats).history(k));
     let mut st = shared.state();
     if !st.accepting {
         return Err(st.refusal.to_owned());
@@ -3919,11 +3916,7 @@ fn detach_with(shared: &Shared, job_id: &str, reason: Option<&str>, force: bool)
         if st.sched.is_queued(job_id) {
             // Dropped under the lock of the check: the scheduling loop
             // cannot admit it in between.
-            let gate = st
-                .jobs
-                .get(job_id)
-                .map(|e| e.request.name())
-                .unwrap_or_default();
+            let gate = st.jobs.get(job_id).map_or_default(|e| e.request.name());
             tracing::info!(job = %job_id, killed_by, "last subscriber gone, dropping the queued job");
             Some(close_job(
                 shared,

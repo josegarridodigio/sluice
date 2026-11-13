@@ -194,13 +194,11 @@ fn is_zombie(pid: u32) -> bool {
 
 /// The command line of a process, words joined by spaces.
 pub fn cmdline_of(pid: u32) -> String {
-    fs::read(format!("/proc/{pid}/cmdline"))
-        .map(|b| {
-            String::from_utf8_lossy(&b)
-                .trim_end_matches('\0')
-                .replace('\0', " ")
-        })
-        .unwrap_or_default()
+    fs::read(format!("/proc/{pid}/cmdline")).map_or_default(|b| {
+        String::from_utf8_lossy(&b)
+            .trim_end_matches('\0')
+            .replace('\0', " ")
+    })
 }
 
 /// Kills (SIGKILL) the live processes left in the test's own tree (only a

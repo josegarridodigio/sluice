@@ -595,8 +595,9 @@ fn via_daemon(
             trace.decision = Some(if *coalesced { "coalesced" } else { "miss-run" });
             let busy = client::connect(&socket)
                 .and_then(client::Client::status)
-                .map(|s| format!(", {} of {} units busy", s.budget.used, s.budget.total))
-                .unwrap_or_default();
+                .map_or_default(|s| {
+                    format!(", {} of {} units busy", s.budget.used, s.budget.total)
+                });
             let sharing = if *coalesced {
                 format!(", sharing job {job_id}")
             } else {
@@ -1165,8 +1166,7 @@ fn spawn_and_wait(ctx: &Context, args: &RunArgs) -> Result<Execution, String> {
         .lock()
         .ok()
         .and_then(|l| l.memory())
-        .map(|bytes| logfile::last_lines(&bytes, usize::MAX))
-        .unwrap_or_default();
+        .map_or_default(|bytes| logfile::last_lines(&bytes, usize::MAX));
     Ok(Execution {
         exit_code: status.code(),
         timed_out,

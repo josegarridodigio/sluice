@@ -340,8 +340,7 @@ fn notice_thread(job_label: String, socket: PathBuf, position: usize, shared: Ar
         }
         let busy = client::connect(&socket)
             .and_then(client::Client::status)
-            .map(|s| format!(", {} of {} units busy", s.budget.used, s.budget.total))
-            .unwrap_or_default();
+            .map_or_default(|s| format!(", {} of {} units busy", s.budget.used, s.budget.total));
         if shared.phase() == Phase::Queued {
             shared.noticed.store(true, Ordering::SeqCst);
             eprintln!("sluice: exec '{job_label}' queued (position {position}{busy})");

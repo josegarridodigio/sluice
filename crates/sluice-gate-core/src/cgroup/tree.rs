@@ -441,8 +441,7 @@ pub fn read_usage(dir: &Path) -> Usage {
         memory_peak: read_u64(&dir.join("memory.peak")),
         pids_current: read_u64(&dir.join("pids.current")),
         memory_events: fs::read_to_string(dir.join("memory.events"))
-            .map(|t| parse_memory_events(&t))
-            .unwrap_or_default(),
+            .map_or_default(|t| parse_memory_events(&t)),
     }
 }
 

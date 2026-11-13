@@ -490,12 +490,11 @@ fn conflict_paths(detail: Option<&Value>) -> Vec<String> {
         Some(Value::Object(o)) => o.get("paths").and_then(Value::as_array),
         _ => None,
     };
-    list.map(|a| {
+    list.map_or_default(|a| {
         a.iter()
             .filter_map(|v| v.as_str().map(str::to_owned))
             .collect()
     })
-    .unwrap_or_default()
 }
 
 /// True when the job's `detail` says its branch changes `.sluice.toml`.

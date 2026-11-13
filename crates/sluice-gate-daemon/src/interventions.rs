@@ -312,14 +312,12 @@ pub fn watch_targets(
 ) -> Vec<(PathBuf, PathBuf)> {
     let mut out = Vec::new();
     let dirs_of = |parent: &Path| -> Vec<PathBuf> {
-        fs::read_dir(parent)
-            .map(|rd| {
-                rd.flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.is_dir())
-                    .collect()
-            })
-            .unwrap_or_default()
+        fs::read_dir(parent).map_or_default(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect()
+        })
     };
     for session in dirs_of(agents_dir) {
         let is_session = session

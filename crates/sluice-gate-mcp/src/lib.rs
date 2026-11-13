@@ -1079,8 +1079,7 @@ impl Server {
                 _ = async { ticker.as_mut().expect("guarded").tick().await }, if ticker.is_some() => {
                     let message = state
                         .lock()
-                        .map(|s| s.describe(gate))
-                        .unwrap_or_default();
+                        .map_or_default(|s| s.describe(gate));
                     if let Some(p) = progress {
                         p.notify(format!("[{}/{}] {message}", position.0, position.1)).await;
                     }

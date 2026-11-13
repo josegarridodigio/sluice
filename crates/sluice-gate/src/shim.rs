@@ -540,16 +540,14 @@ pub fn status(dir: Option<&Path>, json: bool) -> ExitCode {
             }
         })
         .collect();
-    let mut unlisted: Vec<String> = fs::read_dir(&dir)
-        .map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .filter(|e| is_our_shim(&e.path()))
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| !names.contains(n))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut unlisted: Vec<String> = fs::read_dir(&dir).map_or_default(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .filter(|e| is_our_shim(&e.path()))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !names.contains(n))
+            .collect()
+    });
     unlisted.sort();
 
     if json {

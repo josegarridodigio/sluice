@@ -126,14 +126,12 @@ pub fn read_leaf(leaf: &Path) -> LeafReading {
 /// The pids listed in `<leaf>/cgroup.procs` (empty when unreadable).
 #[must_use]
 pub fn leaf_procs(leaf: &Path) -> HashSet<u32> {
-    std::fs::read_to_string(leaf.join("cgroup.procs"))
-        .map(|t| {
-            t.lines()
-                .filter_map(|l| l.trim().parse().ok())
-                .filter(|&pid| !is_system_root(pid))
-                .collect()
-        })
-        .unwrap_or_default()
+    std::fs::read_to_string(leaf.join("cgroup.procs")).map_or_default(|t| {
+        t.lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .filter(|&pid| !is_system_root(pid))
+            .collect()
+    })
 }
 
 /// More escapees than this for one job in one tick is a detection error (a
@@ -248,11 +246,7 @@ pub fn find_escapees<S: std::hash::BuildHasher, P: std::hash::BuildHasher>(
         .collect();
     loop {
         let next = if let Some(pid) = stack.pop() {
-            children
-                .get(&pid)
-                .map(Vec::as_slice)
-                .unwrap_or_default()
-                .to_vec()
+            children.get(&pid).map_or_default(Vec::as_slice).to_vec()
         } else if let Some(root) = roots.pop() {
             vec![root]
         } else {
@@ -284,8 +278,7 @@ pub fn find_escapees<S: std::hash::BuildHasher, P: std::hash::BuildHasher>(
                 pid: child.pid,
                 start: child.start,
                 comm: std::fs::read_to_string(proc_root.join(child.pid.to_string()).join("comm"))
-                    .map(|c| c.trim().to_owned())
-                    .unwrap_or_default(),
+                    .map_or_default(|c| c.trim().to_owned()),
                 cgroup: cg,
                 rss_bytes: crate::memory::rss_bytes(proc_root, child.pid).unwrap_or(0),
             });

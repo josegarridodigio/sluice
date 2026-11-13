@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Sluice's own `.sluice.toml` keys its gates on `RUSTFLAGS`, `RUSTDOCFLAGS` and
   `CARGO_BUILD_TARGET` (`key_env`), so `sluice doctor` no longer warns there.
+- The code passes the clippy of Rust 1.100 (`map_unwrap_or`: `.map(f).unwrap_or_default()`
+  becomes `.map_or_default(f)`; `needless_range_loop` in the store). No behaviour change;
+  the minimum Rust version stays 1.99.
 
 ### Fixed
 

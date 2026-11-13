@@ -966,15 +966,12 @@ impl MemoryBudget {
         } else {
             ""
         };
-        let session = self
-            .session_some_avg10
-            .map(|some| {
-                format!(
-                    ", desktop memory pressure {some:.1}% some / {:.1}% full",
-                    self.session_full_avg10.unwrap_or(0.0)
-                )
-            })
-            .unwrap_or_default();
+        let session = self.session_some_avg10.map_or_default(|some| {
+            format!(
+                ", desktop memory pressure {some:.1}% some / {:.1}% full",
+                self.session_full_avg10.unwrap_or(0.0)
+            )
+        });
         format!(
             "memory:   {} available, {} reserved{observed}, {} still to grow in running jobs{session}",
             gib_text(self.available_bytes),
@@ -989,8 +986,7 @@ impl RunningJob {
     /// nothing without one.
     fn ceiling_text(&self) -> String {
         self.memory_ceiling_bytes
-            .map(|c| format!("  ceiling {}", gib_text(c)))
-            .unwrap_or_default()
+            .map_or_default(|c| format!("  ceiling {}", gib_text(c)))
     }
 
     /// The job's swap, memory pressure and escaped processes in the text

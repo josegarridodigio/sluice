@@ -220,8 +220,7 @@ pub fn respond(input: &str, inputs: &Inputs<'_>) -> Option<String> {
         .gates_from(&cwd)
         .ok()
         .flatten()
-        .map(|g| g.gates)
-        .unwrap_or_default();
+        .map_or_default(|g| g.gates);
     let legacy = || {
         matcher::legacy_gate_hit(command, &legacy_gates).map(|gate| deny(&gate_deny_text(&gate)))
     };

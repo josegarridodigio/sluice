@@ -56,14 +56,12 @@ fn procs(dir: &Path) -> Vec<u32> {
 
 /// The job leaves (subdirectories of `jobs/`; the control files are skipped).
 fn job_leaves(layout: &Layout) -> Vec<std::path::PathBuf> {
-    fs::read_dir(layout.jobs_dir())
-        .map(|d| {
-            d.flatten()
-                .map(|e| e.path())
-                .filter(|p| p.is_dir())
-                .collect()
-        })
-        .unwrap_or_default()
+    fs::read_dir(layout.jobs_dir()).map_or_default(|d| {
+        d.flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect()
+    })
 }
 
 fn cgroup_of(pid: u32) -> String {
@@ -76,8 +74,7 @@ fn cgroup_of(pid: u32) -> String {
 
 fn cmdline_of(pid: u32) -> String {
     fs::read(format!("/proc/{pid}/cmdline"))
-        .map(|b| String::from_utf8_lossy(&b).replace('\0', " "))
-        .unwrap_or_default()
+        .map_or_default(|b| String::from_utf8_lossy(&b).replace('\0', " "))
 }
 
 /// Stacks alive in this process (see `Drop for Stack`).
@@ -727,14 +724,12 @@ fn marked_sleeps(marker: &str) -> Vec<u32> {
         let argv: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
         argv.len() >= 2 && argv[0].ends_with(b"sleep") && argv[1] == marker.as_bytes()
     };
-    fs::read_dir("/proc")
-        .map(|d| {
-            d.flatten()
-                .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
-                .filter(|p| is_marked(*p))
-                .collect()
-        })
-        .unwrap_or_default()
+    fs::read_dir("/proc").map_or_default(|d| {
+        d.flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|p| is_marked(*p))
+            .collect()
+    })
 }
 
 /// Builds a stack whose gate escapes; `None` (after printing why) when the
