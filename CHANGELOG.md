@@ -11,28 +11,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Sluice's own `.sluice.toml` keys its gates on `RUSTFLAGS`, `RUSTDOCFLAGS` and
-  `CARGO_BUILD_TARGET` (`key_env`), so `sluice doctor` no longer warns there.
-- The code passes the clippy of Rust 1.100 (`map_unwrap_or`: `.map(f).unwrap_or_default()`
-  becomes `.map_or_default(f)`; `needless_range_loop` in the store). No behaviour change;
-  the minimum Rust version stays 1.99.
+### Fixed
+
+## [0.12.2] - 2026-11-13
+
+### Changed
+
+- **Sluice's own gates key on the Rust build flags.** The repository's `.sluice.toml`
+  names `RUSTFLAGS`, `RUSTDOCFLAGS` and `CARGO_BUILD_TARGET` in `key_env` (ADR-0029), so a
+  pass made with other flags or another target is never reused, and `sluice doctor` in
+  this repository reports no `key-env` warning. If you build Sluice from source and verify
+  it through Sluice, each gate runs once more after the update.
 
 ### Fixed
 
-- **The escape detection no longer pulls back processes Sluice itself placed**
-  (ADR-0028 amendment): those in its agents scope or in the tree of another Sluice
-  instance, as Sluice's own containment tests create. Moving them back into the job
-  broke what those tests check. Escapes into any other scope, Chromium's included, are
-  still moved back.
-- **The documentation matches 0.12.1.** The README no longer says containment cannot
-  hold a process that moves itself out (0.11.0 moves it back), describes what was
-  validated on which machines, lists the memory containment among the features and says
-  how to update the Claude Code plugin. `docs/configuration.md` and
-  `docs/compatibility.md` name the release of every key that still said "the release
-  after" or "the next release". `docs/how-it-works.md` describes the daemon's allowlisted
-  environment (0.12.0), the swap ceiling, moved-back processes and the desktop guard
-  (0.11.0); `docs/debugging.md` gains "A process of my job left its cgroup" and "Jobs
-  wait while the desktop is under memory pressure".
+- **A gate that starts processes in Sluice's own tree no longer has them pulled back into
+  the job** (ADR-0028 amendment). With `[containment] reclaim_escaped = true` (the
+  default since 0.11.0), the daemon moved back into a job every process that had left its
+  cgroup, including those a gate placed in an agent session of Sluice's agents scope or in
+  the tree of another Sluice instance. Those processes are Sluice's own placements, not
+  escapes: moving them broke what such a gate checks (Sluice's own containment tests
+  failed in three of four local runs). Escapes into any other cgroup are still moved back
+  and killed with the job, Chromium's `app.slice` scopes and a `systemd-run --scope` unit
+  included. Nothing to configure.
+- **The documentation matches what 0.9.0 to 0.12.1 changed.**
+  - The README no longer says containment cannot hold a process that moves itself out
+    (0.11.0 moves it back). It also says what was validated on which machines, lists the
+    memory containment among the features, and gives the commands that update the Claude
+    Code plugin after `sluice update`.
+  - `docs/configuration.md` and `docs/compatibility.md` name the release that introduced
+    each key, where they still said "the release after" or "the next release".
+  - `docs/how-it-works.md` describes the daemon's allowlisted environment (0.12.0), the
+    swap ceiling, the moved-back processes and the desktop guard (0.11.0).
+  - `docs/debugging.md` gains "A process of my job left its cgroup" and "Jobs wait while
+    the desktop is under memory pressure".
 
 ## [0.12.1] - 2026-11-11
 
@@ -852,7 +864,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PSI thresholds must be percentages (rejected at config load otherwise).
 - Findings of the Phase 1, 2, 3 and 4 reconciliation passes.
 
-[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.12.1...HEAD
+[Unreleased]: https://github.com/josegarridodigio/sluice/compare/v0.12.2...HEAD
+[0.12.2]: https://github.com/josegarridodigio/sluice/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/josegarridodigio/sluice/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/josegarridodigio/sluice/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/josegarridodigio/sluice/compare/v0.10.1...v0.11.0
