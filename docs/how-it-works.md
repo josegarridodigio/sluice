@@ -19,11 +19,19 @@ run at once, and it makes identical simultaneous requests share one run.
 - `sluice run <gate>` serves git hooks, humans and scripts. `sluice mcp` serves
   coding agents as an MCP server over stdio. Both talk to the same daemon and
   share cache, queue and logs.
-- The daemon is per user, and its environment is neutral: when a client starts it, the
-  variables that describe that client's own invocation (`GIT_*`, `CLAUDE*`, `SLUICE_JOB`,
-  `SLUICE_AGENT`, `SLUICE_CACHE`, `SLUICE_DISABLE`, `SLUICE_SESSION_LEAF`, `SLUICE_SHIM_DIR`,
+- The daemon is per user, and its environment is neutral (since 0.12.0): it keeps only
+  an allowlist (`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LANGUAGE`, `TZ`,
+  `TMPDIR`, `DBUS_SESSION_BUS_ADDRESS`, `CI`, every `LC_*`, `XDG_*` and `SLUICE_*`
+  variable, and the names in `[daemon] pass_env`), whoever started it: an agent
+  session that autostarts it leaves no session id or token behind. The variables that
+  describe a client's own invocation (`GIT_*`, `CLAUDE*`, `SLUICE_JOB`, `SLUICE_AGENT`,
+  `SLUICE_CACHE`, `SLUICE_DISABLE`, `SLUICE_SESSION_LEAF`, `SLUICE_SHIM_DIR`,
   `SLUICE_SHIMS`, `SLUICE_GUARD`, your `[agent_detection]` variables and the shim
-  directory in `PATH`) are removed; `CI`, `LC_*` and the rest are kept. Merge trains do not
+  directory in `PATH`) are removed even when the allowlist or `pass_env` names them. A
+  `sluice daemon` started by hand re-executes itself in that environment, and the daemon
+  log names (never shows) the dropped variables that look like credentials. A gate job
+  of `sluice run`, `verify` or a hook still runs in the requesting client's environment
+  plus the gate's `env`; `env_remove` takes variables out of it. Merge trains do not
   depend on whoever started it: the tools of a train (its gates, `prepare` and `key_inputs`)
   run in your login environment, which the daemon resolves once at start by running your
   login shell (`[queue] tool_env`, `tool_path`; see [the merge queue](merge-queue.md)). It starts itself the first time a miss needs it and
@@ -115,11 +123,13 @@ run at once, and it makes identical simultaneous requests share one run.
   reserve (10 % of the machine's memory by default) and minus what the running
   jobs are still expected to grow by. A job that waits only for memory shows
   `(budget: memory)` in `sluice status`; the first job on an idle machine always
-  starts. A gate with no passing run yet has no learned figure: its estimate is
+  starts, except while the desktop guard holds (below). A command of a gate with
+  no runs of its own (other arguments, another concurrency) takes the gate's
+  largest learned expectation. A gate with no passing run yet has no learned figure: its estimate is
   `1.2 x` the largest peak of its recent failed or timed-out runs (a lower
   bound), else a guess from the weight and from what the daemon learned about
   lighter or equal gates, and `status` says which (`learned`, `lower-bound`,
-  `guessed`). Such a first run may start as a *memory probe* as soon as a
+  `guessed`). A first run with a guessed estimate (never a lower bound) may start as a *memory probe* as soon as a
   quarter of its estimate is free, one probe per gate and one per machine at a
   time, so a pessimistic guess cannot hold it back for hours; its real peak then
   becomes the estimate. If memory runs out anyway, gate processes are the preferred victims of
@@ -132,6 +142,19 @@ run at once, and it makes identical simultaneous requests share one run.
   run (`[admission] memory_aware`, `memory_reserve`, `memory_guard`,
   `memory_ceiling`, `memory_floor`; see
   [debugging.md](debugging.md#a-gate-killed-for-lack-of-memory)).
+- **Containment of what a job starts** (0.11.0). Each job's swap is bounded the
+  same way (`memory.swap.max`, so the jobs together never take the machine's
+  free swap below `swap_floor`, a quarter of the swap by default). A process
+  that moves itself out of its job's cgroup, as Chromium does (it asks the
+  systemd user manager for a scope of its own, so every Playwright browser
+  leaves its job), is moved back within a second, and whatever is left of a
+  job when it ends is killed, inside its cgroup or outside it. While the user's
+  desktop session stalls on memory (`some avg10` of its `session.slice` at 10 %
+  or more, until it falls under 5 %), no job starts, not even alone on the
+  machine, and the ceilings keep the whole reserve free. Every second the
+  daemon records each job's memory pressure, swap, page cache and escaped
+  processes, and `status` shows them (`[admission] swap_ceiling`, `swap_floor`,
+  `desktop_guard`, `[containment] reclaim_escaped`).
 - **Coalescing.** Two requests for the same tree and gate share one run; the
   second waits for the first one's result. If a marker appears while a request
   is queued, it completes without running.

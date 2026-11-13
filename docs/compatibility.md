@@ -40,7 +40,7 @@ status`, `client.log` and `daemon.log` lines, and the wording of errors.
 | Daemon features | `welcome.features` | `["exec", "queue-only", "queue"]` (0.2.0: `["queue"]`; later releases add `queue-trust-config` and `queue-pr-landing`) |
 | Status JSON | `schema` | 1 |
 | Queue status JSON | `schema` | 1 |
-| Database | tables `schema`, `queue_schema` and `sched_schema` | 1, 1 and 1 (`containment_schema` is 2 from 0.6.0 and 3 from the next release; older binaries ignore it) |
+| Database | tables `schema`, `queue_schema` and `sched_schema` | 1, 1 and 1 (`containment_schema` is 2 from 0.6.0, 3 from 0.8.0, 4 from 0.9.0 and 5 from 0.11.0; older binaries ignore it) |
 | Exit codes, CLI flags, MCP tools | none | n/a |
 | Plugin | `plugin.json` `version`, follows the release | |
 
@@ -124,7 +124,7 @@ path, type and meaning. New optional fields and new counters may appear (0.6.0:
 `queue status` the train's `prepare`, `config_source` and `config_diff`, a gate's
 `note`, and the reasons `gate_modified_tree`, `prepare_failed`, `prepare_dirty`,
 `key_input_failed`, `hook_gate_unverified` and `member_config_invalid`; an
-outcome's `killed_by` may be `memory`; the next release adds `memory_expected_basis`
+outcome's `killed_by` may be `memory`; 0.8.0 adds `memory_expected_basis`
 to running and queued jobs: `learned`, `lower-bound` or `guessed`);
 unknown queue job and train states are parsed as `unknown` by current clients.
 
@@ -137,14 +137,14 @@ daemon simply creates it without the policy. The opt-in `[admission]
 memory_guard` and its `sluice_memory_guard` interventions are one-way like the
 other 0.6.0 keys (fixture `crates/sluice-gate-core/tests/fixtures/unreleased/admission-memory-guard.toml`).
 
-The release after 0.9.0 adds `[admission] memory_ceiling` and `memory_floor` (ADR-0027).
+0.10.0 adds `[admission] memory_ceiling` and `memory_floor` (ADR-0027).
 They are one-way like the 0.6.0 keys: 0.9.0 and older binaries reject a user config that
 has them (fixture `crates/sluice-gate-core/tests/fixtures/unreleased/admission-memory-ceiling.toml`).
 The ceiling is on without the keys; it writes only the `memory.max` of Sluice's own job
 leaves, which an older daemon never reads. `status` JSON gains `memory_ceiling_bytes` per
 running job (additive, schema 1).
 
-The release after 0.10.1 adds `[admission] swap_ceiling`, `swap_floor` and `desktop_guard`
+0.11.0 adds `[admission] swap_ceiling`, `swap_floor` and `desktop_guard`
 and `[containment] reclaim_escaped` (ADR-0028), and the gate key `key_env` (ADR-0029). They
 are one-way like the 0.6.0 keys: 0.10.1 and older binaries reject a user config or a
 `.sluice.toml` that has them (fixtures
@@ -155,7 +155,7 @@ binaries never read. `status` JSON gains, per running job, `memory_swap_bytes`,
 `memory_pressure_some`, `memory_pressure_full`, `escaped_processes` and `escaped_bytes`, and
 `memory.session_some_avg10` / `session_full_avg10` (additive, schema 1).
 
-The release after 0.11.0 adds the gate key `env_remove` and the user config key
+0.12.0 adds the gate key `env_remove` and the user config key
 `[daemon] pass_env` (ADR-0030). They are one-way like the 0.6.0 keys: 0.11.0 and older
 binaries reject a `.sluice.toml` or a user config that has them (fixture
 `crates/sluice-gate-core/tests/fixtures/unreleased/gate-env-remove.toml`). Cache keys are
@@ -168,7 +168,7 @@ has them (fixture `crates/sluice-gate-core/tests/fixtures/unreleased/queue-tool-
 The status JSON gains the optional `queue.tool_env` (`source`, `reason`, `path`), which
 older clients ignore.
 
-The release after 0.7.0 adds `[queue] land = "push" | "pull-request"` (ADR-0025), in `.sluice.toml` and in
+0.8.0 adds `[queue] land = "push" | "pull-request"` (ADR-0025), in `.sluice.toml` and in
 the user config. It is one-way like the 0.6.0 keys: 0.7.0 and older binaries reject a file that has it
 (fixtures `crates/sluice-gate-core/tests/fixtures/unreleased/queue-land.toml` and `queue-land-user.toml`).
 Without it nothing changes: the queue pushes. The queue status JSON gains the states `awaiting_merge` (jobs
@@ -185,13 +185,13 @@ approval tool) instead of ignoring it. The database gains nullable columns `pr_*
 (older binaries name their columns and never read them). A train that is `awaiting_merge` when an older
 daemon starts is not understood by it.
 
-The release after 0.7.0 adds the user config key `[scheduler] backfill` (ADR-0023). It
+0.8.0 adds the user config key `[scheduler] backfill` (ADR-0023). It
 is one-way like the 0.6.0 keys: 0.7.0 and older binaries reject a user config that has
 it (fixture `crates/sluice-gate-core/tests/fixtures/unreleased/scheduler-backfill.toml`).
 The status JSON gains `queued[].reserved_eta_ms` and `totals.backfilled` and
 `totals.backfill_head_delay_ms`, which older clients ignore (schema stays 1).
 
-The release after 0.7.0 also adds the gate key `stall_timeout` (ADR-0024). It is one-way
+0.8.0 also adds the gate key `stall_timeout` (ADR-0024). It is one-way
 like the other keys: 0.7.0 and older binaries reject a `.sluice.toml` that has it (fixture
 `crates/sluice-gate-core/tests/fixtures/unreleased/gate-stall-timeout.toml`). On the
 wire it is the optional `gate.stall_timeout_ms` of a `run` request (`0` is `"off"`), which
@@ -200,7 +200,7 @@ the `progress` message the optional `stalled_ms`; older clients ignore both (sch
 1). A `.sluice.toml` with `stall_timeout` read by an older client simply fails to load, so
 add the key only where every machine runs a newer binary.
 
-The release after 0.7.0 adds the queue reason `target_protected` (ADR-0025): a push the forge
+0.8.0 adds the queue reason `target_protected` (ADR-0025): a push the forge
 refused as a protected branch fails its jobs with it instead of `push_rejected`. It is a new
 string in an existing optional field, shown as is by older clients (which print an unknown
 reason without special wording and suggest a retry that cannot help). `queue-enqueue` replies
@@ -221,7 +221,7 @@ queue's state in two independent schemas. Markers are not in it.
   (`queue_trains.prepare`, `config_source`, `config_hash`,
   `queue_jobs.trust_config`), added by an idempotent migration when the daemon
   opens the file; `queue_schema` stays 1 and an older binary ignores them.
-- The release after 0.7.0 adds the queue table `queue_protected_targets` (the targets that
+- 0.8.0 adds the queue table `queue_protected_targets` (the targets that
   refused a direct push, per endpoint hash and target), created by the same idempotent
   migration when the daemon opens the file; `queue_schema` stays 1 and an older binary
   never reads it.

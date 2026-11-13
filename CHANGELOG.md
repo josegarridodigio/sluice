@@ -11,7 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Sluice's own `.sluice.toml` keys its gates on `RUSTFLAGS`, `RUSTDOCFLAGS` and
+  `CARGO_BUILD_TARGET` (`key_env`), so `sluice doctor` no longer warns there.
+
 ### Fixed
+
+- **The documentation matches 0.12.1.** The README no longer says containment cannot
+  hold a process that moves itself out (0.11.0 moves it back), describes what was
+  validated on which machines, lists the memory containment among the features and says
+  how to update the Claude Code plugin. `docs/configuration.md` and
+  `docs/compatibility.md` name the release of every key that still said "the release
+  after" or "the next release". `docs/how-it-works.md` describes the daemon's allowlisted
+  environment (0.12.0), the swap ceiling, moved-back processes and the desktop guard
+  (0.11.0); `docs/debugging.md` gains "A process of my job left its cgroup" and "Jobs
+  wait while the desktop is under memory pressure".
 
 ## [0.12.1] - 2026-11-11
 

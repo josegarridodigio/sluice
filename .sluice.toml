@@ -2,6 +2,8 @@
 # (see .githooks/ and CONTRIBUTING.md) and from the validation benchmark.
 # The gates are path-scoped (Sluice >= 0.3.0): documentation, KB and
 # harness-only changes keep the cached passes.
+# key_env (Sluice >= 0.11.0): a pass made with other Rust flags or another
+# target is never reused.
 version = 1
 
 [defaults]
@@ -14,6 +16,7 @@ weight = 1
 timeout = "2m"
 hooks = ["pre-commit"]
 key_inputs = ["rustc --version"]
+key_env = ["RUSTFLAGS", "RUSTDOCFLAGS", "CARGO_BUILD_TARGET"]
 paths = ["crates/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "plugin/**"]
 
 [gates.clippy]
@@ -22,6 +25,7 @@ weight = 4
 timeout = "15m"
 hooks = ["pre-commit"]
 key_inputs = ["rustc --version"]
+key_env = ["RUSTFLAGS", "RUSTDOCFLAGS", "CARGO_BUILD_TARGET"]
 paths = ["crates/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "plugin/**"]
 
 [gates.test]
@@ -30,4 +34,5 @@ weight = 6
 timeout = "30m"
 hooks = ["pre-push"]
 key_inputs = ["rustc --version"]
+key_env = ["RUSTFLAGS", "RUSTDOCFLAGS", "CARGO_BUILD_TARGET"]
 paths = ["crates/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "plugin/**"]
