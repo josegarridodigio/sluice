@@ -591,9 +591,8 @@ fn spawn_daemon(env: &EnvMap, socket: &Path, log_path: &Path) -> Spawn {
     // agent-detection variables and `[daemon] pass_env` come from their
     // config; an unreadable config falls back to the defaults (the daemon
     // reports it itself).
-    let (detection, pass) = UserConfig::load(env)
-        .map(|u| (u.agent_detection, u.daemon.pass_env))
-        .unwrap_or_default();
+    let (detection, pass) =
+        UserConfig::load(env).map_or_default(|u| (u.agent_detection, u.daemon.pass_env));
     let mut cmd = Command::new(exe);
     cmd.arg("daemon")
         .env_clear()

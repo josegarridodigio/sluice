@@ -501,12 +501,11 @@ pub fn evaluate(facts: Facts) -> Capabilities {
     let controllers = facts
         .manager_controllers
         .as_ref()
-        .map(|c| Controllers {
+        .map_or_default(|c| Controllers {
             cpu: c.iter().any(|w| w == "cpu"),
             memory: c.iter().any(|w| w == "memory"),
             pids: c.iter().any(|w| w == "pids"),
-        })
-        .unwrap_or_default();
+        });
     let off = |reason: OffReason, facts: Facts| Capabilities {
         outcome: Outcome::Off { reason },
         controllers: Controllers::default(),
@@ -917,7 +916,7 @@ pub fn system_ancestor_policy(env: &EnvMap, uid: u32) -> AncestorPolicy {
             "ManagedOOMMemoryPressureDurationUSec",
         ],
     )
-    .map(|m| {
+    .map_or_default(|m| {
         ancestor_from_show(&format!(
             "ManagedOOMMemoryPressureLimit={}\nManagedOOMMemoryPressureDurationUSec={}\n",
             m.get("ManagedOOMMemoryPressureLimit")
@@ -925,8 +924,7 @@ pub fn system_ancestor_policy(env: &EnvMap, uid: u32) -> AncestorPolicy {
             m.get("ManagedOOMMemoryPressureDurationUSec")
                 .map_or("[not set]", String::as_str)
         ))
-    })
-    .unwrap_or_default();
+    });
     let manager_path = format!("/user.slice/user-{uid}.slice/user@{uid}.service");
     let oomctl = parse_oomctl_dump(&systemd::oomctl_dump(env), &manager_path);
     let conf = ["/etc/systemd/oomd.conf", "/usr/lib/systemd/oomd.conf"]

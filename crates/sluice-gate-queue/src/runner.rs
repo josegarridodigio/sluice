@@ -419,7 +419,7 @@ async fn watch_ready(core: &Arc<Core>, t: &TrainRow) {
     let note = if lost_member {
         Some("member cancelled".to_owned())
     } else {
-        let env = ready.first().map(|j| j.env.clone()).unwrap_or_default();
+        let env = ready.first().map_or_default(|j| j.env.clone());
         let git = core
             .git_for(&env)
             .with_network_timeout(t.settings.network_timeout());
@@ -650,7 +650,7 @@ async fn prepare_and_claim(
         ),
         None => (base_config, None),
     };
-    let queue = config.as_ref().map(|c| c.queue.clone()).unwrap_or_default();
+    let queue = config.as_ref().map_or_default(|c| c.queue.clone());
     let settings = train_settings(&queue, land);
     let max = if trust.is_some() {
         1

@@ -89,8 +89,7 @@ pub fn locate(dir: &Path) -> Place {
         let file = d.join(REPO_CONFIG_FILE);
         if let Ok(text) = fs::read_to_string(&file) {
             let gates = RepoConfig::parse(&text, &file)
-                .map(|c| c.gates.keys().cloned().collect())
-                .unwrap_or_default();
+                .map_or_default(|c| c.gates.keys().cloned().collect());
             return Place::Configured(gates);
         }
         in_git |= d.join(".git").exists();

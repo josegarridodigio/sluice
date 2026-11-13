@@ -126,14 +126,12 @@ pub fn read_leaf(leaf: &Path) -> LeafReading {
 /// The pids listed in `<leaf>/cgroup.procs` (empty when unreadable).
 #[must_use]
 pub fn leaf_procs(leaf: &Path) -> HashSet<u32> {
-    std::fs::read_to_string(leaf.join("cgroup.procs"))
-        .map(|t| {
-            t.lines()
-                .filter_map(|l| l.trim().parse().ok())
-                .filter(|&pid| !is_system_root(pid))
-                .collect()
-        })
-        .unwrap_or_default()
+    std::fs::read_to_string(leaf.join("cgroup.procs")).map_or_default(|t| {
+        t.lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .filter(|&pid| !is_system_root(pid))
+            .collect()
+    })
 }
 
 /// More escapees than this for one job in one tick is a detection error (a
@@ -188,6 +186,22 @@ pub fn cgroup_of(proc_root: &Path, pid: u32) -> Option<String> {
         .map(|p| p.trim().to_owned())
 }
 
+/// True for a cgroup where Sluice itself puts processes, below the daemon's
+/// own `slice` (such as `.../sluice.slice`): its agents scope (the agent
+/// sessions' leaves) and any slice below it (the tree of a nested Sluice
+/// instance; the test suite's daemons live in `sluice.slice/sluice-test.slice`,
+/// as systemd nests unit names on dashes). Any other unit right below the
+/// slice, such as a scope a gate started there, is not.
+#[must_use]
+pub fn placed_by_sluice(cg: &str, slice: &str) -> bool {
+    let Some(rest) = cg.strip_prefix(slice).and_then(|r| r.strip_prefix('/')) else {
+        return false;
+    };
+    let first = rest.split('/').next().unwrap_or_default();
+    // systemd unit names are case-sensitive.
+    first.strip_suffix(".slice").is_some() || first.ends_with("-agents.scope")
+}
+
 /// Whether the cgroup path `cg` is the leaf `leaf_rel` or below it.
 fn inside(cg: &str, leaf_rel: &str) -> bool {
     cg == leaf_rel
@@ -218,7 +232,9 @@ pub struct Escapee {
 /// prints it. Only the processes found outside the leaf's `cgroup.procs`
 /// have their `cgroup` file read. The walk never starts from or reports a
 /// system root ([`is_system_root`]), a `protected` pid or a process in a
-/// [`foreign_cgroup`], and never descends through them.
+/// [`foreign_cgroup`], and never descends through them. Nor is a process
+/// that Sluice itself placed ([`placed_by_sluice`] under `sluice_slice`, the
+/// daemon's own slice).
 #[must_use]
 pub fn find_escapees<S: std::hash::BuildHasher, P: std::hash::BuildHasher>(
     proc_root: &Path,
@@ -227,6 +243,7 @@ pub fn find_escapees<S: std::hash::BuildHasher, P: std::hash::BuildHasher>(
     leaf_rel: &str,
     known: &[(u32, u64)],
     protected: &HashSet<u32, P>,
+    sluice_slice: Option<&str>,
 ) -> Vec<Escapee> {
     let mut children: HashMap<u32, Vec<&ProcEntry>> = HashMap::new();
     let by_pid: HashMap<u32, &ProcEntry> = table.iter().map(|p| (p.pid, p)).collect();
@@ -248,11 +265,7 @@ pub fn find_escapees<S: std::hash::BuildHasher, P: std::hash::BuildHasher>(
         .collect();
     loop {
         let next = if let Some(pid) = stack.pop() {
-            children
-                .get(&pid)
-                .map(Vec::as_slice)
-                .unwrap_or_default()
-                .to_vec()
+            children.get(&pid).map_or_default(Vec::as_slice).to_vec()
         } else if let Some(root) = roots.pop() {
             vec![root]
         } else {
@@ -276,7 +289,7 @@ pub fn find_escapees<S: std::hash::BuildHasher, P: std::hash::BuildHasher>(
                 stack.push(child.pid);
                 continue;
             }
-            if foreign_cgroup(&cg) {
+            if foreign_cgroup(&cg) || sluice_slice.is_some_and(|s| placed_by_sluice(&cg, s)) {
                 continue;
             }
             stack.push(child.pid);
@@ -284,8 +297,7 @@ pub fn find_escapees<S: std::hash::BuildHasher, P: std::hash::BuildHasher>(
                 pid: child.pid,
                 start: child.start,
                 comm: std::fs::read_to_string(proc_root.join(child.pid.to_string()).join("comm"))
-                    .map(|c| c.trim().to_owned())
-                    .unwrap_or_default(),
+                    .map_or_default(|c| c.trim().to_owned()),
                 cgroup: cg,
                 rss_bytes: crate::memory::rss_bytes(proc_root, child.pid).unwrap_or(0),
             });
@@ -749,11 +761,20 @@ mod tests {
             &leaf,
             &[(1, 1), (31, 31)],
             &protected,
+            None,
         );
         assert_eq!(found.iter().map(|e| e.pid).collect::<Vec<_>>(), [41]);
         // Without the protected set, the session and init.scope are still
         // never escapees (pid 30's children are only reached through 30).
-        let found = find_escapees(root, &table, &poisoned, &leaf, &[(30, 30)], &HashSet::new());
+        let found = find_escapees(
+            root,
+            &table,
+            &poisoned,
+            &leaf,
+            &[(30, 30)],
+            &HashSet::new(),
+            None,
+        );
         assert_eq!(found.iter().map(|e| e.pid).collect::<Vec<_>>(), [41]);
         assert!(foreign_cgroup("/"));
         assert!(foreign_cgroup(&format!("{user}/init.scope")));
@@ -805,7 +826,7 @@ mod tests {
             entry(20, 1, 104),
         ];
         let procs = HashSet::from([10]);
-        let found = find_escapees(root, &table, &procs, leaf, &[], &HashSet::new());
+        let found = find_escapees(root, &table, &procs, leaf, &[], &HashSet::new(), None);
         let pids: Vec<u32> = found.iter().map(|e| e.pid).collect();
         assert_eq!(pids, [12, 13]);
         assert_eq!(found[0].comm, "chrome-headless");
@@ -821,6 +842,7 @@ mod tests {
             leaf,
             &[(12, 102)],
             &HashSet::new(),
+            None,
         );
         assert_eq!(found.iter().map(|e| e.pid).collect::<Vec<_>>(), [12, 13]);
         let reused = [entry(12, 1, 999)];
@@ -831,13 +853,77 @@ mod tests {
                 &HashSet::new(),
                 leaf,
                 &[(12, 102)],
-                &HashSet::new()
+                &HashSet::new(),
+                None
             ),
             Vec::new()
         );
         // A leaf path that is only a prefix of another name is not "inside".
         assert!(!inside("/a/jobs/j10", "/a/jobs/j1"));
         assert!(inside("/a/jobs/j1/x", "/a/jobs/j1"));
+    }
+
+    /// A process a job's test placed in another Sluice instance's tree (the
+    /// suite's own daemons live under `sluice.slice/sluice-test.slice`) or in
+    /// an agent session's leaf is Sluice's own placement, not an escape: the
+    /// daemon running the suite once pulled such processes back and broke the
+    /// tests that check them (2026-11-13). Chromium's scope still is one.
+    #[test]
+    fn a_process_in_the_daemons_own_slice_is_not_an_escapee() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let slice = "/user.slice/u.service/sluice.slice";
+        let leaf = format!("{slice}/sluice-daemon.scope/jobs/j1");
+        let nested = format!(
+            "{slice}/sluice-test.slice/sluice-test-7.slice/sluice-test-7-a.slice/\
+             sluice-test-7-a-agents.scope/s-x/tools"
+        );
+        let session = format!("{slice}/sluice-agents.scope/s-y/ui");
+        let scope = "/user.slice/u.service/app.slice/app-org.chromium.Chromium-14.scope";
+        // A scope a gate starts right in the slice (`systemd-run --scope
+        // --slice=`) is still an escape.
+        let own_scope = format!("{slice}/sluice-escapee.scope");
+        for (pid, cg) in [
+            (10, leaf.clone()),
+            (11, nested),
+            (12, session),
+            (13, "/user.slice/u.service/sluice.slice2/x".to_owned()),
+            (14, scope.to_owned()),
+            (15, own_scope),
+        ] {
+            write(root, &format!("{pid}/cgroup"), &format!("0::{cg}\n"));
+            write(root, &format!("{pid}/comm"), "sleep\n");
+        }
+        let table = [
+            entry(10, 1, 100),
+            entry(11, 10, 101),
+            entry(12, 10, 102),
+            entry(13, 10, 103),
+            entry(14, 10, 104),
+            entry(15, 10, 105),
+        ];
+        let procs = HashSet::from([10]);
+        let found = find_escapees(
+            root,
+            &table,
+            &procs,
+            &leaf,
+            &[],
+            &HashSet::new(),
+            Some(slice),
+        );
+        assert_eq!(
+            found.iter().map(|e| e.pid).collect::<Vec<_>>(),
+            [13, 14, 15]
+        );
+        // Without the slice, the old behaviour: every one is an escapee.
+        let found = find_escapees(root, &table, &procs, &leaf, &[], &HashSet::new(), None);
+        assert_eq!(
+            found.iter().map(|e| e.pid).collect::<Vec<_>>(),
+            [11, 12, 13, 14, 15]
+        );
+        assert!(!placed_by_sluice(slice, slice));
+        assert!(!placed_by_sluice(&format!("{slice}x/a.slice"), slice));
     }
 
     #[test]

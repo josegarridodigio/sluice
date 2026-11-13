@@ -87,9 +87,8 @@ pub fn status(all: bool) -> ExitCode {
                 } else {
                     String::new()
                 };
-                let scope = lookup::scope_summary(gate, &entries)
-                    .map(|s| s.status_suffix())
-                    .unwrap_or_default();
+                let scope =
+                    lookup::scope_summary(gate, &entries).map_or_default(|s| s.status_suffix());
                 println!("{name:<16} {line}{scope}{note}");
                 if let Some(memory) = memory_line(&env, &repo.paths.toplevel, name) {
                     println!("{:<16} {memory}", "");

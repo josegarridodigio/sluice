@@ -56,6 +56,13 @@ a 4-CPU runner. Method, raw data and how to run it:
   to use fits what is free. The expectation is learned from the gate's earlier
   runs, kept when an agent changes its arguments, and the reserve grows with
   what the rest of the machine uses while heavy gates run.
+- **Memory containment of every gate job.** Each job runs under a RAM and a
+  swap ceiling that the kernel enforces and the daemon rewrites every second,
+  so the jobs together never take the machine below a floor: a job that does
+  not fit dies in its own cgroup instead of freezing the machine. Processes
+  that move themselves out of their job, as Chromium and so Playwright's
+  browsers do, are moved back and die with it. While the desktop session
+  stalls on memory, no job starts.
 - **Backfilling and stalled jobs.** Small gates start beside a heavy one that
   waits for room when they cannot delay it; a gate that stops making progress
   is reported (`STALLED`), never killed.
@@ -93,7 +100,15 @@ curl -fsSL https://raw.githubusercontent.com/josegarridodigio/sluice/main/script
 
 This installs the latest release into `~/.local/bin` (`SLUICE_VERSION` pins a
 tag, `SLUICE_INSTALL_DIR` relocates). Later, `sluice update` upgrades in place,
-checksum-verified. From source, with a stable Rust toolchain:
+checksum-verified, and the Claude Code plugin follows with
+
+```sh
+claude plugin marketplace update sluice
+claude plugin update sluice@sluice
+```
+
+(then restart the agent sessions; `sluice doctor` says when the plugin and the
+binary differ). From source, with a stable Rust toolchain:
 
 ```sh
 cargo install --path crates/sluice-gate
@@ -180,13 +195,22 @@ Sluice is alpha: complete enough for early adopters, not yet proven by long use.
   kernel's preferred OOM victims; the opt-in `[admission] memory_guard` covers
   machines without `systemd-oomd`). In containers, on cgroup v1 or without a user manager
   Sluice runs uncontained and `sluice doctor` says why. It protects against
-  accidental overload, not against a process that moves itself out.
-- **0.5.0 containment was validated on two Ubuntu 26.04 machines** (20 and
-  12 threads), with real agent sessions on the command line and over SSH.
-  Not yet validated: the agent's Bash sandbox with its default seccomp
-  filter (tested only with `sandbox.network.allowAllUnixSockets`), the
-  interactive terminal UI, IDE integrations, and systems with systemd older
-  than 257. Reports are welcome.
+  accidental overload, not against a hostile process: a process that leaves
+  its job's cgroup is moved back within a second (since 0.11.0), and the memory
+  it used while outside stays outside the job. Memory used outside gates
+  (builds, agents and browsers you start yourself) is never limited.
+- **Validated on three machines with real agent sessions.** Containment was
+  validated from 0.5.0 on two Ubuntu 26.04 machines (20 and 12 threads), on the
+  command line and over SSH; the memory ceilings, the moved-back processes and
+  the desktop guard of 0.10.0 to 0.12.1 ran on those two and a third Linux
+  machine (16 threads); the incidents behind them were analysed on GNOME
+  desktops. Not yet validated: other desktops (the desktop guard reads the
+  systemd user manager's `session.slice`), the
+  agent's Bash sandbox with its default seccomp filter (tested only with
+  `sandbox.network.allowAllUnixSockets`), the interactive terminal UI, IDE
+  integrations, and systems with systemd older than 257. The desktop guard's
+  thresholds and the swap floor are first values, to be tuned from the
+  recorded telemetry. Reports are welcome.
 - **Shims need the agent plugin or setup by hand.** Claude Code gets them
   automatically; other agents need `sluice shim install` and a `PATH` entry.
   A `.sluice.toml` with `weight = "auto"` needs 0.4.0.

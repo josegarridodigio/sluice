@@ -138,7 +138,7 @@ pub struct QueueConfig {
     /// How a verified train reaches the target (ADR-0025): `push` (default)
     /// or `pull-request`. Read from the target commit's `.sluice.toml`, never
     /// from a queued branch; the user config's `[queue] land` is the default
-    /// for repositories that do not set it. Needs the release after 0.7.0.
+    /// for repositories that do not set it. Needs 0.8.0.
     pub land: Option<Land>,
 }
 

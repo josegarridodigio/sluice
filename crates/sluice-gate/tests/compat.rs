@@ -353,13 +353,11 @@ fn by_name(tools: &Value) -> std::collections::BTreeMap<String, Value> {
 }
 
 fn strings(v: &Value) -> BTreeSet<String> {
-    v.as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|s| s.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default()
+    v.as_array().map_or_default(|a| {
+        a.iter()
+            .filter_map(|s| s.as_str().map(str::to_owned))
+            .collect()
+    })
 }
 
 /// Old properties still exist with the same `type`; nothing new is required.

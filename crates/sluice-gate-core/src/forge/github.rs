@@ -128,8 +128,7 @@ pub fn decide(
         .ok()
         .filter(|r| r.status == 200)
         .and_then(|r| r.json())
-        .map(|v| rule_types(&v))
-        .unwrap_or_default();
+        .map_or_default(|v| rule_types(&v));
     if rules.iter().any(|t| t == "pull_request") {
         return Protection::PullRequestRequired(
             "a repository ruleset requires a pull request".into(),

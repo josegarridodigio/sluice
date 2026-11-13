@@ -91,8 +91,7 @@ pub fn defaults_at(git: &Git, common: &Path, rev: &str) -> Result<QueueConfig, T
 
 fn remotes(git: &Git, common: &Path) -> Vec<String> {
     git.repo(common, &["remote"])
-        .map(|s| s.lines().map(|l| l.trim().to_owned()).collect())
-        .unwrap_or_default()
+        .map_or_default(|s| s.lines().map(|l| l.trim().to_owned()).collect())
 }
 
 /// True when `remote` has the branch: a remote-tracking ref exists, or

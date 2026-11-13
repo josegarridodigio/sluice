@@ -324,6 +324,47 @@ status` shows each running job's `ceiling`. If it happens often, the gate does n
 beside what else runs: lower the suite's parallelism, run fewer agents, or tell the
 human; retrying unchanged once memory is free is the right move for an agent.
 
+Since 0.11.0 the swap is bounded the same way (`[admission] swap_ceiling`,
+`swap_floor`): below the swap floor a job keeps the swap it holds and swaps out no
+more, so a job at its RAM ceiling is killed in its own cgroup, reported like any
+ceiling kill, instead of thrashing. `sluice status` shows a running job's `swap` and
+its memory pressure (`psi some%/full%`) when they are not zero, and
+`sluice cache status` the last run's peaks per gate.
+
+#### A process of my job left its cgroup
+
+Some programs move themselves into a systemd scope of their own: Chromium does it
+for its browser process (so every Playwright browser does), as does anything started
+with `systemd-run --user --scope`. The daemon checks every second; it logs a warning
+`a process of the job left its cgroup: its memory escapes the job's accounting,
+ceiling and kill` with the process and the cgroup it moved to, then `moved a process
+of the job back into its cgroup` (`[containment] reclaim_escaped = true`, the
+default since 0.11.0). When the job ends, `killed what was left of the job after it
+ended` names what it killed. A test that must start something outside its job sets
+`reclaim_escaped = false` in the user config: the escape is then only reported
+(`status` shows `N processes outside its cgroup`). Memory the process used while it
+was outside, up to a second, stays charged outside the job.
+
+0.11.0 and 0.12.0 could misread a `0` in a dying job's `cgroup.procs` and move the
+whole desktop session into the job, whose memory kill then logged the user out.
+0.12.1 fixes it: the detection ignores pids 0 to 2, never touches the daemon, its
+ancestors, `init.scope` or `session.slice`, and when more than 64 processes of one
+job seem to have left in one second it logs the error `the escape detection found
+more processes than a job can have moved out; ignoring this reading (nothing moved,
+recorded or killed)` and acts on nothing. On 0.11.x or 0.12.0, set `reclaim_escaped = false` and
+restart the daemon when it is idle (`sluice daemon stop`; it drops queued jobs).
+
+#### Jobs wait while the desktop is under memory pressure
+
+The `memory:` line of `sluice status` ends with `desktop memory pressure X% some /
+Y% full`: the pressure of the user's desktop session (`session.slice` of the systemd
+user manager). While its `some avg10` is 10 % or more, until it falls under 5 %, no
+job starts, not even alone on an idle machine, and the ceilings keep the whole
+`memory_reserve` free (`[admission] desktop_guard`, since 0.11.0). The daemon logs
+when the session crosses either level. The queue moves again once the desktop
+recovers; closing what else uses memory is the human's lever, and `desktop_guard =
+false` turns the guard off.
+
 ### A gate that waits for memory
 
 `sluice status` shows a job that fits the CPU budget but not the memory it is

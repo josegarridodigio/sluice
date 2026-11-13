@@ -738,10 +738,7 @@ fn print_plan(plan: &Plan, root: &Path, dry_run: bool) {
         (false, false) => "wrote",
     };
     for change in &plan.changes {
-        let mode = change
-            .mode
-            .map(|m| format!(" (mode {m:04o})"))
-            .unwrap_or_default();
+        let mode = change.mode.map_or_default(|m| format!(" (mode {m:04o})"));
         println!("  {} {}{mode}", verb(change.old.is_none()), change.rel);
     }
     if plan.set_hooks_path {

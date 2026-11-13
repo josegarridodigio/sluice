@@ -102,13 +102,11 @@ pub fn append_event(path: &Path, event: &Event) {
 /// Reads the log (oldest first); unreadable lines are skipped.
 #[must_use]
 pub fn read_events(path: &Path) -> Vec<Event> {
-    fs::read_to_string(path)
-        .map(|t| {
-            t.lines()
-                .filter_map(|l| serde_json::from_str::<Event>(l).ok())
-                .collect()
-        })
-        .unwrap_or_default()
+    fs::read_to_string(path).map_or_default(|t| {
+        t.lines()
+            .filter_map(|l| serde_json::from_str::<Event>(l).ok())
+            .collect()
+    })
 }
 
 /// The session id in a cgroup path: the first component named `s-<id>`.
@@ -200,9 +198,8 @@ pub fn take_notes_at(
         return Vec::new();
     };
     let known = sanitize_session_id(session);
-    let told: Vec<String> = fs::read_to_string(&file)
-        .map(|t| t.lines().map(str::to_owned).collect())
-        .unwrap_or_default();
+    let told: Vec<String> =
+        fs::read_to_string(&file).map_or_default(|t| t.lines().map(str::to_owned).collect());
     let told_set: BTreeSet<&str> = told.iter().map(String::as_str).collect();
     let mut fresh: Vec<&Event> = Vec::new();
     let mut keys: Vec<String> = Vec::new();

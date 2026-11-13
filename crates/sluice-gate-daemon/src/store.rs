@@ -1436,8 +1436,7 @@ impl Store {
                         reclaimed_processes: r.get(13)?,
                         escaped_names: r
                             .get::<_, Option<String>>(12)?
-                            .map(|n| n.split(' ').map(str::to_owned).collect())
-                            .unwrap_or_default(),
+                            .map_or_default(|n| n.split(' ').map(str::to_owned).collect()),
                     },
                 })
             })
@@ -1640,8 +1639,8 @@ impl Store {
                     t.admitted_at = opt(r, 1)?;
                     t.weight_cfg = r.get(2)?;
                     t.expected_ms = opt(r, 3)?;
-                    for k in 0..5 {
-                        t.waits[k] = opt(r, 4 + k)?;
+                    for (k, wait) in t.waits.iter_mut().enumerate() {
+                        *wait = opt(r, 4 + k)?;
                     }
                     t.admission = r.get(9)?;
                     t.killed_by = r.get(10)?;
