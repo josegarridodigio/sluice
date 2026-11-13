@@ -2,7 +2,7 @@
 # Each channel is auto (published without review), approval (published when you merge the drafts
 # pull request) or off. A channel publishes only once its secrets are set in the launches repo.
 enabled: true
-brand: josegarridodev
+brand: personal
 language: en
 
 triggers:
@@ -14,16 +14,16 @@ publishing:
   devto: approval
   bluesky: approval
   mastodon: approval
-  instagram: off
+  instagram: approval
   reddit: off
   hashnode: off
-  linkedin: off
-  newsletter: off
+  linkedin: approval
+  newsletter: approval
   telegram: off
   discord: off
   githubDiscussions: off
-  threads: off
-  youtube: off
+  threads: approval
+  youtube: approval
 
 # A demo makes the launch: a GIF in the repo, or the deployed project to record one from
 assets:
